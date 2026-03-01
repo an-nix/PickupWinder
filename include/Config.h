@@ -15,8 +15,10 @@
 // ── Potentiomètre ────────────────────────────────────────
 // ⚠ ADC1 uniquement (GPIO 32-39) — ADC2 est incompatible avec le WiFi
 #define POT_PIN             34
-#define POT_FILTER_SIZE     6       // Filtre léger : 6 × 20ms = ~60ms de lissage
+#define POT_INVERTED        true    // true = pot wired in reverse (swap min/max)
+#define POT_FILTER_SIZE     16      // 16 × 20ms = ~320ms de lissage (lisse le bruit ADC)
 #define POT_READ_INTERVAL   20      // ms entre deux lectures
+#define POT_HYSTERESIS_HZ   200     // La vitesse ne change que si l'écart dépasse ce seuil
 #define POT_DEADZONE_HZ     300     // Zone morte démarrage : pot doit dépasser ce seuil (en Hz)
 #define POT_DEADZONE_STOP   150     // Zone morte arrêt : hystérésis (seuil inférieur)
 
@@ -32,4 +34,5 @@
 // Number of turns before the target where the motor starts slowing down.
 // Speed is linearly reduced from the pot value down to SPEED_HZ_MIN over
 // this window so the final stop is gentle on the wire.
+#define LED_FLASH_MS        400   // LED flash duration on pass change (ms)
 #define APPROACH_TURNS        150

@@ -27,6 +27,7 @@ struct WindingGeometry {
     float flangeTop_mm    = 1.5f;    // Épaisseur du tonework haut
     float margin_mm       = 0.5f;    // Marge de sécurité de chaque côté
     float wireDiameter_mm = WireGauge::AWG42;  // Diamètre du fil avec isolation
+    long  turnsPerPassOffset = 0;  // Offset applied to auto-calc (-N to +N)
 
     // Largeur de bobinage utile
     float effectiveWidth() const {
@@ -34,10 +35,16 @@ struct WindingGeometry {
         return max(0.0f, w);
     }
 
-    // Nombre de tours par aller (ou retour)
-    long turnsPerPass() const {
+    // Nombre de tours calculé automatiquement (formule géométrique pure)
+    long turnsPerPassCalc() const {
         if (wireDiameter_mm <= 0.0f) return 1;
         return max(1L, (long)(effectiveWidth() / wireDiameter_mm));
+    }
+
+    // Nombre de tours par aller (ou retour).
+    // Applique l'offset au calcul automatique (clampé à minimum 1).
+    long turnsPerPass() const {
+        return max(1L, turnsPerPassCalc() + turnsPerPassOffset);
     }
 
     void applyPreset(uint8_t idx) {
@@ -46,5 +53,6 @@ struct WindingGeometry {
         flangeBottom_mm = BOBBIN_PRESETS[idx].flangeBot;
         flangeTop_mm    = BOBBIN_PRESETS[idx].flangeTop;
         wireDiameter_mm = BOBBIN_PRESETS[idx].wire;
+        turnsPerPassOffset = 0;  // Reset offset on preset change
     }
 };

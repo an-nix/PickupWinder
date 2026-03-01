@@ -7,7 +7,13 @@ void LEDController::begin() {
 }
 
 int LEDController::update(long currentTurns, long turnsPerPass, bool motorRunning) {
-    // If the motor is stopped or geometry is invalid, turn off the LED and reset.
+    // ── Auto-off: turn LED off once flash duration has elapsed ──
+    if (_ledOn && (millis() - _flashStartMs >= LED_FLASH_MS)) {
+        _ledOn = false;
+        digitalWrite(LED_PIN, LOW);
+    }
+
+    // If the motor is stopped or geometry is invalid, reset.
     if (!motorRunning || turnsPerPass <= 0) {
         reset();
         return 0;
@@ -18,12 +24,13 @@ int LEDController::update(long currentTurns, long turnsPerPass, bool motorRunnin
     int pass = (int)(currentTurns / turnsPerPass);
 
     if (pass != _currentPass) {
-        // Pass number changed → toggle the LED to signal the operator to
+        // Pass number changed → flash the LED to signal the operator to
         // reverse the wire guide direction.
-        _currentPass = pass;
-        _ledState    = !_ledState;
-        digitalWrite(LED_PIN, _ledState ? HIGH : LOW);
-        Serial.printf("[LED] Pass %d — guide %s\n", pass, _ledState ? "→" : "←");
+        _currentPass  = pass;
+        _ledOn        = true;
+        _flashStartMs = millis();
+        digitalWrite(LED_PIN, HIGH);
+        Serial.printf("[LED] Pass %d — direction change!\n", pass);
     }
 
     return _currentPass;
@@ -31,7 +38,8 @@ int LEDController::update(long currentTurns, long turnsPerPass, bool motorRunnin
 
 void LEDController::reset() {
     // Return to the initial state: LED off, pass counter cleared.
-    _currentPass = -1;
-    _ledState    = false;
+    _currentPass  = -1;
+    _ledOn        = false;
+    _flashStartMs = 0;
     digitalWrite(LED_PIN, LOW);
 }

@@ -20,7 +20,26 @@ uint32_t SpeedInput::readHz() {
     for (uint8_t i = 0; i < POT_FILTER_SIZE; i++) sum += _samples[i];
     uint32_t avg = sum / POT_FILTER_SIZE;
 
+    // Invert ADC reading if the pot is wired in reverse.
+    #if POT_INVERTED
+        avg = 4095 - avg;
+    #endif
+
     // Map the 12-bit ADC range (0–4095) to the configured speed range in Hz.
     // Arduino's map() performs integer linear interpolation.
-    return (uint32_t)map(avg, 0, 4095, SPEED_HZ_MIN, SPEED_HZ_MAX);
+    uint32_t hz = (uint32_t)map(avg, 0, 4095, SPEED_HZ_MIN, SPEED_HZ_MAX);
+
+    // Output hysteresis: only update the returned value if the change
+    // exceeds POT_HYSTERESIS_HZ.  This prevents tiny ADC noise from
+    // continuously tweaking the motor speed.
+    // Exception: always track the real value near the deadzone boundaries
+    // so the stop/start logic is never blocked by hysteresis.
+    uint32_t delta = (hz > _lastHz) ? (hz - _lastHz) : (_lastHz - hz);
+    if (delta >= POT_HYSTERESIS_HZ
+        || hz <= SPEED_HZ_MIN + POT_DEADZONE_HZ
+        || hz >= SPEED_HZ_MAX - POT_HYSTERESIS_HZ) {
+        _lastHz = hz;
+    }
+
+    return _lastHz;
 }
