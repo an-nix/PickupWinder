@@ -31,8 +31,9 @@ void WinderApp::run() {
             _lastPotMs = now;
             uint32_t hz        = _pot.readHz();
             bool     potActive = (hz > SPEED_HZ_MIN + POT_DEADZONE_HZ);
+            bool potStop   = (hz < SPEED_HZ_MIN + POT_DEADZONE_STOP);  // seuil d'arrêt plus bas
 
-            if (!potActive) _potWasZero = true;
+            if (potStop) _potWasZero = true;
 
             if (!_motorEnabled && _potWasZero && potActive) {
                 _motorEnabled = true;
@@ -46,8 +47,8 @@ void WinderApp::run() {
                     Serial.printf("▶ Démarrage %s — %u Hz\n",
                                   _direction == Direction::CW ? "CW" : "CCW", hz);
                 }
-            } else if (!potActive && _stepper.isRunning()) {
-                _stepper.stop();
+            } else if (potStop && _stepper.isRunning()) {
+                _stepper.forceStop();   // Arrêt immédiat, pas de décélération
                 _led.reset();
             }
 
@@ -60,6 +61,12 @@ void WinderApp::run() {
             _stop();
             Serial.printf("✓ Bobinage terminé ! %ld tours effectués.\n", _stepper.getTurns());
         }
+    }
+
+    // ── Désactivation différée du driver (après décélération complète) ────────
+    if (_pendingDisable && !_stepper.isRunning()) {
+        _stepper.disableDriver();
+        _pendingDisable = false;
     }
 
     // ── Mode AUTO (futur axe latéral) ─────────────────────────────────────
@@ -90,7 +97,8 @@ void WinderApp::run() {
 // ── Commandes privées ─────────────────────────────────────────────────────────
 
 void WinderApp::_stop() {
-    _motorEnabled = false;
+    _motorEnabled    = false;
+    _pendingDisable  = true;   // le driver sera désactivé une fois la décélération terminée
     _stepper.stop();
     _led.reset();
     Serial.println("■ Arrêt — ramenez le pot à 0 pour redémarrer");
@@ -118,7 +126,7 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
         Direction newDir = (value == "cw") ? Direction::CW : Direction::CCW;
         if (newDir != _direction) {
             _direction = newDir;
-            if (_stepper.isRunning()) _stepper.stop();
+            if (_stepper.isRunning()) _stepper.forceStop();
             Serial.printf("Sens : %s\n", value.c_str());
         }
 

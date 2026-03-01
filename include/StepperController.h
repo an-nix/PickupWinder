@@ -8,7 +8,9 @@ public:
 
     void     setSpeedHz(uint32_t hz);
     void     start(bool forward = true);  // true = CW, false = CCW
-    void     stop();
+    void     stop();           // Décélération contrôlée (ne désactive pas le driver)
+    void     forceStop();      // Arrêt immédiat (par pot ou urgence)
+    void     disableDriver();  // Désactiver le driver (après arrêt complet)
 
     bool     isRunning()  const;
     long     getTurns()   const;   // Basé sur getCurrentPosition()
