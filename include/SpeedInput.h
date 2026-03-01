@@ -18,5 +18,6 @@ public:
 
 private:
     uint32_t _samples[POT_FILTER_SIZE] = {};  // Circular buffer of raw ADC readings
-    uint8_t  _idx = 0;                        // Write index into the circular buffer
+    uint8_t  _idx    = 0;                     // Write index into the circular buffer
+    uint32_t _lastHz = 0;                     // Last output Hz (for hysteresis)
 };

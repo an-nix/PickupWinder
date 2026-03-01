@@ -201,6 +201,23 @@ input:disabled{opacity:.3;cursor:not-allowed}
         <div class="unit">passage LED</div>
       </div>
     </div>
+
+    <!-- Tours/passage : offset slider -->
+    <div style="margin-top:8px">
+      <div class="sect">Ajustement tours/passage <span id="tpp-ofs-lbl" style="color:#4ecca3;font-weight:700">(0)</span></div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font-size:.75em;color:#445;white-space:nowrap">−80</span>
+        <input type="range" id="g-tpp-ofs" min="-80" max="80" value="0" step="1"
+               oninput="tppSlider(this.value)" onchange="tppSlider(this.value)"
+               style="flex:1;accent-color:#4ecca3">
+        <span style="font-size:.75em;color:#445;white-space:nowrap">+80</span>
+        <button class="btn btn-reset" style="flex:0 0 auto;padding:7px 12px;font-size:.78em"
+                onclick="document.getElementById('g-tpp-ofs').value=0;tppSlider(0)">↺ 0</button>
+      </div>
+      <div style="font-size:.72em;color:#445;margin-top:4px">
+        Calcul : <b id="tpp-calc">—</b> &nbsp;→&nbsp; Effectif : <b id="tpp-eff2">—</b> tours/passage
+      </div>
+    </div>
   </div>
 
   <div class="btn-row">
@@ -274,6 +291,15 @@ function update(d) {
     document.getElementById('tpp').textContent  = d.tpp;
     document.getElementById('eff').textContent  = d.eff.toFixed(1);
     document.getElementById('pass').textContent = d.pass >= 0 ? d.pass : '—';
+    // Offset slider sync
+    document.getElementById('tpp-calc').textContent = d.tppCalc;
+    document.getElementById('tpp-eff2').textContent = d.tpp;
+    const ofsEl = document.getElementById('tpp-ofs-lbl');
+    const ofs = d.tppOfs || 0;
+    ofsEl.textContent = '(' + (ofs >= 0 ? '+' : '') + ofs + ')';
+    ofsEl.style.color = ofs === 0 ? '#4ecca3' : '#e94560';
+    const slider = document.getElementById('g-tpp-ofs');
+    if (document.activeElement !== slider) slider.value = ofs;
     // Sync inputs (uniquement si pas focusé pour ne pas perturber la saisie)
     syncInput('g-total',  d.gt);
     syncInput('g-bottom', d.gb);
@@ -314,6 +340,14 @@ function setPreset(idx) {
 function setWire(val) {
   document.getElementById('g-wire').value = val;
   cmd('geom_wire', val);
+}
+
+function tppSlider(v) {
+  v = parseInt(v) || 0;
+  const lbl = document.getElementById('tpp-ofs-lbl');
+  lbl.textContent = '(' + (v >= 0 ? '+' : '') + v + ')';
+  lbl.style.color = v === 0 ? '#4ecca3' : '#e94560';
+  cmd('geom_tpp_ofs', v);
 }
 
 function switchTab(t) {

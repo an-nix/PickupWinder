@@ -21,7 +21,9 @@ struct WinderStatus {
     bool     directionCW;     // True = clockwise, false = counter-clockwise
     bool     autoMode;        // True = auto traverse mode (future)
     // Winding geometry and pass guide (used by the LED traverse indicator)
-    long     turnsPerPass;    // Calculated turns per single traverse pass
+    long     turnsPerPass;      // Effective turns per pass (calc + offset)
+    long     turnsPerPassCalc;  // Auto-calculated turns per pass (geometry only)
+    long     turnsPerPassOffset; // Offset applied to auto-calc
     int      currentPass;     // Current pass number (0-based)
     float    effectiveWidth_mm; // Usable winding width after flanges and margins
     float    geomTotal, geomBottom, geomTop, geomMargin, geomWire; // Raw geometry values

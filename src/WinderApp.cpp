@@ -126,6 +126,8 @@ void WinderApp::run() {
             _direction == Direction::CW,
             _mode == WinderMode::AUTO,
             _geom.turnsPerPass(),
+            _geom.turnsPerPassCalc(),
+            _geom.turnsPerPassOffset,
             _led.getCurrentPass(),
             _geom.effectiveWidth(),
             _geom.totalWidth_mm, _geom.flangeBottom_mm, _geom.flangeTop_mm,
@@ -184,6 +186,25 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
     } else if (cmd == "freerun") {
         // Toggle between free-run (no auto-stop) and target mode.
         _freerun = (value == "true");
+
+        if (_freerun) {
+            // Switching to freerun: clear the target-reached block so the
+            // motor can be restarted (after the pot returns to 0 as usual).
+            if (_targetReached) {
+                _targetReached = false;
+                Serial.println("▶ FreeRun — target block cleared");
+            }
+        } else {
+            // Switching back to target mode: if already past the target,
+            // stop the motor immediately.
+            if (_stepper.getTurns() >= _targetTurns) {
+                _targetReached = true;
+                if (_stepper.isRunning()) {
+                    _stop();
+                    Serial.println("■ Back to Target mode — target already reached, stopping");
+                }
+            }
+        }
         Serial.printf("Mode: %s\n", _freerun ? "FreeRun" : "Target");
 
     } else if (cmd == "direction") {
@@ -217,7 +238,14 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
       else if (cmd == "geom_margin") { _geom.margin_mm       = value.toFloat(); }
       else if (cmd == "geom_wire")   {
         _geom.wireDiameter_mm = value.toFloat();
-        Serial.printf("Wire: %.4f mm — %ld turns/pass\n",
-                      _geom.wireDiameter_mm, _geom.turnsPerPass());
+        Serial.printf("Wire: %.4f mm — %ld turns/pass (calc: %ld)\n",
+                      _geom.wireDiameter_mm, _geom.turnsPerPass(), _geom.turnsPerPassCalc());
+    } else if (cmd == "geom_tpp_ofs") {
+        // Offset applied to auto-calculated turns per pass.
+        // Positive = more turns/pass, negative = fewer.
+        _geom.turnsPerPassOffset = value.toInt();
+        Serial.printf("Turns/pass offset: %+ld (calc %ld → effective %ld)\n",
+                      _geom.turnsPerPassOffset, _geom.turnsPerPassCalc(),
+                      _geom.turnsPerPass());
     }
 }

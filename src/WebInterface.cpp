@@ -53,12 +53,12 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
     if (!_wifiOk || _ws.count() == 0) return;
 
     // Serialise the full machine state to a compact JSON string.
-    // The buffer size (320 bytes) is sized to fit all fields with margin.
-    char buf[320];
+    // The buffer size (400 bytes) is sized to fit all fields with margin.
+    char buf[400];
     snprintf(buf, sizeof(buf),
         "{\"rpm\":%.0f,\"hz\":%u,\"turns\":%ld,\"target\":%ld,"
         "\"running\":%s,\"enabled\":%s,\"freerun\":%s,\"cw\":%s,\"auto\":%s,"
-        "\"tpp\":%ld,\"pass\":%d,\"eff\":%.2f,"
+        "\"tpp\":%ld,\"tppCalc\":%ld,\"tppOfs\":%ld,\"pass\":%d,\"eff\":%.2f,"
         "\"gt\":%.2f,\"gb\":%.2f,\"gtp\":%.2f,\"gm\":%.2f,\"gw\":%.4f}",
         s.rpm, s.speedHz, s.turns, s.targetTurns,
         s.running      ? "true" : "false",
@@ -66,7 +66,8 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         s.freerun      ? "true" : "false",
         s.directionCW  ? "true" : "false",
         s.autoMode     ? "true" : "false",
-        s.turnsPerPass, s.currentPass, s.effectiveWidth_mm,
+        s.turnsPerPass, s.turnsPerPassCalc, s.turnsPerPassOffset,
+        s.currentPass, s.effectiveWidth_mm,
         s.geomTotal, s.geomBottom, s.geomTop, s.geomMargin, s.geomWire);
     // Broadcast to all connected WebSocket clients.
     _ws.textAll(buf);
