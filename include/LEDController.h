@@ -29,5 +29,6 @@ public:
 private:
     int           _currentPass   = -1;    // -1 = not started / reset
     bool          _ledOn         = false;  // Is the LED currently lit?
+    bool          _needsSync     = true;   // True = resync pass on next update (no flash)
     unsigned long _flashStartMs  = 0;      // millis() when flash started
 };
