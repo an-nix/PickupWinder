@@ -3,7 +3,7 @@
 
 void StepperController::begin() {
     pinMode(ENABLE_PIN, OUTPUT);
-    digitalWrite(ENABLE_PIN, LOW);  // Activer le driver (LOW = actif)
+    digitalWrite(ENABLE_PIN, HIGH);  // Driver désactivé au démarrage
 
     _engine.init();
     _stepper = _engine.stepperConnectToPin(STEP_PIN);
@@ -24,12 +24,12 @@ void StepperController::setSpeedHz(uint32_t hz) {
     if (clamped == _speedHz) return;
     _speedHz = clamped;
     _stepper->setSpeedInHz(_speedHz);
-    // La vitesse est prise en compte immédiatement par FastAccelStepper,
-    // y compris pendant la rotation (transition douce via l'accélération)
+    _stepper->applySpeedAcceleration();
 }
 
 void StepperController::start(bool forward) {
     if (!_stepper) return;
+    digitalWrite(ENABLE_PIN, LOW);   // Activer le driver
     _stepper->setSpeedInHz(_speedHz);
     if (forward)
         _stepper->runForward();
@@ -38,9 +38,21 @@ void StepperController::start(bool forward) {
 }
 
 void StepperController::stop() {
-    if (_stepper) _stepper->stopMove();
+    if (_stepper) {
+        _stepper->stopMove();   // Décélération contrôlée — le driver reste actif pendant la décél
+    }
 }
 
+void StepperController::disableDriver() {
+    digitalWrite(ENABLE_PIN, HIGH);
+}
+
+void StepperController::forceStop() {
+    if (_stepper) {
+        _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
+        digitalWrite(ENABLE_PIN, HIGH); // Désactiver le driver
+    }
+}
 bool StepperController::isRunning() const {
     return _stepper && _stepper->isRunning();
 }

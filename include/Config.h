@@ -4,20 +4,21 @@
 #define STEP_PIN            32
 #define DIR_PIN             33
 #define ENABLE_PIN          25      // LOW = driver actif
-#define LED_PIN             26      // LED guide aller-retour (toggle à chaque passage)
+#define LED_PIN             23      // LED guide aller-retour (toggle à chaque passage)
 
-#define MICROSTEPPING       8       // Microstepping configuré sur le driver (MS1/MS2/MS3)
-#define STEPS_PER_REV       (200 * MICROSTEPPING)   // 1600 pas/tour en 1/8 step
-#define ACCELERATION        120000  // pas/s²
-#define SPEED_HZ_MIN        2400    // ~90 RPM  (300 Hz × 8)
-#define SPEED_HZ_MAX        80000   // ~3000 RPM (10000 Hz × 8)
+#define MICROSTEPPING       32      // Microstepping configuré sur le driver (M0/M1/M2)
+#define STEPS_PER_REV       (200 * MICROSTEPPING)   // 6400 pas/tour en 1/32 step
+#define ACCELERATION        50000   // pas/s²
+#define SPEED_HZ_MIN        2400    // ~90 RPM  (90 × 1600 / 60)
+#define SPEED_HZ_MAX        40000   // ~1500 RPM (1500 × 1600 / 60)
 
 // ── Potentiomètre ────────────────────────────────────────
 // ⚠ ADC1 uniquement (GPIO 32-39) — ADC2 est incompatible avec le WiFi
 #define POT_PIN             34
-#define POT_FILTER_SIZE     16      // Taille filtre moyenne glissante
-#define POT_READ_INTERVAL   50      // ms entre deux lectures
-#define POT_DEADZONE_HZ     300     // Zone morte basse du pot (en Hz) pour éviter les démarrages intempestifs
+#define POT_FILTER_SIZE     6       // Filtre léger : 6 × 20ms = ~60ms de lissage
+#define POT_READ_INTERVAL   20      // ms entre deux lectures
+#define POT_DEADZONE_HZ     300     // Zone morte démarrage : pot doit dépasser ce seuil (en Hz)
+#define POT_DEADZONE_STOP   150     // Zone morte arrêt : hystérésis (seuil inférieur)
 
 // ── WiFi & interface web ─────────────────────────────────
 #define WIFI_SSID "<redacted>"

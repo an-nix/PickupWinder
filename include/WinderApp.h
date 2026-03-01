@@ -27,7 +27,8 @@ private:
     volatile bool       _freerun      = false;
     volatile bool       _motorEnabled = true;
 
-    bool     _potWasZero = true;
+    bool     _potWasZero     = true;
+    bool     _pendingDisable = false;  // désactiver le driver après décélération complète
 
     uint32_t _lastWsMs  = 0;
     uint32_t _lastPotMs = 0;
