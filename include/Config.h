@@ -8,15 +8,24 @@
 
 #define MICROSTEPPING       32      // Microstepping configured on driver (M0/M1/M2)
 #define STEPS_PER_REV       (200 * MICROSTEPPING)   // 6400 steps/rev at 1/32
-#define ACCELERATION        200000  // steps/s² — equivalent to 50000 at 1/8 (~1875 RPM/s)
+// Ratio between step frequency and audible frequency produced by the motor.
+// 200-step motor has 50 pole pairs → audible freq = step_freq / (MICROSTEPPING × 4).
+// Verified: 42000 Hz step rate ≈ E4 (329.6 Hz) → 42000/329.6 ≈ 128.
+#define MOTOR_NOTE_MULT     (MICROSTEPPING * 4)      // 128 at 1/32 microstepping
+#define ACCELERATION        150000  // steps/s² — ~1400 RPM/s, réponse vive au pot (le doux démarrage est géré par SPEED_HZ_START)
 #define SPEED_HZ_MIN        9600    // ~90 RPM  (90 × 6400 / 60)
 #define SPEED_HZ_MAX        160000  // ~1500 RPM (1500 × 6400 / 60)
+// Vitesse initiale de départ — le moteur commence à cette vitesse basse
+// et accélère via la rampe jusqu'à la vitesse cible du pot.
+// Cela évite le choc violent au démarrage (sinon le moteur partirait
+// directement à SPEED_HZ_MIN même si le pot est à mi-course).
+#define SPEED_HZ_START      800     // ~7.5 RPM — quasi imperceptible, rampe ensuite
 
 // ── Potentiomètre ────────────────────────────────────────
 // ⚠ ADC1 uniquement (GPIO 32-39) — ADC2 est incompatible avec le WiFi
 #define POT_PIN             34
 #define POT_INVERTED        true    // true = pot wired in reverse (swap min/max)
-#define POT_FILTER_SIZE     16      // 16 × 20ms = ~320ms de lissage (lisse le bruit ADC)
+#define POT_FILTER_SIZE     32      // 32 × 20ms = ~640ms de lissage (lisse le bruit ADC et les à-coups de vitesse)
 #define POT_READ_INTERVAL   20      // ms entre deux lectures
 #define POT_HYSTERESIS_HZ   200     // La vitesse ne change que si l'écart dépasse ce seuil
 #define POT_DEADZONE_HZ     300     // Zone morte démarrage : pot doit dépasser ce seuil (en Hz)

@@ -4,8 +4,12 @@
 void StepperController::begin() {
     // Keep the driver disabled at startup so the motor coils are not energised
     // until the user explicitly starts winding.
-    pinMode(ENABLE_PIN, OUTPUT);
-    digitalWrite(ENABLE_PIN, HIGH);  // HIGH = driver disabled (active-LOW enable)
+    // IMPORTANT: write HIGH to the output register BEFORE enabling the output driver.
+    // On ESP32, pinMode(OUTPUT) defaults to LOW, causing a brief LOW glitch that
+    // would energise the coils and make a clunk on every power cycle.
+    digitalWrite(ENABLE_PIN, HIGH);  // Pre-set output register HIGH
+    pinMode(ENABLE_PIN, OUTPUT);     // Enable output driver — starts HIGH, no glitch
+    _driverEnabled = false;
 
     // Initialise the FastAccelStepper hardware timer engine.
     _engine.init();
@@ -29,23 +33,43 @@ void StepperController::setSpeedHz(uint32_t hz) {
     // Skip update if speed has not changed (avoids unnecessary I2C-like overhead).
     if (clamped == _speedHz) return;
     _speedHz = clamped;
-    _stepper->setSpeedInHz(_speedHz);
-    // applySpeedAcceleration() is required to make the new speed take effect
-    // immediately while the motor is already running; without it the change
-    // would only apply on the next start() call.
-    _stepper->applySpeedAcceleration();
+    // Only commit the speed change to FastAccelStepper if the motor is already
+    // running.  When stopped, applySpeedAcceleration() would "commit" the target
+    // speed inside the library so that the next runForward() starts directly at
+    // that speed — bypassing the SPEED_HZ_START soft-start in start() and
+    // causing a violent jerk on every restart.
+    // When the motor is stopped, _speedHz is updated here and start() will use
+    // it to set the final ramp target after launching from SPEED_HZ_START.
+    if (_stepper->isRunning()) {
+        _stepper->setSpeedInHz(_speedHz);
+        _stepper->applySpeedAcceleration();
+    }
 }
 
 void StepperController::start(bool forward) {
     if (!_stepper) return;
-    // Enable the driver (active-LOW) before issuing move commands.
-    digitalWrite(ENABLE_PIN, LOW);
-    _stepper->setSpeedInHz(_speedHz);
+    // If the driver was off, enable it and let the rotor settle silently to the
+    // nearest full step BEFORE issuing a move command.  Without this pause the
+    // coil snap and the first step overlap, producing the characteristic clunk.
+    if (!_driverEnabled) {
+        digitalWrite(ENABLE_PIN, LOW);
+        _driverEnabled = true;
+        delay(30);  // 30 ms — rotor snaps quietly, imperceptible to the user
+    }
+    // Démarrer à une vitesse très basse (SPEED_HZ_START) puis laisser la rampe
+    // d'accélération monter progressivement vers _speedHz.
+    // Sans ça, le moteur part directement à la vitesse cible (ex. 90 RPM),
+    // ce qui provoque un choc violent, surtout depuis l'arrêt.
+    _stepper->setSpeedInHz(SPEED_HZ_START);
     // Run indefinitely in the requested direction.
     if (forward)
         _stepper->runForward();   // CW
     else
         _stepper->runBackward();  // CCW
+    // Monter immédiatement vers la vitesse cible — la rampe d'accélération
+    // (ACCELERATION) assure la transition douce.
+    _stepper->setSpeedInHz(_speedHz);
+    _stepper->applySpeedAcceleration();
 }
 
 void StepperController::stop() {
@@ -58,9 +82,9 @@ void StepperController::stop() {
 }
 
 void StepperController::disableDriver() {
-    // De-energise the motor coils to save power and reduce heat.
     // Only call this after the motor has fully stopped.
     digitalWrite(ENABLE_PIN, HIGH);
+    _driverEnabled = false;
 }
 
 void StepperController::forceStop() {
@@ -71,6 +95,7 @@ void StepperController::forceStop() {
         _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
         // Disable driver immediately — no controlled stop needed here.
         digitalWrite(ENABLE_PIN, HIGH);
+        _driverEnabled = false;
     }
 }
 
@@ -97,4 +122,39 @@ float StepperController::getRPM() const {
     // (0 when stopped, reflects actual ramp state during accel/decel).
     int32_t mhz = _stepper->getCurrentSpeedInMilliHz();
     return abs((float)mhz) / 1000.0f * 60.0f / STEPS_PER_REV;
+}
+
+void StepperController::playNote(uint16_t freqHz) {
+    if (!_stepper) return;
+    if (freqHz == 0) {
+        // Rest: decelerate smoothly (no violent forceStop).
+        _stepper->stopMove();
+        return;
+    }
+    // Convert musical note frequency to step frequency.
+    // The motor's audible vibration = step_freq / MOTOR_NOTE_MULT.
+    uint32_t stepHz = (uint32_t)freqHz * MOTOR_NOTE_MULT;
+    // Acceleration of 350k gives ~100ms ramp to any note — smooth enough
+    // to avoid a startup clunk while still tracking note changes cleanly.
+    if (!_driverEnabled) {
+        digitalWrite(ENABLE_PIN, LOW);
+        _driverEnabled = true;
+        delay(20);  // Coil settle before first note
+    }
+    _stepper->setAcceleration(350000);
+    _stepper->setSpeedInHz(stepHz);
+    if (!_stepper->isRunning()) {
+        _stepper->runForward();
+    } else {
+        _stepper->applySpeedAcceleration();
+    }
+}
+
+void StepperController::stopNote() {
+    if (!_stepper) return;
+    _stepper->setAcceleration(350000);
+    _stepper->stopMove();
+    // Restore normal winding acceleration.
+    _stepper->setAcceleration(ACCELERATION);
+    digitalWrite(ENABLE_PIN, HIGH);
 }

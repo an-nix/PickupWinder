@@ -27,7 +27,8 @@ struct WindingGeometry {
     float flangeTop_mm    = 1.5f;    // Épaisseur du tonework haut
     float margin_mm       = 0.5f;    // Marge de sécurité de chaque côté
     float wireDiameter_mm = WireGauge::AWG42;  // Diamètre du fil avec isolation
-    long  turnsPerPassOffset = 0;  // Offset applied to auto-calc (-N to +N)
+    long  turnsPerPassOffset = 0;    // Offset applied to auto-calc (-N to +N)
+    float scatterFactor = 2.0f;      // Facteur d'espacement (1.0=dense, 2.0=scatter, 3.0+=très dispersé)
 
     // Largeur de bobinage utile
     float effectiveWidth() const {
@@ -35,10 +36,12 @@ struct WindingGeometry {
         return max(0.0f, w);
     }
 
-    // Nombre de tours calculé automatiquement (formule géométrique pure)
+    // Nombre de tours calculé automatiquement
+    // scatterFactor > 1 élargit l'espacement effectif entre fils (bobinage scatter)
     long turnsPerPassCalc() const {
         if (wireDiameter_mm <= 0.0f) return 1;
-        return max(1L, (long)(effectiveWidth() / wireDiameter_mm));
+        float spacing = wireDiameter_mm * max(0.5f, scatterFactor);
+        return max(1L, (long)(effectiveWidth() / spacing));
     }
 
     // Nombre de tours par aller (ou retour).

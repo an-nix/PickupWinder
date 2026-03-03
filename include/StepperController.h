@@ -52,8 +52,17 @@ public:
     // while accelerating or decelerating).
     uint32_t getSpeedHz() const { return _speedHz; }
 
+    // ── Music mode ────────────────────────────────────────────────────────
+    // Play a single note at the given frequency (Hz). Bypasses normal speed
+    // limits so any audible frequency (100-1000 Hz) can be used.
+    // freq=0 → silence (motor stopped).
+    void     playNote(uint16_t freqHz);
+    // Stop music playback and disable driver.
+    void     stopNote();
+
 private:
     FastAccelStepperEngine _engine;             // FastAccelStepper engine (manages hardware timers)
     FastAccelStepper*      _stepper = nullptr;  // Pointer to the stepper instance
     uint32_t               _speedHz = SPEED_HZ_MIN;  // Current speed setpoint in Hz
+    bool                   _driverEnabled = false;   // True when ENABLE_PIN is LOW (driver on)
 };

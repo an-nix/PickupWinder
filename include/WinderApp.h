@@ -4,6 +4,7 @@
 #include "WebInterface.h"
 #include "WindingGeometry.h"
 #include "LEDController.h"
+#include "StepperMusic.h"
 
 // Operating mode: MANUAL = potentiometer controls speed directly.
 // AUTO = future mode where a second stepper drives the wire guide axis.
@@ -53,6 +54,11 @@ private:
     // Set to true when the winding target is reached. Blocks any restart via the
     // potentiometer until the user explicitly presses Reset in the web UI.
     bool     _targetReached  = false;
+
+    // ── Music mode ────────────────────────────────────────────────────────
+    volatile bool _playingMusic  = false;  // True while a melody is playing
+    size_t        _musicIdx      = 0;      // Current note index in melody
+    uint32_t      _musicNoteMs   = 0;      // millis() when current note started
 
     uint32_t _lastWsMs  = 0;  // Timestamp of last WebSocket status push
     uint32_t _lastPotMs = 0;  // Timestamp of last pot reading
