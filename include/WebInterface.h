@@ -24,6 +24,7 @@ struct WinderStatus {
     long     turnsPerPass;      // Effective turns per pass (calc + offset)
     long     turnsPerPassCalc;  // Auto-calculated turns per pass (geometry only)
     long     turnsPerPassOffset; // Offset applied to auto-calc
+    float    scatterFactor;    // Wire spacing factor (1.0=dense, 2.0=scatter)
     int      currentPass;     // Current pass number (0-based)
     float    effectiveWidth_mm; // Usable winding width after flanges and margins
     float    geomTotal, geomBottom, geomTop, geomMargin, geomWire; // Raw geometry values

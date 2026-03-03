@@ -76,11 +76,10 @@ void WinderApp::run() {
                                   _direction == Direction::CW ? "CW" : "CCW", hz);
                 }
             } else if (_motorEnabled && potStop && _stepper.isRunning()) {
-                // Pot returned to zero while motor was running → immediate stop.
-                // forceStop() is used here (no deceleration ramp) because the user
-                // explicitly turned the pot to zero.
-                _stepper.forceStop();
-                _led.reset();
+                // Pot returned to zero while motor was running → smooth stop.
+                // _stop() triggers a deceleration ramp (no violent jerk),
+                // disables the driver once fully stopped, and resets the interlock.
+                _stop();
             }
 
             // Update the traverse guide LED based on the current turn count.
@@ -95,6 +94,25 @@ void WinderApp::run() {
             _targetReached = true;  // Block restart until explicit reset
             _stop();
             Serial.printf("✓ Winding complete! %ld turns done.\n", _stepper.getTurns());
+        }
+    }
+
+    // ── Music playback state machine ──────────────────────────────────────
+    // Legato playback: notes transition directly without stopping.
+    if (_playingMusic) {
+        const MusicNote& n = MELODY_LA_BAMBA[_musicIdx];
+        if (now - _musicNoteMs >= n.durationMs) {
+            _musicIdx++;
+            // End of melody?
+            if (_musicIdx >= LA_BAMBA_LENGTH || MELODY_LA_BAMBA[_musicIdx].durationMs == 0) {
+                _playingMusic = false;
+                _stepper.stopNote();
+                Serial.println("\xF0\x9F\x8E\xB5 La Bamba finished!");
+            } else {
+                // Play next note directly (legato — no gap).
+                _stepper.playNote(MELODY_LA_BAMBA[_musicIdx].freq);
+                _musicNoteMs = now;
+            }
         }
     }
 
@@ -128,6 +146,7 @@ void WinderApp::run() {
             _geom.turnsPerPass(),
             _geom.turnsPerPassCalc(),
             _geom.turnsPerPassOffset,
+            _geom.scatterFactor,
             _led.getCurrentPass(),
             _geom.effectiveWidth(),
             _geom.totalWidth_mm, _geom.flangeBottom_mm, _geom.flangeTop_mm,
@@ -159,7 +178,29 @@ void WinderApp::_stop() {
 void WinderApp::_handleCommand(const String& cmd, const String& value) {
     if (cmd == "stop") {
         // Emergency/manual stop from the web UI.
+        if (_playingMusic) {
+            _playingMusic = false;
+            _stepper.stopNote();
+        }
         _stop();
+
+    } else if (cmd == "music") {
+        // Start music — stop motor gently first (no forceStop clunk).
+        if (_stepper.isRunning()) _stepper.stop();
+        _motorEnabled = false;
+        _potWasZero   = false;
+        _musicIdx     = 0;
+        _musicNoteMs  = millis();
+        _playingMusic = true;
+        // Enable the driver first at a very low speed so the coils settle,
+        // then the state machine will ramp to the first real note.
+        _stepper.playNote(MELODY_LA_BAMBA[0].freq);
+        Serial.println("\xF0\x9F\x8E\xB5 Playing music!");
+
+    } else if (cmd == "music_stop") {
+        _playingMusic = false;
+        _stepper.stopNote();
+        Serial.println("\xF0\x9F\x8E\xB5 Music stopped");
 
     } else if (cmd == "reset") {
         // Stop, reset the turn counter, LED guide, and unblock the motor.
@@ -247,5 +288,12 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
         Serial.printf("Turns/pass offset: %+ld (calc %ld → effective %ld)\n",
                       _geom.turnsPerPassOffset, _geom.turnsPerPassCalc(),
                       _geom.turnsPerPass());
+    } else if (cmd == "geom_scatter") {
+        float f = value.toFloat();
+        if (f >= 0.5f && f <= 5.0f) {
+            _geom.scatterFactor = f;
+            Serial.printf("Scatter factor: %.2f → %ld tours/pass\n",
+                          _geom.scatterFactor, _geom.turnsPerPass());
+        }
     }
 }

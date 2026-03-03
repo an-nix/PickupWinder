@@ -202,6 +202,22 @@ input:disabled{opacity:.3;cursor:not-allowed}
       </div>
     </div>
 
+    <!-- Facteur scatter -->
+    <div style="margin-top:8px">
+      <div class="sect">Facteur scatter <span id="scatter-lbl" style="color:#4ecca3;font-weight:700">2.0</span>
+        <span style="font-size:.72em;color:#445"> (1.0=dense · 2.0=scatter · 3.0+=lâche)</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span style="font-size:.75em;color:#445;white-space:nowrap">1.0</span>
+        <input type="range" id="g-scatter" min="1.0" max="4.0" value="2.0" step="0.1"
+               oninput="scatterSlider(this.value)" onchange="scatterSlider(this.value)"
+               style="flex:1;accent-color:#4ecca3">
+        <span style="font-size:.75em;color:#445;white-space:nowrap">4.0</span>
+        <button class="btn btn-reset" style="flex:0 0 auto;padding:7px 12px;font-size:.78em"
+                onclick="document.getElementById('g-scatter').value=2.0;scatterSlider(2.0)">↺ 2.0</button>
+      </div>
+    </div>
+
     <!-- Tours/passage : offset slider -->
     <div style="margin-top:8px">
       <div class="sect">Ajustement tours/passage <span id="tpp-ofs-lbl" style="color:#4ecca3;font-weight:700">(0)</span></div>
@@ -223,6 +239,7 @@ input:disabled{opacity:.3;cursor:not-allowed}
   <div class="btn-row">
     <button class="btn btn-stop"  onclick="cmd('stop')">■ Stop urgence</button>
     <button class="btn btn-reset" onclick="cmd('reset')">↺ Reset tours</button>
+        <button class="btn" style="background:#4a1a6e;color:#e0b0ff" onclick="toggleMusic()">🎵 Adeste Fideles</button>
   </div>
 
   <!-- Statut -->
@@ -300,6 +317,13 @@ function update(d) {
     ofsEl.style.color = ofs === 0 ? '#4ecca3' : '#e94560';
     const slider = document.getElementById('g-tpp-ofs');
     if (document.activeElement !== slider) slider.value = ofs;
+    // Scatter factor sync
+    if (d.scatter !== undefined) {
+      const scLbl = document.getElementById('scatter-lbl');
+      scLbl.textContent = parseFloat(d.scatter).toFixed(1);
+      const scSlider = document.getElementById('g-scatter');
+      if (document.activeElement !== scSlider) scSlider.value = d.scatter;
+    }
     // Sync inputs (uniquement si pas focusé pour ne pas perturber la saisie)
     syncInput('g-total',  d.gt);
     syncInput('g-bottom', d.gb);
@@ -348,6 +372,18 @@ function tppSlider(v) {
   lbl.textContent = '(' + (v >= 0 ? '+' : '') + v + ')';
   lbl.style.color = v === 0 ? '#4ecca3' : '#e94560';
   cmd('geom_tpp_ofs', v);
+}
+
+function scatterSlider(v) {
+  v = parseFloat(v).toFixed(1);
+  document.getElementById('scatter-lbl').textContent = v;
+  cmd('geom_scatter', v);
+}
+
+let musicOn = false;
+function toggleMusic() {
+  musicOn = !musicOn;
+  cmd(musicOn ? 'music' : 'music_stop');
 }
 
 function switchTab(t) {
