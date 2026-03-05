@@ -13,7 +13,7 @@
 // Verified: 42000 Hz step rate ≈ E4 (329.6 Hz) → 42000/329.6 ≈ 128.
 #define MOTOR_NOTE_MULT     (MICROSTEPPING * 4)      // 128 at 1/32 microstepping
 #define ACCELERATION        150000  // steps/s² — ~1400 RPM/s, réponse vive au pot (le doux démarrage est géré par SPEED_HZ_START)
-#define SPEED_HZ_MIN        9600    // ~90 RPM  (90 × 6400 / 60)
+#define SPEED_HZ_MIN        9600/9    // ~90 RPM  (90 × 6400 / 60)
 #define SPEED_HZ_MAX        160000  // ~1500 RPM (1500 × 6400 / 60)
 // Vitesse initiale de départ — le moteur commence à cette vitesse basse
 // et accélère via la rampe jusqu'à la vitesse cible du pot.
@@ -27,9 +27,16 @@
 #define POT_INVERTED        true    // true = pot wired in reverse (swap min/max)
 #define POT_FILTER_SIZE     32      // 32 × 20ms = ~640ms de lissage (lisse le bruit ADC et les à-coups de vitesse)
 #define POT_READ_INTERVAL   20      // ms entre deux lectures
-#define POT_HYSTERESIS_HZ   200     // La vitesse ne change que si l'écart dépasse ce seuil
-#define POT_DEADZONE_HZ     300     // Zone morte démarrage : pot doit dépasser ce seuil (en Hz)
-#define POT_DEADZONE_STOP   150     // Zone morte arrêt : hystérésis (seuil inférieur)
+#define POT_HYSTERESIS_HZ   100    // La vitesse ne change que si l'écart dépasse ce seuil
+// Détection zéro sur counts ADC bruts (après inversion).
+// Augmenter si le moteur ne s'arrête pas quand le pot est en butée basse.
+#define POT_ADC_ZERO_BAND   150    // ≈ 11° sur un pot 300° (150/4095 ≈ 3.7%)
+// Courbe exponentielle sur toute la course du pot.
+// Formule : hz = SPEED_HZ_MAX × (e^(k·t) − 1) / (e^k − 1)  avec t ∈ [0..1]
+// Plus k est grand, plus la progression est lente au début et rapide en fin de course.
+// k=4.5 → ~50 RPM à 30% de la course, ~375 RPM à 70%, 1500 RPM à 100%.
+// Augmenter k pour plus d'exponentialité (ex. 6.0), diminuer pour moins (ex. 3.0).
+#define POT_EXP_K           4.5f
 
 // ── WiFi & interface web ─────────────────────────────────
 #define WIFI_SSID "<redacted>"
@@ -44,4 +51,7 @@
 // Speed is linearly reduced from the pot value down to SPEED_HZ_MIN over
 // this window so the final stop is gentle on the wire.
 #define LED_FLASH_MS        400   // LED flash duration on pass change (ms)
-#define APPROACH_TURNS        150
+#define APPROACH_TURNS      80    // Nombre de tours avant la cible où la décélération commence
+// Vitesse plancher en zone d'approche : le moteur ne descend jamais en-dessous
+// de cette valeur (même si le pot est plus haut), puis s'arrête brusquement à la cible.
+#define APPROACH_SPEED_HZ_FLOOR  (200UL * STEPS_PER_REV / 60)  // 200 RPM ≈ 21333 Hz
