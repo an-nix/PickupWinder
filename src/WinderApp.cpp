@@ -36,14 +36,15 @@ void WinderApp::run() {
             _lastPotMs = now;
             uint32_t hz        = _pot.readHz();
 
-            // potActive: pot is above the start threshold → user wants the motor running.
-            bool potActive = (hz > SPEED_HZ_MIN + POT_DEADZONE_HZ);
-            // potStop: pot is below the stop threshold (hysteresis band below potActive).
-            // Using a lower threshold prevents chatter around the start point.
-            bool potStop   = (hz < SPEED_HZ_MIN + POT_DEADZONE_STOP);
+            // potActive : readHz() retourne > 0 → l'utilisateur veut le moteur.
+            // potStop   : readHz() retourne 0 → pot en butée basse (zone ADC zéro).
+            // La détection du zéro est faite dans readHz() sur les counts ADC bruts
+            // (POT_ADC_ZERO_BAND) — plus robuste que les Hz pour les butées physiques.
+            // setSpeedHz() clampera hz à SPEED_HZ_MIN si hz < SPEED_HZ_MIN (zone reptation).
+            bool potActive = (hz > 0);
+            bool potStop   = (hz == 0);
 
-            // Track when the pot returns to zero so we can re-arm the motor
-            // after a stop (safety interlock).
+            // Interlock : le moteur ne redémarre qu'après retour au zéro physique.
             if (potStop) _potWasZero = true;
 
             // Re-enable only if: motor was disabled, pot returned to zero, pot is now active,
@@ -54,16 +55,17 @@ void WinderApp::run() {
             }
 
             if (_motorEnabled && potActive) {
-                // In the approach zone (last APPROACH_TURNS before target),
-                // linearly cap the speed from the pot value down to SPEED_HZ_MIN.
-                // This ensures the motor is already slow when _stop() is called,
-                // making the final deceleration gentle on the wire.
+                // Zone d'approche (APPROACH_TURNS derniers tours avant la cible) :
+                // plafonnement linéaire de la vitesse du pot vers APPROACH_SPEED_HZ_FLOOR.
+                // La descente s'arrête au plancher — le moteur ne va pas plus lentement,
+                // ce qui évite les à-coups de fil à très basse vitesse.
                 if (!_freerun && _stepper.isRunning()) {
                     long remaining = (long)_targetTurns - _stepper.getTurns();
                     if (remaining > 0 && remaining <= APPROACH_TURNS) {
                         float ratio = (float)remaining / APPROACH_TURNS;  // 1.0 → 0.0
-                        float ratioSq = ratio * ratio;  // quadratic: drops fast then levels off low
-                        uint32_t maxHz = SPEED_HZ_MIN + (uint32_t)(ratioSq * (SPEED_HZ_MAX - SPEED_HZ_MIN));
+                        // Linéaire : descente franche de la vitesse courante vers le plancher.
+                        uint32_t maxHz = APPROACH_SPEED_HZ_FLOOR
+                                       + (uint32_t)(ratio * (float)(SPEED_HZ_MAX - APPROACH_SPEED_HZ_FLOOR));
                         hz = min(hz, maxHz);
                     }
                 }
