@@ -46,28 +46,24 @@ void StepperController::setSpeedHz(uint32_t hz) {
 
 void StepperController::start(bool forward) {
     if (!_stepper) return;
-    // If the driver was off, enable it and let the rotor settle silently to the
-    // nearest full step BEFORE issuing a move command.  Without this pause the
-    // coil snap and the first step overlap, producing the characteristic clunk.
+    // Si le driver était éteint, l'activer et laisser le rotor se caler
+    // sur la position de pas la plus proche avant d'émettre des impulsions.
     if (!_driverEnabled) {
         digitalWrite(ENABLE_PIN, LOW);
         _driverEnabled = true;
-        delay(30);  // 30 ms — rotor snaps quietly, imperceptible to the user
+        delay(30);  // 30 ms — calement silencieux du rotor
     }
-    // Démarrer à une vitesse très basse (SPEED_HZ_START) puis laisser la rampe
-    // d'accélération monter progressivement vers _speedHz.
-    // Sans ça, le moteur part directement à la vitesse cible (ex. 90 RPM),
-    // ce qui provoque un choc violent, surtout depuis l'arrêt.
-    _stepper->setSpeedInHz(SPEED_HZ_START);
-    // Run indefinitely in the requested direction.
-    if (forward)
-        _stepper->runForward();   // CW
-    else
-        _stepper->runBackward();  // CCW
-    // Monter immédiatement vers la vitesse cible — la rampe d'accélération
-    // (ACCELERATION) assure la transition douce.
+    // Démarrer directement à la vitesse cible : FastAccelStepper accélère de 0
+    // à _speedHz en utilisant setAcceleration(). SPEED_HZ_START était un contournement
+    // de l'ancien bug où setSpeedHz() pré-committait la vitesse via applySpeedAcceleration()
+    // même quand le moteur était arrêté. Ce bug est corrigé : setSpeedHz() n'appelle
+    // plus applySpeedAcceleration() quand isRunning()==false, donc la bibliothèque
+    // reçoit toujours un état propre (vitesse=0) à l'appel de runForward/runBackward.
     _stepper->setSpeedInHz(_speedHz);
-    _stepper->applySpeedAcceleration();
+    if (forward)
+        _stepper->runForward();
+    else
+        _stepper->runBackward();
 }
 
 void StepperController::stop() {

@@ -116,3 +116,7 @@
 // Vitesse plancher en zone d'approche : le moteur ne descend jamais en-dessous
 // de cette valeur (même si le pot est plus haut), puis s'arrête brusquement à la cible.
 #define APPROACH_SPEED_HZ_FLOOR  (200UL * STEPS_PER_REV / 60)  // 200 RPM ≈ 21333 Hz
+
+// ── Test moteur bobine ────────────────────────────────────────
+// Décommenter pour démarrer automatiquement la bobine à vitesse fixe au boot.
+// #define TEST_BOBINE_RPM     800   // RPM cible pour le test
