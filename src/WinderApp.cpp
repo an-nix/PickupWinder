@@ -12,9 +12,6 @@ void WinderApp::begin() {
     _led.begin();      // Set LED pin as output
     _web.begin();      // WiFi + HTTP + WebSocket  (peut prendre 2-5 s)
     _link.begin();     // UART2 liaison vers ESP écran
-    // Homing démarré EN DERNIER : le WiFi est déjà prêt, loop() va
-    // démarrer immédiatement après begin() → update() est appelé dans
-    // les quelques ms qui suivent → réponse quasi-immédiate au capteur.
     _lateral.begin(_engine);  // GPIO + stepper latéral + homing automatique
 
     // Register the command callback so WebSocket messages are routed to
