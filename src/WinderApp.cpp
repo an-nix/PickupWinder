@@ -6,10 +6,16 @@ void WinderApp::begin() {
     Serial.println("\n=== Pickup Winder ===");
 
     // Initialise each subsystem in dependency order.
-    _stepper.begin();  // GPIO + FastAccelStepper engine
+    _engine.init();        // Une seule engine FastAccelStepper pour tous les steppers
+    _stepper.begin(_engine);  // GPIO + stepper bobine
     _pot.begin();      // Pre-fill ADC filter buffer
     _led.begin();      // Set LED pin as output
-    _web.begin();      // WiFi + HTTP + WebSocket
+    _web.begin();      // WiFi + HTTP + WebSocket  (peut prendre 2-5 s)
+    _link.begin();     // UART2 liaison vers ESP écran
+    // Homing démarré EN DERNIER : le WiFi est déjà prêt, loop() va
+    // démarrer immédiatement après begin() → update() est appelé dans
+    // les quelques ms qui suivent → réponse quasi-immédiate au capteur.
+    _lateral.begin(_engine);  // GPIO + stepper latéral + homing automatique
 
     // Register the command callback so WebSocket messages are routed to
     // _handleCommand() on this instance.
@@ -26,6 +32,9 @@ void WinderApp::begin() {
 
 void WinderApp::run() {
     uint32_t now = millis();
+
+    // Machine d'états du homing latéral — non-bloquante, appelée à chaque itération.
+    _lateral.update();
 
     // ── MANUAL mode ───────────────────────────────────────────────────────
     if (_mode == WinderMode::MANUAL) {
@@ -129,6 +138,27 @@ void WinderApp::run() {
 
     // ── AUTO mode (future: lateral guide axis) ────────────────────────────
     // if (_mode == WinderMode::AUTO) { ... }
+
+    // ── Liaison série ESP écran ──────────────────────────────────────────
+    // Lire les commandes entrantes (paramètres bobinage envoyés par l'écran)
+    // et les dispatcher via le même _handleCommand que le WebSocket.
+    _link.poll([this](const String& cmd, const String& val) {
+        _handleCommand(cmd, val);
+    });
+    // Envoyer le statut compact vers l'écran à intervalle régulier.
+    if (now - _lastLinkMs >= LINK_UPDATE_MS) {
+        _lastLinkMs = now;
+        _link.sendStatus(
+            _stepper.getRPM(),
+            _stepper.getSpeedHz(),
+            _stepper.getTurns(),
+            (long)_targetTurns,
+            _stepper.isRunning(),
+            (bool)_motorEnabled,
+            (bool)_freerun,
+            _direction == Direction::CW
+        );
+    }
 
     // ── WebSocket status push ─────────────────────────────────────────────
     // Send a full machine state snapshot to all connected clients at a fixed
