@@ -1,7 +1,7 @@
 #include "StepperController.h"
 #include <Arduino.h>
 
-void StepperController::begin() {
+void StepperController::begin(FastAccelStepperEngine& engine) {
     // Keep the driver disabled at startup so the motor coils are not energised
     // until the user explicitly starts winding.
     // IMPORTANT: write HIGH to the output register BEFORE enabling the output driver.
@@ -11,9 +11,7 @@ void StepperController::begin() {
     pinMode(ENABLE_PIN, OUTPUT);     // Enable output driver — starts HIGH, no glitch
     _driverEnabled = false;
 
-    // Initialise the FastAccelStepper hardware timer engine.
-    _engine.init();
-    _stepper = _engine.stepperConnectToPin(STEP_PIN);
+    _stepper = engine.stepperConnectToPin(STEP_PIN);
     if (!_stepper) {
         // Fatal error: cannot allocate a hardware timer channel for this pin.
         Serial.println("[Stepper] ERROR: could not initialise stepper!");

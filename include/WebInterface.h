@@ -3,10 +3,10 @@
 #include <ESPAsyncWebServer.h>
 #include <functional>
 #include "Config.h"
+#include "Types.h"
 
-// Callback type invoked by WebInterface when a command arrives over WebSocket.
-// Parameters: cmd (command name), val (optional value string).
-using CommandCallback = std::function<void(const String&, const String&)>;
+// Callback type invoqué quand une commande arrive via WebSocket.
+// Défini dans Types.h — partagé avec LinkSerial.
 
 // Full machine state snapshot sent to all connected WebSocket clients
 // every WS_UPDATE_MS milliseconds.

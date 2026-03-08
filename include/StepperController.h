@@ -8,8 +8,9 @@
 // turn counting (via step position), and driver enable/disable via ENABLE_PIN.
 class StepperController {
 public:
-    // Initialise GPIO pins, FastAccelStepper engine and set default speed.
-    void     begin();
+    // Initialise GPIO pins and connect to the shared engine.
+    // The engine must have been initialised (engine.init()) before this call.
+    void     begin(FastAccelStepperEngine& engine);
 
     // Update target speed (Hz). Clamped to [SPEED_HZ_MIN, SPEED_HZ_MAX].
     // applySpeedAcceleration() is called so the change takes effect immediately
@@ -61,7 +62,6 @@ public:
     void     stopNote();
 
 private:
-    FastAccelStepperEngine _engine;             // FastAccelStepper engine (manages hardware timers)
     FastAccelStepper*      _stepper = nullptr;  // Pointer to the stepper instance
     uint32_t               _speedHz = SPEED_HZ_MIN;  // Current speed setpoint in Hz
     bool                   _driverEnabled = false;   // True when ENABLE_PIN is LOW (driver on)

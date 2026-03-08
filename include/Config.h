@@ -1,10 +1,57 @@
 #pragma once
 
-// ── Moteur pas à pas ─────────────────────────────────────
-#define STEP_PIN            32
-#define DIR_PIN             33
-#define ENABLE_PIN          25      // LOW = driver actif
-#define LED_PIN             23      // LED guide aller-retour (toggle à chaque passage)
+// ── Stepper bobine (axe principal) ───────────────────────
+#define STEP_PIN            26
+#define DIR_PIN             27
+#define ENABLE_PIN          14      // LOW = driver actif
+
+// ── Stepper latéral (guide fil) ──────────────────────────
+#define STEP_PIN_LAT        32
+#define DIR_PIN_LAT         33
+#define ENABLE_PIN_LAT      25      // LOW = driver actif
+
+#define LED_PIN             2       // LED guide aller-retour — déplacée sur GPIO 2 (LED onboard)
+                                    // GPIO 23 libéré pour l'encodeur
+
+// ── Encodeur rotatif ─────────────────────────────────────
+// Interrupt-capable, pull-up interne dispo (INPUT_PULLUP).
+// Déplacé sur 18/19 — 22/23 utilisés par le capteur de position latérale.
+#define ENC1_CLK            18      // Signal A
+#define ENC1_DT             19      // Signal B
+
+// ── Capteur position initiale axe latéral ────────────────
+// Le capteur est connecté à la masse, entrées en INPUT_PULLUP.
+// Contact fermé (pin à GND) = LOW. Contact ouvert (pull-up) = HIGH.
+//   Hors home : NO ouvert (HIGH)  | NC fermé (LOW)
+//   En home   : NO fermé (LOW)   | NC ouvert (HIGH)
+//   Défaut    : NO et NC identiques (les deux HIGH = capteur absent)
+#define HOME_PIN_NO         23      // Normally Open  — LOW quand en home
+#define HOME_PIN_NC         22      // Normally Closed — HIGH quand en home
+
+// Paramètres du homing de l'axe latéral
+// true = runForward() va vers le home, false = runBackward(). À ajuster selon le câblage.
+#define LAT_HOME_DIR        false   // false = runBackward() vers le capteur (gauche)
+#define LAT_ACCEL           40000   // steps/s² — accélération axe latéral
+#define LAT_HOME_SPEED_HZ   4800    // Vitesse de homing (≈45 RPM à 1/32)
+// Choisir UNE option selon le protocole retenu :
+//
+// Option A — UART2  (simple, 2 fils, longue distance)
+//   TX → GPIO 17  |  RX → GPIO 16
+//   Activer dans platformio.ini : build_flags = -DCOMM_UART
+//
+// Option B — SPI esclave  (rapide, 4 fils)
+//   MOSI → GPIO 13  |  MISO → GPIO 15
+//   CLK  → GPIO 18  |  CS   → GPIO 19
+//   Activer dans platformio.ini : build_flags = -DCOMM_SPI
+//
+// GPIO 21/22 réservés I2C SDA/SCL — ne pas utiliser ici.
+
+// ── UART2 liaison série ESP ↔ ESP ────────────────────────
+#define LINK_UART           Serial2
+#define LINK_BAUD           115200
+#define LINK_TX_PIN         17      // Winder TX → Écran RX
+#define LINK_RX_PIN         16      // Winder RX ← Écran TX
+#define LINK_UPDATE_MS      100     // Intervalle d'envoi du statut vers l'écran (ms)
 
 #define MICROSTEPPING       32      // Microstepping configured on driver (M0/M1/M2)
 #define STEPS_PER_REV       (200 * MICROSTEPPING)   // 6400 steps/rev at 1/32
@@ -38,7 +85,21 @@
 // Augmenter k pour plus d'exponentialité (ex. 6.0), diminuer pour moins (ex. 3.0).
 #define POT_EXP_K           4.5f
 
-// ── WiFi & interface web ─────────────────────────────────
+// ── Mode test moteurs ─────────────────────────────────────
+// Décommenter (ou ajouter -DTEST_MOTORS dans platformio.ini build_flags)
+// pour activer le mode test. L'application normale n'est PAS démarrée.
+// Le test fait tourner les deux steppers séquentiellement pour valider le câblage.
+//
+// #define TEST_MOTORS
+//
+// Paramètres du test (modifiables sans changer la logique) :
+#define TEST_RPM_MAIN       300     // Vitesse du stepper bobine en test (RPM)
+#define TEST_RPM_LAT        15      // Vitesse du stepper latéral en test (RPM) — axe lent
+#define TEST_ACCEL_LAT      8000    // Accélération du latéral en test (steps/s²)
+#define TEST_RUN_MS         3000    // Durée de chaque séquence (ms)
+#define TEST_PAUSE_MS       1000    // Pause entre les séquences (ms)
+
+
 #define WIFI_SSID "<redacted>"
 #define WIFI_PASSWORD "<redacted>"
 #define WEB_PORT            80
