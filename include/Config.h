@@ -33,19 +33,37 @@
 #define LAT_HOME_DIR        false   // false = runBackward() vers le capteur (gauche)
 #define LAT_ACCEL           40000   // steps/s² — accélération axe latéral
 #define LAT_HOME_SPEED_HZ   4800    // Vitesse de homing (≈45 RPM à 1/32)
+// Offset entre le hard-stop physique (capteur) et la position 0 réelle.
+// Valeur par défaut à la compilation — peut être modifié depuis l'interface web
+// et stocké en mémoire NVS (sans recompilation).
+#define LAT_HOME_OFFSET_DEFAULT_MM  15.0f // mm — 15 mm entre le hard-stop et la position 0 réelle
 // Cinématique axe latéral
-// Tige filetée M6 : pas = 1 mm/tr → 6400 steps/mm (200 pas × 1/32)
-#define LAT_STEPS_PER_MM    6400    // steps/mm — tige M6 (1 mm/tr), 1/32 microstep
-#define LAT_TRAVERSE_MM     120     // Course maximale en mm (12 cm)
-#define LAT_TRAVERSE_SPEED_HZ 4800  // Vitesse de traversée (même que homing par défaut)
+// Moteur 96 pas, 1/32 microstep, tige M6 (1 mm/tr)
+// steps/mm = 96 × 32 / 1 = 3072
+#define LAT_MOTOR_STEPS     96      // Pas/tr du moteur latéral
+#define LAT_STEPS_PER_MM    (LAT_MOTOR_STEPS * MICROSTEPPING)  // 3072 steps/mm
+#define LAT_TRAVERSE_MM     100     // 10 cm — vérification calibration
+#define LAT_TRAVERSE_SPEED_HZ 4800  // Vitesse de traversée ≈ 0.75 mm/s (M6 1/32)
 
 // Décommenter pour activer le test/rodage aller-retour de l'axe latéral.
 // Le moteur de bobine n'est PAS lancé dans ce mode.
-#define LAT_TEST_TRAVERSE// Choisir UNE option selon le protocole retenu :
+#define LAT_TEST_TRAVERSE   // Actif : simulation des mouvements de bobinage
+
+// Simulation de bobinage (utilisé si LAT_TEST_TRAVERSE est défini)
+// Simule un micro Strat (AWG42, 17 mm total) bobiné à 800 tr/min, 8000 tours.
+// Enchaîne 3 scénarios : scatter faible → moyen → élevé.
+#define SIM_TARGET_TURNS       8000   // Nombre de tours simulés
+#define SIM_BOBBIN_RPM         1500   // Vitesse de bobinage simulée (tr/min)
+#define SIM_SCATTER_LOW        1.0f   // Scatter faible  — bobinage dense
+#define SIM_SCATTER_MED        2.0f   // Scatter moyen
+#define SIM_SCATTER_HIGH       3.5f   // Scatter élevé   — bobinage lâche
+#define SIM_PAUSE_BETWEEN_MS   3000   // Pause entre deux scénarios (ms)
+
+// Choisir UNE option selon le protocole retenu :
 //
 // Option A — UART2  (simple, 2 fils, longue distance)
 //   TX → GPIO 17  |  RX → GPIO 16
-//   Activer dans platformio.ini : build_flags = -DCOMM_UART
+//   Activer dans platformio.ini : build_flags = -Dil COMM_UART
 //
 // Option B — SPI esclave  (rapide, 4 fils)
 //   MOSI → GPIO 13  |  MISO → GPIO 15

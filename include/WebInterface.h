@@ -28,6 +28,7 @@ struct WinderStatus {
     int      currentPass;     // Current pass number (0-based)
     float    effectiveWidth_mm; // Usable winding width after flanges and margins
     float    geomTotal, geomBottom, geomTop, geomMargin, geomWire; // Raw geometry values
+    float    latOffset;   // Offset home axe latéral en mm (depuis NVS)
 };
 
 // ── WebInterface ─────────────────────────────────────────────────────────────

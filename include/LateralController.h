@@ -9,9 +9,11 @@ enum class LatState {
     HOMING,         // Déplacement vers la position initiale (home)
     HOMING_DECEL,   // Capteur atteint — décélération normale en cours avant arrêt
     HOMING_ALIGN,   // Alignement sur le pas complet le plus proche (supprime le grésillement)
+    HOMING_OFFSET,  // Déplacement de l'offset entre le capteur et la vraie position 0
     HOMED,          // Position initiale atteinte — driver maintenu actif en permanence
-    TRAVERSE_FWD,   // Test/rodage : aller vers la position maximale
-    TRAVERSE_BWD,   // Test/rodage : retour vers la position initiale (0)
+    TRAVERSE_FWD,   // Simulation : aller vers effectiveWidth (position max)
+    TRAVERSE_BWD,   // Simulation : retour vers la position 0
+    SIM_PAUSE,      // Simulation : pause non-bloquante entre deux scénarios
 };
 
 // ── LateralController ─────────────────────────────────────────────────────────
@@ -50,12 +52,16 @@ public:
     // Sans effet si le capteur est absent.
     void rehome();
 
+    // Offset entre le hard-stop capteur et la vraie position 0.
+    // Valeur positive en mm. Persisté en NVS — survit aux redémarrages.
+    void  setHomeOffset(float mm);
+    float getHomeOffset() const { return _homeOffsetMm; }
+
 private:
     FastAccelStepper*      _stepper         = nullptr;
     LatState               _state           = LatState::FAULT;
-    uint32_t               _lastCheckMs     = 0;  // Timer pour les vérifications périodiques
-    // Drapeau positionné par l'ISR GPIO dès que HOME_PIN_NO passe à LOW.
-    // Traité dans update() pour arrêter le moteur sans dépendre de la cadence de la boucle.
+    uint32_t               _lastCheckMs     = 0;
+    float                  _homeOffsetMm    = LAT_HOME_OFFSET_DEFAULT_MM;  // Offset chargé depuis NVS
     volatile bool          _homeFlag        = false;
 
     // ── Lecture capteur (INPUT_PULLUP, contact à GND = LOW) ───────────────
@@ -77,7 +83,21 @@ private:
 
     void _startHoming();
     void _startBackoff();
-    void _startTraverseFwd();  // Lance un aller vers LAT_TRAVERSE_MM (test/rodage)
+    void _applyOffsetOrNext(); // Après alignement : déplacement offset ou HOMED direct
+    void _gotoHomed();         // Transition finale : HOMED ou simulation selon config
     void _enableDriver();
     void _disableDriver();
+
+#ifdef LAT_TEST_TRAVERSE
+    // ── Variables d'état de la simulation de bobinage ─────────────────────────────
+    uint8_t  _simIdx         = 0;     // Scénario courant (0=faible, 1=moyen, 2=élevé)
+    long     _simPassesDone  = 0;     // Passes effectuées (aller + retour comptés)
+    long     _simPassesTotal = 0;     // Total de passes pour ce scénario
+    int32_t  _simEndSteps    = 0;     // Position fin d'axe (effWidth en steps)
+    uint32_t _simSpeedHz     = 0;     // Vitesse latérale calculée pour ce scénario
+    bool     _simNeedReturn  = false; // Vrai si retour à 0 non compté après fin de scénario
+    uint32_t _simPauseStart  = 0;     // millis() au début de la pause inter-scénario
+    void _startSimScenario(uint8_t idx); // Démarre le scénario idx
+    void _finishSimScenario();           // Termine le scénario → pause ou HOMED
+#endif
 };

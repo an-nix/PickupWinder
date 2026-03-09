@@ -179,7 +179,8 @@ void WinderApp::run() {
             _led.getCurrentPass(),
             _geom.effectiveWidth(),
             _geom.totalWidth_mm, _geom.flangeBottom_mm, _geom.flangeTop_mm,
-            _geom.margin_mm, _geom.wireDiameter_mm
+            _geom.margin_mm, _geom.wireDiameter_mm,
+            _lateral.getHomeOffset()
         });
     }
 }
@@ -323,6 +324,12 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
             _geom.scatterFactor = f;
             Serial.printf("Scatter factor: %.2f → %ld tours/pass\n",
                           _geom.scatterFactor, _geom.turnsPerPass());
+        }
+
+    } else if (cmd == "lat_offset") {
+        float mm = value.toFloat();
+        if (mm >= 0.0f) {
+            _lateral.setHomeOffset(mm);
         }
     }
 }
