@@ -33,7 +33,15 @@
 #define LAT_HOME_DIR        false   // false = runBackward() vers le capteur (gauche)
 #define LAT_ACCEL           40000   // steps/s² — accélération axe latéral
 #define LAT_HOME_SPEED_HZ   4800    // Vitesse de homing (≈45 RPM à 1/32)
-// Choisir UNE option selon le protocole retenu :
+// Cinématique axe latéral
+// Tige filetée M6 : pas = 1 mm/tr → 6400 steps/mm (200 pas × 1/32)
+#define LAT_STEPS_PER_MM    6400    // steps/mm — tige M6 (1 mm/tr), 1/32 microstep
+#define LAT_TRAVERSE_MM     120     // Course maximale en mm (12 cm)
+#define LAT_TRAVERSE_SPEED_HZ 4800  // Vitesse de traversée (même que homing par défaut)
+
+// Décommenter pour activer le test/rodage aller-retour de l'axe latéral.
+// Le moteur de bobine n'est PAS lancé dans ce mode.
+#define LAT_TEST_TRAVERSE// Choisir UNE option selon le protocole retenu :
 //
 // Option A — UART2  (simple, 2 fils, longue distance)
 //   TX → GPIO 17  |  RX → GPIO 16

@@ -9,7 +9,9 @@ enum class LatState {
     HOMING,         // Déplacement vers la position initiale (home)
     HOMING_DECEL,   // Capteur atteint — décélération normale en cours avant arrêt
     HOMING_ALIGN,   // Alignement sur le pas complet le plus proche (supprime le grésillement)
-    HOMED           // Position initiale atteinte — driver maintenu actif en permanence
+    HOMED,          // Position initiale atteinte — driver maintenu actif en permanence
+    TRAVERSE_FWD,   // Test/rodage : aller vers la position maximale
+    TRAVERSE_BWD,   // Test/rodage : retour vers la position initiale (0)
 };
 
 // ── LateralController ─────────────────────────────────────────────────────────
@@ -75,6 +77,7 @@ private:
 
     void _startHoming();
     void _startBackoff();
+    void _startTraverseFwd();  // Lance un aller vers LAT_TRAVERSE_MM (test/rodage)
     void _enableDriver();
     void _disableDriver();
 };
