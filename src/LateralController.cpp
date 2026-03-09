@@ -124,8 +124,12 @@ void LateralController::update() {
             } else {
                 // Déjà aligné — pas de mouvement nécessaire.
                 _stepper->forceStopAndNewPosition(0);
+#ifdef LAT_TEST_TRAVERSE
+                _startTraverseFwd();
+#else
                 _state = LatState::HOMED;
                 Serial.println("[Lateral] ✓ Position initiale atteinte — axe latéral prêt.");
+#endif
             }
         }
         break;
@@ -134,12 +138,16 @@ void LateralController::update() {
     case LatState::HOMING_ALIGN:
         if (!_stepper->isRunning()) {
             _stepper->forceStopAndNewPosition(0);
+#ifdef LAT_TEST_TRAVERSE
+            _startTraverseFwd();
+#else
             _state = LatState::HOMED;
             Serial.println("[Lateral] ✓ Position initiale atteinte — axe latéral prêt.");
+#endif
         }
         break;
 
-    // ── HOMED ─────────────────────────────────────────────────────────────
+    // ── HOMED ──────────────────────────────────────────────────────────
     case LatState::HOMED:
         // Driver maintenu actif en permanence.
         // Vérification périodique de la santé du capteur (toutes les 5 s).
@@ -150,6 +158,27 @@ void LateralController::update() {
             }
         }
         break;
+
+#ifdef LAT_TEST_TRAVERSE
+    // ── TRAVERSE_FWD ───────────────────────────────────────────────────
+    case LatState::TRAVERSE_FWD:
+        if (!_stepper->isRunning()) {
+            // Position max atteinte → retour vers 0 (home)
+            _stepper->setSpeedInHz(LAT_TRAVERSE_SPEED_HZ);
+            _stepper->moveTo(0);
+            _state = LatState::TRAVERSE_BWD;
+            Serial.println("[Lateral] Traverse: retour home...");
+        }
+        break;
+
+    // ── TRAVERSE_BWD ───────────────────────────────────────────────────
+    case LatState::TRAVERSE_BWD:
+        if (!_stepper->isRunning()) {
+            // Home atteint → repartir en avant
+            _startTraverseFwd();
+        }
+        break;
+#endif
     }
 }
 
@@ -180,6 +209,8 @@ const char* LateralController::stateStr() const {
         case LatState::HOMING_DECEL:  return "HOMING_DECEL";
         case LatState::HOMING_ALIGN:  return "HOMING_ALIGN";
         case LatState::HOMED:         return "HOMED";
+        case LatState::TRAVERSE_FWD:  return "TRAVERSE_FWD";
+        case LatState::TRAVERSE_BWD:  return "TRAVERSE_BWD";
         default:                      return "?";
     }
 }
@@ -213,6 +244,15 @@ void LateralController::_disableDriver() {
         _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
     }
     digitalWrite(ENABLE_PIN_LAT, HIGH);
+}
+
+void LateralController::_startTraverseFwd() {
+    constexpr int32_t target = (int32_t)LAT_TRAVERSE_MM * (int32_t)LAT_STEPS_PER_MM;
+    _stepper->setSpeedInHz(LAT_TRAVERSE_SPEED_HZ);
+    _stepper->moveTo(target);
+    _state = LatState::TRAVERSE_FWD;
+    Serial.printf("[Lateral] Traverse: aller → %d mm (%ld steps)...\n",
+                  (int)LAT_TRAVERSE_MM, (long)target);
 }
 
 // ── ISR GPIO — détection instantanée du capteur de home ──────────────────────
