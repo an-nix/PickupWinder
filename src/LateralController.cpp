@@ -1,5 +1,6 @@
 #include "LateralController.h"
 #include <Arduino.h>
+#include <Preferences.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -20,6 +21,15 @@ void LateralController::begin(FastAccelStepperEngine& engine) {
     }
     _stepper->setDirectionPin(DIR_PIN_LAT);
     _stepper->setAcceleration(LAT_ACCEL);
+
+    // Charger l'offset depuis la mémoire NVS (persistant entre les redémarrages).
+    {
+        Preferences prefs;
+        prefs.begin("lateral", true);  // read-only
+        _homeOffsetMm = prefs.getFloat("offset_mm", LAT_HOME_OFFSET_DEFAULT_MM);
+        prefs.end();
+        Serial.printf("[Lateral] Offset home : %.2f mm\n", _homeOffsetMm);
+    }
 
     // Laisser les pull-ups se stabiliser avant de lire le capteur.
     delay(10);
@@ -124,12 +134,7 @@ void LateralController::update() {
             } else {
                 // Déjà aligné — pas de mouvement nécessaire.
                 _stepper->forceStopAndNewPosition(0);
-#ifdef LAT_TEST_TRAVERSE
-                _startTraverseFwd();
-#else
-                _state = LatState::HOMED;
-                Serial.println("[Lateral] ✓ Position initiale atteinte — axe latéral prêt.");
-#endif
+                _applyOffsetOrNext();
             }
         }
         break;
@@ -138,12 +143,16 @@ void LateralController::update() {
     case LatState::HOMING_ALIGN:
         if (!_stepper->isRunning()) {
             _stepper->forceStopAndNewPosition(0);
-#ifdef LAT_TEST_TRAVERSE
-            _startTraverseFwd();
-#else
-            _state = LatState::HOMED;
-            Serial.println("[Lateral] ✓ Position initiale atteinte — axe latéral prêt.");
-#endif
+            _applyOffsetOrNext();
+        }
+        break;
+
+    // ── HOMING_OFFSET ──────────────────────────────────────────────────
+    case LatState::HOMING_OFFSET:
+        if (!_stepper->isRunning()) {
+            // Offset atteint : cette position devient le zéro réel.
+            _stepper->forceStopAndNewPosition(0);
+            _gotoHomed();
         }
         break;
 
@@ -161,21 +170,50 @@ void LateralController::update() {
 
 #ifdef LAT_TEST_TRAVERSE
     // ── TRAVERSE_FWD ───────────────────────────────────────────────────
+    // Aller : 0 → effWidth. Chaque sens compte +1 passe.
     case LatState::TRAVERSE_FWD:
         if (!_stepper->isRunning()) {
-            // Position max atteinte → retour vers 0 (home)
-            _stepper->setSpeedInHz(LAT_TRAVERSE_SPEED_HZ);
-            _stepper->moveTo(0);
-            _state = LatState::TRAVERSE_BWD;
-            Serial.println("[Lateral] Traverse: retour home...");
+            _simPassesDone++;
+            if (_simPassesDone >= _simPassesTotal) {
+                // Scénario terminé alors qu'on est à effW → retour rapide à 0 (non compté)
+                _simNeedReturn = true;
+                _stepper->setSpeedInHz(LAT_TRAVERSE_SPEED_HZ);
+                _stepper->moveTo(0);
+                _state = LatState::TRAVERSE_BWD;
+            } else {
+                _stepper->setSpeedInHz(_simSpeedHz);
+                _stepper->moveTo(0);
+                _state = LatState::TRAVERSE_BWD;
+            }
         }
         break;
 
-    // ── TRAVERSE_BWD ───────────────────────────────────────────────────
+    // ── TRAVERSE_BWD ────────────────────────────────────────────────
+    // Retour : effWidth → 0. Comptage de la passe sauf si retour de fin de scénario.
     case LatState::TRAVERSE_BWD:
         if (!_stepper->isRunning()) {
-            // Home atteint → repartir en avant
-            _startTraverseFwd();
+            if (_simNeedReturn) {
+                // Retour non compté après fin de scénario
+                _simNeedReturn = false;
+                _finishSimScenario();
+            } else {
+                _simPassesDone++;
+                if (_simPassesDone >= _simPassesTotal) {
+                    _finishSimScenario(); // déjà en position 0
+                } else {
+                    _stepper->setSpeedInHz(_simSpeedHz);
+                    _stepper->moveTo(_simEndSteps);
+                    _state = LatState::TRAVERSE_FWD;
+                }
+            }
+        }
+        break;
+
+    // ── SIM_PAUSE ─────────────────────────────────────────────────
+    // Attente non-bloquante entre deux scénarios de scatter.
+    case LatState::SIM_PAUSE:
+        if (millis() - _simPauseStart >= SIM_PAUSE_BETWEEN_MS) {
+            _startSimScenario(_simIdx + 1);
         }
         break;
 #endif
@@ -203,15 +241,17 @@ void LateralController::rehome() {
 
 const char* LateralController::stateStr() const {
     switch (_state) {
-        case LatState::FAULT:         return "FAULT";
-        case LatState::BACKOFF:       return "BACKOFF";
-        case LatState::HOMING:        return "HOMING";
-        case LatState::HOMING_DECEL:  return "HOMING_DECEL";
-        case LatState::HOMING_ALIGN:  return "HOMING_ALIGN";
-        case LatState::HOMED:         return "HOMED";
-        case LatState::TRAVERSE_FWD:  return "TRAVERSE_FWD";
-        case LatState::TRAVERSE_BWD:  return "TRAVERSE_BWD";
-        default:                      return "?";
+        case LatState::FAULT:           return "FAULT";
+        case LatState::BACKOFF:         return "BACKOFF";
+        case LatState::HOMING:          return "HOMING";
+        case LatState::HOMING_DECEL:    return "HOMING_DECEL";
+        case LatState::HOMING_ALIGN:    return "HOMING_ALIGN";
+        case LatState::HOMING_OFFSET:   return "HOMING_OFFSET";
+        case LatState::HOMED:           return "HOMED";
+        case LatState::TRAVERSE_FWD:    return "SIM_FWD";
+        case LatState::TRAVERSE_BWD:    return "SIM_BWD";
+        case LatState::SIM_PAUSE:       return "SIM_PAUSE";
+        default:                        return "?";
     }
 }
 
@@ -246,14 +286,93 @@ void LateralController::_disableDriver() {
     digitalWrite(ENABLE_PIN_LAT, HIGH);
 }
 
-void LateralController::_startTraverseFwd() {
-    constexpr int32_t target = (int32_t)LAT_TRAVERSE_MM * (int32_t)LAT_STEPS_PER_MM;
-    _stepper->setSpeedInHz(LAT_TRAVERSE_SPEED_HZ);
-    _stepper->moveTo(target);
-    _state = LatState::TRAVERSE_FWD;
-    Serial.printf("[Lateral] Traverse: aller → %d mm (%ld steps)...\n",
-                  (int)LAT_TRAVERSE_MM, (long)target);
+void LateralController::setHomeOffset(float mm) {
+    _homeOffsetMm = (mm < 0.0f) ? 0.0f : mm;
+    Preferences prefs;
+    prefs.begin("lateral", false);  // read-write
+    prefs.putFloat("offset_mm", _homeOffsetMm);
+    prefs.end();
+    Serial.printf("[Lateral] Offset home enregistré : %.2f mm\n", _homeOffsetMm);
 }
+
+void LateralController::_applyOffsetOrNext() {
+    // Appelé après forceStopAndNewPosition(0) — le capteur est à la position 0.
+    // Si un offset est défini, on se déplace de cet offset dans la direction
+    // opposée au capteur (direction positive), puis on remet la position à 0.
+    int32_t offsetSteps = (int32_t)(_homeOffsetMm * (float)LAT_STEPS_PER_MM);
+    if (offsetSteps > 0) {
+        _stepper->setSpeedInHz(LAT_HOME_SPEED_HZ);
+        _stepper->moveTo(offsetSteps);
+        _state = LatState::HOMING_OFFSET;
+        Serial.printf("[Lateral] Offset : déplacement de %.2f mm (%ld steps)...\n",
+                      _homeOffsetMm, (long)offsetSteps);
+    } else {
+        _gotoHomed();
+    }
+}
+
+void LateralController::_gotoHomed() {
+#ifdef LAT_TEST_TRAVERSE
+    _startSimScenario(0);
+#else
+    _state = LatState::HOMED;
+    Serial.println("[Lateral] ✓ Position 0 atteinte — axe latéral prêt.");
+#endif
+}
+
+#ifdef LAT_TEST_TRAVERSE
+void LateralController::_startSimScenario(uint8_t idx) {
+    // Géométrie Strat (BOBBIN_PRESETS[0]) avec marge par défaut 0.5 mm
+    constexpr float effW_mm = 17.0f - 1.5f - 1.5f - 2.0f * 0.5f; // 13.0 mm utile
+    constexpr float wire_mm = 0.071f;                              // AWG42
+
+    const float scatters[3] = { SIM_SCATTER_LOW, SIM_SCATTER_MED, SIM_SCATTER_HIGH };
+    const char* names[3]    = { "faible (1.0)", "moyen (2.0)", "eleve (3.5)" };
+
+    _simIdx       = idx;
+    float scatter = scatters[idx];
+    float spacing = wire_mm * scatter;
+    long  tpp     = (long)(effW_mm / spacing);
+    if (tpp < 1) tpp = 1;
+
+    _simPassesTotal = ((long)SIM_TARGET_TURNS + tpp - 1) / tpp;
+    _simPassesDone  = 0;
+    _simNeedReturn  = false;
+
+    // Vitesse latérale : effWidth doit être parcouru en (tpp tours @ SIM_BOBBIN_RPM)
+    // pass_duration_s = tpp / RPM * 60
+    // lat_speed_Hz    = effW_steps / pass_duration_s = effW_steps * RPM / (tpp * 60)
+    float effW_steps = effW_mm * (float)LAT_STEPS_PER_MM;
+    float latHz      = effW_steps * (float)SIM_BOBBIN_RPM / ((float)tpp * 60.0f);
+    _simSpeedHz      = (uint32_t)max(100.0f, latHz);
+    _simEndSteps     = (int32_t)effW_steps;
+
+    Serial.printf("\n[Sim] \u2550\u2550\u2550 Sc\u00e9nario %d/3 : scatter %s \u2550\u2550\u2550\n", idx + 1, names[idx]);
+    Serial.printf("[Sim]   effWidth=%.1f mm  tpp=%ld tours/passe  passes=%ld\n",
+                  effW_mm, tpp, _simPassesTotal);
+    Serial.printf("[Sim]   vitesse lat=%u Hz (%.3f mm/s)\n",
+                  _simSpeedHz, (float)_simSpeedHz / (float)LAT_STEPS_PER_MM);
+    Serial.printf("[Sim]   dur\u00e9e estim\u00e9e : %.1f min\n",
+                  (float)_simPassesTotal * (float)tpp / (float)SIM_BOBBIN_RPM);
+
+    _stepper->setSpeedInHz(_simSpeedHz);
+    _stepper->moveTo(_simEndSteps);
+    _state = LatState::TRAVERSE_FWD;
+}
+
+void LateralController::_finishSimScenario() {
+    uint8_t next = _simIdx + 1;
+    if (next < 3) {
+        Serial.printf("[Sim] Sc\u00e9nario %d/3 termin\u00e9. Pause %d ms avant le suivant...\n",
+                      _simIdx + 1, (int)SIM_PAUSE_BETWEEN_MS);
+        _simPauseStart = millis();
+        _state = LatState::SIM_PAUSE;
+    } else {
+        _state = LatState::HOMED;
+        Serial.println("[Sim] \u2713 Tous les sc\u00e9narios termin\u00e9s \u2014 axe en position 0.");
+    }
+}
+#endif
 
 // ── ISR GPIO — détection instantanée du capteur de home ──────────────────────
 // Appelée sur le front descendant de HOME_PIN_NO (INPUT_PULLUP, actif à GND).

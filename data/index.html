@@ -236,6 +236,20 @@ input:disabled{opacity:.3;cursor:not-allowed}
     </div>
   </div>
 
+  <!-- Axe latéral : offset homing -->
+  <div>
+    <div class="sect">Offset homing axe latéral (mm) — <span id="lat-ofs-lbl" style="color:#4ecca3;font-weight:700">0.00</span></div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input type="number" id="lat-ofs-input" value="0.00" min="0" max="50" step="0.1"
+             style="flex:1" onchange="setLatOffset(this.value)">
+      <button class="btn btn-reset" style="flex:0 0 auto;padding:9px 12px;font-size:.85em"
+              onclick="setLatOffset(0)">↺ 0</button>
+    </div>
+    <div style="font-size:.72em;color:#445;margin-top:4px">
+      Déplacement après le homing (persistant NVS). Prend effet au prochain homing.
+    </div>
+  </div>
+
   <div class="btn-row">
     <button class="btn btn-stop"  onclick="cmd('stop')">■ Stop urgence</button>
     <button class="btn btn-reset" onclick="cmd('reset')">↺ Reset tours</button>
@@ -337,6 +351,12 @@ function update(d) {
       document.getElementById(id).checked = (v === key);
     });
   }
+  // Offset homing latéral
+  if (d.latOfs !== undefined) {
+    document.getElementById('lat-ofs-lbl').textContent = parseFloat(d.latOfs).toFixed(2);
+    const el = document.getElementById('lat-ofs-input');
+    if (document.activeElement !== el) el.value = parseFloat(d.latOfs).toFixed(2);
+  }
 }
 
 function syncInput(id, val) {
@@ -378,6 +398,13 @@ function scatterSlider(v) {
   v = parseFloat(v).toFixed(1);
   document.getElementById('scatter-lbl').textContent = v;
   cmd('geom_scatter', v);
+}
+
+function setLatOffset(v) {
+  v = Math.max(0, parseFloat(v) || 0);
+  document.getElementById('lat-ofs-input').value = v.toFixed(2);
+  document.getElementById('lat-ofs-lbl').textContent = v.toFixed(2);
+  cmd('lat_offset', v.toFixed(2));
 }
 
 let musicOn = false;
