@@ -54,8 +54,10 @@ void WinderApp::run() {
             if (potStop) _potWasZero = true;
 
             // Re-enable only if: motor was disabled, pot returned to zero, pot is now active,
-            // AND the target has not been reached (requires explicit reset to clear).
-            if (!_motorEnabled && _potWasZero && potActive && !_targetReached) {
+            // AND the target has not been reached (requires explicit reset to clear),
+            // AND the lateral axis has completed homing (safety interlock).
+            if (!_motorEnabled && _potWasZero && potActive && !_targetReached
+                               && _lateral.isHomed()) {
                 _motorEnabled = true;
                 Serial.println("▶ Pot active — motor ready");
             }
@@ -75,13 +77,31 @@ void WinderApp::run() {
                         hz = min(hz, maxHz);
                     }
                 }
+                // Ralentissement aux demi-tours latéraux : pendant la fenêtre de décél+accél
+                // du guide-fil, on réduit la vitesse de bobinage pour éviter l'accumulation
+                // de spires aux extrémités du bobbin.
+                if (_lateral.isReversing()) {
+                    hz = max((uint32_t)SPEED_HZ_MIN,
+                             (uint32_t)((float)hz * LAT_REVERSAL_SLOWDOWN));
+                }
                 // Update speed setpoint — will ramp to new speed using ACCELERATION.
                 _stepper.setSpeedHz(hz);
                 // If the motor is not yet running, start it in the configured direction.
                 if (!_stepper.isRunning()) {
-                    _stepper.start(_direction == Direction::CW);
+                    // Appliquer l'inversion matérielle du moteur de bobinage si nécessaire.
+                    bool forward = (_direction == Direction::CW) != (bool)WINDING_MOTOR_INVERTED;
+                    _stepper.start(forward);
+                    _lateral.startWinding(hz, _geom.turnsPerPass(), _geom.effectiveWidth());
                     Serial.printf("▶ Start %s — %u Hz\n",
                                   _direction == Direction::CW ? "CW" : "CCW", hz);
+                } else {
+                    // Moteur en marche : soit démarrer le guide-fil si son premier
+                    // départ a été manqué, soit synchroniser sa vitesse en continu.
+                    if (_lateral.getState() == LatState::HOMED) {
+                        _lateral.startWinding(hz, _geom.turnsPerPass(), _geom.effectiveWidth());
+                    } else {
+                        _lateral.updateWinding(hz, _geom.turnsPerPass(), _geom.effectiveWidth());
+                    }
                 }
             } else if (_motorEnabled && potStop && _stepper.isRunning()) {
                 // Pot returned to zero while motor was running → smooth stop.
@@ -201,6 +221,8 @@ void WinderApp::_stop() {
     _pendingDisable = true;
     // Initiate a smooth deceleration ramp to zero.
     _stepper.stop();
+    // Arrêter le guide-fil proprement (décélération douce, retour à HOMED).
+    _lateral.stopWinding();
     _led.reset();
     Serial.println("■ Stopped — return pot to 0 to restart");
 }
@@ -285,6 +307,9 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
             // forceStop() instead of stop() to avoid coasting through the
             // resonance zone during a slow deceleration ramp.
             if (_stepper.isRunning()) _stepper.forceStop();
+            // Remettre le latéral en HOMED pour qu'il reparte proprement
+            // au prochain démarrage (startWinding exige l'état HOMED).
+            _lateral.stopWinding();
             Serial.printf("Direction: %s\n", value.c_str());
         }
 
