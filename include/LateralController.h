@@ -11,6 +11,8 @@ enum class LatState {
     HOMING_ALIGN,   // Alignement sur le pas complet le plus proche (supprime le grésillement)
     HOMING_OFFSET,  // Déplacement de l'offset entre le capteur et la vraie position 0
     HOMED,          // Position initiale atteinte — driver maintenu actif en permanence
+    WINDING_FWD,    // Bobinage réel : aller (0 → effWidth), synchronisé sur la vitesse de bobinage
+    WINDING_BWD,    // Bobinage réel : retour (effWidth → 0), synchronisé sur la vitesse de bobinage
     TRAVERSE_FWD,   // Simulation : aller vers effectiveWidth (position max)
     TRAVERSE_BWD,   // Simulation : retour vers la position 0
     SIM_PAUSE,      // Simulation : pause non-bloquante entre deux scénarios
@@ -44,13 +46,36 @@ public:
 
     // État courant de l'axe latéral.
     LatState    getState()  const { return _state; }
-    bool        isHomed()   const { return _state == LatState::HOMED;  }
+    bool        isHomed()   const {
+        return _state == LatState::HOMED
+            || _state == LatState::WINDING_FWD
+            || _state == LatState::WINDING_BWD;
+    }
     bool        isFault()   const { return _state == LatState::FAULT;  }
     const char* stateStr()  const;
 
     // Relancer le homing manuellement (ex. depuis l'interface web).
     // Sans effet si le capteur est absent.
     void rehome();
+
+    // ── Bobinage synchronisé ──────────────────────────────────────
+    // Démarrer la traversée latérale synchronisée avec le moteur de bobinage.
+    //   windingHz : fréquence de pas du stepper bobinage (readHz() / SpeedInput)
+    //   tpp       : tours par passe (WindingGeometry::turnsPerPass())
+    //   effWidthMm: largeur utile de bobinage en mm (WindingGeometry::effectiveWidth())
+    // Sans effet si l'axe n'est pas en état HOMED.
+    void startWinding(uint32_t windingHz, long tpp, float effWidthMm);
+
+    // Mettre à jour la vitesse latérale en temps réel (appeler à chaque lecture du pot).
+    // Sans effet si l'axe n'est pas en état WINDING_FWD / WINDING_BWD.
+    void updateWinding(uint32_t windingHz, long tpp, float effWidthMm);
+
+    // Arrêter la traversée latérale (décélération douce, retour à HOMED).
+    void stopWinding();
+
+    // Vrai pendant la fenêtre de demi-tour (décél + accél du moteur latéral).
+    // WinderApp réduit la vitesse de bobinage pendant ce temps (LAT_REVERSAL_SLOWDOWN).
+    bool isReversing() const { return millis() < _reversingUntilMs; }
 
     // Offset entre le hard-stop capteur et la vraie position 0.
     // Valeur positive en mm. Persisté en NVS — survit aux redémarrages.
@@ -63,6 +88,18 @@ private:
     uint32_t               _lastCheckMs     = 0;
     float                  _homeOffsetMm    = LAT_HOME_OFFSET_DEFAULT_MM;  // Offset chargé depuis NVS
     volatile bool          _homeFlag        = false;
+
+    // ── Bobinage réel : état de la traversée synchronisée ────────────────────
+    uint32_t               _latHz           = 0;    // Vitesse latérale courante (steps/s)
+    int32_t                _latEndSteps     = 0;    // Position extrémité (effWidth en steps)
+    uint32_t               _reversingUntilMs = 0;  // Fin de la fenêtre de ralentissement
+
+    // Calcule la vitesse latérale (steps/s) synchronisée sur la vitesse de bobinage.
+    // lat_Hz = effWidth_steps × windingHz / (tpp × STEPS_PER_REV)
+    uint32_t _calcLatHz(uint32_t windingHz, long tpp, float effWidthMm) const;
+
+    // Déclenche la fenêtre de ralentissement bobinage au demi-tour latéral.
+    void _onReversal();
 
     // ── Lecture capteur (INPUT_PULLUP, contact à GND = LOW) ───────────────
     // NO actif (contact fermé = en home) : pin LOW

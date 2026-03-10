@@ -4,6 +4,7 @@
 #define STEP_PIN            26
 #define DIR_PIN             27
 #define ENABLE_PIN          14      // LOW = driver actif
+#define WINDING_MOTOR_INVERTED  true   // true = brochage moteur bobinage inversé (inverse DIR)
 
 // ── Stepper latéral (guide fil) ──────────────────────────
 #define STEP_PIN_LAT        32
@@ -44,10 +45,14 @@
 #define LAT_STEPS_PER_MM    (LAT_MOTOR_STEPS * MICROSTEPPING)  // 3072 steps/mm
 #define LAT_TRAVERSE_MM     100     // 10 cm — vérification calibration
 #define LAT_TRAVERSE_SPEED_HZ 4800  // Vitesse de traversée ≈ 0.75 mm/s (M6 1/32)
+// Facteur de ralentissement du moteur de bobinage pendant le demi-tour latéral.
+// La durée effective est calculée dynamiquement : 2 × (v_lat / LAT_ACCEL) secondes.
+// Réduire si les extrémités s'accumulent ; augmenter si les variations de vitesse gênent.
+#define LAT_REVERSAL_SLOWDOWN  0.5f  // 0 < x ≤ 1.0 — vitesse bobinage × ce facteur au demi-tour
 
 // Décommenter pour activer le test/rodage aller-retour de l'axe latéral.
 // Le moteur de bobine n'est PAS lancé dans ce mode.
-#define LAT_TEST_TRAVERSE   // Actif : simulation des mouvements de bobinage
+// #define LAT_TEST_TRAVERSE   // Actif : simulation des mouvements de bobinage
 
 // Simulation de bobinage (utilisé si LAT_TEST_TRAVERSE est défini)
 // Simule un micro Strat (AWG42, 17 mm total) bobiné à 800 tr/min, 8000 tours.
@@ -97,7 +102,7 @@
 // ── Potentiomètre ────────────────────────────────────────
 // ⚠ ADC1 uniquement (GPIO 32-39) — ADC2 est incompatible avec le WiFi
 #define POT_PIN             34
-#define POT_INVERTED        true    // true = pot wired in reverse (swap min/max)
+#define POT_INVERTED        false   // true = pot wired in reverse (swap min/max)
 #define POT_FILTER_SIZE     32      // 32 × 20ms = ~640ms de lissage (lisse le bruit ADC et les à-coups de vitesse)
 #define POT_READ_INTERVAL   20      // ms entre deux lectures
 #define POT_HYSTERESIS_HZ   100    // La vitesse ne change que si l'écart dépasse ce seuil

@@ -167,7 +167,43 @@ void LateralController::update() {
             }
         }
         break;
+    // ── WINDING_FWD ───────────────────────────────────────────
+    // Bobinage réel : aller (0 → effWidth). Quand le stepper s'arrête :
+    //   1. on déclenche la fenêtre de ralentissement pour WinderApp,
+    //   2. on repart immédiatement vers 0 (pas d'attente d'arrêt complet).
+    case LatState::WINDING_FWD:
+        if (_latEndSteps <= 0) {
+            _stepper->stopMove();
+            _state = LatState::HOMED;
+            break;
+        }
+        if (_stepper->getCurrentPosition() >= _latEndSteps) {
+            _stepper->forceStopAndNewPosition(_latEndSteps);
+            _onReversal();
+            _stepper->setSpeedInHz(max(1u, _latHz));
+            _stepper->runBackward();
+            _state = LatState::WINDING_BWD;
+            Serial.printf("[Lateral] ↩ Demi-tour → BWD (pos=%ld)\n", (long)_stepper->getCurrentPosition());
+        }
+        break;
 
+    // ── WINDING_BWD ──────────────────────────────────────────
+    // Bobinage réel : retour (effWidth → 0). Même logique.
+    case LatState::WINDING_BWD:
+        if (_latEndSteps <= 0) {
+            _stepper->stopMove();
+            _state = LatState::HOMED;
+            break;
+        }
+        if (_stepper->getCurrentPosition() <= 0) {
+            _stepper->forceStopAndNewPosition(0);
+            _onReversal();
+            _stepper->setSpeedInHz(max(1u, _latHz));
+            _stepper->runForward();
+            _state = LatState::WINDING_FWD;
+            Serial.printf("[Lateral] ↪ Demi-tour → FWD (pos=%ld)\n", (long)_stepper->getCurrentPosition());
+        }
+        break;
 #ifdef LAT_TEST_TRAVERSE
     // ── TRAVERSE_FWD ───────────────────────────────────────────────────
     // Aller : 0 → effWidth. Chaque sens compte +1 passe.
@@ -248,6 +284,8 @@ const char* LateralController::stateStr() const {
         case LatState::HOMING_ALIGN:    return "HOMING_ALIGN";
         case LatState::HOMING_OFFSET:   return "HOMING_OFFSET";
         case LatState::HOMED:           return "HOMED";
+        case LatState::WINDING_FWD:     return "WIND_FWD";
+        case LatState::WINDING_BWD:     return "WIND_BWD";
         case LatState::TRAVERSE_FWD:    return "SIM_FWD";
         case LatState::TRAVERSE_BWD:    return "SIM_BWD";
         case LatState::SIM_PAUSE:       return "SIM_PAUSE";
@@ -373,7 +411,87 @@ void LateralController::_finishSimScenario() {
     }
 }
 #endif
+// ── Bobinage synchronisé ──────────────────────────────────────────────────────
 
+uint32_t LateralController::_calcLatHz(uint32_t windingHz, long tpp, float effWidthMm) const {
+    if (tpp <= 0 || windingHz == 0 || effWidthMm <= 0.0f) return 0;
+    float effSteps = effWidthMm * (float)LAT_STEPS_PER_MM;
+    // lat_Hz = effWidth_steps × windingHz / (tpp × STEPS_PER_REV)
+    float hz = effSteps * (float)windingHz / ((float)tpp * (float)STEPS_PER_REV);
+    return (uint32_t)max(1.0f, hz);
+}
+
+void LateralController::_onReversal() {
+    // Durée de la fenêtre : 2 × v/a secondes (équivalent à la décél + accél du latéral).
+    uint32_t ms = (_latHz > 0)
+        ? (uint32_t)(2000.0f * (float)_latHz / (float)LAT_ACCEL)
+        : 200;
+    _reversingUntilMs = millis() + max(100u, min(600u, ms));
+}
+
+void LateralController::startWinding(uint32_t windingHz, long tpp, float effWidthMm) {
+    // Si déjà en mouvement de bobinage, mettre à jour vitesse + fin de course uniquement.
+    if (_state == LatState::WINDING_FWD || _state == LatState::WINDING_BWD) {
+        updateWinding(windingHz, tpp, effWidthMm);
+        return;
+    }
+    // Sinon : ne démarre que depuis l'état HOMED (après homing complet).
+    if (_state != LatState::HOMED) {
+        Serial.printf("[Lateral] startWinding ignoré — état : %s\n", stateStr());
+        return;
+    }
+    if (windingHz == 0 || tpp <= 0 || effWidthMm <= 0.0f) {
+        Serial.printf("[Lateral] startWinding ignoré — paramètres invalides : windHz=%u tpp=%ld eff=%.2f\n",
+                      windingHz, (long)tpp, effWidthMm);
+        return;
+    }
+
+    _enableDriver();  // Sécurité : s'assurer que le driver est actif
+    _latEndSteps = (int32_t)(effWidthMm * (float)LAT_STEPS_PER_MM);
+    _latHz = _calcLatHz(windingHz, tpp, effWidthMm);
+    if (_latHz < 1) _latHz = 1;
+
+    _stepper->setSpeedInHz(_latHz);
+    _stepper->applySpeedAcceleration();
+    // Choisir le sens en fonction de la position courante :
+    // première moitié de course → FWD, deuxième moitié → BWD.
+    int32_t pos = _stepper->getCurrentPosition();
+    if (pos < _latEndSteps / 2) {
+        _stepper->runForward();
+        _state = LatState::WINDING_FWD;
+    } else {
+        _stepper->runBackward();
+        _state = LatState::WINDING_BWD;
+    }
+    float mmPerSec = (float)_latHz / (float)LAT_STEPS_PER_MM;
+    float passDuration = (mmPerSec > 0.0f) ? (effWidthMm / mmPerSec) : 0.0f;
+    Serial.printf("[Lateral] ▶ Bobinage démarré : %u Hz (%.2f mm/s)  passe=%.1fs  dir=%s\n",
+                  _latHz, mmPerSec, passDuration,
+                  (_state == LatState::WINDING_FWD) ? "FWD" : "BWD");
+}
+
+void LateralController::updateWinding(uint32_t windingHz, long tpp, float effWidthMm) {
+    if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
+
+    // Mettre à jour la position fin de course (peut changer si la géométrie est modifiée).
+    _latEndSteps = (int32_t)(effWidthMm * (float)LAT_STEPS_PER_MM);
+
+    uint32_t newHz = _calcLatHz(windingHz, tpp, effWidthMm);
+    if (newHz < 1) newHz = 1;
+    if (newHz != _latHz) {
+        _latHz = newHz;
+        _stepper->setSpeedInHz(_latHz);
+        _stepper->applySpeedAcceleration();
+    }
+}
+
+void LateralController::stopWinding() {
+    if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
+    if (_stepper->isRunning()) _stepper->stopMove();
+    _state = LatState::HOMED;
+    _reversingUntilMs = 0;
+    Serial.println("[Lateral] Bobinage arrêté.");
+}
 // ── ISR GPIO — détection instantanée du capteur de home ──────────────────────
 // Appelée sur le front descendant de HOME_PIN_NO (INPUT_PULLUP, actif à GND).
 // On vérifie _state == HOMING pour éviter les déclenchements parasites
