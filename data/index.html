@@ -115,6 +115,26 @@ input[type=number],input[type=range]{width:100%} input[type=number]{background:#
         </div>
       </div>
       <div class="card">
+        <div class="label">Actions bobinage en cours</div>
+        <div class="grid g2" style="gap:10px">
+          <div>
+            <div class="sub" style="margin-bottom:6px">Ajuster la cible à la volée</div>
+            <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
+              <button class="btn reset" onclick="cmd('target', String(Math.max(1, (parseInt(byId('ti-run').value||'0',10)-100))))">−100 tours</button>
+              <button class="btn reset" onclick="cmd('target', String((parseInt(byId('ti-run').value||'0',10)+100)))">+100 tours</button>
+            </div>
+            <div style="margin-top:8px"><input id="ti-run" type="number" min="1" max="50000" step="1" onchange="cmd('target',this.value)"></div>
+          </div>
+          <div>
+            <div class="sub" style="margin-bottom:6px">Arrêt à la prochaine butée (doux)</div>
+            <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
+              <button class="btn stop" onclick="cmd('stop_next_high')">Stop @ butée haute</button>
+              <button class="btn stop" onclick="cmd('stop_next_low')">Stop @ butée basse</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
         <div class="label">Correction positions (web/encodeur)</div>
         <div class="grid g2">
           <div>
@@ -200,9 +220,11 @@ function update(d){
   byId('m-target').checked = !d.freerun;
   byId('m-free').checked = !!d.freerun;
   byId('ti').disabled = !!d.freerun;
+  byId('ti-run').disabled = !!d.freerun;
   if(d.wStyle){ byId('ws-straight').checked=d.wStyle==='straight'; byId('ws-scatter').checked=d.wStyle==='scatter'; byId('ws-human').checked=d.wStyle==='human'; }
 
   syncInput('ti', d.target);
+  syncInput('ti-run', d.target);
   syncInput('lat-ofs-input', d.latOfs);
   syncInput('w-seed', d.seed);
   syncInput('g-total', d.gt); syncInput('g-margin', d.gm); syncInput('g-bottom', d.gb); syncInput('g-top', d.gtp);

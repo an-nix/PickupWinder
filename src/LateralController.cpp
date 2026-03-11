@@ -141,11 +141,12 @@
                         _stepper->forceStopAndNewPosition(_latEndSteps);
                         _passCount++;
                         _onReversal();
-                           if (_pauseOnNextReversal) {
+                           if (_pauseOnNextReversal || _stopOnNextHigh) {
                                _pauseOnNextReversal = false;
+                               _stopOnNextHigh = false;
                                _pausedAtReversal = true;
                                _state = LatState::HOMED;
-                               Serial.printf("[Lateral] ⏸ Pause à la première inversion : %.2f mm\n", getCurrentPositionMm());
+                               Serial.printf("[Lateral] ⏸ Arrêt sur butée haute : %.2f mm\n", getCurrentPositionMm());
                                break;
                            }
                         _stepper->setSpeedInHz(max(1u, _latHz));
@@ -165,6 +166,13 @@
                         _stepper->forceStopAndNewPosition(_latStartSteps);
                         _passCount++;
                         _onReversal();
+                        if (_stopOnNextLow) {
+                            _stopOnNextLow = false;
+                            _pausedAtReversal = true;
+                            _state = LatState::HOMED;
+                            Serial.printf("[Lateral] ⏸ Arrêt sur butée basse : %.2f mm\n", getCurrentPositionMm());
+                            break;
+                        }
                         _stepper->setSpeedInHz(max(1u, _latHz));
                         _stepper->runForward();
                         _state = LatState::WINDING_FWD;
@@ -189,6 +197,8 @@
                 _latStartSteps = 0;
                 _latEndSteps = 0;
                     _pauseOnNextReversal = false;
+                    _stopOnNextHigh = false;
+                    _stopOnNextLow = false;
                     _pausedAtReversal = false;
                 if (_atHome()) _startBackoff();
                 else           _startHoming();
@@ -272,6 +282,8 @@
                 _state = LatState::HOMED;
                 _passCount = 0;
                     _pauseOnNextReversal = false;
+                    _stopOnNextHigh = false;
+                    _stopOnNextLow = false;
                     _pausedAtReversal = false;
                 Serial.println("[Lateral] ✓ Position 0 atteinte — axe latéral prêt.");
             }
@@ -343,7 +355,24 @@
             void LateralController::updateWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale) {
                 if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
 
-                _setTraverseBounds(startMm, endMm);
+                float s = max(0.0f, startMm);
+                float e = max(s, endMm);
+                int32_t newStart = (int32_t)(s * (float)LAT_STEPS_PER_MM);
+                int32_t newEnd   = (int32_t)(e * (float)LAT_STEPS_PER_MM);
+
+                // Prise en compte immédiate, mais sans changer la butée déjà "derrière"
+                // la direction courante. Ainsi, une butée modifiée est appliquée
+                // au prochain passage sur cette butée.
+                if (_state == LatState::WINDING_FWD) {
+                    // On va vers END : END doit être prise en compte tout de suite.
+                    // START est derrière, elle sera appliquée au prochain retour BWD.
+                    _latEndSteps = max(newEnd, _latStartSteps);
+                } else { // WINDING_BWD
+                    // On va vers START : START doit être prise en compte tout de suite.
+                    // END est derrière, elle sera appliquée au prochain aller FWD.
+                    _latStartSteps = min(newStart, _latEndSteps);
+                }
+
                 uint32_t newHz = _calcLatHz(windingHz, tpp, endMm - startMm, speedScale);
                 if (newHz < 1) newHz = 1;
                 if (newHz != _latHz) {
@@ -356,6 +385,9 @@
             void LateralController::stopWinding() {
                 if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
                 _lastDirFwd = (_state == LatState::WINDING_FWD);  // mémorise la direction
+                _pauseOnNextReversal = false;
+                _stopOnNextHigh = false;
+                _stopOnNextLow = false;
                 if (_stepper->isRunning()) {
                     _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
                 }

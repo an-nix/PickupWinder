@@ -64,6 +64,9 @@ public:
     bool isAtZero() const { return _state == LatState::HOMED && _stepper && abs(_stepper->getCurrentPosition()) <= MICROSTEPPING; }
     bool isBusy() const { return _stepper && _stepper->isRunning(); }
     void armPauseOnNextReversal() { _pauseOnNextReversal = true; _pausedAtReversal = false; }
+    void armStopAtNextHigh() { _stopOnNextHigh = true; _pausedAtReversal = false; }
+    void armStopAtNextLow()  { _stopOnNextLow  = true; _pausedAtReversal = false; }
+    bool hasStopAtNextBoundArmed() const { return _stopOnNextHigh || _stopOnNextLow; }
     bool consumePausedAtReversal() {
         bool v = _pausedAtReversal;
         _pausedAtReversal = false;
@@ -114,6 +117,8 @@ private:
     uint32_t               _reversingUntilMs = 0;  // Fin de la fenêtre de ralentissement
     uint32_t               _passCount       = 0;    // Nombre de demi-couches réellement effectuées
     bool                   _pauseOnNextReversal = false;
+    bool                   _stopOnNextHigh      = false;
+    bool                   _stopOnNextLow       = false;
     bool                   _pausedAtReversal    = false;
     bool                   _lastDirFwd          = true;   // Direction mémorisée au dernier stopWinding()
 
