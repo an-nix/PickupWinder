@@ -1,4 +1,5 @@
 #include "WebInterface.h"
+#include <ArduinoJson.h>
 #include <WiFi.h>
 
 // The HTML file is embedded into the firmware binary at compile time.
@@ -44,6 +45,16 @@ void WebInterface::begin() {
         req->send(200, "text/html", index_html_start, len);
     });
 
+    _server.on("/recipe.json", HTTP_GET, [this](AsyncWebServerRequest* req) {
+        if (!_recipeProvider) {
+            req->send(503, "application/json", "{\"error\":\"recipe unavailable\"}");
+            return;
+        }
+        AsyncWebServerResponse* res = req->beginResponse(200, "application/json", _recipeProvider());
+        res->addHeader("Content-Disposition", "attachment; filename=pickup-winder-recipe.json");
+        req->send(res);
+    });
+
     _server.begin();
     Serial.println("[Web] Server started");
 }
@@ -54,30 +65,40 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
 
     // Serialise the full machine state to a compact JSON string.
     // The buffer size (400 bytes) is sized to fit all fields with margin.
-    char buf[460];
+    char buf[768];
     snprintf(buf, sizeof(buf),
         "{\"rpm\":%.0f,\"hz\":%u,\"turns\":%ld,\"target\":%ld,"
-        "\"running\":%s,\"enabled\":%s,\"freerun\":%s,\"cw\":%s,\"auto\":%s,"
+        "\"running\":%s,\"enabled\":%s,\"startRequested\":%s,\"carriageReady\":%s,\"firstPause\":%s,\"freerun\":%s,\"cw\":%s,\"auto\":%s,"
         "\"tpp\":%ld,\"tppCalc\":%ld,\"tppOfs\":%ld,\"scatter\":%.2f,"
-        "\"pass\":%d,\"eff\":%.2f,"
+        "\"pass\":%d,\"activeTpp\":%ld,\"latScale\":%.3f,\"latProgress\":%.3f,\"latPos\":%.3f,\"wStart\":%.3f,\"wEnd\":%.3f,\"wStartTrim\":%.3f,\"wEndTrim\":%.3f,\"eff\":%.2f,"
         "\"gt\":%.2f,\"gb\":%.2f,\"gtp\":%.2f,\"gm\":%.2f,\"gw\":%.4f,"
-        "\"latOfs\":%.2f}",
+        "\"latOfs\":%.2f,\"wStyle\":\"%s\",\"seed\":%lu,"
+        "\"layerJitter\":%.3f,\"layerSpeed\":%.3f,\"humanTraverse\":%.3f,\"humanSpeed\":%.3f}",
         s.rpm, s.speedHz, s.turns, s.targetTurns,
         s.running      ? "true" : "false",
         s.motorEnabled ? "true" : "false",
+        s.startRequested ? "true" : "false",
+        s.carriageReady  ? "true" : "false",
+        s.firstReversalPaused ? "true" : "false",
         s.freerun      ? "true" : "false",
         s.directionCW  ? "true" : "false",
         s.autoMode     ? "true" : "false",
         s.turnsPerPass, s.turnsPerPassCalc, s.turnsPerPassOffset, s.scatterFactor,
-        s.currentPass, s.effectiveWidth_mm,
+        s.currentPass, s.activeTurnsPerPass, s.activeSpeedScale, s.latProgress,
+        s.latPositionMm, s.windingStartMm, s.windingEndMm, s.windingStartTrimMm, s.windingEndTrimMm, s.effectiveWidth_mm,
         s.geomTotal, s.geomBottom, s.geomTop, s.geomMargin, s.geomWire,
-        s.latOffset);
+        s.latOffset, s.windingStyle, (unsigned long)s.seed,
+        s.layerJitterPct, s.layerSpeedPct, s.humanTraversePct, s.humanSpeedPct);
     // Broadcast to all connected WebSocket clients.
     _ws.textAll(buf);
 }
 
 void WebInterface::setCommandCallback(CommandCallback cb) {
     _callback = cb;
+}
+
+void WebInterface::setRecipeProvider(RecipeJsonProvider cb) {
+    _recipeProvider = cb;
 }
 
 String WebInterface::getIP() const {
@@ -94,21 +115,12 @@ void WebInterface::_onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* clie
     // Multi-frame or binary messages are ignored for simplicity.
     if (!info->final || info->index != 0 || info->len != len || info->opcode != WS_TEXT) return;
 
-    String msg((char*)data, len);
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, data, len);
+    if (err) return;
 
-    // Minimal JSON field extractor: finds the value for a given string key.
-    // Expects the pattern "key":"value" inside the message.
-    auto extract = [&](const char* key) -> String {
-        String k = String("\"") + key + "\":\"";
-        int i = msg.indexOf(k);
-        if (i < 0) return "";
-        int s = i + k.length();
-        int e = msg.indexOf("\"", s);
-        return (e > s) ? msg.substring(s, e) : "";
-    };
-
-    String cmd = extract("cmd");
-    String val = extract("val");
+    String cmd = String((const char*)(doc["cmd"] | ""));
+    String val = String((const char*)(doc["val"] | ""));
 
     // Forward to the registered command handler (WinderApp::_handleCommand).
     if (cmd.length() > 0 && _callback) {

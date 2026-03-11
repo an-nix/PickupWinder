@@ -26,14 +26,31 @@ struct WindingGeometry {
     float flangeBottom_mm = 1.5f;    // Épaisseur du tonework bas
     float flangeTop_mm    = 1.5f;    // Épaisseur du tonework haut
     float margin_mm       = 0.5f;    // Marge de sécurité de chaque côté
+    float windingStartTrim_mm = 0.0f; // Ajustement fin de la butée min (départ)
+    float windingEndTrim_mm = 0.0f;  // Ajustement fin de la butée max (web/validation)
     float wireDiameter_mm = WireGauge::AWG42;  // Diamètre du fil avec isolation
     long  turnsPerPassOffset = 0;    // Offset applied to auto-calc (-N to +N)
-    float scatterFactor = 2.0f;      // Facteur d'espacement (1.0=dense, 2.0=scatter, 3.0+=très dispersé)
+    float scatterFactor = 1.0f;      // Facteur d'espacement de base (1.0=régulier, >1.0 plus aéré)
 
     // Largeur de bobinage utile
     float effectiveWidth() const {
-        float w = totalWidth_mm - flangeBottom_mm - flangeTop_mm - 2.0f * margin_mm;
-        return max(0.0f, w);
+        return max(0.0f, windingEndMm() - windingStartMm());
+    }
+
+    // Position du début de bobinage mesurée depuis la base du tonework.
+    // La zone utile commence après le tonework bas + marge de sécurité.
+    float windingStartMm() const {
+        float start = flangeBottom_mm + margin_mm + windingStartTrim_mm;
+        start = max(0.0f, start);
+        return min(start, totalWidth_mm);
+    }
+
+    // Position de la fin de bobinage mesurée depuis la base du tonework.
+    // La zone utile s'arrête avant le tonework haut - marge de sécurité.
+    float windingEndMm() const {
+        float end = totalWidth_mm - flangeTop_mm - margin_mm + windingEndTrim_mm;
+        end = min(totalWidth_mm, end);
+        return max(windingStartMm(), end);
     }
 
     // Nombre de tours calculé automatiquement
@@ -55,6 +72,8 @@ struct WindingGeometry {
         totalWidth_mm   = BOBBIN_PRESETS[idx].total;
         flangeBottom_mm = BOBBIN_PRESETS[idx].flangeBot;
         flangeTop_mm    = BOBBIN_PRESETS[idx].flangeTop;
+        windingStartTrim_mm = 0.0f;
+        windingEndTrim_mm = 0.0f;
         wireDiameter_mm = BOBBIN_PRESETS[idx].wire;
         turnsPerPassOffset = 0;  // Reset offset on preset change
     }

@@ -11,11 +11,9 @@ enum class LatState {
     HOMING_ALIGN,   // Alignement sur le pas complet le plus proche (supprime le grésillement)
     HOMING_OFFSET,  // Déplacement de l'offset entre le capteur et la vraie position 0
     HOMED,          // Position initiale atteinte — driver maintenu actif en permanence
+    POSITIONING,    // Déplacement vers la position de départ avant autorisation du bobinage
     WINDING_FWD,    // Bobinage réel : aller (0 → effWidth), synchronisé sur la vitesse de bobinage
     WINDING_BWD,    // Bobinage réel : retour (effWidth → 0), synchronisé sur la vitesse de bobinage
-    TRAVERSE_FWD,   // Simulation : aller vers effectiveWidth (position max)
-    TRAVERSE_BWD,   // Simulation : retour vers la position 0
-    SIM_PAUSE,      // Simulation : pause non-bloquante entre deux scénarios
 };
 
 // ── LateralController ─────────────────────────────────────────────────────────
@@ -39,7 +37,7 @@ class LateralController {
 public:
     // Initialise les GPIO, se connecte à l'engine partagée et démarre le homing.
     // L'engine doit avoir été initialisée (engine.init()) avant cet appel.
-    void begin(FastAccelStepperEngine& engine);
+    void begin(FastAccelStepperEngine& engine, float homeOffsetMm = LAT_HOME_OFFSET_DEFAULT_MM);
 
     // Machine d'états non-bloquante — appeler à chaque itération de loop().
     void update();
@@ -58,17 +56,31 @@ public:
     // Sans effet si le capteur est absent.
     void rehome();
 
+    // Déplacer le chariot vers la position de départ de la fenêtre de bobinage.
+    // startMm est exprimé depuis la base du tonework.
+    void prepareStartPosition(float startMm);
+    bool isPositionedForStart() const { return _state == LatState::HOMED && _isAtStartPosition(); }
+    void parkAtZero() { prepareStartPosition(0.0f); }
+    bool isAtZero() const { return _state == LatState::HOMED && _stepper && abs(_stepper->getCurrentPosition()) <= MICROSTEPPING; }
+    bool isBusy() const { return _stepper && _stepper->isRunning(); }
+    void armPauseOnNextReversal() { _pauseOnNextReversal = true; _pausedAtReversal = false; }
+    bool consumePausedAtReversal() {
+        bool v = _pausedAtReversal;
+        _pausedAtReversal = false;
+        return v;
+    }
+
     // ── Bobinage synchronisé ──────────────────────────────────────
     // Démarrer la traversée latérale synchronisée avec le moteur de bobinage.
     //   windingHz : fréquence de pas du stepper bobinage (readHz() / SpeedInput)
     //   tpp       : tours par passe (WindingGeometry::turnsPerPass())
     //   effWidthMm: largeur utile de bobinage en mm (WindingGeometry::effectiveWidth())
     // Sans effet si l'axe n'est pas en état HOMED.
-    void startWinding(uint32_t windingHz, long tpp, float effWidthMm);
+    void startWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale = 1.0f);
 
     // Mettre à jour la vitesse latérale en temps réel (appeler à chaque lecture du pot).
     // Sans effet si l'axe n'est pas en état WINDING_FWD / WINDING_BWD.
-    void updateWinding(uint32_t windingHz, long tpp, float effWidthMm);
+    void updateWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale = 1.0f);
 
     // Arrêter la traversée latérale (décélération douce, retour à HOMED).
     void stopWinding();
@@ -76,11 +88,17 @@ public:
     // Vrai pendant la fenêtre de demi-tour (décél + accél du moteur latéral).
     // WinderApp réduit la vitesse de bobinage pendant ce temps (LAT_REVERSAL_SLOWDOWN).
     bool isReversing() const { return millis() < _reversingUntilMs; }
+    bool isTraversing() const {
+        return _state == LatState::WINDING_FWD || _state == LatState::WINDING_BWD;
+    }
+    uint32_t getPassCount() const { return _passCount; }
+    float    getTraversalProgress() const;
 
     // Offset entre le hard-stop capteur et la vraie position 0.
-    // Valeur positive en mm. Persisté en NVS — survit aux redémarrages.
+    // Valeur positive en mm.
     void  setHomeOffset(float mm);
     float getHomeOffset() const { return _homeOffsetMm; }
+    float getCurrentPositionMm() const;
 
 private:
     FastAccelStepper*      _stepper         = nullptr;
@@ -91,12 +109,19 @@ private:
 
     // ── Bobinage réel : état de la traversée synchronisée ────────────────────
     uint32_t               _latHz           = 0;    // Vitesse latérale courante (steps/s)
-    int32_t                _latEndSteps     = 0;    // Position extrémité (effWidth en steps)
+    int32_t                _latStartSteps   = 0;    // Début réel de la fenêtre de bobinage
+    int32_t                _latEndSteps     = 0;    // Fin réelle de la fenêtre de bobinage
     uint32_t               _reversingUntilMs = 0;  // Fin de la fenêtre de ralentissement
+    uint32_t               _passCount       = 0;    // Nombre de demi-couches réellement effectuées
+    bool                   _pauseOnNextReversal = false;
+    bool                   _pausedAtReversal    = false;
+    bool                   _lastDirFwd          = true;   // Direction mémorisée au dernier stopWinding()
 
     // Calcule la vitesse latérale (steps/s) synchronisée sur la vitesse de bobinage.
     // lat_Hz = effWidth_steps × windingHz / (tpp × STEPS_PER_REV)
-    uint32_t _calcLatHz(uint32_t windingHz, long tpp, float effWidthMm) const;
+    uint32_t _calcLatHz(uint32_t windingHz, long tpp, float widthMm, float speedScale) const;
+    bool     _isAtStartPosition() const;
+    void     _setTraverseBounds(float startMm, float endMm);
 
     // Déclenche la fenêtre de ralentissement bobinage au demi-tour latéral.
     void _onReversal();
@@ -121,20 +146,7 @@ private:
     void _startHoming();
     void _startBackoff();
     void _applyOffsetOrNext(); // Après alignement : déplacement offset ou HOMED direct
-    void _gotoHomed();         // Transition finale : HOMED ou simulation selon config
+    void _gotoHomed();         // Transition finale : axe prêt pour le bobinage
     void _enableDriver();
     void _disableDriver();
-
-#ifdef LAT_TEST_TRAVERSE
-    // ── Variables d'état de la simulation de bobinage ─────────────────────────────
-    uint8_t  _simIdx         = 0;     // Scénario courant (0=faible, 1=moyen, 2=élevé)
-    long     _simPassesDone  = 0;     // Passes effectuées (aller + retour comptés)
-    long     _simPassesTotal = 0;     // Total de passes pour ce scénario
-    int32_t  _simEndSteps    = 0;     // Position fin d'axe (effWidth en steps)
-    uint32_t _simSpeedHz     = 0;     // Vitesse latérale calculée pour ce scénario
-    bool     _simNeedReturn  = false; // Vrai si retour à 0 non compté après fin de scénario
-    uint32_t _simPauseStart  = 0;     // millis() au début de la pause inter-scénario
-    void _startSimScenario(uint8_t idx); // Démarre le scénario idx
-    void _finishSimScenario();           // Termine le scénario → pause ou HOMED
-#endif
 };
