@@ -1,124 +1,189 @@
 #include "WinderApp.h"
 #include <Arduino.h>
+#include "Diag.h"
 
 void WinderApp::begin() {
-    Serial.begin(115200);
-    Serial.println("\n=== Pickup Winder ===");
-
     _recipeStore.begin();
     _recipe = _captureRecipe();
     if (_recipeStore.load(_recipe)) {
-        Serial.println("[Recipe] Recette restaurée depuis la NVS.");
+        Diag::info("[Recipe] Recipe restored from NVS.");
     } else {
-        Serial.println("[Recipe] Recette par défaut chargée.");
+        Diag::info("[Recipe] Default recipe loaded.");
     }
     _applyRecipe(_recipe, false);
 
     // Initialise each subsystem in dependency order.
-    _engine.init();        // Une seule engine FastAccelStepper pour tous les steppers
-    _stepper.begin(_engine);  // GPIO + stepper bobine
-    _pot.begin();      // Pre-fill ADC filter buffer
-    _led.begin();      // Set LED pin as output
-    _web.begin();      // WiFi + HTTP + WebSocket  (peut prendre 2-5 s)
-    _link.begin();     // UART2 liaison vers ESP écran
-    _lateral.begin(_engine, _recipe.latOffsetMm);  // GPIO + stepper latéral + homing automatique
-
-    // Register the command callback so WebSocket messages are routed to
-    // _handleCommand() on this instance.
-    _web.setCommandCallback([this](const String& cmd, const String& val) {
-        _handleCommand(cmd, val);
-    });
-    _web.setRecipeProvider([this]() {
-        return _recipeStore.toJson(_captureRecipe());
-    });
+    _engine.init();                                    // One shared FastAccelStepper engine for all steppers
+    _stepper.begin(_engine);                           // GPIO setup + bobbin stepper
+    _led.begin();                                      // Set LED pin as output
+    _lateral.begin(_engine, _recipe.latOffsetMm);      // GPIO setup + traverse stepper + automatic homing sequence
 
     _activePlan = _planner.getPlan(0, 0.0f);
 
-    if (_web.isConnected()) {
-        Serial.printf("→ Web interface: http://%s\n", _web.getIP().c_str());
-    }
-    Serial.printf("Ready — Geometry: %.1fmm usable, %ld turns/pass, profile=%s\n",
-                  _geom.effectiveWidth(), _geom.turnsPerPass(),
+    Diag::infof("[Winder] Ready — Geometry: %.1fmm usable, %ld turns/pass, profile=%s",
+            _geom.effectiveWidth(), _geom.turnsPerPass(),
                   WindingPatternPlanner::styleName(_recipe.style));
 }
 
-void WinderApp::run() {
-    uint32_t now = millis();
-
+void WinderApp::tick(uint32_t potHz) {
     _handleLateralEvents();
-    _handlePotCycle();
+    _handlePotCycle(potHz);
     _checkAutoStop();
     _applyDeferredDisable();
-    _pollSerialLink(now);
-    _pushWebStatus(now);
+}
+
+// ── State transitions ──────────────────────────────────────────────────────────────
+//
+// Every _toXxx() is self-contained: sets _state, adjusts hardware, clears flags.
+
+void WinderApp::_toIdle() {
+    _state          = WindingState::IDLE;
+    _canStart     = false;
+    _pendingDisable = true;
+    _lowVerified    = false;
+    _highVerified   = false;
+    _stepper.stop();
+    _lateral.stopWinding();
+    _lateral.parkAtZero();
+    _stepper.resetTurns();
+    _planner.reset();
+    _activePlan = _planner.getPlan(0, 0.0f);
+    _led.reset();
+    Diag::info("[IDLE] Stop -- carriage to home, counter reset");
+}
+
+void WinderApp::_toVerifyLow() {
+    _state          = WindingState::VERIFY_LOW;
+    _canStart     = false;
+    _pendingDisable = true;
+    _stepper.stop();
+    _lateral.stopWinding();
+    _lateral.prepareStartPosition(_windingStartMm());
+    Diag::infof("[VERIFY_LOW] Carriage -> %.2f mm (low bound)%s",
+            _windingStartMm(), _lowVerified ? " [already confirmed]" : "");
+}
+
+void WinderApp::_toVerifyHigh() {
+    _state          = WindingState::VERIFY_HIGH;
+    _canStart     = false;
+    _pendingDisable = true;
+    _stepper.stop();
+    _lateral.stopWinding();
+    _lateral.prepareStartPosition(_windingEndMm());
+    Diag::infof("[VERIFY_HIGH] Carriage -> %.2f mm (high bound)%s",
+            _windingEndMm(), _highVerified ? " [already confirmed]" : "");
+}
+
+void WinderApp::_toWinding() {
+    _state          = WindingState::WINDING;
+    _canStart     = false;
+    _pendingDisable = false;
+    _lateral.prepareStartPosition(_windingStartMm());
+    Diag::infof("[WINDING] Both bounds verified -- %.2f -> %.2f mm, waiting for pot",
+            _windingStartMm(), _windingEndMm());
+}
+
+void WinderApp::_toPaused() {
+    _state          = WindingState::PAUSED;
+    _canStart     = false;
+    _pendingDisable = true;
+    _stepper.stop();
+    _lateral.stopWinding();
+    Diag::info("[PAUSED] Resume from current position when pot goes up");
+}
+
+void WinderApp::_toTargetReached() {
+    _state          = WindingState::TARGET_REACHED;
+    _canStart     = false;
+    _pendingDisable = true;
+    _stepper.stop();
+    _lateral.stopWinding();
+    Diag::infof("[TARGET_REACHED] %ld turns -- raise target to continue or press Stop",
+            _stepper.getTurns());
 }
 
 void WinderApp::_handleLateralEvents() {
-    // Machine d'états du homing latéral — non-bloquante, appelée à chaque itération.
+    // Advance the traverse axis state machine once per loop iteration.
+    // Reversal detection, softstart ramps and position tracking all live inside
+    // LateralController::update(). WinderApp reacts here only when a lateral
+    // event must trigger an FSM transition; in the current design all transitions
+    // are operator-driven (verify + confirm), so no extra logic is needed.
     _lateral.update();
-    if (!_lateral.consumePausedAtReversal()) return;
-
-    _motorEnabled = false;
-    // On garde _startRequested = true : l'utilisateur peut reprendre au pot.
-    _pausedForVerification = true;
-    _pauseOnFirstReversal  = false;
-    _inVerificationRun     = false;  // passe de vérification terminée
-    _midWindingPaused      = false;
-    _resumeFromCurrentPos  = false;
-    _pendingDisable        = true;
-    _potWasZero            = false;
-    // Arrêt net pour synchroniser avec l'arrêt latéral au point de butée.
-    _stepper.forceStop();
-    Serial.println("[Start] ⏸ Première inversion — vérifie la butée max et remonte le pot pour reprendre.");
 }
 
-void WinderApp::_handlePotCycle() {
-    uint32_t now = millis();
-    if (now - _lastPotMs < POT_READ_INTERVAL) return;
-    _lastPotMs = now;
 
-    uint32_t hz = _pot.readHz();
-    bool potActive = (hz > 0);
-    bool potStop   = (hz == 0);
+void WinderApp::_handlePotCycle(uint32_t hz) {
+    // Arm flag (_canStart): requires the pot to physically return to zero before
+    // every (re)start. This prevents unexpected motion if the pot is already
+    // raised when entering a new state. Can also be set without a physical zero
+    // trip by the UI 'resume' command (useful after a brief pause).
+    if (hz == 0) _canStart = true;
 
-    // Interlock : le moteur ne redémarre qu'après retour au zéro physique.
-    if (potStop) _potWasZero = true;
+    switch (_state) {
 
-    // Si Start n'est pas armé, toujours revenir à la position 0.
-    if (!_startRequested && _lateral.getState() == LatState::HOMED
-        && !_lateral.isBusy() && !_lateral.isAtZero()) {
-        _lateral.parkAtZero();
+    case WindingState::IDLE:
+        // When idle the carriage should always rest at the home (zero) position.
+        // If an operator moved it manually, or a previous session ended mid-travel,
+        // silently drive it back to zero whenever the axis is free.
+        if (_lateral.isHomed() && !_lateral.isBusy() && !_lateral.isAtZero())
+            _lateral.parkAtZero();
+        break;
+
+    case WindingState::VERIFY_LOW:
+    case WindingState::VERIFY_HIGH: {
+        // Fresh entry (_canStart == false): drive carriage to the verification
+        // bound and wait for the operator to raise the pot.
+        // Mid-verify pause (_canStart == true): motor stopped because pot hit
+        // zero; leave carriage in place so the operator resumes from there.
+        if (!_stepper.isRunning() && !_canStart && _lateral.isHomed() && !_lateral.isBusy()) {
+            float pos = (_state == WindingState::VERIFY_LOW)
+                        ? _windingStartMm() : _windingEndMm();
+            _lateral.prepareStartPosition(pos);
+        }
+        if (hz > 0 && _canStart) {
+            _runWindingAtHz(hz);         // resumes from current position at verify speed
+        } else if (hz == 0 && _stepper.isRunning()) {
+            _pendingDisable = true;
+            _stepper.stop();
+            _lateral.stopWinding();
+            Diag::infof("[%s] Pot zero -- paused, will resume from current position",
+            windingStateName(_state));
+        }
+        break;
     }
 
-    // Start armé mais moteur pas encore lancé : garder le chariot à la position de départ.
-    if (_startRequested && !_stepper.isRunning() && _lateral.getState() == LatState::HOMED
-        && !_lateral.isBusy() && !_pausedForVerification && !_resumeFromCurrentPos) {
-        _lateral.prepareStartPosition(_windingStartMm());
-    }
+    case WindingState::WINDING:
+        if (hz > 0)
+            _runWindingAtHz(hz);
+        else
+            _toPaused();
+        break;
 
-    if (!_motorEnabled && _startRequested && _potWasZero && potActive && !_targetReached
-                       && _readyForSpin()) {
-        _motorEnabled = true;
-        Serial.println("▶ Start confirmé — moteur prêt");
-    }
+    case WindingState::PAUSED:
+        // Pot up + arm flag set + lateral ready -> resume winding.
+        if (hz > 0 && _canStart && _lateral.isHomed() && !_lateral.isBusy())
+            _runWindingAtHz(hz);
+        break;
 
-    if (_motorEnabled && potActive) {
-        _runWindingAtHz(hz);
-    } else if (_motorEnabled && potStop && _stepper.isRunning()) {
-        _pause();
+    case WindingState::TARGET_REACHED:
+        // Locked -- only raising the target can unlock.
+        break;
     }
 
     _led.update(_stepper.getTurns(), max(1L, _activePlan.turnsPerPass), _stepper.isRunning());
 }
 
 bool WinderApp::_readyForSpin() const {
-    return (_pausedForVerification || _resumeFromCurrentPos)
-        ? (_lateral.isHomed() && !_lateral.isBusy())
-        : (_lateral.isHomed() && _lateral.isPositionedForStart());
+    // Used to guard resume after pause: lateral must be homed and idle.
+    return _lateral.isHomed() && !_lateral.isBusy();
 }
 
 void WinderApp::_runWindingAtHz(uint32_t hz) {
-    // Zone d'approche (APPROACH_TURNS derniers tours avant la cible).
+    // ── Speed caps (applied in priority order) ───────────────────────────────
+    //
+    // 1. Approach zone: linearly ramp the maximum allowed speed down to
+    //    APPROACH_SPEED_HZ_FLOOR during the last APPROACH_TURNS turns so the
+    //    bobbin coasts smoothly to the target count without overshoot.
     if (!_freerun && _stepper.isRunning()) {
         long remaining = (long)_targetTurns - _stepper.getTurns();
         if (remaining > 0 && remaining <= APPROACH_TURNS) {
@@ -128,26 +193,28 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
             hz = min(hz, maxHz);
         }
     }
-
-    // Passe de vérification : limiter la vitesse pour un arrêt synchronisé avec le latéral.
-    if (_inVerificationRun) hz = min(hz, (uint32_t)VERIFY_SPEED_HZ_MAX);
+    // 2. Verification pass: hard cap at VERIFY_SPEED_HZ_MAX so the traverse axis
+    //    can always stop within one half-stroke when the pot drops to zero.
+    if (_state == WindingState::VERIFY_LOW || _state == WindingState::VERIFY_HIGH)
+        hz = min(hz, (uint32_t)VERIFY_SPEED_HZ_MAX);
 
     _activePlan = _buildTraversePlan(hz);
 
-    // Ralentissement aux demi-tours latéraux.
-    if (_lateral.isReversing()) {
-        hz = max((uint32_t)SPEED_HZ_MIN,
-                 (uint32_t)((float)hz * LAT_REVERSAL_SLOWDOWN));
-    }
+    // 3. Reversal slow-down: briefly reduce speed at each traverse flip point
+    //    to prevent wire bunching and reduce mechanical shock on the carriage.
+    if (_lateral.isReversing())
+        hz = max((uint32_t)SPEED_HZ_MIN, (uint32_t)((float)hz * LAT_REVERSAL_SLOWDOWN));
 
-    // Mode "arrêt à la prochaine butée" : ralentissement progressif à
-    // l'approche de la butée ciblée pour un arrêt doux.
+    // 4. "Stop at next bound" mode: once the carriage enters the last 20% of the
+    //    current traverse stroke, linearly scale speed down to 30% of its current
+    //    value. This ensures a soft, synchronised stop at the flip point without
+    //    stalling (the floor is always at least SPEED_HZ_MIN).
     if (_lateral.hasStopAtNextBoundArmed()) {
-        float progress = _lateral.getTraversalProgress(); // 0..1 dans le sens courant
-        const float zoneStart = 0.80f;
-        const float floorFactor = 0.30f;
+        float progress = _lateral.getTraversalProgress(); // 0..1 in the current direction
+        const float zoneStart  = 0.80f;  // start slowing at 80% of the traverse stroke
+        const float floorFactor = 0.30f; // never go below 30% of the current speed
         if (progress >= zoneStart) {
-            float t = (progress - zoneStart) / (1.0f - zoneStart);
+            float t = (progress - zoneStart) / (1.0f - zoneStart); // 0..1 inside the zone
             t = constrain(t, 0.0f, 1.0f);
             float factor = 1.0f - (1.0f - floorFactor) * t;
             hz = max((uint32_t)SPEED_HZ_MIN, (uint32_t)((float)hz * factor));
@@ -155,27 +222,36 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
     }
 
     _stepper.setSpeedHz(hz);
+
+    // ── Motor start ───────────────────────────────────────────────────────────
     if (!_stepper.isRunning()) {
         bool forward = (_direction == Direction::CW) != (bool)WINDING_MOTOR_INVERTED;
-        if (_pauseOnFirstReversal) {
-            _lateral.armPauseOnNextReversal();
-            _pauseOnFirstReversal = false;
-            _inVerificationRun = true;
+
+        // Transition the state to WINDING on first spin, unless we are in a
+        // VERIFY state — verify passes intentionally leave _state unchanged so
+        // the operator can continue confirming bounds without losing context.
+        if (_state != WindingState::VERIFY_LOW && _state != WindingState::VERIFY_HIGH) {
+            _state = WindingState::WINDING;
+            Diag::infof("[WINDING] %s -- %u Hz -- profile=%s tpp=%ld scale=%.2f",
+            _direction == Direction::CW ? "CW" : "CCW", hz,
+                          WindingPatternPlanner::styleName(_recipe.style),
+                          _activePlan.turnsPerPass, _activePlan.speedScale);
         }
-        _midWindingPaused = false;
-        _resumeFromCurrentPos = false;
+        // VERIFY_LOW / VERIFY_HIGH: motor spins at capped speed but _state is
+        // preserved so the operator can still issue 'confirm' or 'verify_high'.
+
         _stepper.start(forward);
         _lateral.startWinding(hz, _activePlan.turnsPerPass,
                               _windingStartMm(), _windingEndMm(),
                               _activePlan.speedScale);
-        _pausedForVerification = false;
-        Serial.printf("▶ Start %s — %u Hz — profil=%s tpp=%ld scale=%.2f\n",
-                      _direction == Direction::CW ? "CW" : "CCW", hz,
-                      WindingPatternPlanner::styleName(_recipe.style),
-                      _activePlan.turnsPerPass, _activePlan.speedScale);
         return;
     }
 
+    // ── Motor already running: update traverse parameters ────────────────────
+    // If the lateral is in HOMED state it means it completed a positioning move
+    // and is waiting for a new winding command — call startWinding() to enter
+    // closed-loop traverse. Otherwise the traverse is already active; call
+    // updateWinding() to push new speed/tpp values without restarting the pass.
     if (_lateral.getState() == LatState::HOMED) {
         _lateral.startWinding(hz, _activePlan.turnsPerPass,
                               _windingStartMm(), _windingEndMm(),
@@ -188,58 +264,52 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
 }
 
 void WinderApp::_checkAutoStop() {
-    if (_motorEnabled && !_freerun && _stepper.isRunning() && _stepper.getTurns() >= _targetTurns) {
-        _targetReached = true;
-        // Fin de cible: on met en pause sur place (pas de retour à 0),
-        // l'opérateur peut augmenter la cible et reprendre.
-        _pause();
-        Serial.printf("✓ Cible atteinte (%ld tours). En pause sur place: ajuste la cible ou clique Stop.\n",
-                      _stepper.getTurns());
+    // Evaluate the turn target every loop. Only fires during active WINDING and
+    // when freerun mode is off. Uses >= rather than == to handle the edge case
+    // where the pot drops at the exact target turn and the stepper overshoots by
+    // one count before the ISR processes the stop command.
+    if (_state == WindingState::WINDING && !_freerun
+        && _stepper.getTurns() >= _targetTurns) {
+        _toTargetReached();
     }
 }
 
 void WinderApp::_applyDeferredDisable() {
+    // The stepper driver must not be disabled mid-ramp: cutting power during
+    // deceleration causes a mechanical jerk and loses position. _pendingDisable
+    // is set by every stop/pause/transition instead of cutting the driver
+    // directly. Here, once the stepper reports it has actually stopped, the
+    // driver current is safely cut to reduce heat and coil noise.
     if (_pendingDisable && !_stepper.isRunning()) {
         _stepper.disableDriver();
         _pendingDisable = false;
     }
 }
 
-void WinderApp::_pollSerialLink(uint32_t now) {
-    _link.poll([this](const String& cmd, const String& val) {
-        _handleCommand(cmd, val);
-    });
+WinderStatus WinderApp::getStatus() const {
+    // Map the current WindingState enum to the flat boolean fields expected by
+    // the WebSocket protocol and the LinkSerial bridge. The protocol was designed
+    // when WinderApp used individual flags; the state machine now drives all
+    // behaviour, but these derived booleans keep the UI layer unchanged.
+    const bool sessionActive = (_state != WindingState::IDLE);
+    const bool motorEnabled  = (_state == WindingState::WINDING
+                             || _state == WindingState::VERIFY_LOW
+                             || _state == WindingState::VERIFY_HIGH);
 
-    if (now - _lastLinkMs < LINK_UPDATE_MS) return;
-    _lastLinkMs = now;
-    _link.sendStatus(
+    return {
         _stepper.getRPM(),
         _stepper.getSpeedHz(),
         _stepper.getTurns(),
         (long)_targetTurns,
         _stepper.isRunning(),
-        (bool)_motorEnabled,
-        (bool)_freerun,
-        _direction == Direction::CW
-    );
-}
-
-void WinderApp::_pushWebStatus(uint32_t now) {
-    if (now - _lastWsMs < WS_UPDATE_MS) return;
-    _lastWsMs = now;
-    _web.sendUpdate({
-        _stepper.getRPM(),
-        _stepper.getSpeedHz(),
-        _stepper.getTurns(),
-        (long)_targetTurns,
-        _stepper.isRunning(),
-        (bool)_motorEnabled,
-        (bool)_startRequested,
+        motorEnabled,
+        sessionActive,
         _lateral.isPositionedForStart(),
-        _pausedForVerification,
+        (_state == WindingState::VERIFY_LOW),    // verifyLow
+        (_state == WindingState::VERIFY_HIGH),   // verifyHigh
         (bool)_freerun,
-        _direction == Direction::CW,
-        false,
+        (_direction == Direction::CW),
+        false,   // autoMode — reserved
         _geom.turnsPerPass(),
         _geom.turnsPerPassCalc(),
         _geom.turnsPerPassOffset,
@@ -249,7 +319,8 @@ void WinderApp::_pushWebStatus(uint32_t now) {
         _activePlan.speedScale,
         _lateral.getTraversalProgress(),
         _lateral.getCurrentPositionMm(),
-        _windingStartMm(), _windingEndMm(), _geom.windingStartTrim_mm, _geom.windingEndTrim_mm,
+        _windingStartMm(), _windingEndMm(),
+        _geom.windingStartTrim_mm, _geom.windingEndTrim_mm,
         _geom.effectiveWidth(),
         _geom.totalWidth_mm, _geom.flangeBottom_mm, _geom.flangeTop_mm,
         _geom.margin_mm, _geom.wireDiameter_mm,
@@ -259,139 +330,146 @@ void WinderApp::_pushWebStatus(uint32_t now) {
         _recipe.layerJitterPct,
         _recipe.layerSpeedPct,
         _recipe.humanTraversePct,
-        _recipe.humanSpeedPct
-    });
+        _recipe.humanSpeedPct,
+        windingStateName(_state),
+    };
 }
 
-// ── Private helpers ───────────────────────────────────────────────────────────
-
-void WinderApp::_pause() {
-    _motorEnabled        = false;
-    _potWasZero          = false;
-    _midWindingPaused    = true;
-    _resumeFromCurrentPos = true;
-    _pendingDisable      = true;
-    _pauseOnFirstReversal = false;
-    _stepper.stop();
-    _lateral.stopWinding();
-    Serial.println("⏸ Pause — reprise depuis position courante");
+String WinderApp::recipeJson() const {
+    return _recipeStore.toJson(_captureRecipe());
 }
 
-void WinderApp::_stop() {
-    // Disable the motor control logic immediately so no further commands
-    // (including repeated auto-stop triggers) can be processed.
-    _motorEnabled   = false;
-    // Force the pot-to-zero interlock: the motor won't restart until the pot
-    // physically returns to zero. Without this, _potWasZero stays true and
-    // _motorEnabled would be re-set on the very next pot read (20ms later),
-    // calling start() while the motor is still decelerating → conflict/noise.
-    _potWasZero     = false;
-    _startRequested        = false;
-    _targetReached         = false;
-    _pauseOnFirstReversal  = false;
-    _pausedForVerification = false;
-    _midWindingPaused      = false;
-    _inVerificationRun     = false;
-    _resumeFromCurrentPos  = false;
-    // Request deferred driver disable: the driver will be cut once the
-    // deceleration ramp completes (checked in run() via _pendingDisable).
-    _pendingDisable = true;
-    // Initiate a smooth deceleration ramp to zero.
-    _stepper.stop();
-    // Arrêter le guide-fil proprement (décélération douce, retour à HOMED).
-    _lateral.stopWinding();
-    _lateral.parkAtZero();
-    // Stop explicite = fin de bobinage courant : remise à zéro des variables de cycle.
-    _stepper.resetTurns();
-    _planner.reset();
-    _activePlan = _planner.getPlan(0, 0.0f);
-    _led.reset();
-    Serial.println("■ Stopped — chariot retour position 0");
-}
-
-bool WinderApp::_parametersLocked() const {
-    return _startRequested || _motorEnabled || _stepper.isRunning()
-        || _pausedForVerification || _midWindingPaused;
-}
+// ── Geometry change — live carriage repositioning ────────────────────────────
+// When the operator adjusts a geometry parameter (trim, width, wire diameter…)
+// the winding bounds change in real time. If the machine is at rest, drive the
+// carriage to the affected bound immediately so the operator gets instant visual
+// feedback of the new position before starting or resuming.
 
 void WinderApp::_refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged) {
-    if (_stepper.isRunning()) return; // En bobinage réel, prise en compte via updateWinding().
-    if (_lateral.getState() != LatState::HOMED || _lateral.isBusy()) return;
+    // Never interrupt a running motor or an in-progress positioning move.
+    if (_stepper.isRunning()) return;
+    if (!_lateral.isHomed() || _lateral.isBusy()) return;
 
-    // Phase de démarrage en pause sur butée haute (pause auto à la 1re inversion).
-    if (_pausedForVerification) {
-        if (endBoundChanged) {
-            _lateral.prepareStartPosition(_windingEndMm());
-        }
-        return;
-    }
-
-    // Phase de démarrage armée / pause début : rester sur la butée basse (start).
-    if (_startRequested || _midWindingPaused || _resumeFromCurrentPos) {
-        if (startBoundChanged) {
-            _lateral.prepareStartPosition(_windingStartMm());
-        }
+    switch (_state) {
+    case WindingState::VERIFY_LOW:
+    case WindingState::WINDING:
+    case WindingState::PAUSED:
+        if (startBoundChanged) _lateral.prepareStartPosition(_windingStartMm());
+        break;
+    case WindingState::VERIFY_HIGH:
+        if (endBoundChanged) _lateral.prepareStartPosition(_windingEndMm());
+        break;
+    default:
+        break;
     }
 }
 
+// Processes state-machine lifecycle commands (start, stop, verify_low/high,
+// confirm, resume, stop_next_low/high). These are always accepted regardless
+// of parameter-lock state. Returns true if the command was consumed.
 bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) {
     if (cmd == "stop") {
-        _stop();
+        _toIdle();
         return true;
     }
 
     if (cmd == "reset") {
-        _targetReached = false;
-        _stop();
-        _stepper.resetTurns();
-        _planner.reset();
-        _activePlan = _planner.getPlan(0, 0.0f);
-        _pauseOnFirstReversal = false;
-        _pausedForVerification = false;
-        _led.reset();
-        Serial.println("↺ Turn counter reset");
+        _toIdle();
+        Diag::info("[IDLE] Turn counter reset");
         return true;
     }
 
     if (cmd == "start") {
-        if (_startRequested) return true;
-        if (_lateral.getState() != LatState::HOMED || _lateral.isBusy()) {
-            Serial.println("[Start] Impossible: axe latéral non prêt.");
+        if (_state != WindingState::IDLE && _state != WindingState::TARGET_REACHED) {
+            Diag::info("[Start] Ignored -- session already active");
             return true;
         }
-        if (!_lateral.isAtZero()) {
-            Serial.println("[Start] Refusé: chariot pas en position 0.");
+        if (!_lateral.isHomed() || _lateral.isBusy()) {
+            Diag::error("[Start] Impossible -- lateral axis not ready");
             return true;
         }
-        if (_targetReached) _targetReached = false;
-        _startRequested        = true;
-        _motorEnabled          = false;
-        _pausedForVerification = false;
-        _midWindingPaused      = false;
-        _inVerificationRun     = false;
-        _resumeFromCurrentPos  = false;
-        _pauseOnFirstReversal  = (_stepper.getTurns() == 0);
-        _lateral.prepareStartPosition(_windingStartMm());
-        Serial.printf("[Start] Fenêtre bobinage %.2f → %.2f mm\n",
-                      _windingStartMm(), _windingEndMm());
+        // Fresh session: reset turn counter and verification state.
+        if (_state == WindingState::TARGET_REACHED) {
+            _stepper.resetTurns();
+            _planner.reset();
+        }
+        _lowVerified  = false;
+        _highVerified = false;
+        _toVerifyLow();
+        return true;
+    }
+
+    // Jump to low-bound verification from any active state.
+    if (cmd == "verify_low") {
+        if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
+            Diag::info("[verify_low] No active session");
+            return true;
+        }
+        _toVerifyLow();
+        return true;
+    }
+
+    // Jump to high-bound verification from any active state.
+    if (cmd == "verify_high") {
+        if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
+            Diag::info("[verify_high] No active session");
+            return true;
+        }
+        _toVerifyHigh();
+        return true;
+    }
+
+    // Confirm the current verification bound; auto-advances when both done.
+    if (cmd == "confirm") {
+        if (_state == WindingState::VERIFY_LOW) {
+            _lowVerified = true;
+            Diag::info("[VERIFY_LOW] Low bound confirmed");
+            if (_highVerified) _toWinding();
+            else               _toVerifyHigh();
+        } else if (_state == WindingState::VERIFY_HIGH) {
+            _highVerified = true;
+            Diag::info("[VERIFY_HIGH] High bound confirmed");
+            if (_lowVerified) _toWinding();
+            else              _toVerifyLow();
+        } else {
+            Diag::infof("[Confirm] Ignored in state %s",
+            windingStateName(_state));
+        }
+        return true;
+    }
+
+    // Resume: arms the motor without requiring a physical pot-zero trip.
+    if (cmd == "resume") {
+        if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
+            Diag::info("[Resume] No active session to resume");
+        } else if (_canStart) {
+            Diag::info("[Resume] Already armed -- raise the pot to start");
+        } else {
+            _canStart = true;
+            Diag::infof("[Resume] Armed in %s -- raise pot to run",
+            windingStateName(_state));
+        }
         return true;
     }
 
     if (cmd == "stop_next_high") {
         _lateral.armStopAtNextHigh();
-        Serial.println("[Mode] Arrêt armé sur prochaine butée haute.");
+        Diag::info("[Mode] Stop armed on next high bound");
         return true;
     }
 
     if (cmd == "stop_next_low") {
         _lateral.armStopAtNextLow();
-        Serial.println("[Mode] Arrêt armé sur prochaine butée basse.");
+        Diag::info("[Mode] Stop armed on next low bound");
         return true;
     }
 
     return false;
 }
 
+// Handles all coil geometry parameters (dimensions, wire diameter, trim offsets,
+// presets). Geometry can always be adjusted, even during a session — changes take
+// effect immediately and the carriage is repositioned if the machine is at rest.
 bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
     if (cmd == "geom_start_trim") {
         _geom.windingStartTrim_mm = constrain(value.toFloat(), -5.0f, 5.0f);
@@ -427,8 +505,8 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
         uint8_t idx = (uint8_t)value.toInt();
         _geom.applyPreset(idx);
         _refreshCarriageForGeometryChange(true, true);
-        Serial.printf("Bobbin preset: %s — %ld turns/pass\n",
-                      BOBBIN_PRESETS[idx].name, _geom.turnsPerPass());
+        Diag::infof("Bobbin preset: %s — %ld turns/pass",
+            BOBBIN_PRESETS[idx].name, _geom.turnsPerPass());
         _saveRecipe();
         return true;
     }
@@ -440,16 +518,16 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
 
     if (cmd == "geom_wire") {
         _geom.wireDiameter_mm = value.toFloat();
-        Serial.printf("Wire: %.4f mm — %ld turns/pass (calc: %ld)\n",
-                      _geom.wireDiameter_mm, _geom.turnsPerPass(), _geom.turnsPerPassCalc());
+        Diag::infof("Wire: %.4f mm — %ld turns/pass (calc: %ld)",
+            _geom.wireDiameter_mm, _geom.turnsPerPass(), _geom.turnsPerPassCalc());
         _saveRecipe();
         return true;
     }
 
     if (cmd == "geom_tpp_ofs") {
         _geom.turnsPerPassOffset = value.toInt();
-        Serial.printf("Turns/pass offset: %+ld (calc %ld → effective %ld)\n",
-                      _geom.turnsPerPassOffset, _geom.turnsPerPassCalc(),
+        Diag::infof("Turns/pass offset: %+ld (calc %ld → effective %ld)",
+            _geom.turnsPerPassOffset, _geom.turnsPerPassCalc(),
                       _geom.turnsPerPass());
         _saveRecipe();
         return true;
@@ -459,8 +537,8 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
         float f = value.toFloat();
         if (f >= 0.5f && f <= 5.0f) {
             _geom.scatterFactor = f;
-            Serial.printf("Scatter factor: %.2f → %ld tours/pass\n",
-                          _geom.scatterFactor, _geom.turnsPerPass());
+            Diag::infof("Scatter factor: %.2f -> %ld turns/pass",
+            _geom.scatterFactor, _geom.turnsPerPass());
             _saveRecipe();
         }
         return true;
@@ -473,7 +551,8 @@ bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
     if (cmd == "winding_style") {
         _recipe.style = WindingPatternPlanner::styleFromString(value);
         _planner.setRecipe(_captureRecipe());
-        Serial.printf("Winding style: %s\n", WindingPatternPlanner::styleName(_recipe.style));
+        Diag::infof("Winding style: %s",
+            WindingPatternPlanner::styleName(_recipe.style));
         _saveRecipe();
         return true;
     }
@@ -482,7 +561,8 @@ bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
         uint32_t seed = (uint32_t)((value.toInt() > 0) ? value.toInt() : 1);
         _recipe.seed = seed;
         _planner.setRecipe(_captureRecipe());
-        Serial.printf("Winding seed: %lu\n", (unsigned long)_recipe.seed);
+        Diag::infof("Winding seed: %lu",
+            (unsigned long)_recipe.seed);
         _saveRecipe();
         return true;
     }
@@ -518,33 +598,44 @@ bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
     return false;
 }
 
-void WinderApp::_handleCommand(const String& cmd, const String& value) {
+// ── Command dispatch ─────────────────────────────────────────────────────────
+// Priority order:
+//   1. Immediate / state-machine commands (start, stop, confirm, resume, …)
+//   2. Geometry commands (always editable — live feedback is useful mid-session)
+//   3. Turn target (always editable — operator may increase target while winding)
+//   4. All other parameters (freerun, direction, pattern…) — locked during session
+void WinderApp::handleCommand(const String& cmd, const String& value) {
     if (_handleImmediateCommand(cmd, value)) return;
-    if (_handleGeometryCommand(cmd, value)) return;
+    if (_handleGeometryCommand(cmd, value))  return;
 
-    // La cible doit être modifiable à la volée, même en bobinage/pause.
+    // Turn target: modifiable at any time. Raising the target above the current
+    // count while in TARGET_REACHED transitions back to PAUSED automatically.
     if (cmd == "target") {
         long t = value.toInt();
         if (t > 0) {
             _targetTurns = t;
-            if (_targetReached && t > _stepper.getTurns()) {
-                _targetReached = false;
-                Serial.println("▶ Cible augmentée — reprise possible");
+            if (_state == WindingState::TARGET_REACHED && t > _stepper.getTurns()) {
+                _toPaused();
+                Diag::info("[PAUSED] Target raised -- resume possible");
             }
-            Serial.printf("Target: %ld turns\n", t);
+            Diag::infof("Target: %ld turns",
+            t);
             _saveRecipe();
         }
         return;
     }
 
+    // All other parameters are locked once a session is active.
     if (_parametersLocked()) {
-        Serial.printf("[Lock] Paramètre ignoré pendant le bobinage: %s\n", cmd.c_str());
+        Diag::infof("[Lock] Ignored during session (%s): %s",
+            windingStateName(_state), cmd.c_str());
         return;
     }
 
     if (cmd == "freerun") {
         _freerun = (value == "true");
-        Serial.printf("Mode: %s\n", _freerun ? "FreeRun" : "Target");
+        Diag::infof("Mode: %s",
+            _freerun ? "FreeRun" : "Target");
         _saveRecipe();
         return;
     }
@@ -553,7 +644,8 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
         Direction newDir = (value == "cw") ? Direction::CW : Direction::CCW;
         if (newDir != _direction) {
             _direction = newDir;
-            Serial.printf("Direction: %s\n", value.c_str());
+            Diag::infof("Direction: %s",
+            value.c_str());
             _saveRecipe();
         }
         return;
@@ -565,9 +657,9 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
         WindingRecipe imported;
         if (_recipeStore.fromJson(value, imported)) {
             _applyRecipe(imported, true);
-            Serial.println("[Recipe] Recette importée.");
+            Diag::info("[Recipe] Recipe imported");
         } else {
-            Serial.println("[Recipe] ERREUR : JSON recette invalide.");
+            Diag::error("[Recipe] ERROR -- invalid JSON");
         }
         return;
     }
@@ -576,46 +668,48 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
         float mm = value.toFloat();
         if (mm >= 0.0f) {
             _lateral.setHomeOffset(mm);
-            _startRequested = false;
-            _motorEnabled = false;
-            _pausedForVerification = false;
-            _midWindingPaused = false;
-            _inVerificationRun = false;
-                _resumeFromCurrentPos = false;
-            // Appliquer immédiatement le nouvel offset : homing complet,
-            // puis retour automatique à la position 0 logique (avec offset).
+            _toIdle();
             _lateral.rehome();
-            Serial.printf("[Lateral] Offset modifié à %.2f mm — rehoming lancé.\n", mm);
+            Diag::infof("[Lateral] Offset %.2f mm -- rehoming started",
+            mm);
             _saveRecipe();
         }
         return;
     }
 }
 
+// Queries the pattern planner for the current traverse parameters (turns-per-pass,
+// speed scale). The planner may vary these over time to produce scatter, jitter or
+// human-like patterns. windingHz is forwarded for future adaptive-speed recipes;
+// it is currently unused and suppressed to avoid a compiler warning.
 TraversePlan WinderApp::_buildTraversePlan(uint32_t windingHz) const {
     (void)windingHz;
     return _planner.getPlan(_stepper.getTurns(), _lateral.getTraversalProgress());
 }
 
+// Applies all fields from a recipe struct to every live subsystem.
+// Always forces the machine to IDLE: applying a recipe mid-session would leave
+// subsystem state inconsistent (different geometry, wrong target, etc.).
+// The caller is responsible for issuing a new 'start' command once ready.
 void WinderApp::_applyRecipe(const WindingRecipe& recipe, bool persist) {
-    _recipe = recipe;
-    _geom = recipe.geometry;
+    _recipe      = recipe;
+    _geom        = recipe.geometry;
     _targetTurns = recipe.targetTurns;
-    _freerun = recipe.freerun;
-    _direction = recipe.directionCW ? Direction::CW : Direction::CCW;
-    _startRequested = false;
-    _motorEnabled = false;
-    _pauseOnFirstReversal = false;
-    _pausedForVerification = false;
-    _midWindingPaused = false;
-    _inVerificationRun = false;
-    _resumeFromCurrentPos = false;
+    _freerun     = recipe.freerun;
+    _direction   = recipe.directionCW ? Direction::CW : Direction::CCW;
+    // Hard-reset the session: no partial state can survive a recipe change.
+    _state                = WindingState::IDLE;
+    _canStart           = false;
+    _pendingDisable       = false;
     _lateral.setHomeOffset(recipe.latOffsetMm);
     _planner.setRecipe(_recipe);
     _activePlan = _planner.getPlan(_stepper.getTurns(), 0.0f);
     if (persist) _saveRecipe();
 }
 
+// Takes a point-in-time snapshot of all mutable runtime parameters
+// (target, freerun, direction, geometry, lateral offset) and merges them
+// into a copy of _recipe. Used both for NVS persistence and JSON export.
 WindingRecipe WinderApp::_captureRecipe() const {
     WindingRecipe recipe = _recipe;
     recipe.targetTurns = _targetTurns;
@@ -626,6 +720,10 @@ WindingRecipe WinderApp::_captureRecipe() const {
     return recipe;
 }
 
+// Commits the current live state to NVS. Always call this after mutating any
+// recipe field so the planner and persistent store stay in sync. The capture
+// step is intentional: _recipe may lag behind volatile fields (direction,
+// targetTurns, freerun) that are mutated without going through _applyRecipe.
 void WinderApp::_saveRecipe() {
     _recipe = _captureRecipe();
     _planner.setRecipe(_recipe);
