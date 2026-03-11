@@ -372,19 +372,65 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 int32_t newStart = (int32_t)(s * (float)LAT_STEPS_PER_MM);
                 int32_t newEnd   = (int32_t)(e * (float)LAT_STEPS_PER_MM);
 
-                // Prise en compte immédiate, mais sans changer la butée déjà "derrière"
-                // la direction courante. Ainsi, une butée modifiée est appliquée
-                // au prochain passage sur cette butée.
+                // Apply the bound the carriage is heading toward immediately.
+                // The bound behind the carriage will be applied on the next pass
+                // (applying it now would have no effect anyway since we are
+                // already travelling away from it).
                 if (_state == LatState::WINDING_FWD) {
-                    // On va vers END : END doit être prise en compte tout de suite.
-                    // START est derrière, elle sera appliquée au prochain retour BWD.
                     _latEndSteps = max(newEnd, _latStartSteps);
-                } else { // WINDING_BWD
-                    // On va vers START : START doit être prise en compte tout de suite.
-                    // END est derrière, elle sera appliquée au prochain aller FWD.
+                } else {
                     _latStartSteps = min(newStart, _latEndSteps);
                 }
 
+                // ── Overrun detection ─────────────────────────────────────────
+                // The operator may have shrunk the active bound to a position
+                // that is already behind the carriage (e.g. end bound moved from
+                // 40 mm to 30 mm while the carriage is at 35 mm heading forward).
+                // In that case the carriage has logically overshot the new bound.
+                // Trigger the same reversal sequence that update() would normally
+                // produce, so that behaviour stays consistent with every other
+                // reversal: snap position to the bound (corrects the offset error)
+                // and immediately change direction.
+                int32_t pos = _stepper->getCurrentPosition();
+
+                if (_state == LatState::WINDING_FWD && pos >= _latEndSteps) {
+                    _stepper->forceStopAndNewPosition(_latEndSteps);
+                    _passCount++;
+                    _onReversal();
+                    if (_pauseOnNextReversal || _stopOnNextHigh) {
+                        _pauseOnNextReversal = false;
+                        _stopOnNextHigh      = false;
+                        _pausedAtReversal    = true;
+                        _state = LatState::HOMED;
+                        Diag::infof("[Lateral] Overrun corrected — stopped at high bound (%.2f mm)",
+                            getCurrentPositionMm());
+                    } else {
+                        _stepper->setSpeedInHz(max(1u, _latHz));
+                        _stepper->runBackward();
+                        _state = LatState::WINDING_BWD;
+                        Diag::infof("[Lateral] Overrun corrected — reversed to BWD at %.2f mm (bound moved behind carriage)",
+                            getCurrentPositionMm());
+                    }
+                } else if (_state == LatState::WINDING_BWD && pos <= _latStartSteps) {
+                    _stepper->forceStopAndNewPosition(_latStartSteps);
+                    _passCount++;
+                    _onReversal();
+                    if (_stopOnNextLow) {
+                        _stopOnNextLow    = false;
+                        _pausedAtReversal = true;
+                        _state = LatState::HOMED;
+                        Diag::infof("[Lateral] Overrun corrected — stopped at low bound (%.2f mm)",
+                            getCurrentPositionMm());
+                    } else {
+                        _stepper->setSpeedInHz(max(1u, _latHz));
+                        _stepper->runForward();
+                        _state = LatState::WINDING_FWD;
+                        Diag::infof("[Lateral] Overrun corrected — reversed to FWD at %.2f mm (bound moved behind carriage)",
+                            getCurrentPositionMm());
+                    }
+                }
+
+                // ── Speed update ──────────────────────────────────────────────
                 uint32_t newHz = _calcLatHz(windingHz, tpp, endMm - startMm, speedScale);
                 if (newHz < 1) newHz = 1;
                 if (newHz != _latHz) {
