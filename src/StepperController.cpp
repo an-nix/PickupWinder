@@ -1,5 +1,6 @@
 #include "StepperController.h"
 #include <Arduino.h>
+#include "Diag.h"
 
 void StepperController::begin(FastAccelStepperEngine& engine) {
     // Keep the driver disabled at startup so the motor coils are not energised
@@ -14,7 +15,7 @@ void StepperController::begin(FastAccelStepperEngine& engine) {
     _stepper = engine.stepperConnectToPin(STEP_PIN);
     if (!_stepper) {
         // Fatal error: cannot allocate a hardware timer channel for this pin.
-        Serial.println("[Stepper] ERROR: could not initialise stepper!");
+        Diag::error("[Stepper] ERROR: could not initialise stepper!");
         while (true);  // Halt — nothing can run without a stepper
     }
 
@@ -22,7 +23,7 @@ void StepperController::begin(FastAccelStepperEngine& engine) {
     _stepper->setAcceleration(ACCELERATION);
     _stepper->setSpeedInHz(_speedHz);  // Set the initial speed target
 
-    Serial.println("[Stepper] OK");
+    Diag::info("[Stepper] OK");
 }
 
 void StepperController::setSpeedHz(uint32_t hz) {

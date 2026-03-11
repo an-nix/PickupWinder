@@ -1,11 +1,12 @@
 #include "LinkSerial.h"
 #include <Arduino.h>
+#include "Diag.h"
 
 void LinkSerial::begin() {
     // SERIAL_8N1 : 8 bits de données, pas de parité, 1 bit de stop.
     // Les pins TX/RX sont définis dans Config.h.
     LINK_UART.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
-    Serial.println("[Link] UART2 OK");
+    Diag::info("[Link] UART2 OK");
 }
 
 void LinkSerial::sendStatus(float    rpm,

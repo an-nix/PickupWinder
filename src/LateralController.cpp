@@ -1,42 +1,46 @@
 #include "LateralController.h"
 #include <Arduino.h>
+#include "Diag.h"
 
-            void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm) {
-                pinMode(HOME_PIN_NO, INPUT_PULLUP);
-                pinMode(HOME_PIN_NC, INPUT_PULLUP);
+void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm) 
+{
+    pinMode(HOME_PIN_NO, INPUT_PULLUP);
+    pinMode(HOME_PIN_NC, INPUT_PULLUP);
 
-                digitalWrite(ENABLE_PIN_LAT, HIGH);
-                pinMode(ENABLE_PIN_LAT, OUTPUT);
+    digitalWrite(ENABLE_PIN_LAT, HIGH);
+    pinMode(ENABLE_PIN_LAT, OUTPUT);
 
-                _stepper = engine.stepperConnectToPin(STEP_PIN_LAT);
-                if (!_stepper) {
-                    Serial.println("[Lateral] ERREUR : impossible d'initialiser le stepper latéral !");
-                    _state = LatState::FAULT;
-                    return;
-                }
+    _stepper = engine.stepperConnectToPin(STEP_PIN_LAT);
+    if (!_stepper) 
+    {
+        Diag::error("[Lateral] ERREUR : impossible d'initialiser le stepper latéral !");
+        _state = LatState::FAULT;
+        return;
+    }
 
-                _stepper->setDirectionPin(DIR_PIN_LAT);
-                _stepper->setAcceleration(LAT_ACCEL);
-                _homeOffsetMm = max(0.0f, homeOffsetMm);
-                _passCount = 0;
-                Serial.printf("[Lateral] Offset home : %.2f mm\n", _homeOffsetMm);
+    _stepper->setDirectionPin(DIR_PIN_LAT);
+    _stepper->setAcceleration(LAT_ACCEL);
+    _homeOffsetMm = max(0.0f, homeOffsetMm);
+    _passCount = 0;
+    Diag::infof("[Lateral] Offset home : %.2f mm",
+            _homeOffsetMm);
 
                 delay(10);
 
                 if (!_sensorPresent()) {
-                    Serial.println("[Lateral] ERREUR : capteur de position absent ou défaillant !");
-                    Serial.printf("[Lateral]   NO=GPIO%d=%d  NC=GPIO%d=%d (attendu : l'un LOW, l'autre HIGH)\n",
-                                  HOME_PIN_NO, digitalRead(HOME_PIN_NO),
+                    Diag::error("[Lateral] ERREUR : capteur de position absent ou défaillant !");
+                    Diag::infof("[Lateral]   NO=GPIO%d=%d  NC=GPIO%d=%d (attendu : l'un LOW, l'autre HIGH)",
+            HOME_PIN_NO, digitalRead(HOME_PIN_NO),
                                   HOME_PIN_NC, digitalRead(HOME_PIN_NC));
                     _state = LatState::FAULT;
                     return;
                 }
 
                 if (_atHome()) {
-                    Serial.println("[Lateral] Capteur actif au démarrage — recul avant homing...");
+                    Diag::info("[Lateral] Capteur actif au démarrage — recul avant homing...");
                     _startBackoff();
                 } else {
-                    Serial.println("[Lateral] Homing en cours — déplacement vers la position initiale...");
+                    Diag::info("[Lateral] Homing en cours — déplacement vers la position initiale...");
                     _startHoming();
                 }
             }
@@ -49,7 +53,7 @@
                     if (millis() - _lastCheckMs >= 1000) {
                         _lastCheckMs = millis();
                         if (_sensorPresent()) {
-                            Serial.println("[Lateral] Capteur détecté — reprise du homing.");
+                            Diag::info("[Lateral] Capteur détecté — reprise du homing.");
                             if (_atHome()) _startBackoff();
                             else           _startHoming();
                         }
@@ -59,10 +63,10 @@
                 case LatState::BACKOFF:
                     if (!_atHome()) {
                         _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
-                        Serial.println("[Lateral] Capteur libéré — départ homing...");
+                        Diag::info("[Lateral] Capteur libéré — départ homing...");
                         _startHoming();
                     } else if (!_stepper->isRunning()) {
-                        Serial.println("[Lateral] AVERTISSEMENT : recul terminé, capteur encore actif !");
+                        Diag::warn("[Lateral] AVERTISSEMENT : recul terminé, capteur encore actif !");
                         _startHoming();
                     }
                     break;
@@ -73,10 +77,10 @@
                         _detachHomeISR();
                         _stepper->stopMove();
                         _state = LatState::HOMING_DECEL;
-                        Serial.println("[Lateral] Capteur atteint — décélération...");
+                        Diag::info("[Lateral] Capteur atteint — décélération...");
                     } else if (!_stepper->isRunning()) {
                         _detachHomeISR();
-                        Serial.println("[Lateral] ERREUR : homing échoué (home non atteint) !");
+                        Diag::error("[Lateral] ERREUR : homing échoué (home non atteint) !");
                         _disableDriver();
                         _state = LatState::FAULT;
                     }
@@ -118,7 +122,7 @@
                     if (millis() - _lastCheckMs >= 5000) {
                         _lastCheckMs = millis();
                         if (!_sensorPresent()) {
-                            Serial.println("[Lateral] AVERTISSEMENT : capteur non détecté (câble ?)");
+                            Diag::warn("[Lateral] AVERTISSEMENT : capteur non détecté (câble ?)");
                         }
                     }
                     break;
@@ -127,7 +131,8 @@
                     if (!_stepper->isRunning()) {
                         _stepper->forceStopAndNewPosition(_latStartSteps);
                         _state = LatState::HOMED;
-                        Serial.printf("[Lateral] ✓ Position de départ atteinte : %.2f mm\n", getCurrentPositionMm());
+                        Diag::infof("[Lateral] ✓ Position de départ atteinte : %.2f mm",
+            getCurrentPositionMm());
                     }
                     break;
 
@@ -146,13 +151,15 @@
                                _stopOnNextHigh = false;
                                _pausedAtReversal = true;
                                _state = LatState::HOMED;
-                               Serial.printf("[Lateral] ⏸ Arrêt sur butée haute : %.2f mm\n", getCurrentPositionMm());
+                               Diag::infof("[Lateral] ⏸ Arrêt sur butée haute : %.2f mm",
+            getCurrentPositionMm());
                                break;
                            }
                         _stepper->setSpeedInHz(max(1u, _latHz));
                         _stepper->runBackward();
                         _state = LatState::WINDING_BWD;
-                        Serial.printf("[Lateral] ↩ Demi-tour → BWD (pos=%ld)\n", (long)_stepper->getCurrentPosition());
+                        Diag::infof("[Lateral] ↩ Demi-tour → BWD (pos=%ld)",
+            (long)_stepper->getCurrentPosition());
                     }
                     break;
 
@@ -170,13 +177,15 @@
                             _stopOnNextLow = false;
                             _pausedAtReversal = true;
                             _state = LatState::HOMED;
-                            Serial.printf("[Lateral] ⏸ Arrêt sur butée basse : %.2f mm\n", getCurrentPositionMm());
+                            Diag::infof("[Lateral] ⏸ Arrêt sur butée basse : %.2f mm",
+            getCurrentPositionMm());
                             break;
                         }
                         _stepper->setSpeedInHz(max(1u, _latHz));
                         _stepper->runForward();
                         _state = LatState::WINDING_FWD;
-                        Serial.printf("[Lateral] ↪ Demi-tour → FWD (pos=%ld)\n", (long)_stepper->getCurrentPosition());
+                        Diag::infof("[Lateral] ↪ Demi-tour → FWD (pos=%ld)",
+            (long)_stepper->getCurrentPosition());
                     }
                     break;
                 }
@@ -185,7 +194,7 @@
             void LateralController::rehome() {
                 if (!_stepper) return;
                 if (!_sensorPresent()) {
-                    Serial.println("[Lateral] Rehoming impossible : capteur absent.");
+                    Diag::error("[Lateral] Rehoming impossible : capteur absent.");
                     return;
                 }
                 if (_state == LatState::HOMING) _detachHomeISR();
@@ -202,7 +211,7 @@
                     _pausedAtReversal = false;
                 if (_atHome()) _startBackoff();
                 else           _startHoming();
-                Serial.println("[Lateral] Rehoming lancé.");
+                Diag::info("[Lateral] Rehoming lancé.");
             }
 
             const char* LateralController::stateStr() const {
@@ -229,7 +238,8 @@
                 _stepper->setSpeedInHz(LAT_TRAVERSE_SPEED_HZ);
                 _stepper->moveTo(_latStartSteps);
                 _state = LatState::POSITIONING;
-                Serial.printf("[Lateral] Positionnement départ bobinage : %.2f mm\n", startMm);
+                Diag::infof("[Lateral] Positionnement départ bobinage : %.2f mm",
+            startMm);
             }
 
             void LateralController::_startHoming() {
@@ -262,7 +272,8 @@
 
             void LateralController::setHomeOffset(float mm) {
                 _homeOffsetMm = (mm < 0.0f) ? 0.0f : mm;
-                Serial.printf("[Lateral] Offset home enregistré : %.2f mm\n", _homeOffsetMm);
+                Diag::infof("[Lateral] Offset home enregistré : %.2f mm",
+            _homeOffsetMm);
             }
 
             void LateralController::_applyOffsetOrNext() {
@@ -271,8 +282,8 @@
                     _stepper->setSpeedInHz(LAT_HOME_SPEED_HZ);
                     _stepper->moveTo(offsetSteps);
                     _state = LatState::HOMING_OFFSET;
-                    Serial.printf("[Lateral] Offset : déplacement de %.2f mm (%ld steps)...\n",
-                                  _homeOffsetMm, (long)offsetSteps);
+                    Diag::infof("[Lateral] Offset : déplacement de %.2f mm (%ld steps)...",
+            _homeOffsetMm, (long)offsetSteps);
                 } else {
                     _gotoHomed();
                 }
@@ -285,7 +296,7 @@
                     _stopOnNextHigh = false;
                     _stopOnNextLow = false;
                     _pausedAtReversal = false;
-                Serial.println("[Lateral] ✓ Position 0 atteinte — axe latéral prêt.");
+                Diag::info("[Lateral] ✓ Position 0 atteinte — axe latéral prêt.");
             }
 
             uint32_t LateralController::_calcLatHz(uint32_t windingHz, long tpp, float effWidthMm, float speedScale) const {
@@ -309,12 +320,13 @@
                     return;
                 }
                 if (_state != LatState::HOMED) {
-                    Serial.printf("[Lateral] startWinding ignoré — état : %s\n", stateStr());
+                    Diag::infof("[Lateral] startWinding ignoré — état : %s",
+            stateStr());
                     return;
                 }
                 if (windingHz == 0 || tpp <= 0 || endMm <= startMm) {
-                    Serial.printf("[Lateral] startWinding ignoré — paramètres invalides : windHz=%u tpp=%ld start=%.2f end=%.2f\n",
-                                  windingHz, (long)tpp, startMm, endMm);
+                    Diag::errorf("[Lateral] startWinding ignoré — paramètres invalides : windHz=%u tpp=%ld start=%.2f end=%.2f",
+             windingHz, (long)tpp, startMm, endMm);
                     return;
                 }
 
@@ -347,8 +359,8 @@
 
                 float mmPerSec = (float)_latHz / (float)LAT_STEPS_PER_MM;
                 float passDuration = (mmPerSec > 0.0f) ? ((endMm - startMm) / mmPerSec) : 0.0f;
-                Serial.printf("[Lateral] ▶ Bobinage démarré : %u Hz (%.2f mm/s)  passe=%.1fs  dir=%s\n",
-                              _latHz, mmPerSec, passDuration,
+                Diag::infof("[Lateral] ▶ Bobinage démarré : %u Hz (%.2f mm/s)  passe=%.1fs  dir=%s",
+            _latHz, mmPerSec, passDuration,
                               (_state == LatState::WINDING_FWD) ? "FWD" : "BWD");
             }
 
@@ -393,7 +405,7 @@
                 }
                 _state = LatState::HOMED;
                 _reversingUntilMs = 0;
-                Serial.println("[Lateral] Bobinage arrêté.");
+                Diag::info("[Lateral] Bobinage arrêté.");
             }
 
             float LateralController::getTraversalProgress() const {

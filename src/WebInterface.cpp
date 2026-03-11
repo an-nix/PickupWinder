@@ -1,6 +1,7 @@
 #include "WebInterface.h"
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include "Diag.h"
 
 // The HTML file is embedded into the firmware binary at compile time.
 // platformio.ini: board_build.embed_txtfiles = data/index.html
@@ -24,12 +25,13 @@ void WebInterface::begin() {
 
     if (WiFi.status() != WL_CONNECTED) {
         // WiFi failure is non-fatal: the motor still works via the potentiometer.
-        Serial.println("\n[WiFi] Failed — web interface disabled. Motor still works.");
+        Diag::error("\n[WiFi] Failed — web interface disabled. Motor still works.");
         return;
     }
 
     _wifiOk = true;
-    Serial.printf("\n[WiFi] Connected — IP: %s\n", WiFi.localIP().toString().c_str());
+    Diag::infof("\n[WiFi] Connected — IP: %s",
+            WiFi.localIP().toString().c_str());
 
     // Register the WebSocket event handler using a lambda to forward calls
     // to the private _onWsEvent method (captures `this`).
@@ -56,7 +58,7 @@ void WebInterface::begin() {
     });
 
     _server.begin();
-    Serial.println("[Web] Server started");
+    Diag::info("[Web] Server started");
 }
 
 void WebInterface::sendUpdate(const WinderStatus& s) {

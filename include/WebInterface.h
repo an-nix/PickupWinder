@@ -5,50 +5,8 @@
 #include "Config.h"
 #include "Types.h"
 
-// Callback type invoqué quand une commande arrive via WebSocket.
-// Défini dans Types.h — partagé avec LinkSerial.
-
-// Full machine state snapshot sent to all connected WebSocket clients
-// every WS_UPDATE_MS milliseconds.
-struct WinderStatus {
-    float    rpm;              // Actual instantaneous speed in RPM
-    uint32_t speedHz;         // Current speed setpoint in Hz
-    long     turns;           // Total turns since last reset
-    long     targetTurns;     // Target turn count for auto-stop
-    bool     running;         // True while the motor is moving
-    bool     motorEnabled;    // False after stop — pot must return to 0 to re-enable
-    bool     startRequested;  // Explicit start command armed from UI
-    bool     carriageReady;   // Lateral carriage positioned at winding start
-    bool     firstReversalPaused; // Pause de validation à la première inversion
-    bool     freerun;         // True = no auto-stop (free-run mode)
-    bool     directionCW;     // True = clockwise, false = counter-clockwise
-    bool     autoMode;        // True = auto traverse mode (future)
-    // Winding geometry and pass guide (used by the LED traverse indicator)
-    long     turnsPerPass;      // Effective turns per pass (calc + offset)
-    long     turnsPerPassCalc;  // Auto-calculated turns per pass (geometry only)
-    long     turnsPerPassOffset; // Offset applied to auto-calc
-    float    scatterFactor;    // Wire spacing factor (1.0=dense, 2.0=scatter)
-    int      currentPass;     // Current pass number (0-based)
-    long     activeTurnsPerPass; // Turns/pass currently applied after profile modulation
-    float    activeSpeedScale; // Lateral speed multiplier from current winding profile
-    float    latProgress;     // 0..1 position within the current traverse
-    float    latPositionMm;   // Position latérale absolue
-    float    windingStartMm;  // Début réel de la fenêtre de bobinage
-    float    windingEndMm;    // Fin réelle de la fenêtre de bobinage
-    float    windingStartTrimMm; // Ajustement manuel de butée min
-    float    windingEndTrimMm; // Ajustement manuel de butée max
-    float    effectiveWidth_mm; // Usable winding width after flanges and margins
-    float    geomTotal, geomBottom, geomTop, geomMargin, geomWire; // Raw geometry values
-    float    latOffset;   // Offset home axe latéral en mm (depuis NVS)
-    const char* windingStyle; // straight / scatter / human
-    uint32_t seed;
-    float    layerJitterPct;
-    float    layerSpeedPct;
-    float    humanTraversePct;
-    float    humanSpeedPct;
-};
-
-using RecipeJsonProvider = std::function<String(void)>;
+// WinderStatus and RecipeJsonProvider are defined in Types.h.
+// CommandCallback is defined in Types.h.
 
 // ── WebInterface ─────────────────────────────────────────────────────────────
 // Manages WiFi connection, HTTP server (serves embedded HTML) and WebSocket.

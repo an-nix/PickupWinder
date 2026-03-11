@@ -1,102 +1,112 @@
 #pragma once
 #include <FastAccelStepper.h>
 #include "StepperController.h"
-#include "SpeedInput.h"
-#include "WebInterface.h"
 #include "WindingGeometry.h"
 #include "WindingPattern.h"
 #include "WindingRecipeStore.h"
 #include "LEDController.h"
-#include "LinkSerial.h"
 #include "LateralController.h"
+#include "Types.h"
+#include "Config.h"
 
 // Winding direction seen from the front of the bobbin.
-enum class Direction  { CW, CCW };
+enum class Direction { CW, CCW };
 
 // ── WinderApp ─────────────────────────────────────────────────────────────────
-// Top-level application class. Owns all subsystems and orchestrates the main
-// control loop: pot reading, motor control, auto-stop, LED guide and WebSocket.
+// Winding controller. Owns the bobbin motor, traverse axis, LED guide and
+// recipe persistence. Infrastructure (Serial, WiFi, LinkSerial, SpeedInput) is
+// managed by main and injected via tick(potHz) and handleCommand().
+//
+// The session lifecycle is modelled as an explicit state machine (WindingState).
+// All state transitions go through a dedicated _toXxx() method so the full
+// set of state changes is visible in one place.
 class WinderApp {
 public:
-    // Initialise all subsystems (serial, stepper, pot, LED, web) and
-    // register the WebSocket command callback.
+    // Initialise winding subsystems. Serial must be open before calling begin().
     void begin();
 
-    // Main loop body — must be called from Arduino loop() as fast as possible.
-    // Handles: pot sampling, motor start/stop, auto-stop on target,
-    // deferred driver disable, and periodic WebSocket status push.
-    void run();
+    // Winding loop body — call from the main loop as fast as possible.
+    // potHz : filtered speed value from SpeedInput (0 = pot at zero).
+    void tick(uint32_t potHz);
+
+    // Dispatch a command (from WebSocket or LinkSerial) into the winding logic.
+    void handleCommand(const String& cmd, const String& value);
+
+    // Build a full status snapshot for pushing to WebSocket / LinkSerial.
+    WinderStatus getStatus() const;
+
+    // Return the current recipe serialised as JSON (for UI download).
+    String recipeJson() const;
 
 private:
-    FastAccelStepperEngine _engine;    // Engine FastAccelStepper unique — partagée entre tous les steppers
-    StepperController  _stepper;  // Stepper motor abstraction
-    SpeedInput         _pot;      // Potentiometer with sliding-window filter
-    WebInterface       _web;      // WiFi + HTTP + WebSocket server
-    LEDController      _led;      // Traverse guide LED (toggles each pass)
-    WindingGeometry    _geom;     // Bobbin geometry and turns-per-pass calculation
-    WindingPatternPlanner _planner; // Profil de bobinage déterministe (droit/scatter/humain)
-    WindingRecipeStore _recipeStore; // Persistance NVS + export JSON de la recette
-    LinkSerial         _link;     // Liaison UART2 vers l'ESP écran
-    LateralController  _lateral;  // Axe latéral avec homing automatique
-    WindingRecipe      _recipe;   // Recette courante — source de vérité des paramètres
-    TraversePlan       _activePlan; // Dernier plan latéral appliqué
+    // ── Hardware subsystems ───────────────────────────────────────────────────
+    FastAccelStepperEngine _engine;
+    StepperController      _stepper;
+    LEDController          _led;
+    WindingGeometry        _geom;
+    WindingPatternPlanner  _planner;
+    WindingRecipeStore     _recipeStore;
+    LateralController      _lateral;
+    WindingRecipe          _recipe;
+    TraversePlan           _activePlan;
 
-    // These fields are marked volatile because they can be written from the
-    // WebSocket callback (running on FreeRTOS Core 0) and read from loop()
-    // (running on Core 1). Without volatile the compiler may cache stale values.
-    volatile Direction  _direction    = Direction::CW;
-    volatile long       _targetTurns  = DEFAULT_TARGET_TURNS;
-    volatile bool       _freerun      = false;  // true = no auto-stop
-    volatile bool       _motorEnabled = false;  // false = blocked until pot returns to 0
-    volatile bool       _startRequested = false; // true after pressing Start in the UI
-    bool                _pauseOnFirstReversal  = false;
-    bool                _pausedForVerification = false;
-    bool                _midWindingPaused      = false; // true : pause mid-bobinage, reprend sans Start
-    bool                _inVerificationRun     = false; // true : passe initiale lente (cap vitesse)
-    bool                _resumeFromCurrentPos  = false; // pause en passe initiale : reprise à la position courante
-    // Safety interlock: pot must return to zero (below POT_ADC_ZERO_BAND) before the
-    // motor can start — including the very first start after power-on.
-    bool     _potWasZero     = false;
+    // ── State machine ─────────────────────────────────────────────────────────
+    // _state is the single source of truth for the winding lifecycle.
+    // Marked volatile: handleCommand() runs on FreeRTOS Core 0 (WebSocket task)
+    // while tick() runs on Core 1 (Arduino loop task).
+    volatile WindingState _state        = WindingState::IDLE;
 
-    // When true, the driver will be disabled as soon as isRunning() goes false.
-    // Set by _stop() so the motor decelerates smoothly before power is cut.
-    bool     _pendingDisable = false;
+    // Recipe scalars that can be changed at runtime from the UI (Core 0).
+    volatile Direction    _direction    = Direction::CW;
+    volatile long         _targetTurns  = DEFAULT_TARGET_TURNS;
+    volatile bool         _freerun      = false;
 
-    // Set to true when the winding target is reached. Blocks any restart via the
-    // potentiometer until the user explicitly presses Reset in the web UI.
-    bool     _targetReached  = false;
+    // ── Transient hardware flags ──────────────────────────────────────────────
+    // These cut across states and are not part of the session lifecycle.
 
-    uint32_t _lastWsMs   = 0;  // Timestamp of last WebSocket status push
-    uint32_t _lastPotMs  = 0;  // Timestamp of last pot reading
-    uint32_t _lastLinkMs = 0;  // Timestamp of last UART status push to display ESP
+    // Start/resume arm flag: must be true before the motor (re)starts.
+    // Set by the pot returning to zero, or by a UI "resume" command.
+    // Cleared on every state transition so each stop requires an explicit re-arm.
+    bool _canStart = false;
 
-    TraversePlan _buildTraversePlan(uint32_t windingHz) const;
+    // Deferred driver disable: set when stopping so the driver is cut only
+    // after the deceleration ramp finishes (checked in _applyDeferredDisable).
+    bool _pendingDisable = false;
+
+    // Verification tracking: set to true when the operator confirms each bound.
+    // Both must be true before WINDING starts. Reset on _toIdle().
+    bool _lowVerified  = false;
+    bool _highVerified = false;
+
+    // ── State transitions ─────────────────────────────────────────────────────
+    void _toIdle();
+    void _toVerifyLow();
+    void _toVerifyHigh();
+    void _toWinding();        // called from confirm once both bounds verified
+    void _toPaused();
+    void _toTargetReached();
+
+    // ── Tick helpers ──────────────────────────────────────────────────────────
     float _windingStartMm() const { return _geom.windingStartMm(); }
     float _windingEndMm()   const { return _geom.windingEndMm(); }
-    void _handleLateralEvents();
-    void _handlePotCycle();
-    bool _readyForSpin() const;
-    void _runWindingAtHz(uint32_t hz);
-    void _checkAutoStop();
-    void _applyDeferredDisable();
-    void _pollSerialLink(uint32_t now);
-    void _pushWebStatus(uint32_t now);
+    void  _handleLateralEvents();
+    void  _handlePotCycle(uint32_t hz);
+    bool  _readyForSpin() const;
+    void  _runWindingAtHz(uint32_t hz);
+    void  _checkAutoStop();
+    void  _applyDeferredDisable();
+    TraversePlan _buildTraversePlan(uint32_t hz) const;
 
-    void _applyRecipe(const WindingRecipe& recipe, bool persist);
-    WindingRecipe _captureRecipe() const;
-    void _saveRecipe();
-    bool _parametersLocked() const;
-
-    void _refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged);
+    // ── Command handlers ──────────────────────────────────────────────────────
+    bool _parametersLocked() const { return _state != WindingState::IDLE; }
     bool _handleImmediateCommand(const String& cmd, const String& value);
     bool _handleGeometryCommand(const String& cmd, const String& value);
     bool _handlePatternCommand(const String& cmd, const String& value);
+    void _refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged);
 
-    // Initiate a controlled stop: disable motor, set _pendingDisable, reset LED.
-    void _stop();
-    // Pause mid-winding (pot→0): keeps _startRequested so pot-up resumes without pressing Start.
-    void _pause();
-
-    // Dispatch a WebSocket command (cmd/value pair) to the appropriate handler.
-    void _handleCommand(const String& cmd, const String& value);
+    // ── Recipe helpers ────────────────────────────────────────────────────────
+    void          _applyRecipe(const WindingRecipe& recipe, bool persist);
+    WindingRecipe _captureRecipe() const;
+    void          _saveRecipe();
 };
+
