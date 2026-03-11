@@ -440,6 +440,22 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
             }
 
+            void LateralController::jog(float deltaMm) {
+                if (_state != LatState::HOMED && _state != LatState::POSITIONING) return;
+                // Base = cible actuelle si on est déjà en mouvement, sinon position courante.
+                float baseMm = (_state == LatState::POSITIONING)
+                    ? (float)_latStartSteps / (float)LAT_STEPS_PER_MM
+                    : getCurrentPositionMm();
+                float targetMm = constrain(baseMm + deltaMm, 0.0f, (float)LAT_TRAVERSE_MM);
+                _latStartSteps = (int32_t)(targetMm * (float)LAT_STEPS_PER_MM);
+                _latEndSteps   = _latStartSteps;
+                _enableDriver();
+                _stepper->setSpeedInHz(LAT_TRAVERSE_SPEED_HZ);
+                _stepper->moveTo(_latStartSteps);
+                _state = LatState::POSITIONING;
+                Diag::infof("[Lateral] Jog → %.2f mm", targetMm);
+            }
+
             void LateralController::stopWinding() {
                 if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
                 _lastDirFwd = (_state == LatState::WINDING_FWD);  // mémorise la direction

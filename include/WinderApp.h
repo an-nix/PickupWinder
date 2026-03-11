@@ -32,6 +32,12 @@ public:
     // Dispatch a command (from WebSocket or LinkSerial) into the winding logic.
     void handleCommand(const String& cmd, const String& value);
 
+    // Called from the encoder ISR consumer (main loop) with the tick delta
+    // since the last call. Only active in VERIFY_LOW / VERIFY_HIGH:
+    //   VERIFY_LOW  → adjusts windingStartTrim_mm, repositions carriage
+    //   VERIFY_HIGH → adjusts windingEndTrim_mm,   repositions carriage
+    void handleEncoderDelta(int32_t delta);
+
     // Build a full status snapshot for pushing to WebSocket / LinkSerial.
     WinderStatus getStatus() const;
 
