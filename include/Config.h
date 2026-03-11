@@ -50,20 +50,6 @@
 // Réduire si les extrémités s'accumulent ; augmenter si les variations de vitesse gênent.
 #define LAT_REVERSAL_SLOWDOWN  0.5f  // 0 < x ≤ 1.0 — vitesse bobinage × ce facteur au demi-tour
 
-// Décommenter pour activer le test/rodage aller-retour de l'axe latéral.
-// Le moteur de bobine n'est PAS lancé dans ce mode.
-// #define LAT_TEST_TRAVERSE   // Actif : simulation des mouvements de bobinage
-
-// Simulation de bobinage (utilisé si LAT_TEST_TRAVERSE est défini)
-// Simule un micro Strat (AWG42, 17 mm total) bobiné à 800 tr/min, 8000 tours.
-// Enchaîne 3 scénarios : scatter faible → moyen → élevé.
-#define SIM_TARGET_TURNS       8000   // Nombre de tours simulés
-#define SIM_BOBBIN_RPM         1500   // Vitesse de bobinage simulée (tr/min)
-#define SIM_SCATTER_LOW        1.0f   // Scatter faible  — bobinage dense
-#define SIM_SCATTER_MED        2.0f   // Scatter moyen
-#define SIM_SCATTER_HIGH       3.5f   // Scatter élevé   — bobinage lâche
-#define SIM_PAUSE_BETWEEN_MS   3000   // Pause entre deux scénarios (ms)
-
 // Choisir UNE option selon le protocole retenu :
 //
 // Option A — UART2  (simple, 2 fils, longue distance)
@@ -116,21 +102,6 @@
 // Augmenter k pour plus d'exponentialité (ex. 6.0), diminuer pour moins (ex. 3.0).
 #define POT_EXP_K           4.5f
 
-// ── Mode test moteurs ─────────────────────────────────────
-// Décommenter (ou ajouter -DTEST_MOTORS dans platformio.ini build_flags)
-// pour activer le mode test. L'application normale n'est PAS démarrée.
-// Le test fait tourner les deux steppers séquentiellement pour valider le câblage.
-//
-// #define TEST_MOTORS
-//
-// Paramètres du test (modifiables sans changer la logique) :
-#define TEST_RPM_MAIN       300     // Vitesse du stepper bobine en test (RPM)
-#define TEST_RPM_LAT        15      // Vitesse du stepper latéral en test (RPM) — axe lent
-#define TEST_ACCEL_LAT      8000    // Accélération du latéral en test (steps/s²)
-#define TEST_RUN_MS         3000    // Durée de chaque séquence (ms)
-#define TEST_PAUSE_MS       1000    // Pause entre les séquences (ms)
-
-
 #define WIFI_SSID           "meba"
 #define WIFI_PASSWORD       "welcome@th0me4.0"
 #define WEB_PORT            80
@@ -138,6 +109,11 @@
 
 // ── Bobinage ─────────────────────────────────────────────
 #define DEFAULT_TARGET_TURNS  8000
+#define WINDING_DEFAULT_SEED   424242UL
+#define WINDING_LAYER_JITTER_DEFAULT          0.10f
+#define WINDING_LAYER_SPEED_JITTER_DEFAULT    0.08f
+#define WINDING_HUMAN_TRAVERSE_JITTER_DEFAULT 0.16f
+#define WINDING_HUMAN_SPEED_JITTER_DEFAULT    0.12f
 
 // Number of turns before the target where the motor starts slowing down.
 // Speed is linearly reduced from the pot value down to SPEED_HZ_MIN over
@@ -147,7 +123,7 @@
 // Vitesse plancher en zone d'approche : le moteur ne descend jamais en-dessous
 // de cette valeur (même si le pot est plus haut), puis s'arrête brusquement à la cible.
 #define APPROACH_SPEED_HZ_FLOOR  (200UL * STEPS_PER_REV / 60)  // 200 RPM ≈ 21333 Hz
-
-// ── Test moteur bobine ────────────────────────────────────────
-// Décommenter pour démarrer automatiquement la bobine à vitesse fixe au boot.
-// #define TEST_BOBINE_RPM     800   // RPM cible pour le test
+// Vitesse max pendant la passe de vérification de la première inversion.
+// Le moteur est limité à cette vitesse pour que l'arrêt soit quasi-synchrone
+// avec le chariot latéral (décel rapide depuis une vitesse faible).
+#define VERIFY_SPEED_HZ_MAX      (100UL * STEPS_PER_REV / 60)  // ~100 RPM

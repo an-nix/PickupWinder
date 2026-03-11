@@ -1,424 +1,229 @@
 <!DOCTYPE html><html lang="fr"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Pickup Winder</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,sans-serif;background:#0f0f1a;color:#e0e0e0;
-     min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:20px 16px;gap:0}
-h1{font-size:1.5em;color:#e94560;letter-spacing:2px;margin-bottom:14px}
-
-/* Tabs */
-.tabs{display:flex;gap:0;width:100%;max-width:480px}
-.tab{flex:1;padding:10px;border:none;border-radius:10px 10px 0 0;font-size:.9em;font-weight:600;
-     cursor:pointer;background:#0d1a2e;color:#444;transition:all .2s;border-bottom:2px solid transparent}
-.tab.active{background:#16213e;color:#4ecca3;border-bottom:2px solid #4ecca3}
-.tab.disabled{cursor:not-allowed;opacity:.35}
-
-/* Panel */
-.panel{width:100%;max-width:480px;background:#16213e;border-radius:0 0 14px 14px;
-       padding:16px;display:flex;flex-direction:column;gap:12px}
-.panel.hidden{display:none}
-
-/* Row of cards */
-.row{display:flex;gap:10px}
-.card{flex:1;background:#0f3460;border-radius:10px;padding:12px 8px;text-align:center}
-.big{font-size:2.5em;font-weight:700;color:#4ecca3;line-height:1}
-.unit{font-size:.78em;color:#667;margin-top:4px}
-
-/* Progress */
-.progress-hdr{display:flex;justify-content:space-between;font-size:.82em;color:#99a;margin-bottom:5px}
-.bar-wrap{background:#0d2137;border-radius:8px;height:11px;overflow:hidden}
-.bar{height:100%;background:linear-gradient(90deg,#4ecca3,#e94560);border-radius:8px;
-     transition:width .4s;width:0%}
-.pct{text-align:right;font-size:.72em;color:#445;margin-top:3px}
-
-/* Section label */
-.sect{font-size:.72em;color:#445;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px}
-
-/* Toggle group */
-.tgroup{display:flex;gap:6px}
-.tgroup label{flex:1}
-.tgroup input[type=radio]{display:none}
-.tbtn{display:block;text-align:center;padding:9px 6px;border-radius:8px;font-size:.88em;
-      font-weight:600;cursor:pointer;background:#0d2137;color:#445;
-      transition:all .2s;border:2px solid transparent}
-.tgroup input[type=radio]:checked + .tbtn{background:#1a3a6e;color:#fff;border-color:#4ecca3}
-#r-ccw:checked + .tbtn{border-color:#e94560 !important;color:#e94560 !important}
-
-/* Input */
-input[type=number]{background:#0d2137;border:1px solid #1a3a6e;color:#eee;
-                   padding:9px;border-radius:8px;font-size:1em;width:100%;text-align:center}
-input:disabled{opacity:.3;cursor:not-allowed}
-.target-section{transition:opacity .3s}
-
-/* Buttons */
-.btn-row{display:flex;gap:8px}
-.btn{flex:1;padding:11px 8px;border:none;border-radius:8px;font-size:.88em;
-     font-weight:600;cursor:pointer;transition:opacity .15s}
-.btn:active{opacity:.7}
-.btn-stop{background:#e94560;color:#fff}
-.btn-reset{background:#1a2a4a;color:#aaa}
-
-/* Status bar */
-.status-bar{display:flex;align-items:center;gap:6px;font-size:.73em;color:#445;flex-wrap:wrap}
-.dot{width:8px;height:8px;border-radius:50%;background:#333;flex-shrink:0}
-.dot.green{background:#4ecca3}
-.dot.orange{background:#f0a500}
-.dot.red{background:#e94560}
-
-/* Auto placeholder */
-.auto-ph{text-align:center;padding:40px 20px;color:#334}
-.auto-ph .ico{font-size:2.8em;margin-bottom:10px}
-.auto-ph p{font-size:.88em;line-height:1.7;color:#445}
-</style>
-</head>
-<body>
-<h1>🎸 Pickup Winder</h1>
-
-<!-- Mode tabs -->
-<div class="tabs">
-  <button class="tab active" id="tab-manual" onclick="switchTab('manual')">Manuel</button>
-  <button class="tab disabled" id="tab-auto"  onclick="switchTab('auto')">Auto ⚙</button>
-</div>
-
-<!-- ── Panel MANUEL ──────────────────────────────────────────────────── -->
-<div class="panel" id="panel-manual">
-
-  <!-- RPM / Hz -->
-  <div class="row">
-    <div class="card">
-      <div class="big" id="rpm">0</div>
-      <div class="unit">RPM</div>
-    </div>
-    <div class="card">
-      <div class="big" id="spd">0</div>
-      <div class="unit">Hz</div>
-    </div>
+*{box-sizing:border-box}html,body{height:100%;margin:0;overflow:hidden}
+body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:#0b1220;color:#e8edf7;padding:10px}
+.app{height:100%;max-width:1180px;margin:0 auto;display:grid;grid-template-rows:auto auto 1fr auto;gap:10px}
+.head{display:flex;justify-content:space-between;align-items:center;background:#111b2f;border:1px solid #22314f;border-radius:12px;padding:10px 14px}
+.title{font-weight:700;font-size:18px;letter-spacing:.4px}.mini{font-size:12px;color:#95a3bd}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;background:#f66}
+.dot.ok{background:#36d399}.dot.warn{background:#fbbf24}
+.status{background:#111b2f;border:1px solid #22314f;border-radius:12px;padding:10px 14px;font-size:14px;color:#c9d4e8}
+.views{height:100%;min-height:0}.view{display:none;height:100%}.view.show{display:grid;gap:10px}
+#setup{grid-template-rows:repeat(3,minmax(0,1fr))}
+#run{grid-template-rows:auto auto 1fr auto}
+.grid{display:grid;gap:10px}.g2{grid-template-columns:repeat(2,minmax(0,1fr))}.g3{grid-template-columns:repeat(3,minmax(0,1fr))}.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.card{background:#111b2f;border:1px solid #22314f;border-radius:12px;padding:10px;min-height:0}
+.label{font-size:11px;color:#8ea0c0;text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px}
+.val{font-size:30px;font-weight:700;line-height:1;color:#7dd3fc}.sub{font-size:12px;color:#95a3bd}
+input[type=number],input[type=range]{width:100%} input[type=number]{background:#0d1628;color:#e8edf7;border:1px solid #2a3b60;border-radius:8px;padding:9px;font-size:14px}
+.seg{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.seg3{grid-template-columns:repeat(3,1fr)}
+.seg input{display:none}.pill{display:block;text-align:center;padding:9px;border-radius:8px;background:#0d1628;border:1px solid #2a3b60;color:#b7c4dc;font-size:13px;font-weight:600;cursor:pointer}
+.seg input:checked + .pill{border-color:#36d399;color:#fff;background:#14314a}
+.row{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;align-items:end}
+.actions{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:10px}
+.btn{border:none;border-radius:10px;padding:12px 10px;font-size:15px;font-weight:700;cursor:pointer}
+.start{background:#16a34a;color:#fff}.stop{background:#dc2626;color:#fff}.reset{background:#334155;color:#e2e8f0}
+.bar{height:12px;background:#0d1628;border:1px solid #2a3b60;border-radius:20px;overflow:hidden}.fill{height:100%;width:0%;background:linear-gradient(90deg,#22d3ee,#34d399)}
+.kv{display:grid;grid-template-columns:1fr auto;gap:8px;padding:4px 0;font-size:14px;color:#c8d3e8}
+@media (max-width:1000px){.row{grid-template-columns:repeat(3,minmax(0,1fr))}.g4{grid-template-columns:repeat(2,minmax(0,1fr))}.actions{grid-template-columns:1fr 1fr}}
+@media (max-width:700px){.g3,.g2,.row{grid-template-columns:1fr}.actions{grid-template-columns:1fr}}
+</style></head><body>
+<div class="app">
+  <div class="head">
+    <div><div class="title">Pickup Winder — Production</div><div class="mini" id="phase">Préparation</div></div>
+    <div class="mini"><span class="dot" id="ws-dot"></span><span id="ws-lbl">Connexion...</span></div>
   </div>
 
-  <!-- Compteur de tours -->
-  <div>
-    <div class="progress-hdr">
-      <span>Tours : <b id="turns">0</b></span>
-      <span>Cible : <b id="tgt">8000</b></span>
-    </div>
-    <div class="bar-wrap"><div class="bar" id="bar"></div></div>
-    <div class="pct" id="pct">0%</div>
-  </div>
+  <div class="status" id="status-line">Initialisation...</div>
 
-  <!-- Direction CW / CCW -->
-  <div>
-    <div class="sect">Sens de bobinage</div>
-    <div class="tgroup">
-      <label>
-        <input type="radio" name="dir" id="r-cw"  value="cw"  checked onchange="cmd('direction','cw')">
-        <span class="tbtn">↻ CW (horaire)</span>
-      </label>
-      <label>
-        <input type="radio" name="dir" id="r-ccw" value="ccw"        onchange="cmd('direction','ccw')">
-        <span class="tbtn">↺ CCW (anti-horaire)</span>
-      </label>
-    </div>
-  </div>
-
-  <!-- Mode arrêt : Cible / FreeRun -->
-  <div>
-    <div class="sect">Mode d'arrêt</div>
-    <div class="tgroup">
-      <label>
-        <input type="radio" name="runmode" id="r-target" value="target" checked onchange="setFreerun(false)">
-        <span class="tbtn">🎯 Cible tours</span>
-      </label>
-      <label>
-        <input type="radio" name="runmode" id="r-free"   value="free"         onchange="setFreerun(true)">
-        <span class="tbtn">∞ FreeRun</span>
-      </label>
-    </div>
-  </div>
-
-  <!-- Cible nombre de tours -->
-  <div class="target-section" id="target-section">
-    <div class="sect">Nombre de tours cible</div>
-    <input type="number" id="ti" value="8000" min="100" max="50000" step="100"
-           onchange="cmd('target', this.value)">
-  </div>
-
-  <!-- Géométrie & LED guide -->
-  <div>
-    <div class="sect">Bobine & fil — guide aller-retour</div>
-
-    <!-- Presets -->
-    <div class="tgroup" style="margin-bottom:10px">
-      <label><input type="radio" name="preset" id="p0" onchange="setPreset(0)"><span class="tbtn">Strat</span></label>
-      <label><input type="radio" name="preset" id="p1" onchange="setPreset(1)"><span class="tbtn">Tele</span></label>
-      <label><input type="radio" name="preset" id="p2" onchange="setPreset(2)"><span class="tbtn">P90</span></label>
-      <label><input type="radio" name="preset" id="p3" onchange="setPreset(3)"><span class="tbtn">Humbucker</span></label>
-    </div>
-
-    <!-- Dimensions -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
-      <div>
-        <div class="sect" style="margin-bottom:3px">Épaisseur totale (mm)</div>
-        <input type="number" id="g-total"  step="0.1" min="5" max="60" onchange="cmd('geom_total',  this.value)">
-      </div>
-      <div>
-        <div class="sect" style="margin-bottom:3px">Marge sécurité (mm)</div>
-        <input type="number" id="g-margin" step="0.1" min="0" max="5"  onchange="cmd('geom_margin', this.value)">
-      </div>
-      <div>
-        <div class="sect" style="margin-bottom:3px">Tonework bas (mm)</div>
-        <input type="number" id="g-bottom" step="0.1" min="0" max="10" onchange="cmd('geom_bottom', this.value)">
-      </div>
-      <div>
-        <div class="sect" style="margin-bottom:3px">Tonework haut (mm)</div>
-        <input type="number" id="g-top"    step="0.1" min="0" max="10" onchange="cmd('geom_top',    this.value)">
-      </div>
-    </div>
-
-    <!-- Fil -->
-    <div class="sect" style="margin-bottom:4px">Diamètre fil avec isolation (mm)</div>
-    <div class="tgroup" style="margin-bottom:8px">
-      <label><input type="radio" name="wire" id="w42" value="0.071" onchange="setWire(this.value)"><span class="tbtn">42 AWG</span></label>
-      <label><input type="radio" name="wire" id="w43" value="0.064" onchange="setWire(this.value)"><span class="tbtn">43 AWG</span></label>
-      <label><input type="radio" name="wire" id="w44" value="0.058" onchange="setWire(this.value)"><span class="tbtn">44 AWG</span></label>
-      <label><input type="radio" name="wire" id="w46" value="0.047" onchange="setWire(this.value)"><span class="tbtn">46 AWG</span></label>
-    </div>
-    <input type="number" id="g-wire" step="0.001" min="0.01" max="0.5" placeholder="mm (manuel)"
-           onchange="cmd('geom_wire', this.value)" style="margin-bottom:8px">
-
-    <!-- Résultat calculé + passage courant -->
-    <div class="row">
+  <div class="views">
+    <div class="view show" id="setup">
       <div class="card">
-        <div class="big" id="tpp">—</div>
-        <div class="unit">tours / passage</div>
+        <div class="label">Paramètres machine (modifiables avant Start)</div>
+        <div class="row">
+          <div><div class="label">Sens</div><div class="seg"><label><input type="radio" name="dir" id="r-cw" onchange="cmd('direction','cw')"><span class="pill">CW</span></label><label><input type="radio" name="dir" id="r-ccw" onchange="cmd('direction','ccw')"><span class="pill">CCW</span></label></div></div>
+          <div><div class="label">Mode</div><div class="seg"><label><input type="radio" name="mode" id="m-target" onchange="cmd('freerun','false')"><span class="pill">Cible</span></label><label><input type="radio" name="mode" id="m-free" onchange="cmd('freerun','true')"><span class="pill">FreeRun</span></label></div></div>
+          <div><div class="label">Cible tours</div><input id="ti" type="number" min="100" max="50000" step="100" onchange="cmd('target',this.value)"></div>
+          <div>
+            <div class="label">Offset position initiale (mm)</div>
+            <input id="lat-ofs-input" type="number" min="0" max="50" step="0.1" onchange="cmd('lat_offset',this.value)">
+            <div class="sub" style="margin-top:4px">Modif = rehoming automatique</div>
+          </div>
+          <div><div class="label">Seed</div><input id="w-seed" type="number" min="1" max="4294967295" step="1" onchange="cmd('winding_seed',this.value)"></div>
+        </div>
+      </div>
+
+      <div class="grid g2">
+        <div class="card">
+          <div class="label">Géométrie</div>
+          <div class="grid g2">
+            <div><div class="label">Largeur totale</div><input id="g-total" type="number" step="0.1" onchange="cmd('geom_total',this.value)"></div>
+            <div><div class="label">Marge</div><input id="g-margin" type="number" step="0.1" onchange="cmd('geom_margin',this.value)"></div>
+            <div><div class="label">Tonework bas</div><input id="g-bottom" type="number" step="0.1" onchange="cmd('geom_bottom',this.value)"></div>
+            <div><div class="label">Tonework haut</div><input id="g-top" type="number" step="0.1" onchange="cmd('geom_top',this.value)"></div>
+            <div><div class="label">Butée min trim</div><input id="g-start-trim" type="number" step="0.1" min="-5" max="5" onchange="cmd('geom_start_trim',this.value)"></div>
+            <div><div class="label">Butée max trim</div><input id="g-end-trim" type="number" step="0.1" min="-5" max="5" onchange="cmd('geom_end_trim',this.value)"></div>
+            <div><div class="label">Fil (mm)</div><input id="g-wire" type="number" step="0.001" onchange="cmd('geom_wire',this.value)"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="label">Profil de bobinage</div>
+          <div class="seg seg3" style="margin-bottom:8px"><label><input type="radio" name="wstyle" id="ws-straight" onchange="cmd('winding_style','straight')"><span class="pill">Droit</span></label><label><input type="radio" name="wstyle" id="ws-scatter" onchange="cmd('winding_style','scatter')"><span class="pill">Scatter</span></label><label><input type="radio" name="wstyle" id="ws-human" onchange="cmd('winding_style','human')"><span class="pill">Humain</span></label></div>
+          <div class="label">Scatter <span id="scatter-lbl">1.0</span></div><input id="g-scatter" type="range" min="0.5" max="4" step="0.1" oninput="document.getElementById('scatter-lbl').textContent=parseFloat(this.value).toFixed(1)" onchange="cmd('geom_scatter',this.value)">
+          <div class="label">Offset tours/passe <span id="tpp-ofs-lbl">0</span></div><input id="g-tpp-ofs" type="range" min="-80" max="80" step="1" oninput="document.getElementById('tpp-ofs-lbl').textContent=this.value" onchange="cmd('geom_tpp_ofs',this.value)">
+          <div class="label">Jitter couche <span id="lj">0.10</span></div><input id="w-layer-jitter" type="range" min="0" max="0.45" step="0.01" oninput="document.getElementById('lj').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_layer_jitter',this.value)">
+          <div class="label">Jitter vitesse couche <span id="ls">0.08</span></div><input id="w-layer-speed" type="range" min="0" max="0.45" step="0.01" oninput="document.getElementById('ls').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_layer_speed',this.value)">
+          <div class="label">Jitter traverse humain <span id="ht">0.16</span></div><input id="w-human-traverse" type="range" min="0" max="0.45" step="0.01" oninput="document.getElementById('ht').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_human_traverse',this.value)">
+          <div class="label">Jitter vitesse humain <span id="hs">0.12</span></div><input id="w-human-speed" type="range" min="0" max="0.45" step="0.01" oninput="document.getElementById('hs').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_human_speed',this.value)">
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="grid g3">
+          <div class="kv"><span>Position chariot</span><b id="lat-pos">0.00 mm</b></div>
+          <div class="kv"><span>Fenêtre bobinage</span><b><span id="w-start">0.00</span> → <span id="w-end">0.00</span> mm</b></div>
+          <div class="kv"><span>Tours/passe</span><b id="tpp">0</b></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="view" id="run">
+      <div class="grid g4">
+        <div class="card"><div class="label">RPM</div><div class="val" id="rpm">0</div></div>
+        <div class="card"><div class="label">Hz</div><div class="val" id="spd">0</div></div>
+        <div class="card"><div class="label">Tours</div><div class="val" id="turns">0</div></div>
+        <div class="card"><div class="label">Passe</div><div class="val" id="pass">0</div></div>
       </div>
       <div class="card">
-        <div class="big" id="eff">—</div>
-        <div class="unit">mm utile</div>
+        <div class="kv"><span>Progression</span><b id="pct">0%</b></div>
+        <div class="bar"><div class="fill" id="bar"></div></div>
+      </div>
+      <div class="card grid g2">
+        <div>
+          <div class="kv"><span>Cible</span><b id="tgt">0</b></div>
+          <div class="kv"><span>Position chariot</span><b id="lat-pos-run">0.00 mm</b></div>
+          <div class="kv"><span>Fenêtre</span><b><span id="w-start-run">0.00</span> → <span id="w-end-run">0.00</span> mm</b></div>
+          <div class="kv"><span>tours/passe actif</span><b id="active-tpp">0</b></div>
+        </div>
+        <div>
+          <div class="kv"><span>Scale latérale</span><b id="lat-scale">1.00×</b></div>
+          <div class="kv"><span>Progression couche</span><b id="lat-progress">0%</b></div>
+          <div class="kv"><span>Trim min / max</span><b><span id="w-start-trim-run">0.00</span> / <span id="w-end-trim-run">0.00</span> mm</b></div>
+          <div class="kv"><span>Mode</span><b id="run-mode">Cible</b></div>
+        </div>
       </div>
       <div class="card">
-        <div class="big" id="pass" style="color:#e94560">—</div>
-        <div class="unit">passage LED</div>
+        <div class="label">Correction positions (web/encodeur)</div>
+        <div class="grid g2">
+          <div>
+            <div class="sub" style="margin-bottom:6px">Départ bobinage</div>
+            <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
+              <button class="btn reset" onclick="cmd('geom_start_trim_nudge','-0.05')">−0.05 mm</button>
+              <button class="btn reset" onclick="cmd('geom_start_trim_nudge','0.05')">+0.05 mm</button>
+            </div>
+          </div>
+          <div>
+            <div class="sub" style="margin-bottom:6px">Butée max</div>
+            <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
+              <button class="btn reset" onclick="cmd('geom_end_trim_nudge','-0.05')">−0.05 mm</button>
+              <button class="btn reset" onclick="cmd('geom_end_trim_nudge','0.05')">+0.05 mm</button>
+            </div>
+          </div>
+        </div>
       </div>
-    </div>
-
-    <!-- Facteur scatter -->
-    <div style="margin-top:8px">
-      <div class="sect">Facteur scatter <span id="scatter-lbl" style="color:#4ecca3;font-weight:700">2.0</span>
-        <span style="font-size:.72em;color:#445"> (1.0=dense · 2.0=scatter · 3.0+=lâche)</span>
-      </div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <span style="font-size:.75em;color:#445;white-space:nowrap">1.0</span>
-        <input type="range" id="g-scatter" min="1.0" max="4.0" value="2.0" step="0.1"
-               oninput="scatterSlider(this.value)" onchange="scatterSlider(this.value)"
-               style="flex:1;accent-color:#4ecca3">
-        <span style="font-size:.75em;color:#445;white-space:nowrap">4.0</span>
-        <button class="btn btn-reset" style="flex:0 0 auto;padding:7px 12px;font-size:.78em"
-                onclick="document.getElementById('g-scatter').value=2.0;scatterSlider(2.0)">↺ 2.0</button>
-      </div>
-    </div>
-
-    <!-- Tours/passage : offset slider -->
-    <div style="margin-top:8px">
-      <div class="sect">Ajustement tours/passage <span id="tpp-ofs-lbl" style="color:#4ecca3;font-weight:700">(0)</span></div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <span style="font-size:.75em;color:#445;white-space:nowrap">−80</span>
-        <input type="range" id="g-tpp-ofs" min="-80" max="80" value="0" step="1"
-               oninput="tppSlider(this.value)" onchange="tppSlider(this.value)"
-               style="flex:1;accent-color:#4ecca3">
-        <span style="font-size:.75em;color:#445;white-space:nowrap">+80</span>
-        <button class="btn btn-reset" style="flex:0 0 auto;padding:7px 12px;font-size:.78em"
-                onclick="document.getElementById('g-tpp-ofs').value=0;tppSlider(0)">↺ 0</button>
-      </div>
-      <div style="font-size:.72em;color:#445;margin-top:4px">
-        Calcul : <b id="tpp-calc">—</b> &nbsp;→&nbsp; Effectif : <b id="tpp-eff2">—</b> tours/passage
+      <div class="actions">
+        <button class="btn stop" onclick="cmd('stop')">■ Stop</button>
+        <button class="btn reset" onclick="cmd('reset')">↺ Reset tours</button>
+        <button class="btn reset" onclick="cmd('start')">↺ Réarmer Start</button>
       </div>
     </div>
   </div>
 
-  <!-- Axe latéral : offset homing -->
-  <div>
-    <div class="sect">Offset homing axe latéral (mm) — <span id="lat-ofs-lbl" style="color:#4ecca3;font-weight:700">0.00</span></div>
-    <div style="display:flex;gap:8px;align-items:center">
-      <input type="number" id="lat-ofs-input" value="0.00" min="0" max="50" step="0.1"
-             style="flex:1" onchange="setLatOffset(this.value)">
-      <button class="btn btn-reset" style="flex:0 0 auto;padding:9px 12px;font-size:.85em"
-              onclick="setLatOffset(0)">↺ 0</button>
-    </div>
-    <div style="font-size:.72em;color:#445;margin-top:4px">
-      Déplacement après le homing (persistant NVS). Prend effet au prochain homing.
-    </div>
-  </div>
-
-  <div class="btn-row">
-    <button class="btn btn-stop"  onclick="cmd('stop')">■ Stop urgence</button>
-    <button class="btn btn-reset" onclick="cmd('reset')">↺ Reset tours</button>
-        <button class="btn" style="background:#4a1a6e;color:#e0b0ff" onclick="toggleMusic()">🎵 Adeste Fideles</button>
-  </div>
-
-  <!-- Statut -->
-  <div class="status-bar">
-    <div class="dot" id="dot-ws"></div><span id="lbl-ws">Connexion...</span>
-    &nbsp;·&nbsp;
-    <div class="dot" id="dot-run"></div><span id="lbl-run">—</span>
-  </div>
-</div>
-
-<!-- ── Panel AUTO ────────────────────────────────────────────────────── -->
-<div class="panel hidden" id="panel-auto">
-  <div class="auto-ph">
-    <div class="ico">⚙️</div>
-    <p>Mode automatique non disponible.<br>L'axe latéral de guidage du fil est requis.</p>
+  <div class="actions">
+    <button class="btn start" onclick="cmd('start')">▶ Start</button>
+    <button class="btn stop" onclick="cmd('stop')">■ Stop</button>
+    <button class="btn reset" onclick="cmd('reset')">↺ Reset</button>
   </div>
 </div>
 
 <script>
 let ws;
+const byId = id => document.getElementById(id);
 
-function connect() {
+function cmd(c,v=''){ if(ws && ws.readyState===1) ws.send(JSON.stringify({cmd:c,val:''+v})); }
+function syncInput(id,val){ const el=byId(id); if(el && document.activeElement!==el && val!==undefined) el.value=val; }
+function syncRange(id,val,labelId,fix){ const el=byId(id); if(el && document.activeElement!==el && val!==undefined) el.value=val; if(labelId&&val!==undefined) byId(labelId).textContent=parseFloat(val).toFixed(fix); }
+function setWs(ok){ byId('ws-dot').className='dot '+(ok?'ok':''); byId('ws-lbl').textContent=ok?'Connecté':'Déconnecté'; }
+
+function connect(){
   ws = new WebSocket('ws://' + location.host + '/ws');
-  ws.onopen  = () => setWs(true);
-  ws.onclose = () => { setWs(false); setTimeout(connect, 2000); };
-  ws.onmessage = e => update(JSON.parse(e.data));
+  ws.onopen=()=>setWs(true);
+  ws.onclose=()=>{setWs(false);setTimeout(connect,2000)};
+  ws.onmessage=e=>update(JSON.parse(e.data));
 }
 
-function update(d) {
-  document.getElementById('rpm').textContent   = Math.round(d.rpm);
-  document.getElementById('spd').textContent   = d.hz;
-  document.getElementById('turns').textContent = d.turns;
-  document.getElementById('tgt').textContent   = d.target;
+function update(d){
+  const armed = !!d.startRequested;
+  byId('setup').classList.toggle('show', !armed);
+  byId('run').classList.toggle('show', armed);
+  byId('phase').textContent = armed ? 'Production' : 'Préparation';
 
-  const p = d.target > 0 ? Math.min(100, d.turns / d.target * 100) : 0;
-  document.getElementById('bar').style.width  = p + '%';
-  document.getElementById('pct').textContent  = p.toFixed(1) + '%';
+  byId('rpm').textContent = Math.round(d.rpm||0);
+  byId('spd').textContent = d.hz||0;
+  byId('turns').textContent = d.turns||0;
+  byId('tgt').textContent = d.target||0;
+  byId('pass').textContent = d.pass||0;
+  byId('active-tpp').textContent = d.activeTpp ?? d.tpp ?? 0;
+  byId('lat-scale').textContent = ((d.latScale ?? 1)).toFixed(2) + '×';
+  byId('lat-progress').textContent = Math.round((d.latProgress ?? 0)*100) + '%';
+  byId('run-mode').textContent = d.freerun ? 'FreeRun' : 'Cible';
+  byId('w-start-trim-run').textContent = ((d.wStartTrim ?? 0)).toFixed(2);
+  byId('w-end-trim-run').textContent = ((d.wEndTrim ?? 0)).toFixed(2);
 
-  // Direction
-  document.getElementById('r-cw').checked  =  d.cw;
-  document.getElementById('r-ccw').checked = !d.cw;
+  const pos = parseFloat(d.latPos ?? 0);
+  byId('lat-pos').textContent = pos.toFixed(2) + ' mm';
+  byId('lat-pos-run').textContent = pos.toFixed(2) + ' mm';
+  byId('w-start').textContent = parseFloat(d.wStart ?? 0).toFixed(2);
+  byId('w-end').textContent = parseFloat(d.wEnd ?? 0).toFixed(2);
+  byId('w-start-run').textContent = parseFloat(d.wStart ?? 0).toFixed(2);
+  byId('w-end-run').textContent = parseFloat(d.wEnd ?? 0).toFixed(2);
+  byId('tpp').textContent = d.tpp ?? 0;
 
-  // Mode arrêt
-  document.getElementById('r-target').checked = !d.freerun;
-  document.getElementById('r-free').checked   =  d.freerun;
-  const ts = document.getElementById('target-section');
-  ts.style.opacity  = d.freerun ? '0.3' : '1';
-  document.getElementById('ti').disabled = d.freerun;
+  const pct = (d.target>0) ? Math.min(100,(d.turns/d.target)*100) : 0;
+  byId('bar').style.width = pct.toFixed(1)+'%';
+  byId('pct').textContent = pct.toFixed(1)+'%';
 
-  // État moteur
-  const dotRun = document.getElementById('dot-run');
-  const lblRun = document.getElementById('lbl-run');
-  if (d.running) {
-    dotRun.className = 'dot green';
-    lblRun.textContent = '▶ En marche';
-  } else if (d.enabled) {
-    dotRun.className = 'dot orange';
-    lblRun.textContent = '⏸ Tournez le potentiomètre pour démarrer';
-  } else {
-    dotRun.className = 'dot red';
-    lblRun.textContent = '■ Arrêté — ramenez le pot à 0 pour redémarrer';
-  }
+  byId('r-cw').checked = !!d.cw;
+  byId('r-ccw').checked = !d.cw;
+  byId('m-target').checked = !d.freerun;
+  byId('m-free').checked = !!d.freerun;
+  byId('ti').disabled = !!d.freerun;
+  if(d.wStyle){ byId('ws-straight').checked=d.wStyle==='straight'; byId('ws-scatter').checked=d.wStyle==='scatter'; byId('ws-human').checked=d.wStyle==='human'; }
 
-  // Géométrie & LED
-  if (d.tpp !== undefined) {
-    document.getElementById('tpp').textContent  = d.tpp;
-    document.getElementById('eff').textContent  = d.eff.toFixed(1);
-    document.getElementById('pass').textContent = d.pass >= 0 ? d.pass : '—';
-    // Offset slider sync
-    document.getElementById('tpp-calc').textContent = d.tppCalc;
-    document.getElementById('tpp-eff2').textContent = d.tpp;
-    const ofsEl = document.getElementById('tpp-ofs-lbl');
-    const ofs = d.tppOfs || 0;
-    ofsEl.textContent = '(' + (ofs >= 0 ? '+' : '') + ofs + ')';
-    ofsEl.style.color = ofs === 0 ? '#4ecca3' : '#e94560';
-    const slider = document.getElementById('g-tpp-ofs');
-    if (document.activeElement !== slider) slider.value = ofs;
-    // Scatter factor sync
-    if (d.scatter !== undefined) {
-      const scLbl = document.getElementById('scatter-lbl');
-      scLbl.textContent = parseFloat(d.scatter).toFixed(1);
-      const scSlider = document.getElementById('g-scatter');
-      if (document.activeElement !== scSlider) scSlider.value = d.scatter;
-    }
-    // Sync inputs (uniquement si pas focusé pour ne pas perturber la saisie)
-    syncInput('g-total',  d.gt);
-    syncInput('g-bottom', d.gb);
-    syncInput('g-top',    d.gtp);
-    syncInput('g-margin', d.gm);
-    syncInput('g-wire',   d.gw);
-    // Sélection radio AWG
-    const awgMap = {'0.071':'w42','0.064':'w43','0.058':'w44','0.047':'w46'};
-    const key = d.gw.toFixed(3);
-    Object.entries(awgMap).forEach(([v, id]) => {
-      document.getElementById(id).checked = (v === key);
-    });
-  }
-  // Offset homing latéral
-  if (d.latOfs !== undefined) {
-    document.getElementById('lat-ofs-lbl').textContent = parseFloat(d.latOfs).toFixed(2);
-    const el = document.getElementById('lat-ofs-input');
-    if (document.activeElement !== el) el.value = parseFloat(d.latOfs).toFixed(2);
-  }
-}
+  syncInput('ti', d.target);
+  syncInput('lat-ofs-input', d.latOfs);
+  syncInput('w-seed', d.seed);
+  syncInput('g-total', d.gt); syncInput('g-margin', d.gm); syncInput('g-bottom', d.gb); syncInput('g-top', d.gtp);
+  syncInput('g-start-trim', d.wStartTrim);
+  syncInput('g-end-trim', d.wEndTrim); syncInput('g-wire', d.gw);
+  syncRange('g-scatter', d.scatter, 'scatter-lbl', 1);
+  if(byId('g-tpp-ofs') && document.activeElement!==byId('g-tpp-ofs') && d.tppOfs!==undefined) byId('g-tpp-ofs').value=d.tppOfs;
+  byId('tpp-ofs-lbl').textContent = d.tppOfs ?? 0;
+  syncRange('w-layer-jitter', d.layerJitter, 'lj', 2);
+  syncRange('w-layer-speed', d.layerSpeed, 'ls', 2);
+  syncRange('w-human-traverse', d.humanTraverse, 'ht', 2);
+  syncRange('w-human-speed', d.humanSpeed, 'hs', 2);
 
-function syncInput(id, val) {
-  const el = document.getElementById(id);
-  if (el && document.activeElement !== el) el.value = val;
-}
-
-function setWs(ok) {
-  document.getElementById('dot-ws').className = 'dot ' + (ok ? 'green' : 'red');
-  document.getElementById('lbl-ws').textContent = ok ? 'Connecté' : 'Déconnecté — reconnexion...';
-}
-
-function cmd(c, v = '') {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify({cmd: c, val: '' + v}));
-}
-
-function setFreerun(f) {
-  cmd('freerun', f ? 'true' : 'false');
-}
-
-function setPreset(idx) {
-  cmd('geom_preset', idx);
-}
-
-function setWire(val) {
-  document.getElementById('g-wire').value = val;
-  cmd('geom_wire', val);
-}
-
-function tppSlider(v) {
-  v = parseInt(v) || 0;
-  const lbl = document.getElementById('tpp-ofs-lbl');
-  lbl.textContent = '(' + (v >= 0 ? '+' : '') + v + ')';
-  lbl.style.color = v === 0 ? '#4ecca3' : '#e94560';
-  cmd('geom_tpp_ofs', v);
-}
-
-function scatterSlider(v) {
-  v = parseFloat(v).toFixed(1);
-  document.getElementById('scatter-lbl').textContent = v;
-  cmd('geom_scatter', v);
-}
-
-function setLatOffset(v) {
-  v = Math.max(0, parseFloat(v) || 0);
-  document.getElementById('lat-ofs-input').value = v.toFixed(2);
-  document.getElementById('lat-ofs-lbl').textContent = v.toFixed(2);
-  cmd('lat_offset', v.toFixed(2));
-}
-
-let musicOn = false;
-function toggleMusic() {
-  musicOn = !musicOn;
-  cmd(musicOn ? 'music' : 'music_stop');
-}
-
-function switchTab(t) {
-  if (t === 'auto') return; // Non disponible
-  document.getElementById('panel-manual').classList.toggle('hidden', t !== 'manual');
-  document.getElementById('panel-auto').classList.toggle('hidden',   t !== 'auto');
-  document.getElementById('tab-manual').classList.toggle('active',   t === 'manual');
-  document.getElementById('tab-auto').classList.toggle('active',     t === 'auto');
+  const atZero = Math.abs(pos) < 0.03;
+  const status = byId('status-line');
+  if (d.running) status.textContent = '▶ Bobinage en cours';
+  else if (d.firstPause) status.textContent = '⏸ Pause vérification butée — remonter le pot pour reprendre';
+  else if (d.startRequested && !d.carriageReady) status.textContent = '↔ Positionnement chariot vers le début de fenêtre';
+  else if (d.startRequested && d.carriageReady) status.textContent = '⏸ Prêt: monter le potentiomètre pour démarrer';
+  else if (!atZero) status.textContent = 'Ramener le chariot en position 0 puis appuyer sur Start';
+  else status.textContent = 'Prêt: paramètres validés, appuyer sur Start';
 }
 
 connect();

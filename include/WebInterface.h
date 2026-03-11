@@ -17,6 +17,9 @@ struct WinderStatus {
     long     targetTurns;     // Target turn count for auto-stop
     bool     running;         // True while the motor is moving
     bool     motorEnabled;    // False after stop — pot must return to 0 to re-enable
+    bool     startRequested;  // Explicit start command armed from UI
+    bool     carriageReady;   // Lateral carriage positioned at winding start
+    bool     firstReversalPaused; // Pause de validation à la première inversion
     bool     freerun;         // True = no auto-stop (free-run mode)
     bool     directionCW;     // True = clockwise, false = counter-clockwise
     bool     autoMode;        // True = auto traverse mode (future)
@@ -26,10 +29,26 @@ struct WinderStatus {
     long     turnsPerPassOffset; // Offset applied to auto-calc
     float    scatterFactor;    // Wire spacing factor (1.0=dense, 2.0=scatter)
     int      currentPass;     // Current pass number (0-based)
+    long     activeTurnsPerPass; // Turns/pass currently applied after profile modulation
+    float    activeSpeedScale; // Lateral speed multiplier from current winding profile
+    float    latProgress;     // 0..1 position within the current traverse
+    float    latPositionMm;   // Position latérale absolue
+    float    windingStartMm;  // Début réel de la fenêtre de bobinage
+    float    windingEndMm;    // Fin réelle de la fenêtre de bobinage
+    float    windingStartTrimMm; // Ajustement manuel de butée min
+    float    windingEndTrimMm; // Ajustement manuel de butée max
     float    effectiveWidth_mm; // Usable winding width after flanges and margins
     float    geomTotal, geomBottom, geomTop, geomMargin, geomWire; // Raw geometry values
     float    latOffset;   // Offset home axe latéral en mm (depuis NVS)
+    const char* windingStyle; // straight / scatter / human
+    uint32_t seed;
+    float    layerJitterPct;
+    float    layerSpeedPct;
+    float    humanTraversePct;
+    float    humanSpeedPct;
 };
+
+using RecipeJsonProvider = std::function<String(void)>;
 
 // ── WebInterface ─────────────────────────────────────────────────────────────
 // Manages WiFi connection, HTTP server (serves embedded HTML) and WebSocket.
@@ -47,6 +66,7 @@ public:
 
     // Register the callback that will be invoked for each incoming WebSocket command.
     void   setCommandCallback(CommandCallback cb);
+    void   setRecipeProvider(RecipeJsonProvider cb);
 
     // Returns the ESP32 local IP as a string (or "N/A" if not connected).
     String getIP()         const;
@@ -58,6 +78,7 @@ private:
     AsyncWebServer  _server;    // ESPAsyncWebServer instance on WEB_PORT
     AsyncWebSocket  _ws;        // WebSocket handler mounted at /ws
     CommandCallback _callback;  // Registered command handler (set by WinderApp)
+    RecipeJsonProvider _recipeProvider; // Download current recipe as JSON
     bool            _wifiOk = false;  // Set to true once WiFi is connected
 
     // Internal WebSocket event dispatcher; routes DATA frames to _callback.
