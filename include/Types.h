@@ -41,7 +41,6 @@ inline const char* windingStateName(WindingState s) {
         default:                           return "UNKNOWN";
     }
 }
-}
 
 // ── WinderStatus ──────────────────────────────────────────────────────────────
 // Full machine state snapshot sent to all connected WebSocket clients

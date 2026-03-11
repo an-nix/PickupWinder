@@ -63,6 +63,11 @@ public:
     void parkAtZero() { prepareStartPosition(0.0f); }
     bool isAtZero() const { return _state == LatState::HOMED && _stepper && abs(_stepper->getCurrentPosition()) <= MICROSTEPPING; }
     bool isBusy() const { return _stepper && _stepper->isRunning(); }
+
+    // Déplacement relatif depuis la position courante (ou depuis la cible en cours).
+    // Fonctionne en état HOMED ou POSITIONING — met à jour la cible à la volée.
+    // Utilisé par l'encodeur pour contrôle direct du chariot.
+    void jog(float deltaMm);
     void armPauseOnNextReversal() { _pauseOnNextReversal = true; _pausedAtReversal = false; }
     void armStopAtNextHigh() { _stopOnNextHigh = true; _pausedAtReversal = false; }
     void armStopAtNextLow()  { _stopOnNextLow  = true; _pausedAtReversal = false; }

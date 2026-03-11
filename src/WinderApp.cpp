@@ -37,11 +37,11 @@ void WinderApp::tick(uint32_t potHz) {
 // Every _toXxx() is self-contained: sets _state, adjusts hardware, clears flags.
 
 void WinderApp::_toIdle() {
-    _state          = WindingState::IDLE;
-    _canStart     = false;
-    _pendingDisable = true;
-    _lowVerified    = false;
-    _highVerified   = false;
+    _state                 = WindingState::IDLE;
+    _canStart              = false;
+    _pendingDisable        = true;
+    _lowVerified           = false;
+    _highVerified          = false;
     _stepper.stop();
     _lateral.stopWinding();
     _lateral.parkAtZero();
@@ -53,8 +53,23 @@ void WinderApp::_toIdle() {
 }
 
 void WinderApp::_toVerifyLow() {
+    const bool fromWinding = (_state == WindingState::WINDING || _state == WindingState::PAUSED);
+    if (fromWinding) {
+        // During an active session: stop motor immediately, move carriage to low
+        // bound, stay in PAUSED. Pot →0 then ↑ resumes winding from that position.
+        _state          = WindingState::PAUSED;
+        _canStart       = false;
+        _pendingDisable = false;  // forceStop already cuts the driver
+        _stepper.forceStop();
+        _lateral.stopWinding();
+        _lateral.prepareStartPosition(_windingStartMm());
+        Diag::infof("[VERIFY_LOW] Quick check depuis bobinage — chariot → %.2f mm (butée basse)",
+                _windingStartMm());
+        return;
+    }
+    // Normal startup flow.
     _state          = WindingState::VERIFY_LOW;
-    _canStart     = false;
+    _canStart       = false;
     _pendingDisable = true;
     _stepper.stop();
     _lateral.stopWinding();
@@ -64,8 +79,24 @@ void WinderApp::_toVerifyLow() {
 }
 
 void WinderApp::_toVerifyHigh() {
+    const bool fromWinding = (_state == WindingState::WINDING || _state == WindingState::PAUSED);
+    if (fromWinding) {
+        // During an active session: stop motor immediately, move carriage to high
+        // bound, stay in PAUSED. Pot →0 then ↑ resumes winding from that position.
+        _state          = WindingState::PAUSED;
+        _canStart       = false;
+        _pendingDisable = false;  // forceStop already cuts the driver
+        _stepper.forceStop();
+        _lateral.stopWinding();
+        _lateral.prepareStartPosition(_windingEndMm());
+        Diag::infof("[VERIFY_HIGH] Quick check depuis bobinage — chariot → %.2f mm (butée haute)",
+                _windingEndMm());
+        return;
+    }
+    // Auto-transition from VERIFY_LOW or normal operator command: go to VERIFY_HIGH.
+    // Preserve _lowVerified if we're coming from VERIFY_LOW auto-transition.
     _state          = WindingState::VERIFY_HIGH;
-    _canStart     = false;
+    _canStart       = false;
     _pendingDisable = true;
     _stepper.stop();
     _lateral.stopWinding();
@@ -78,7 +109,9 @@ void WinderApp::_toWinding() {
     _state          = WindingState::WINDING;
     _canStart     = false;
     _pendingDisable = false;
-    _lateral.prepareStartPosition(_windingStartMm());
+    // Do NOT reposition the carriage here. After verification the carriage is
+    // already at the high bound (VERIFY_HIGH). startWinding() will choose the
+    // correct initial direction based on the current position.
     Diag::infof("[WINDING] Both bounds verified -- %.2f -> %.2f mm, waiting for pot",
             _windingStartMm(), _windingEndMm());
 }
@@ -103,12 +136,24 @@ void WinderApp::_toTargetReached() {
 }
 
 void WinderApp::_handleLateralEvents() {
-    // Advance the traverse axis state machine once per loop iteration.
-    // Reversal detection, softstart ramps and position tracking all live inside
-    // LateralController::update(). WinderApp reacts here only when a lateral
-    // event must trigger an FSM transition; in the current design all transitions
-    // are operator-driven (verify + confirm), so no extra logic is needed.
     _lateral.update();
+
+    // WINDING: the operator armed stop_next_high or stop_next_low.
+    // The lateral stopped at the bound (_pausedAtReversal = true, state = HOMED).
+    // Transition to PAUSED so the pot must return to 0 before winding resumes.
+    if (_state == WindingState::WINDING && _lateral.consumePausedAtReversal()) {
+        _toPaused();
+        Diag::info("[WINDING] Butée atteinte (stop armé) — passage en PAUSE.");
+        return;
+    }
+
+    // VERIFY_LOW (normal startup flow): when the carriage reaches the high
+    // bound, mark low as confirmed and auto-transition to VERIFY_HIGH.
+    if (_state == WindingState::VERIFY_LOW && _lateral.consumePausedAtReversal()) {
+        _lowVerified = true;
+        _toVerifyHigh();
+        Diag::info("[VERIFY_LOW] Butée haute atteinte — passage en VERIFY_HIGH (confirmez pour démarrer).");
+    }
 }
 
 
@@ -139,6 +184,14 @@ void WinderApp::_handlePotCycle(uint32_t hz) {
             float pos = (_state == WindingState::VERIFY_LOW)
                         ? _windingStartMm() : _windingEndMm();
             _lateral.prepareStartPosition(pos);
+        }
+        // VERIFY_HIGH after auto-transition from VERIFY_LOW (_lowVerified is true):
+        // both bounds have been seen. Raising the pot starts winding directly.
+        if (_state == WindingState::VERIFY_HIGH && _lowVerified && hz > 0 && _canStart) {
+            _highVerified = true;
+            _toWinding();
+            _runWindingAtHz(hz);
+            break;
         }
         if (hz > 0 && _canStart) {
             _runWindingAtHz(hz);         // resumes from current position at verify speed
@@ -239,15 +292,36 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
         }
         // VERIFY_LOW / VERIFY_HIGH: motor spins at capped speed but _state is
         // preserved so the operator can still issue 'confirm' or 'verify_high'.
+        //
+        // VERIFY_HIGH specifically: the carriage is already at the high bound.
+        // Do NOT start lateral traversal — the carriage must stay on the high
+        // bound so the operator can visually confirm the end position.
+        // VERIFY_LOW starts traversal normally (low → high) so the operator
+        // sees the full forward pass from the start bound.
 
         _stepper.start(forward);
-        _lateral.startWinding(hz, _activePlan.turnsPerPass,
-                              _windingStartMm(), _windingEndMm(),
-                              _activePlan.speedScale);
+        if (_state == WindingState::VERIFY_LOW) {
+            // Arm stop at high bound: lateral will halt at the end of this pass
+            // instead of reversing, allowing the operator to confirm the position.
+            _lateral.armStopAtNextHigh();
+            _lateral.startWinding(hz, _activePlan.turnsPerPass,
+                                  _windingStartMm(), _windingEndMm(),
+                                  _activePlan.speedScale);
+        } else if (_state != WindingState::VERIFY_HIGH) {
+            _lateral.startWinding(hz, _activePlan.turnsPerPass,
+                                  _windingStartMm(), _windingEndMm(),
+                                  _activePlan.speedScale);
+        }
         return;
     }
 
     // ── Motor already running: update traverse parameters ────────────────────
+    // VERIFY_HIGH: carriage stays fixed at the high bound — skip lateral cmds.
+    if (_state == WindingState::VERIFY_HIGH) return;
+    // VERIFY_LOW: keep stop-at-high-bound arm active every tick.
+    if (_state == WindingState::VERIFY_LOW)
+        _lateral.armStopAtNextHigh();
+
     // If the lateral is in HOMED state it means it completed a positioning move
     // and is waiting for a new winding command — call startWinding() to enter
     // closed-loop traverse. Otherwise the traverse is already active; call
@@ -604,6 +678,28 @@ bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
 //   2. Geometry commands (always editable — live feedback is useful mid-session)
 //   3. Turn target (always editable — operator may increase target while winding)
 //   4. All other parameters (freerun, direction, pattern…) — locked during session
+void WinderApp::handleEncoderDelta(int32_t delta) {
+    if (delta == 0) return;
+    // En mode vérification : l'encodeur contrôle directement le chariot.
+    // jog() met à jour la cible même si le chariot est déjà en mouvement.
+    // Le trim est mis à jour simultanément pour mémoriser la position en NVS.
+    if (_state == WindingState::VERIFY_LOW) {
+        float step = delta * ENC_STEP_MM;
+        _lateral.jog(step);
+        _geom.windingStartTrim_mm = constrain(_geom.windingStartTrim_mm + step, -5.0f, 5.0f);
+        _saveRecipe();
+        Diag::infof("[Encoder] Butée basse: %.2f mm (trim %.2f)",
+            _windingStartMm(), _geom.windingStartTrim_mm);
+    } else if (_state == WindingState::VERIFY_HIGH) {
+        float step = delta * ENC_STEP_MM;
+        _lateral.jog(step);
+        _geom.windingEndTrim_mm = constrain(_geom.windingEndTrim_mm + step, -5.0f, 5.0f);
+        _saveRecipe();
+        Diag::infof("[Encoder] Butée haute: %.2f mm (trim %.2f)",
+            _windingEndMm(), _geom.windingEndTrim_mm);
+    }
+}
+
 void WinderApp::handleCommand(const String& cmd, const String& value) {
     if (_handleImmediateCommand(cmd, value)) return;
     if (_handleGeometryCommand(cmd, value))  return;

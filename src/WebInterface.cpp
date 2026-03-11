@@ -81,7 +81,7 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         s.motorEnabled ? "true" : "false",
         s.startRequested ? "true" : "false",
         s.carriageReady  ? "true" : "false",
-        s.firstReversalPaused ? "true" : "false",
+        "false",
         s.freerun      ? "true" : "false",
         s.directionCW  ? "true" : "false",
         s.autoMode     ? "true" : "false",

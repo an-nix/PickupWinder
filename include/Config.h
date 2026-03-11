@@ -17,9 +17,9 @@
 // ── Encodeur rotatif ─────────────────────────────────────
 // Interrupt-capable, pull-up interne dispo (INPUT_PULLUP).
 // Déplacé sur 18/19 — 22/23 utilisés par le capteur de position latérale.
-#define ENC1_CLK            18      // Signal A
-#define ENC1_DT             19      // Signal B
-
+#define ENC1_CLK            19      // Signal A
+#define ENC1_DT             18      // Signal B// Déplacement de la butée par cran d'encodeur (mm) pendant la phase de vérification.
+#define ENC_STEP_MM         0.1f
 // ── Capteur position initiale axe latéral ────────────────
 // Le capteur est connecté à la masse, entrées en INPUT_PULLUP.
 // Contact fermé (pin à GND) = LOW. Contact ouvert (pull-up) = HIGH.
@@ -126,4 +126,4 @@
 // Vitesse max pendant la passe de vérification de la première inversion.
 // Le moteur est limité à cette vitesse pour que l'arrêt soit quasi-synchrone
 // avec le chariot latéral (décel rapide depuis une vitesse faible).
-#define VERIFY_SPEED_HZ_MAX      (100UL * STEPS_PER_REV / 60)  // ~100 RPM
+#define VERIFY_SPEED_HZ_MAX      (600UL * STEPS_PER_REV / 60)  // ~100 RPM
