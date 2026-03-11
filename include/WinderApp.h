@@ -87,7 +87,7 @@ private:
     void _saveRecipe();
     bool _parametersLocked() const;
 
-    void _refreshStartPositionIfArmed();
+    void _refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged);
     bool _handleImmediateCommand(const String& cmd, const String& value);
     bool _handleGeometryCommand(const String& cmd, const String& value);
     bool _handlePatternCommand(const String& cmd, const String& value);

@@ -140,6 +140,20 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
                  (uint32_t)((float)hz * LAT_REVERSAL_SLOWDOWN));
     }
 
+    // Mode "arrêt à la prochaine butée" : ralentissement progressif à
+    // l'approche de la butée ciblée pour un arrêt doux.
+    if (_lateral.hasStopAtNextBoundArmed()) {
+        float progress = _lateral.getTraversalProgress(); // 0..1 dans le sens courant
+        const float zoneStart = 0.80f;
+        const float floorFactor = 0.30f;
+        if (progress >= zoneStart) {
+            float t = (progress - zoneStart) / (1.0f - zoneStart);
+            t = constrain(t, 0.0f, 1.0f);
+            float factor = 1.0f - (1.0f - floorFactor) * t;
+            hz = max((uint32_t)SPEED_HZ_MIN, (uint32_t)((float)hz * factor));
+        }
+    }
+
     _stepper.setSpeedHz(hz);
     if (!_stepper.isRunning()) {
         bool forward = (_direction == Direction::CW) != (bool)WINDING_MOTOR_INVERTED;
@@ -176,8 +190,11 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
 void WinderApp::_checkAutoStop() {
     if (_motorEnabled && !_freerun && _stepper.isRunning() && _stepper.getTurns() >= _targetTurns) {
         _targetReached = true;
-        _stop();
-        Serial.printf("✓ Winding complete! %ld turns done.\n", _stepper.getTurns());
+        // Fin de cible: on met en pause sur place (pas de retour à 0),
+        // l'opérateur peut augmenter la cible et reprendre.
+        _pause();
+        Serial.printf("✓ Cible atteinte (%ld tours). En pause sur place: ajuste la cible ou clique Stop.\n",
+                      _stepper.getTurns());
     }
 }
 
@@ -270,6 +287,7 @@ void WinderApp::_stop() {
     // calling start() while the motor is still decelerating → conflict/noise.
     _potWasZero     = false;
     _startRequested        = false;
+    _targetReached         = false;
     _pauseOnFirstReversal  = false;
     _pausedForVerification = false;
     _midWindingPaused      = false;
@@ -283,8 +301,10 @@ void WinderApp::_stop() {
     // Arrêter le guide-fil proprement (décélération douce, retour à HOMED).
     _lateral.stopWinding();
     _lateral.parkAtZero();
+    // Stop explicite = fin de bobinage courant : remise à zéro des variables de cycle.
+    _stepper.resetTurns();
     _planner.reset();
-    _activePlan = _planner.getPlan(_stepper.getTurns(), 0.0f);
+    _activePlan = _planner.getPlan(0, 0.0f);
     _led.reset();
     Serial.println("■ Stopped — chariot retour position 0");
 }
@@ -294,16 +314,23 @@ bool WinderApp::_parametersLocked() const {
         || _pausedForVerification || _midWindingPaused;
 }
 
-void WinderApp::_refreshStartPositionIfArmed() {
-    // Ne JAMAIS recaler le chariot pendant une pause :
-    // pause = reprise depuis position courante, sans retour à la position initiale.
-    if (_startRequested
-        && !_midWindingPaused
-        && !_resumeFromCurrentPos
-        && !_stepper.isRunning()
-        && _lateral.getState() == LatState::HOMED
-        && !_lateral.isBusy()) {
-        _lateral.prepareStartPosition(_windingStartMm());
+void WinderApp::_refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged) {
+    if (_stepper.isRunning()) return; // En bobinage réel, prise en compte via updateWinding().
+    if (_lateral.getState() != LatState::HOMED || _lateral.isBusy()) return;
+
+    // Phase de démarrage en pause sur butée haute (pause auto à la 1re inversion).
+    if (_pausedForVerification) {
+        if (endBoundChanged) {
+            _lateral.prepareStartPosition(_windingEndMm());
+        }
+        return;
+    }
+
+    // Phase de démarrage armée / pause début : rester sur la butée basse (start).
+    if (_startRequested || _midWindingPaused || _resumeFromCurrentPos) {
+        if (startBoundChanged) {
+            _lateral.prepareStartPosition(_windingStartMm());
+        }
     }
 }
 
@@ -350,19 +377,32 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         return true;
     }
 
+    if (cmd == "stop_next_high") {
+        _lateral.armStopAtNextHigh();
+        Serial.println("[Mode] Arrêt armé sur prochaine butée haute.");
+        return true;
+    }
+
+    if (cmd == "stop_next_low") {
+        _lateral.armStopAtNextLow();
+        Serial.println("[Mode] Arrêt armé sur prochaine butée basse.");
+        return true;
+    }
+
     return false;
 }
 
 bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
     if (cmd == "geom_start_trim") {
         _geom.windingStartTrim_mm = constrain(value.toFloat(), -5.0f, 5.0f);
-        _refreshStartPositionIfArmed();
+        _refreshCarriageForGeometryChange(true, false);
         _saveRecipe();
         return true;
     }
 
     if (cmd == "geom_end_trim") {
         _geom.windingEndTrim_mm = constrain(value.toFloat(), -5.0f, 5.0f);
+        _refreshCarriageForGeometryChange(false, true);
         _saveRecipe();
         return true;
     }
@@ -370,7 +410,7 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
     if (cmd == "geom_start_trim_nudge") {
         float delta = constrain(value.toFloat(), -1.0f, 1.0f);
         _geom.windingStartTrim_mm = constrain(_geom.windingStartTrim_mm + delta, -5.0f, 5.0f);
-        _refreshStartPositionIfArmed();
+        _refreshCarriageForGeometryChange(true, false);
         _saveRecipe();
         return true;
     }
@@ -378,6 +418,7 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
     if (cmd == "geom_end_trim_nudge") {
         float delta = constrain(value.toFloat(), -1.0f, 1.0f);
         _geom.windingEndTrim_mm = constrain(_geom.windingEndTrim_mm + delta, -5.0f, 5.0f);
+        _refreshCarriageForGeometryChange(false, true);
         _saveRecipe();
         return true;
     }
@@ -385,17 +426,17 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
     if (cmd == "geom_preset") {
         uint8_t idx = (uint8_t)value.toInt();
         _geom.applyPreset(idx);
-        _refreshStartPositionIfArmed();
+        _refreshCarriageForGeometryChange(true, true);
         Serial.printf("Bobbin preset: %s — %ld turns/pass\n",
                       BOBBIN_PRESETS[idx].name, _geom.turnsPerPass());
         _saveRecipe();
         return true;
     }
 
-    if (cmd == "geom_total")  { _geom.totalWidth_mm   = value.toFloat(); _refreshStartPositionIfArmed(); _saveRecipe(); return true; }
-    if (cmd == "geom_bottom") { _geom.flangeBottom_mm = value.toFloat(); _refreshStartPositionIfArmed(); _saveRecipe(); return true; }
+    if (cmd == "geom_total")  { _geom.totalWidth_mm   = value.toFloat(); _refreshCarriageForGeometryChange(true, true); _saveRecipe(); return true; }
+    if (cmd == "geom_bottom") { _geom.flangeBottom_mm = value.toFloat(); _refreshCarriageForGeometryChange(true, false); _saveRecipe(); return true; }
     if (cmd == "geom_top")    { _geom.flangeTop_mm    = value.toFloat(); _saveRecipe(); return true; }
-    if (cmd == "geom_margin") { _geom.margin_mm       = value.toFloat(); _refreshStartPositionIfArmed(); _saveRecipe(); return true; }
+    if (cmd == "geom_margin") { _geom.margin_mm       = value.toFloat(); _refreshCarriageForGeometryChange(true, true); _saveRecipe(); return true; }
 
     if (cmd == "geom_wire") {
         _geom.wireDiameter_mm = value.toFloat();
@@ -481,18 +522,23 @@ void WinderApp::_handleCommand(const String& cmd, const String& value) {
     if (_handleImmediateCommand(cmd, value)) return;
     if (_handleGeometryCommand(cmd, value)) return;
 
-    if (_parametersLocked()) {
-        Serial.printf("[Lock] Paramètre ignoré pendant le bobinage: %s\n", cmd.c_str());
-        return;
-    }
-
+    // La cible doit être modifiable à la volée, même en bobinage/pause.
     if (cmd == "target") {
         long t = value.toInt();
         if (t > 0) {
             _targetTurns = t;
+            if (_targetReached && t > _stepper.getTurns()) {
+                _targetReached = false;
+                Serial.println("▶ Cible augmentée — reprise possible");
+            }
             Serial.printf("Target: %ld turns\n", t);
             _saveRecipe();
         }
+        return;
+    }
+
+    if (_parametersLocked()) {
+        Serial.printf("[Lock] Paramètre ignoré pendant le bobinage: %s\n", cmd.c_str());
         return;
     }
 
