@@ -76,7 +76,8 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         "\"gt\":%.2f,\"gb\":%.2f,\"gtp\":%.2f,\"gm\":%.2f,\"gw\":%.4f,"
         "\"latOfs\":%.2f,\"wStyle\":\"%s\",\"seed\":%lu,"
         "\"layerJitter\":%.3f,\"layerSpeed\":%.3f,\"humanTraverse\":%.3f,\"humanSpeed\":%.3f,"
-        "\"manualMode\":%s,\"rodageMode\":%s,\"rodagePass\":%d,\"rodagePasses\":%d,\"rodageDist\":%.1f}",
+        "\"manualMode\":%s,\"rodageMode\":%s,\"rodagePass\":%d,\"rodagePasses\":%d,\"rodageDist\":%.1f,"
+        "\"endPos\":%d,\"endPosTurns\":%d}",
         s.rpm, s.speedHz, s.turns, s.targetTurns,
         s.running      ? "true" : "false",
         s.motorEnabled ? "true" : "false",
@@ -94,7 +95,8 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         s.layerJitterPct, s.layerSpeedPct, s.humanTraversePct, s.humanSpeedPct,
         s.manualMode ? "true" : "false",
         s.rodageMode ? "true" : "false",
-        s.rodagePassDone, s.rodagePasses, s.rodageDistMm);
+        s.rodagePassDone, s.rodagePasses, s.rodageDistMm,
+        s.endPos, s.endPosTurns);
     // Broadcast to all connected WebSocket clients.
     _ws.textAll(buf);
 }

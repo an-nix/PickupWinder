@@ -40,6 +40,8 @@ String WindingRecipeStore::toJson(const WindingRecipe& recipe) const {
 	doc["humanTraversePct"] = recipe.humanTraversePct;
 	doc["humanSpeedPct"] = recipe.humanSpeedPct;
 	doc["latOffsetMm"] = recipe.latOffsetMm;
+	doc["endPos"] = windingEndPosKey(recipe.endPos);
+	doc["endPosTurns"] = recipe.endPosTurns;
 
 	JsonObject geom = doc["geometry"].to<JsonObject>();
 	geom["totalWidthMm"] = recipe.geometry.totalWidth_mm;
@@ -73,6 +75,8 @@ bool WindingRecipeStore::fromJson(const String& json, WindingRecipe& recipe) con
 	recipe.humanTraversePct = doc["humanTraversePct"] | WINDING_HUMAN_TRAVERSE_JITTER_DEFAULT;
 	recipe.humanSpeedPct    = doc["humanSpeedPct"] | WINDING_HUMAN_SPEED_JITTER_DEFAULT;
 	recipe.latOffsetMm      = doc["latOffsetMm"] | LAT_HOME_OFFSET_DEFAULT_MM;
+	recipe.endPos           = windingEndPosFromString(String((const char*)(doc["endPos"] | "none")));
+	recipe.endPosTurns      = constrain((int)(doc["endPosTurns"] | 3), 1, 20);
 
 	JsonObject geom = doc["geometry"].as<JsonObject>();
 	recipe.geometry.totalWidth_mm     = geom["totalWidthMm"] | 17.0f;

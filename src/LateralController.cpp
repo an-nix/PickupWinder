@@ -230,16 +230,35 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
             }
 
+            // Move the carriage toward an absolute target. During the final
+            // winding phase this method may be called repeatedly with the same
+            // target but a different speed; therefore both HOMED and POSITIONING
+            // states are accepted so an in-flight move can be retimed without
+            // changing the target or forcing a return to zero.
             void LateralController::prepareStartPosition(float startMm, uint32_t speedHz) {
-                if (_state != LatState::HOMED) return;
+                if (_state != LatState::HOMED && _state != LatState::POSITIONING) return;
+
+                const bool wasPositioning = (_state == LatState::POSITIONING);
+                const int32_t prevTarget = _latStartSteps;
                 _setTraverseBounds(startMm, startMm);
-                if (_isAtStartPosition()) return;
+
+                if (_isAtStartPosition()) {
+                    if (_stepper->isRunning()) {
+                        _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
+                    }
+                    _state = LatState::HOMED;
+                    return;
+                }
+
                 _enableDriver();
-                _stepper->setSpeedInHz(speedHz);
+                _stepper->setSpeedInHz(max(1u, speedHz));
                 _stepper->moveTo(_latStartSteps);
                 _state = LatState::POSITIONING;
-                Diag::infof("[Lateral] Positionnement départ bobinage : %.2f mm",
-            startMm);
+
+                if (!wasPositioning || prevTarget != _latStartSteps) {
+                    Diag::infof("[Lateral] Positionnement départ bobinage : %.2f mm",
+                startMm);
+                }
             }
 
             void LateralController::_startHoming() {
@@ -457,6 +476,16 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
             }
 
             void LateralController::stopWinding() {
+                // POSITIONING : mouvement de repositionnement en cours (ex. phase finale
+                // de bobinage). Forcer l'arrêt et repasser en HOMED.
+                if (_state == LatState::POSITIONING) {
+                    if (_stepper->isRunning()) {
+                        _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
+                    }
+                    _state = LatState::HOMED;
+                    Diag::info("[Lateral] Positionnement annulé (stopWinding).");
+                    return;
+                }
                 if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
                 _lastDirFwd = (_state == LatState::WINDING_FWD);  // mémorise la direction
                 _pauseOnNextReversal = false;

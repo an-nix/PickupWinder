@@ -53,6 +53,9 @@
 #define LAT_STEPS_PER_MM    (LAT_MOTOR_STEPS * MICROSTEPPING)  // 3072 steps/mm
 #define LAT_TRAVERSE_MM     100     // 10 cm — vérification calibration
 #define LAT_TRAVERSE_SPEED_HZ 4800  // Vitesse de traversée ≈ 0.75 mm/s (M6 1/32)
+// Vitesse fallback pour la phase de positionnement final (endPos) si le
+// moteur ne tourne pas encore — ≈ 1/6 de la vitesse normale.
+#define LAT_ENDPOS_FALLBACK_HZ  (LAT_TRAVERSE_SPEED_HZ / 6)
 // Vitesse pendant le rodage : plus rapide que la traversée normale.
 // 12 000 Hz ≈ 3.9 mm/s (2.5× la traversée), confortable pour le rodage mécanique.
 #define LAT_RODAGE_SPEED_HZ  12000
