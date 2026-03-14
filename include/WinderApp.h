@@ -33,9 +33,10 @@ public:
     void handleCommand(const String& cmd, const String& value);
 
     // Called from the encoder ISR consumer (main loop) with the tick delta
-    // since the last call. Only active in VERIFY_LOW / VERIFY_HIGH:
-    //   VERIFY_LOW  → adjusts windingStartTrim_mm, repositions carriage
-    //   VERIFY_HIGH → adjusts windingEndTrim_mm,   repositions carriage
+    // since the last call.
+    // VERIFY_LOW  → adjusts windingStartTrim_mm, repositions carriage
+    // VERIFY_HIGH → adjusts windingEndTrim_mm,   repositions carriage
+    // MANUAL      → jog direct du chariot (pas de trim, pas de limite de fenêtre)
     void handleEncoderDelta(int32_t delta);
 
     // Build a full status snapshot for pushing to WebSocket / LinkSerial.
@@ -43,6 +44,21 @@ public:
 
     // Return the current recipe serialised as JSON (for UI download).
     String recipeJson() const;
+
+    // Retourne true si la capture de position est active (mode MANUAL).
+    bool   isCaptureActive() const { return _captureActive; }
+
+    // Retourne un point de capture à streamer si la position a changé de plus de
+    // CAPTURE_MIN_DELTA_MM depuis le dernier envoi. Retourne false sinon.
+    bool   getCapturePoint(float& posMm, long& turns) {
+        if (!_captureActive) return false;
+        float cur = _lateral.getCurrentPositionMm();
+        if (fabsf(cur - _captureLastPosMm) < 0.05f) return false;
+        _captureLastPosMm = cur;
+        posMm = cur;
+        turns = _stepper.getTurns();
+        return true;
+    }
 
 private:
     // ── Hardware subsystems ───────────────────────────────────────────────────
@@ -88,6 +104,8 @@ private:
     void _toIdle();
     void _toVerifyLow();
     void _toVerifyHigh();
+    void _toManual();         // Mode manuel : encodeur = jog libre, pot = moteur, capture WS
+    void _toRodage();         // Rodage axe latéral : aller-retour N passes
     void _toWinding();        // called from confirm once both bounds verified
     void _toPaused();
     void _toTargetReached();
@@ -114,5 +132,27 @@ private:
     void          _applyRecipe(const WindingRecipe& recipe, bool persist);
     WindingRecipe _captureRecipe() const;
     void          _saveRecipe();
-};
+    // ── Mode manuel ─────────────────────────────────────────────────
+    // Pas encodeur en mode manuel (mm) — réglable via commande 'manual_step'.
+    float  _manualJogStepMm  = 0.05f;
+    // Indique si la capture de la position est active (streaming WS).
+    bool   _captureActive    = false;
+    // Dernière position streamée (pour ne pas répéter si pas de mouvement).
+    float  _captureLastPosMm = -999.0f;
+    // Vrai si la commande 'manual' a été demandée depuis IDLE : après la
+    // vérification des deux butées, on bascule en MANUAL au lieu de WINDING.
+    bool   _pendingManual    = false;
+    // Vrai jusqu'à ce que le chariot atteigne une butée en mode MANUAL.
+    // Quand vrai, le pas encodeur est multiplié par MANUAL_FAST_STEP_MULT.
+    bool   _manualFirstPass  = true;
+    // ── Rodage axe latéral ──────────────────────────────────────
+    // Nombre d'allers-retours à effectuer (paramétrable depuis l'UI).
+    int    _rodagePasses   = 10;
+    // Distance depuis la butee home jusqu'à la position max (mm).
+    float  _rodageDistMm   = 80.0f;
+    // Passes complétées depuis le début du rodage.
+    int    _rodagePassDone = 0;
+    // true = chariot en train d'aller vers _rodageDistMm
+    // false = chariot en train de revenir vers 0
+    bool   _rodageFwd      = true;};
 

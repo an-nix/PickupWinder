@@ -22,6 +22,11 @@ public:
     // Serialise a WinderStatus snapshot to JSON and broadcast to all WS clients.
     void   sendUpdate(const WinderStatus& status);
 
+    // Envoie un point de capture de position au format compact vers tous les clients WS.
+    // Appelé uniquement en mode MANUAL quand la capture est active.
+    // Format : {"type":"cap","t":1234,"pos":12.34,"turns":1500}
+    void   sendCapture(uint32_t timestampMs, float posMm, long turns);
+
     // Register the callback that will be invoked for each incoming WebSocket command.
     void   setCommandCallback(CommandCallback cb);
     void   setRecipeProvider(RecipeJsonProvider cb);

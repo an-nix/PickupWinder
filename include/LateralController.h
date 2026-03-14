@@ -58,7 +58,7 @@ public:
 
     // Déplacer le chariot vers la position de départ de la fenêtre de bobinage.
     // startMm est exprimé depuis la base du tonework.
-    void prepareStartPosition(float startMm);
+    void prepareStartPosition(float startMm, uint32_t speedHz = LAT_TRAVERSE_SPEED_HZ);
     bool isPositionedForStart() const { return _state == LatState::HOMED && _isAtStartPosition(); }
     void parkAtZero() { prepareStartPosition(0.0f); }
     bool isAtZero() const { return _state == LatState::HOMED && _stepper && abs(_stepper->getCurrentPosition()) <= MICROSTEPPING; }
@@ -107,6 +107,9 @@ public:
     void  setHomeOffset(float mm);
     float getHomeOffset() const { return _homeOffsetMm; }
     float getCurrentPositionMm() const;
+    // Retourne la position cible actuelle (en mm). En POSITIONING, c'est la cible
+    // en cours de mouvement ; en HOMED, c'est la position physique courante.
+    float getTargetPositionMm() const;
 
 private:
     FastAccelStepper*      _stepper         = nullptr;

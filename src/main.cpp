@@ -28,8 +28,17 @@ static const int8_t ENC_QEM[16] = { 0,-1, 1, 0,
                                      0, 1,-1, 0 };
 static volatile int32_t encCount   = 0;
 static volatile uint8_t encLastAB  = 0;
+// Horodatage (µs) de la dernière ISR acceptée — filtre le bruit EMI du moteur.
+// Les impulsions step du moteur génèrent du bruit <10 µs ; les transitions
+// humaines légitimes sont espacées de ≥ 3 ms (tourne rapide) → seuil : 1000 µs.
+static volatile uint32_t encLastUs = 0;
 
 void IRAM_ATTR encISR() {
+    uint32_t now = micros();
+    // Anti-rebond : ignore les transitions plus rapides que ENC_DEBOUNCE_US.
+    // Protège contre le bruit EMI des impulsions step du moteur principal.
+    if (now - encLastUs < ENC_DEBOUNCE_US) return;
+    encLastUs = now;
     uint8_t a = digitalRead(ENC1_CLK);
     uint8_t b = digitalRead(ENC1_DT);
     uint8_t ab = (a << 1) | b;
@@ -86,7 +95,14 @@ void loop() {
         int32_t cur = encCount;
         int32_t delta = cur - lastEncConsumed;
         if (delta != 0) {
-            lastEncConsumed = cur;
+            // Plafonner le delta par tick pour limiter l'effet d'un burst de
+            // bruit résiduel (EMI) qui aurait quand même franchi l'anti-rebond.
+            // Un humain tourne rarement plus de 3-4 crans entre deux passages
+            // dans le loop (< 1 ms). Un delta > MAX_ENC_DELTA signale du bruit.
+            constexpr int32_t MAX_ENC_DELTA = 4;
+            if (delta >  MAX_ENC_DELTA) delta =  MAX_ENC_DELTA;
+            if (delta < -MAX_ENC_DELTA) delta = -MAX_ENC_DELTA;
+            lastEncConsumed = cur;  // consomme TOUT (évite accumulation)
             winder.handleEncoderDelta(delta);
         }
         if (now - lastEncMs >= 50) {
@@ -107,6 +123,15 @@ void loop() {
 
     // Winding logic (motor, traverse, auto-stop).
     winder.tick(lastPotHz);
+
+    // Mode manuel : streaming WebSocket de la position toutes les 50 ms.
+    static uint32_t lastCapMs = 0;
+    if (winder.isCaptureActive() && now - lastCapMs >= 50) {
+        lastCapMs = now;
+        float posMm; long capTurns;
+        if (winder.getCapturePoint(posMm, capTurns))
+            web.sendCapture(now, posMm, capTurns);
+    }
 
     // UART link: receive commands from display, push status periodically.
     serialLink.poll([](const String& cmd, const String& val) {

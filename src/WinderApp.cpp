@@ -135,6 +135,41 @@ void WinderApp::_toTargetReached() {
             _stepper.getTurns());
 }
 
+void WinderApp::_toManual() {
+    // Accessible depuis n'importe quel état (sauf MANUAL lui-même).
+    // Le moteur est arrêté / le chariot est libéré de la traverse.
+    // Le pot redémarre le moteur directement sans gestion de traverse automatique.
+    // Les butes windingStartMm/windingEndMm définissent la fenêtre autorisée.
+    _state           = WindingState::MANUAL;
+    _canStart        = false;
+    _pendingDisable  = true;
+    _pendingManual   = false;   // consommé
+    _manualFirstPass = true;    // premier passage = pas rapide
+    _stepper.stop();
+    _lateral.stopWinding();    // détache le mode WINDING_FWD/BWD, repasse HOMED
+    _captureActive    = false;
+    _captureLastPosMm = -999.0f;
+    Diag::infof("[MANUAL] Mode manuel actif — fenêtre [%.2f → %.2f mm], pas: %.2f mm (x%d sur 1er passage)",
+        _windingStartMm(), _windingEndMm(), _manualJogStepMm, MANUAL_FAST_STEP_MULT);
+}
+void WinderApp::_toRodage() {
+    // Passe le syst\u00e8me en mode rodage : le chariot effectue N allers-retours
+    // entre 0 et _rodageDistMm. Le moteur bobineur reste arr\u00eat\u00e9.
+    // Uniquement accessible depuis IDLE (chariot d\u00e9j\u00e0 en position 0).
+    _state         = WindingState::RODAGE;
+    _canStart      = false;
+    _pendingDisable = true;
+    _stepper.stop();
+    _lateral.stopWinding();  // no-op si pas en WINDING, mais s\u00e9curit\u00e9
+    _rodagePassDone = 0;
+    _rodageFwd      = true;  // premier mouvement : vers _rodageDistMm
+    // D\u00e9marrer le premier passage imm\u00e9diatement (chariot est \u00e0 0 en IDLE).
+    if (_lateral.isHomed()) {
+        _lateral.prepareStartPosition(_rodageDistMm, LAT_RODAGE_SPEED_HZ);
+    }
+    Diag::infof("[RODAGE] D\u00e9marrage: %d passes, dist=%.1f mm",
+        _rodagePasses, _rodageDistMm);
+}
 void WinderApp::_handleLateralEvents() {
     _lateral.update();
 
@@ -154,7 +189,26 @@ void WinderApp::_handleLateralEvents() {
         _toVerifyHigh();
         Diag::info("[VERIFY_LOW] Butée haute atteinte — passage en VERIFY_HIGH (confirmez pour démarrer).");
     }
-}
+    // RODAGE : le chariot vient d'atteindre une but\u00e9e (HOMED apr\u00e8s POSITIONING).
+    // Alterner aller-retour jusqu'\u00e0 ce que _rodagePassDone >= _rodagePasses.
+    if (_state == WindingState::RODAGE && _lateral.isHomed()) {
+        if (_rodageFwd) {
+            // Arriv\u00e9 \u00e0 _rodageDistMm \u2014 repartir vers 0.
+            _rodageFwd = false;
+            _lateral.prepareStartPosition(0.0f, LAT_RODAGE_SPEED_HZ);
+        } else {
+            // Arriv\u00e9 \u00e0 0 \u2014 aller-retour compl\u00e9t\u00e9.
+            _rodagePassDone++;
+            Diag::infof("[RODAGE] Passe %d/%d termin\u00e9e", _rodagePassDone, _rodagePasses);
+            if (_rodagePassDone >= _rodagePasses) {
+                Diag::infof("[RODAGE] Termin\u00e9 (%d passes) \u2014 retour IDLE", _rodagePassDone);
+                _toIdle();
+            } else {
+                _rodageFwd = true;
+                _lateral.prepareStartPosition(_rodageDistMm, LAT_RODAGE_SPEED_HZ);
+            }
+        }
+    }}
 
 
 void WinderApp::_handlePotCycle(uint32_t hz) {
@@ -187,7 +241,9 @@ void WinderApp::_handlePotCycle(uint32_t hz) {
         }
         // VERIFY_HIGH after auto-transition from VERIFY_LOW (_lowVerified is true):
         // both bounds have been seen. Raising the pot starts winding directly.
-        if (_state == WindingState::VERIFY_HIGH && _lowVerified && hz > 0 && _canStart) {
+        // Exception : si _pendingManual, on ne démarre pas automatiquement—
+        // l'opérateur doit confirmer explicitement pour basculer en MANUAL.
+        if (_state == WindingState::VERIFY_HIGH && _lowVerified && hz > 0 && _canStart && !_pendingManual) {
             _highVerified = true;
             _toWinding();
             _runWindingAtHz(hz);
@@ -218,8 +274,31 @@ void WinderApp::_handlePotCycle(uint32_t hz) {
             _runWindingAtHz(hz);
         break;
 
+    case WindingState::MANUAL:
+        // En mode manuel le chariot est piloté exclusivement par l'encodeur.
+        // Le pot contrôle uniquement le moteur principal (sans limite de vitesse
+        // de vérification et sans gestionnaire de traverse automatique).
+        if (hz == 0) {
+            _canStart = true;
+            if (_stepper.isRunning()) {
+                _pendingDisable = true;
+                _stepper.stop();
+            }
+        } else if (_canStart) {
+            // Démarrage direct sans traverse : on tourne librement.
+            bool forward = (_direction == Direction::CW) != (bool)WINDING_MOTOR_INVERTED;
+            _stepper.setSpeedHz(hz);
+            if (!_stepper.isRunning()) _stepper.start(forward);
+        }
+        break;
+
     case WindingState::TARGET_REACHED:
         // Locked -- only raising the target can unlock.
+        break;
+
+    case WindingState::RODAGE:
+        // Le moteur bobineux ne tourne pas pendant le rodage.
+        // Le pot est ignor\u00e9. Le chariot est pilot\u00e9 uniquement par _handleLateralEvents.
         break;
     }
 
@@ -381,6 +460,11 @@ WinderStatus WinderApp::getStatus() const {
         _lateral.isPositionedForStart(),
         (_state == WindingState::VERIFY_LOW),    // verifyLow
         (_state == WindingState::VERIFY_HIGH),   // verifyHigh
+        (_state == WindingState::MANUAL),        // manualMode
+        (_state == WindingState::RODAGE),        // rodageMode
+        _rodagePassDone,
+        _rodagePasses,
+        _rodageDistMm,
         (bool)_freerun,
         (_direction == Direction::CW),
         false,   // autoMode — reserved
@@ -498,13 +582,19 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         if (_state == WindingState::VERIFY_LOW) {
             _lowVerified = true;
             Diag::info("[VERIFY_LOW] Low bound confirmed");
-            if (_highVerified) _toWinding();
-            else               _toVerifyHigh();
+            if (_highVerified) {
+                if (_pendingManual) _toManual(); else _toWinding();
+            } else {
+                _toVerifyHigh();
+            }
         } else if (_state == WindingState::VERIFY_HIGH) {
             _highVerified = true;
             Diag::info("[VERIFY_HIGH] High bound confirmed");
-            if (_lowVerified) _toWinding();
-            else              _toVerifyLow();
+            if (_lowVerified) {
+                if (_pendingManual) _toManual(); else _toWinding();
+            } else {
+                _toVerifyLow();
+            }
         } else {
             Diag::infof("[Confirm] Ignored in state %s",
             windingStateName(_state));
@@ -538,6 +628,84 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         return true;
     }
 
+    // ── Mode manuel ──────────────────────────────────────────────────────────
+    if (cmd == "manual") {
+        if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
+            // Depuis IDLE : passer d'abord par la vérification des butes pour
+            // définir la fenêtre, puis basculer en MANUAL au lieu de WINDING.
+            _pendingManual = true;
+            _lowVerified   = false;
+            _highVerified  = false;
+            if (_state == WindingState::TARGET_REACHED) _stepper.resetTurns();
+            _toVerifyLow();
+            Diag::info("[MANUAL] Vérification des butes avant mode manuel...");
+        } else {
+            // Déjà dans une session (butes connues) : basculer directement.
+            _toManual();
+        }
+        return true;
+    }
+
+    if (cmd == "manual_stop") {
+        if (_state == WindingState::MANUAL) {
+            _toIdle();
+            Diag::info("[MANUAL] Mode manuel terminé → IDLE");
+        }
+        return true;
+    }
+
+    // Réglage du pas de jog manuel (en mm par cran encodeur).
+    if (cmd == "manual_step") {
+        float s = value.toFloat();
+        if (s > 0.0f && s <= 5.0f) {
+            _manualJogStepMm = s;
+            Diag::infof("[MANUAL] Pas jog: %.3f mm/cran", _manualJogStepMm);
+        }
+        return true;
+    }
+
+    // Démarrage / arrêt de la capture streaming WS.
+    if (cmd == "manual_capture_start") {
+        if (_state == WindingState::MANUAL) {
+            _captureActive    = true;
+            _captureLastPosMm = -999.0f;
+            Diag::info("[MANUAL] Capture démarrée");
+        }
+        return true;
+    }
+
+    if (cmd == "manual_capture_stop") {
+        _captureActive = false;
+        Diag::info("[MANUAL] Capture arrêtée");
+        return true;
+    }
+    // \u2500\u2500 Rodage axe lat\u00e9ral \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    if (cmd == "rodage_dist") {
+        _rodageDistMm = constrain(value.toFloat(), 5.0f, (float)LAT_TRAVERSE_MM);
+        Diag::infof("[RODAGE] Distance: %.1f mm", _rodageDistMm);
+        return true;
+    }
+    if (cmd == "rodage_passes") {
+        _rodagePasses = (int)constrain(value.toInt(), 1L, 200L);
+        Diag::infof("[RODAGE] Passes: %d", _rodagePasses);
+        return true;
+    }
+    if (cmd == "rodage") {
+        if (_state == WindingState::IDLE) {
+            _toRodage();
+        } else {
+            Diag::infof("[RODAGE] Ignor\u00e9 \u2014 \u00e9tat actuel: %s",
+                windingStateName(_state));
+        }
+        return true;
+    }
+    if (cmd == "rodage_stop") {
+        if (_state == WindingState::RODAGE) {
+            _toIdle();
+            Diag::info("[RODAGE] Arr\u00eat demand\u00e9 par l'op\u00e9rateur");
+        }
+        return true;
+    }
     return false;
 }
 
@@ -685,18 +853,42 @@ void WinderApp::handleEncoderDelta(int32_t delta) {
     // Le trim est mis à jour simultanément pour mémoriser la position en NVS.
     if (_state == WindingState::VERIFY_LOW) {
         float step = delta * ENC_STEP_MM;
-        _lateral.jog(step);
         _geom.windingStartTrim_mm = constrain(_geom.windingStartTrim_mm + step, -5.0f, 5.0f);
+        _refreshCarriageForGeometryChange(true, false);
         _saveRecipe();
         Diag::infof("[Encoder] Butée basse: %.2f mm (trim %.2f)",
             _windingStartMm(), _geom.windingStartTrim_mm);
     } else if (_state == WindingState::VERIFY_HIGH) {
         float step = delta * ENC_STEP_MM;
-        _lateral.jog(step);
         _geom.windingEndTrim_mm = constrain(_geom.windingEndTrim_mm + step, -5.0f, 5.0f);
+        _refreshCarriageForGeometryChange(false, true);
         _saveRecipe();
         Diag::infof("[Encoder] Butée haute: %.2f mm (trim %.2f)",
             _windingEndMm(), _geom.windingEndTrim_mm);
+    } else if (_state == WindingState::MANUAL) {
+        // Pas rapide (x10) sur le premier passage pour traverser vite la fenêtre,
+        // puis pas fins dès qu'une bute a été atteinte.
+        float stepMm = _manualFirstPass
+            ? (_manualJogStepMm * (float)MANUAL_FAST_STEP_MULT)
+            : _manualJogStepMm;
+
+        // Calculer la nouvelle cible à partir de la cible actuelle du stepper
+        // (pas la position physique, pour éviter les écarts pendant un mouvement).
+        float baseMm    = _lateral.getTargetPositionMm();
+        float newTarget = constrain(baseMm + delta * stepMm,
+                                    _windingStartMm(), _windingEndMm());
+        float actualDelta = newTarget - baseMm;
+        if (fabsf(actualDelta) > 0.001f) {
+            _lateral.jog(actualDelta);
+            // Dès que la cible touche une bute, on passe aux pas fins.
+            if (_manualFirstPass &&
+                (newTarget >= _windingEndMm()   - 0.2f ||
+                 newTarget <= _windingStartMm() + 0.2f)) {
+                _manualFirstPass = false;
+                Diag::infof("[MANUAL] Première bute atteinte — passage aux pas fins (%.2f mm)",
+                    _manualJogStepMm);
+            }
+        }
     }
 }
 

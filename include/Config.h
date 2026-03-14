@@ -18,8 +18,16 @@
 // Interrupt-capable, pull-up interne dispo (INPUT_PULLUP).
 // Déplacé sur 18/19 — 22/23 utilisés par le capteur de position latérale.
 #define ENC1_CLK            19      // Signal A
-#define ENC1_DT             18      // Signal B// Déplacement de la butée par cran d'encodeur (mm) pendant la phase de vérification.
-#define ENC_STEP_MM         0.1f
+#define ENC1_DT             18      // Signal B
+// Durée minimale (µs) entre deux fronts d'encodeur acceptés dans l'ISR.
+// Filtre le bruit EMI généré par les impulsions step du moteur ;
+// les transitions humaines légitimes sont espacées de ≥ 3 000 µs même
+// en tournant vite → 1 000 µs est un choix confortable.
+#define ENC_DEBOUNCE_US     1000// Déplacement de la butée par cran d'encodeur (mm) pendant la phase de vérification.
+#define ENC_STEP_MM         0.05f
+// Multiplicateur de pas appliqué au premier passage en mode MANUAL (avant qu'une bute soit atteinte).
+// Permet de traverser rapidement la fenêtre en début de bobinage.
+#define MANUAL_FAST_STEP_MULT  10
 // ── Capteur position initiale axe latéral ────────────────
 // Le capteur est connecté à la masse, entrées en INPUT_PULLUP.
 // Contact fermé (pin à GND) = LOW. Contact ouvert (pull-up) = HIGH.
@@ -45,6 +53,9 @@
 #define LAT_STEPS_PER_MM    (LAT_MOTOR_STEPS * MICROSTEPPING)  // 3072 steps/mm
 #define LAT_TRAVERSE_MM     100     // 10 cm — vérification calibration
 #define LAT_TRAVERSE_SPEED_HZ 4800  // Vitesse de traversée ≈ 0.75 mm/s (M6 1/32)
+// Vitesse pendant le rodage : plus rapide que la traversée normale.
+// 12 000 Hz ≈ 3.9 mm/s (2.5× la traversée), confortable pour le rodage mécanique.
+#define LAT_RODAGE_SPEED_HZ  12000
 // Facteur de ralentissement du moteur de bobinage pendant le demi-tour latéral.
 // La durée effective est calculée dynamiquement : 2 × (v_lat / LAT_ACCEL) secondes.
 // Réduire si les extrémités s'accumulent ; augmenter si les variations de vitesse gênent.

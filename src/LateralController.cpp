@@ -230,12 +230,12 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
             }
 
-            void LateralController::prepareStartPosition(float startMm) {
+            void LateralController::prepareStartPosition(float startMm, uint32_t speedHz) {
                 if (_state != LatState::HOMED) return;
                 _setTraverseBounds(startMm, startMm);
                 if (_isAtStartPosition()) return;
                 _enableDriver();
-                _stepper->setSpeedInHz(LAT_TRAVERSE_SPEED_HZ);
+                _stepper->setSpeedInHz(speedHz);
                 _stepper->moveTo(_latStartSteps);
                 _state = LatState::POSITIONING;
                 Diag::infof("[Lateral] Positionnement départ bobinage : %.2f mm",
@@ -480,6 +480,16 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 
             float LateralController::getCurrentPositionMm() const {
                 if (!_stepper) return 0.0f;
+                return (float)_stepper->getCurrentPosition() / (float)LAT_STEPS_PER_MM;
+            }
+
+            float LateralController::getTargetPositionMm() const {
+                if (!_stepper) return 0.0f;
+                // En POSITIONING, utiliser la cible (_latStartSteps) plutôt que la
+                // position physique pour éviter l'accumulation d'erreur lors d'appels
+                // répétés alors que le chariot est encore en mouvement.
+                if (_state == LatState::POSITIONING)
+                    return (float)_latStartSteps / (float)LAT_STEPS_PER_MM;
                 return (float)_stepper->getCurrentPosition() / (float)LAT_STEPS_PER_MM;
             }
 

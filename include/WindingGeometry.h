@@ -38,18 +38,17 @@ struct WindingGeometry {
     }
 
     // Position du début de bobinage mesurée depuis la base du tonework.
-    // La zone utile commence après le tonework bas + marge de sécurité.
+    // Le trim permet un ajustement fin ; la limite physique du rail (LAT_TRAVERSE_MM)
+    // est assurée par jog() et prepareStartPosition().
     float windingStartMm() const {
         float start = flangeBottom_mm + margin_mm + windingStartTrim_mm;
-        start = max(0.0f, start);
-        return min(start, totalWidth_mm);
+        return max(0.0f, start);
     }
 
     // Position de la fin de bobinage mesurée depuis la base du tonework.
-    // La zone utile s'arrête avant le tonework haut - marge de sécurité.
+    // Le trim peut dépasser totalWidth_mm pour couvrir les bobbins sous-dimensionnés.
     float windingEndMm() const {
         float end = totalWidth_mm - flangeTop_mm - margin_mm + windingEndTrim_mm;
-        end = min(totalWidth_mm, end);
         return max(windingStartMm(), end);
     }
 

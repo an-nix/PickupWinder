@@ -21,6 +21,7 @@ using RecipeJsonProvider = std::function<String(void)>;
 //  Any state ──(stop/reset)──► IDLE
 //  VERIFY_LOW ◄──► VERIFY_HIGH at any time via verify_low / verify_high commands.
 //  When both low and high have been confirmed, auto-transitions to WINDING.
+//  Any state ──(manual)──► MANUAL  (encoder = carriage jog, pot = motor, capture WS)
 enum class WindingState {
     IDLE,           // No session — all parameters writable, carriage at home
     VERIFY_LOW,     // Verifying low (start) bound — carriage at start, pot runs motor at verify speed
@@ -28,6 +29,8 @@ enum class WindingState {
     WINDING,        // Active winding at user-set speed
     PAUSED,         // Mid-winding pause (pot→0) — resumes from current position
     TARGET_REACHED, // Auto-stop: target turns hit — blocked until reset or target raised
+    MANUAL,         // Mode manuel : encodeur contrôle le chariot librement, moteur tourne via pot
+    RODAGE,         // Rodage axe latéral : aller-retour N passes sur distance configurée
 };
 
 inline const char* windingStateName(WindingState s) {
@@ -38,7 +41,9 @@ inline const char* windingStateName(WindingState s) {
         case WindingState::WINDING:        return "WINDING";
         case WindingState::PAUSED:         return "PAUSED";
         case WindingState::TARGET_REACHED: return "TARGET_REACHED";
-        default:                           return "UNKNOWN";
+        case WindingState::MANUAL:          return "MANUAL";
+        case WindingState::RODAGE:          return "RODAGE";
+        default:                            return "UNKNOWN";
     }
 }
 
@@ -56,6 +61,11 @@ struct WinderStatus {
     bool     carriageReady;       // Lateral carriage positioned at winding start
     bool     verifyLow;           // True in VERIFY_LOW state
     bool     verifyHigh;          // True in VERIFY_HIGH state
+    bool     manualMode;          // True in MANUAL state
+    bool     rodageMode;          // True in RODAGE state
+    int      rodagePassDone;      // Passes complétées
+    int      rodagePasses;        // Total passes configurées
+    float    rodageDistMm;        // Distance de traverse (mm)
     bool     freerun;
     bool     directionCW;
     bool     autoMode;            // Reserved
