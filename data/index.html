@@ -4,7 +4,10 @@
 <style>
 *{box-sizing:border-box}html,body{height:100%;margin:0;overflow:hidden}
 body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:#0b1220;color:#e8edf7;padding:10px}
-.app{height:100%;max-width:1180px;margin:0 auto;display:grid;grid-template-rows:auto auto 1fr auto;gap:10px}
+.app{height:100%;max-width:1180px;margin:0 auto;display:grid;grid-template-rows:auto auto auto 1fr auto;gap:10px}
+.tab-bar{display:flex;gap:6px}
+.tab-btn{flex:1;background:#111b2f;border:1px solid #22314f;border-radius:10px;padding:9px 8px;font-size:14px;font-weight:600;color:#8ea0c0;cursor:pointer;text-align:center}
+.tab-btn.tab-active{border-color:#36d399;color:#fff;background:#14314a}
 .head{display:flex;justify-content:space-between;align-items:center;background:#111b2f;border:1px solid #22314f;border-radius:12px;padding:10px 14px}
 .title{font-weight:700;font-size:18px;letter-spacing:.4px}.mini{font-size:12px;color:#95a3bd}
 .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;background:#f66}
@@ -38,6 +41,11 @@ input[type=number],input[type=range]{width:100%} input[type=number]{background:#
 
   <div class="status" id="status-line">Initialisation...</div>
 
+  <div class="tab-bar">
+    <button class="tab-btn tab-active" id="tab-main" onclick="showTab('main')">&#127919; Bobinage</button>
+    <button class="tab-btn" id="tab-config" onclick="showTab('config')">&#9881; Configuration</button>
+  </div>
+
   <div class="views">
     <div class="view show" id="setup">
       <div class="card">
@@ -46,11 +54,6 @@ input[type=number],input[type=range]{width:100%} input[type=number]{background:#
           <div><div class="label">Sens</div><div class="seg"><label><input type="radio" name="dir" id="r-cw" onchange="cmd('direction','cw')"><span class="pill">CW</span></label><label><input type="radio" name="dir" id="r-ccw" onchange="cmd('direction','ccw')"><span class="pill">CCW</span></label></div></div>
           <div><div class="label">Mode</div><div class="seg"><label><input type="radio" name="mode" id="m-target" onchange="cmd('freerun','false')"><span class="pill">Cible</span></label><label><input type="radio" name="mode" id="m-free" onchange="cmd('freerun','true')"><span class="pill">FreeRun</span></label></div></div>
           <div><div class="label">Cible tours</div><input id="ti" type="number" min="100" max="50000" step="100" onchange="cmd('target',this.value)"></div>
-          <div>
-            <div class="label">Offset position initiale (mm)</div>
-            <input id="lat-ofs-input" type="number" min="0" max="50" step="0.1" onchange="cmd('lat_offset',this.value)">
-            <div class="sub" style="margin-top:4px">Modif = rehoming automatique</div>
-          </div>
           <div><div class="label">Seed</div><input id="w-seed" type="number" min="1" max="4294967295" step="1" onchange="cmd('winding_seed',this.value)"></div>
         </div>
       </div>
@@ -159,17 +162,80 @@ input[type=number],input[type=range]{width:100%} input[type=number]{background:#
         <button class="btn reset" onclick="cmd('start')">↺ Réarmer Start</button>
       </div>
     </div>
-  </div>
+    <div class="view" id="config">
+      <div class="card">
+        <div class="label">&#127968; Offset position initiale axe latéral</div>
+        <div class="sub" style="margin-bottom:12px">Décalage appliqué après le homing : le chariot se positionne à cette valeur plutôt qu'à 0. Toute modification déclenche un rehoming automatique.</div>
+        <div style="max-width:220px">
+          <div class="label">Offset (mm)</div>
+          <input id="lat-ofs-input" type="number" min="0" max="50" step="0.1" onchange="cmd('lat_offset',this.value)">
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">&#128295; Rodage axe latéral</div>
+        <div class="sub" style="margin-bottom:12px">Fait effectuer N allers-retours à l'axe latéral entre la position home (0) et la distance configurée. Idéal pour le rodage mécanique d'un axe neuf ou après montage.</div>
+        <div class="grid g2" style="gap:10px;margin-bottom:14px">
+          <div><div class="label">Distance max (mm)</div><input id="rod-dist" type="number" min="5" max="100" step="1" value="80"></div>
+          <div><div class="label">Passes (allers-retours)</div><input id="rod-passes" type="number" min="1" max="200" step="1" value="10"></div>
+        </div>
+        <div id="rod-progress" style="display:none;margin-bottom:12px">
+          <div class="kv"><span>Passe en cours</span><b id="rod-pass-lbl">0 / 0</b></div>
+          <div class="bar" style="margin-top:6px"><div class="fill" id="rod-bar"></div></div>
+        </div>
+        <div class="actions" style="grid-template-columns:1fr 1fr;gap:10px">
+          <button id="btn-rod-start" class="btn start" onclick="startRodage()">&#9654; Démarrer rodage</button>
+          <button id="btn-rod-stop" class="btn stop" style="display:none" onclick="cmd('stop')">&#9632; Arrêter</button>
+        </div>
+        <div id="rod-msg" class="sub" style="margin-top:8px;color:#36d399"></div>
+      </div>
+    </div>  </div>
 
   <div class="actions">
     <button class="btn start" onclick="cmd('start')">▶ Start</button>
     <button class="btn stop" onclick="cmd('stop')">■ Stop</button>
     <button class="btn reset" onclick="cmd('reset')">↺ Reset</button>
+    <button class="btn" id="btn-manual" style="background:#7c3aed;color:#fff" onclick="toggleManual()">⚙ Manuel</button>
+  </div>
+
+  <!-- Panneau mode manuel (caché par défaut) -->
+  <div id="manual-panel" style="display:none;background:#111b2f;border:1px solid #7c3aed;border-radius:12px;padding:12px;margin-top:8px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <span style="font-weight:700;color:#c4b5fd">⚙ Mode Manuel</span>
+      <span id="manual-cap-dot" class="dot"></span>
+    </div>
+    <div class="grid g2" style="gap:8px;margin-bottom:10px">
+      <div>
+        <div class="label">Pas encodeur (mm/cran)</div>
+        <div class="actions" style="grid-template-columns:1fr 1fr 1fr 1fr;gap:6px">
+          <button class="btn reset" onclick="setManualStep(0.05)">0.05</button>
+          <button class="btn reset" onclick="setManualStep(0.1)">0.1</button>
+          <button class="btn reset" onclick="setManualStep(0.5)">0.5</button>
+          <button class="btn reset" onclick="setManualStep(1.0)">1.0</button>
+        </div>
+        <div class="sub" style="margin-top:4px">Actuel : <b id="manual-step-lbl">0.05</b> mm</div>
+      </div>
+      <div>
+        <div class="label">Position chariot</div>
+        <div class="val" id="manual-pos" style="font-size:22px">0.00 mm</div>
+        <div class="sub">Tours moteur : <b id="manual-turns">0</b></div>
+      </div>
+    </div>
+    <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
+      <button class="btn" id="btn-capture" style="background:#0369a1;color:#fff" onclick="toggleCapture()">⏺ Démarrer capture</button>
+      <button class="btn" id="btn-dl-capture" style="background:#334155;color:#e2e8f0;display:none" onclick="downloadCapture()">⬇ Télécharger JSON</button>
+    </div>
+    <div id="manual-cap-status" class="sub" style="margin-top:6px"></div>
   </div>
 </div>
 
 <script>
 let ws;
+let activeTab = 'main';
+let lastStatus = null;
+let rodageWasActive = false;
+let manualActive = false;
+let captureActive = false;
+let captureData = [];  // [{t, pos, turns}, ...]
 const byId = id => document.getElementById(id);
 
 function cmd(c,v=''){ if(ws && ws.readyState===1) ws.send(JSON.stringify({cmd:c,val:''+v})); }
@@ -177,18 +243,105 @@ function syncInput(id,val){ const el=byId(id); if(el && document.activeElement!=
 function syncRange(id,val,labelId,fix){ const el=byId(id); if(el && document.activeElement!==el && val!==undefined) el.value=val; if(labelId&&val!==undefined) byId(labelId).textContent=parseFloat(val).toFixed(fix); }
 function setWs(ok){ byId('ws-dot').className='dot '+(ok?'ok':''); byId('ws-lbl').textContent=ok?'Connecté':'Déconnecté'; }
 
+function toggleManual() {
+  if (!manualActive) {
+    cmd('manual');
+    manualActive = true;
+    byId('manual-panel').style.display = 'block';
+    byId('btn-manual').textContent = '⚙ Quitter Manuel';
+    byId('btn-manual').style.background = '#dc2626';
+    byId('manual-step-lbl').textContent = '0.05';
+  } else {
+    if (captureActive) toggleCapture();
+    cmd('manual_stop');
+    manualActive = false;
+    byId('manual-panel').style.display = 'none';
+    byId('btn-manual').textContent = '⚙ Manuel';
+    byId('btn-manual').style.background = '#7c3aed';
+  }
+}
+
+function setManualStep(s) {
+  cmd('manual_step', '' + s);
+  byId('manual-step-lbl').textContent = '' + s;
+}
+
+function toggleCapture() {
+  if (!captureActive) {
+    captureData = [];
+    captureActive = true;
+    cmd('manual_capture_start');
+    byId('btn-capture').textContent = '⏹ Arrêter capture';
+    byId('btn-capture').style.background = '#dc2626';
+    byId('manual-cap-dot').className = 'dot warn';
+    byId('btn-dl-capture').style.display = 'none';
+    byId('manual-cap-status').textContent = '⏺ Capture en cours — 0 points';
+  } else {
+    captureActive = false;
+    cmd('manual_capture_stop');
+    byId('btn-capture').textContent = '⏺ Démarrer capture';
+    byId('btn-capture').style.background = '#0369a1';
+    byId('manual-cap-dot').className = 'dot';
+    byId('manual-cap-status').textContent = '✓ Capture terminée — ' + captureData.length + ' points';
+    if (captureData.length > 0) byId('btn-dl-capture').style.display = '';
+  }
+}
+
+function downloadCapture() {
+  const blob = new Blob([JSON.stringify({capture: captureData}, null, 2)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'capture_' + Date.now() + '.json';
+  a.click();
+}
+
 function connect(){
   ws = new WebSocket('ws://' + location.host + '/ws');
   ws.onopen=()=>setWs(true);
   ws.onclose=()=>{setWs(false);setTimeout(connect,2000)};
-  ws.onmessage=e=>update(JSON.parse(e.data));
+  ws.onmessage=e=>{
+    const d = JSON.parse(e.data);
+    if (d.type === 'cap') {
+      // Point de capture mode manuel
+      if (captureActive) {
+        captureData.push({t: d.t, pos: d.pos, turns: d.turns});
+        byId('manual-cap-status').textContent = '⏺ Capture en cours — ' + captureData.length + ' points';
+      }
+      byId('manual-pos').textContent = parseFloat(d.pos).toFixed(2) + ' mm';
+      byId('manual-turns').textContent = d.turns;
+      return;
+    }
+    update(d);
+  };
 }
 
 function update(d){
+  lastStatus = d;
   const armed = !!d.startRequested;
-  byId('setup').classList.toggle('show', !armed);
-  byId('run').classList.toggle('show', armed);
-  byId('phase').textContent = armed ? 'Production' : 'Préparation';
+  const isManual = !!d.manualMode;
+  const isRodage = !!d.rodageMode;
+  // Switcher les vues seulement si l'onglet Bobinage est actif
+  if (activeTab === 'main') {
+    byId('setup').classList.toggle('show', !armed && !isManual && !isRodage);
+    byId('run').classList.toggle('show', (armed || isRodage) && !isManual);
+  }
+  byId('phase').textContent = isManual ? 'Mode Manuel' : isRodage ? 'Rodage axe' : (armed ? 'Production' : 'Préparation');
+  // ── Rodage UI (toujours mis à jour, quel que soit l'onglet actif) ──
+  const rod = isRodage;
+  byId('btn-rod-start').style.display = rod ? 'none' : '';
+  byId('btn-rod-stop').style.display = rod ? '' : 'none';
+  byId('rod-dist').disabled = rod;
+  byId('rod-passes').disabled = rod;
+  byId('rod-progress').style.display = rod ? '' : 'none';
+  if (rod) {
+    const p = d.rodagePass || 0, t = d.rodagePasses || 1;
+    byId('rod-pass-lbl').textContent = p + ' / ' + t;
+    byId('rod-bar').style.width = Math.round(p / t * 100) + '%';
+    byId('rod-msg').textContent = '';
+  } else if (rodageWasActive) {
+    byId('rod-msg').textContent = '✓ Rodage terminé — ' + (lastStatus && lastStatus.rodagePasses ? lastStatus.rodagePasses : '') + ' passes effectuées';
+  }
+  rodageWasActive = rod;
 
   byId('rpm').textContent = Math.round(d.rpm||0);
   byId('spd').textContent = d.hz||0;
@@ -205,6 +358,8 @@ function update(d){
   const pos = parseFloat(d.latPos ?? 0);
   byId('lat-pos').textContent = pos.toFixed(2) + ' mm';
   byId('lat-pos-run').textContent = pos.toFixed(2) + ' mm';
+  byId('manual-pos').textContent = pos.toFixed(2) + ' mm';
+  byId('manual-turns').textContent = d.turns ?? 0;
   byId('w-start').textContent = parseFloat(d.wStart ?? 0).toFixed(2);
   byId('w-end').textContent = parseFloat(d.wEnd ?? 0).toFixed(2);
   byId('w-start-run').textContent = parseFloat(d.wStart ?? 0).toFixed(2);
@@ -246,6 +401,27 @@ function update(d){
   else if (d.startRequested && d.carriageReady) status.textContent = '⏸ Prêt: monter le potentiomètre pour démarrer';
   else if (!atZero) status.textContent = 'Ramener le chariot en position 0 puis appuyer sur Start';
   else status.textContent = 'Prêt: paramètres validés, appuyer sur Start';
+}
+
+function showTab(tab) {
+  activeTab = tab;
+  byId('tab-main').classList.toggle('tab-active', tab === 'main');
+  byId('tab-config').classList.toggle('tab-active', tab === 'config');
+  if (tab === 'config') {
+    byId('setup').classList.remove('show');
+    byId('run').classList.remove('show');
+    byId('config').classList.add('show');
+  } else {
+    byId('config').classList.remove('show');
+    if (lastStatus) update(lastStatus);
+  }
+}
+
+function startRodage() {
+  cmd('rodage_dist', byId('rod-dist').value);
+  cmd('rodage_passes', byId('rod-passes').value);
+  cmd('rodage');
+  byId('rod-msg').textContent = '';
 }
 
 connect();
