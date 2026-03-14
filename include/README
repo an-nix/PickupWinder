@@ -35,3 +35,43 @@ Read more about using header files in official GCC documentation:
 * Computed Includes
 
 https://gcc.gnu.org/onlinedocs/cpp/Header-Files.html
+
+---
+
+PickupWinder notes
+==================
+
+Final winding position (`endPos`)
+---------------------------------
+
+The winding recipe can optionally force the carriage to finish on a chosen
+bound:
+
+- `none`: normal behavior, no forced final position
+- `high`: finish on the high bound
+- `low`: finish on the low bound
+
+`endPosTurns` defines how many final turns must be done while the carriage is
+already resting on that bound in order to lock the wire in place.
+
+Predictive final traverse logic
+-------------------------------
+
+The final positioning is not done by abruptly sending the carriage to the bound.
+Instead, the firmware tries to predict the remaining traverse motion and slow the
+current/next pass so that the carriage reaches the requested bound exactly when
+the final hold turns begin.
+
+High-level behavior:
+
+1. The firmware computes how much traverse path remains before the requested
+	bound (`pathUnits`, expressed in fractions of a pass).
+2. It converts that path into nominal turns to reach the bound using the current
+	`turnsPerPass`.
+3. It compares that with the number of turns remaining before the hold zone.
+4. It adjusts the lateral `speedScale` so the carriage arrives on the bound at
+	the right moment.
+5. Once the bound is reached, lateral motion is stopped and must not restart.
+
+This is intentionally based on remaining turns and traverse geometry, so it can
+keep adapting while the winding speed changes during the end of the job.

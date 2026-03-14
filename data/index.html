@@ -55,6 +55,8 @@ input[type=number],input[type=range]{width:100%} input[type=number]{background:#
           <div><div class="label">Mode</div><div class="seg"><label><input type="radio" name="mode" id="m-target" onchange="cmd('freerun','false')"><span class="pill">Cible</span></label><label><input type="radio" name="mode" id="m-free" onchange="cmd('freerun','true')"><span class="pill">FreeRun</span></label></div></div>
           <div><div class="label">Cible tours</div><input id="ti" type="number" min="100" max="50000" step="100" onchange="cmd('target',this.value)"></div>
           <div><div class="label">Seed</div><input id="w-seed" type="number" min="1" max="4294967295" step="1" onchange="cmd('winding_seed',this.value)"></div>
+          <div><div class="label">Position finale</div><div class="seg seg3"><label><input type="radio" name="endpos" id="ep-none" onchange="cmd('end_pos','none')"><span class="pill">Libre</span></label><label><input type="radio" name="endpos" id="ep-high" onchange="cmd('end_pos','high')"><span class="pill">But&eacute;e&nbsp;&uarr;</span></label><label><input type="radio" name="endpos" id="ep-low" onchange="cmd('end_pos','low')"><span class="pill">But&eacute;e&nbsp;&darr;</span></label></div></div>
+          <div><div class="label">Tours maintien</div><input id="ep-turns" type="number" min="1" max="20" step="1" onchange="cmd('end_pos_turns',this.value)"></div>
         </div>
       </div>
 
@@ -377,6 +379,14 @@ function update(d){
   byId('ti').disabled = !!d.freerun;
   byId('ti-run').disabled = !!d.freerun;
   if(d.wStyle){ byId('ws-straight').checked=d.wStyle==='straight'; byId('ws-scatter').checked=d.wStyle==='scatter'; byId('ws-human').checked=d.wStyle==='human'; }
+
+  // Position finale
+  const epStr = ['none','high','low'][d.endPos ?? 0] || 'none';
+  byId('ep-none').checked = epStr==='none';
+  byId('ep-high').checked = epStr==='high';
+  byId('ep-low').checked  = epStr==='low';
+  byId('ep-turns').disabled = (epStr==='none');
+  syncInput('ep-turns', d.endPosTurns);
 
   syncInput('ti', d.target);
   syncInput('ti-run', d.target);

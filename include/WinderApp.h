@@ -145,6 +145,10 @@ private:
     // Vrai jusqu'à ce que le chariot atteigne une butée en mode MANUAL.
     // Quand vrai, le pas encodeur est multiplié par MANUAL_FAST_STEP_MULT.
     bool   _manualFirstPass  = true;
+    // ── Position finale de bobinage ──────────────────────────────────────
+    // Vrai dès que le hook de fin de bobinage a repositionné le chariot.
+    // Remis à false à chaque _toWinding() / _toIdle().
+    bool   _endPosArmed      = false;
     // ── Rodage axe latéral ──────────────────────────────────────
     // Nombre d'allers-retours à effectuer (paramétrable depuis l'UI).
     int    _rodagePasses   = 10;

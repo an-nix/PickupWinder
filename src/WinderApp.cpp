@@ -42,6 +42,7 @@ void WinderApp::_toIdle() {
     _pendingDisable        = true;
     _lowVerified           = false;
     _highVerified          = false;
+    _endPosArmed           = false;
     _stepper.stop();
     _lateral.stopWinding();
     _lateral.parkAtZero();
@@ -109,6 +110,7 @@ void WinderApp::_toWinding() {
     _state          = WindingState::WINDING;
     _canStart     = false;
     _pendingDisable = false;
+    _endPosArmed    = false;
     // Do NOT reposition the carriage here. After verification the carriage is
     // already at the high bound (VERIFY_HIGH). startWinding() will choose the
     // correct initial direction based on the current position.
@@ -130,7 +132,11 @@ void WinderApp::_toTargetReached() {
     _canStart     = false;
     _pendingDisable = true;
     _stepper.stop();
+    // À la cible, tout doit être déjà en place. On stoppe donc toujours l'axe
+    // latéral ; si le positionnement final n'est pas terminé, on préfère un arrêt
+    // franc à un mouvement résiduel après l'arrêt du bobinage.
     _lateral.stopWinding();
+    _endPosArmed = false;
     Diag::infof("[TARGET_REACHED] %ld turns -- raise target to continue or press Stop",
             _stepper.getTurns());
 }
@@ -332,6 +338,69 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
 
     _activePlan = _buildTraversePlan(hz);
 
+    // Actual traverse scale applied.
+    //
+    // During the final phase (`_endPosArmed`), the firmware does not simply stop
+    // at the next bound. It tries to predict the remaining motion toward the
+    // requested final bound and spread that motion over the number of turns left
+    // before the hold zone begins.
+    //
+    // Principle:
+    //   - `pathUnits` expresses the remaining path to the target bound in
+    //     "fractions of a pass":
+    //       1.0 = finish the current pass to the bound,
+    //       2.0 = first go to the opposite bound, then come back.
+    //   - `nominalTurnsToBound = pathUnits * turnsPerPass` is the number of
+    //     turns this path would consume with `speedScale = 1.0`.
+    //   - `moveTurnsRemaining = remainingTurns - holdTurns` is the turn budget
+    //     available before the carriage must already be resting on the bound.
+    //   - `desiredScale = nominalTurnsToBound / moveTurnsRemaining` is then used
+    //     to target approximately: `turnsToBound ~= moveTurnsRemaining`.
+    //
+    // Practical effect: if the bound must be reached later, the current pass is
+    // slowed down; if it must be reached sooner, it may be sped up (within the
+    // allowed 0.40 .. 1.80 range).
+    float traverseScale = _activePlan.speedScale;
+
+    if (_state == WindingState::WINDING && _endPosArmed && _recipe.endPos != WindingEndPos::NONE) {
+        const long remainingTurns = max(0L, (long)_targetTurns - _stepper.getTurns());
+        const long holdTurns = max(1L, (long)_recipe.endPosTurns);
+        const float moveTurnsRemaining = max(0.25f, (float)remainingTurns - (float)holdTurns);
+        const float progress = constrain(_lateral.getTraversalProgress(), 0.0f, 1.0f);
+        const LatState latState = _lateral.getState();
+
+        float pathUnits = 0.0f;
+        bool atTargetBound = false;
+        if (_recipe.endPos == WindingEndPos::TOP) {
+            if (latState == LatState::WINDING_FWD) {
+                pathUnits = 1.0f - progress;
+            } else if (latState == LatState::WINDING_BWD) {
+                pathUnits = 2.0f - progress;
+            } else if (latState == LatState::HOMED && fabsf(_lateral.getCurrentPositionMm() - _windingEndMm()) <= 0.10f) {
+                atTargetBound = true;
+            }
+        } else if (_recipe.endPos == WindingEndPos::BOTTOM) {
+            if (latState == LatState::WINDING_BWD) {
+                pathUnits = 1.0f - progress;
+            } else if (latState == LatState::WINDING_FWD) {
+                pathUnits = 2.0f - progress;
+            } else if (latState == LatState::HOMED && fabsf(_lateral.getCurrentPositionMm() - _windingStartMm()) <= 0.10f) {
+                atTargetBound = true;
+            }
+        }
+
+        if (!atTargetBound && pathUnits > 0.0f && _activePlan.turnsPerPass > 0) {
+            // Nombre de tours que la trajectoire restante consommerait avec scale=1.0.
+            const float nominalTurnsToBound = pathUnits * (float)_activePlan.turnsPerPass;
+            // Choisir le scale qui fait correspondre la fin de trajectoire avec
+            // le début des tours de maintien : turnsToBound = nominal / scale.
+            const float desiredScale = nominalTurnsToBound / moveTurnsRemaining;
+            traverseScale = constrain(desiredScale, 0.40f, 1.80f);
+        }
+    }
+
+    _activePlan.speedScale = traverseScale;
+
     // 3. Reversal slow-down: briefly reduce speed at each traverse flip point
     //    to prevent wire bunching and reduce mechanical shock on the carriage.
     if (_lateral.isReversing())
@@ -401,6 +470,23 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
     if (_state == WindingState::VERIFY_LOW)
         _lateral.armStopAtNextHigh();
 
+    // Final phase: once stop-at-bound has been armed, let the traverse complete
+    // its natural motion to the requested bound, then keep the carriage still
+    // until the final target is reached. Most importantly, do not restart a new
+    // traverse when the lateral axis returns to HOMED on that bound, otherwise
+    // we would reintroduce the exact unwanted behavior: "reaches the bound,
+    // leaves it, then comes back".
+    if (_state == WindingState::WINDING && _endPosArmed) {
+        if (_recipe.endPos == WindingEndPos::TOP) {
+            _lateral.armStopAtNextHigh();
+        } else if (_recipe.endPos == WindingEndPos::BOTTOM) {
+            _lateral.armStopAtNextLow();
+        }
+        if (_lateral.getState() == LatState::HOMED) {
+            return;
+        }
+    }
+
     // If the lateral is in HOMED state it means it completed a positioning move
     // and is waiting for a new winding command — call startWinding() to enter
     // closed-loop traverse. Otherwise the traverse is already active; call
@@ -417,12 +503,65 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
 }
 
 void WinderApp::_checkAutoStop() {
-    // Evaluate the turn target every loop. Only fires during active WINDING and
-    // when freerun mode is off. Uses >= rather than == to handle the edge case
-    // where the pot drops at the exact target turn and the stepper overshoots by
-    // one count before the ISR processes the stop command.
-    if (_state == WindingState::WINDING && !_freerun
-        && _stepper.getTurns() >= _targetTurns) {
+    if (_state != WindingState::WINDING || (bool)_freerun) return;
+
+    // ── Hook position finale ─────────────────────────────────────────────────
+    // No direct repositioning toward the final bound is used anymore.
+    //
+    // Instead, stop-at-next-natural-bound is armed early enough so that the
+    // predictive logic in `_runWindingAtHz()` has time to slow the current pass
+    // — and if needed the next one — and make the carriage reach the requested
+    // bound exactly when the hold turns begin. This avoids artificial end-of-run
+    // back-and-forth motion.
+    if (_recipe.endPos != WindingEndPos::NONE) {
+        const long remainingTurns = (long)_targetTurns - _stepper.getTurns();
+        if (remainingTurns > 0 && !_endPosArmed) {
+            const long holdTurns = max(1L, (long)_recipe.endPosTurns);
+            const float progress = constrain(_lateral.getTraversalProgress(), 0.0f, 1.0f);
+            const long tpp = max(1L, _activePlan.turnsPerPass);
+            const LatState latState = _lateral.getState();
+            float pathUnits = 0.0f;
+            bool targetAlreadyReached = false;
+
+            if (_recipe.endPos == WindingEndPos::TOP) {
+                if (latState == LatState::WINDING_FWD) {
+                    pathUnits = 1.0f - progress;
+                } else if (latState == LatState::WINDING_BWD) {
+                    pathUnits = 2.0f - progress;
+                } else if (latState == LatState::HOMED && fabsf(_lateral.getCurrentPositionMm() - _windingEndMm()) <= 0.10f) {
+                    targetAlreadyReached = true;
+                }
+            } else if (_recipe.endPos == WindingEndPos::BOTTOM) {
+                if (latState == LatState::WINDING_BWD) {
+                    pathUnits = 1.0f - progress;
+                } else if (latState == LatState::WINDING_FWD) {
+                    pathUnits = 2.0f - progress;
+                } else if (latState == LatState::HOMED && fabsf(_lateral.getCurrentPositionMm() - _windingStartMm()) <= 0.10f) {
+                    targetAlreadyReached = true;
+                }
+            }
+
+            // Arm early enough to allow slowing down as far as scale=0.40.
+            // `maxPredictiveTurns` is therefore the largest number of turns over
+            // which the remaining path can be spread without leaving the planner's
+            // mechanically acceptable range.
+            const long maxPredictiveTurns = (long)ceilf((pathUnits * (float)tpp) / 0.40f);
+
+            if (targetAlreadyReached || (pathUnits > 0.0f && remainingTurns <= (holdTurns + maxPredictiveTurns))) {
+                _endPosArmed = true;
+                if (_recipe.endPos == WindingEndPos::TOP) {
+                    _lateral.armStopAtNextHigh();
+                } else {
+                    _lateral.armStopAtNextLow();
+                }
+                Diag::infof("[END_POS] Armé: reste %ld tours, trajectoire %.2f passes, maintien %ld tours",
+                    remainingTurns, pathUnits, holdTurns);
+            }
+        }
+    }
+
+    // Auto-stop sur la cible.
+    if (_stepper.getTurns() >= _targetTurns) {
         _toTargetReached();
     }
 }
@@ -489,6 +628,8 @@ WinderStatus WinderApp::getStatus() const {
         _recipe.layerSpeedPct,
         _recipe.humanTraversePct,
         _recipe.humanSpeedPct,
+        (int)_recipe.endPos,
+        _recipe.endPosTurns,
         windingStateName(_state),
     };
 }
@@ -679,6 +820,20 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         Diag::info("[MANUAL] Capture arrêtée");
         return true;
     }
+
+    // ── Position finale de bobinage ───────────────────────────────────────────
+    if (cmd == "end_pos") {
+        _recipe.endPos = windingEndPosFromString(value);
+        _saveRecipe();
+        Diag::infof("[END_POS] Position finale: %s", windingEndPosKey(_recipe.endPos));
+        return true;
+    }
+    if (cmd == "end_pos_turns") {
+        _recipe.endPosTurns = (int)constrain(value.toInt(), 1L, 20L);
+        _saveRecipe();
+        Diag::infof("[END_POS] Tours finaux: %d", _recipe.endPosTurns);
+        return true;
+    }
     // \u2500\u2500 Rodage axe lat\u00e9ral \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     if (cmd == "rodage_dist") {
         _rodageDistMm = constrain(value.toFloat(), 5.0f, (float)LAT_TRAVERSE_MM);
@@ -853,18 +1008,24 @@ void WinderApp::handleEncoderDelta(int32_t delta) {
     // Le trim est mis à jour simultanément pour mémoriser la position en NVS.
     if (_state == WindingState::VERIFY_LOW) {
         float step = delta * ENC_STEP_MM;
-        _geom.windingStartTrim_mm = constrain(_geom.windingStartTrim_mm + step, -5.0f, 5.0f);
-        _refreshCarriageForGeometryChange(true, false);
+        // Jog direct — fonctionne depuis HOMED ou POSITIONING (pas de garde
+        // _stepper.isRunning). Mettre à jour le trim depuis la nouvelle cible.
+        _lateral.jog(step);
+        float newPos = _lateral.getTargetPositionMm();
+        _geom.windingStartTrim_mm = constrain(
+            newPos - (_geom.flangeBottom_mm + _geom.margin_mm), -5.0f, 5.0f);
         _saveRecipe();
         Diag::infof("[Encoder] Butée basse: %.2f mm (trim %.2f)",
-            _windingStartMm(), _geom.windingStartTrim_mm);
+            newPos, _geom.windingStartTrim_mm);
     } else if (_state == WindingState::VERIFY_HIGH) {
         float step = delta * ENC_STEP_MM;
-        _geom.windingEndTrim_mm = constrain(_geom.windingEndTrim_mm + step, -5.0f, 5.0f);
-        _refreshCarriageForGeometryChange(false, true);
+        _lateral.jog(step);
+        float newPos = _lateral.getTargetPositionMm();
+        _geom.windingEndTrim_mm = constrain(
+            newPos - (_geom.totalWidth_mm - _geom.flangeTop_mm - _geom.margin_mm), -5.0f, 5.0f);
         _saveRecipe();
         Diag::infof("[Encoder] Butée haute: %.2f mm (trim %.2f)",
-            _windingEndMm(), _geom.windingEndTrim_mm);
+            newPos, _geom.windingEndTrim_mm);
     } else if (_state == WindingState::MANUAL) {
         // Pas rapide (x10) sur le premier passage pour traverser vite la fenêtre,
         // puis pas fins dès qu'une bute a été atteinte.

@@ -91,5 +91,8 @@ struct WinderStatus {
     float    layerSpeedPct;
     float    humanTraversePct;
     float    humanSpeedPct;
+    // Position finale de bobinage (0=NONE 1=HIGH 2=LOW) + nb tours de maintien.
+    int      endPos;
+    int      endPosTurns;
     const char* stateName;        // Human-readable WindingState label
 };

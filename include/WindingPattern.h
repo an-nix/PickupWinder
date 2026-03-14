@@ -9,6 +9,30 @@ enum class WindingStyle : uint8_t {
 	HUMAN    = 2,
 };
 
+// Position finale du chariot en fin de bobinage.
+// HIGH/LOW : le chariot est ramené sur la bute correspondante N tours avant
+// la fin pour bloquer le fil ; ces derniers tours se font sur place (no traverse).
+// NOTE : éviter HIGH/LOW qui sont des macros Arduino (#define HIGH 0x1 / LOW 0x0)
+enum class WindingEndPos : uint8_t {
+	NONE  = 0,  // Comportement actuel : aucune position finale imposée
+	TOP   = 1,  // Terminer sur la butée haute (bloquer le fil)
+	BOTTOM = 2, // Terminer sur la butée basse (bloquer le fil)
+};
+
+inline const char* windingEndPosKey(WindingEndPos p) {
+	switch (p) {
+		case WindingEndPos::TOP:    return "high";
+		case WindingEndPos::BOTTOM: return "low";
+		default:                    return "none";
+	}
+}
+
+inline WindingEndPos windingEndPosFromString(const String& s) {
+	if (s == "high") return WindingEndPos::TOP;
+	if (s == "low")  return WindingEndPos::BOTTOM;
+	return WindingEndPos::NONE;
+}
+
 struct WindingRecipe {
 	uint32_t        version            = 1;
 	long            targetTurns        = DEFAULT_TARGET_TURNS;
@@ -22,6 +46,10 @@ struct WindingRecipe {
 	float           layerSpeedPct      = WINDING_LAYER_SPEED_JITTER_DEFAULT;
 	float           humanTraversePct   = WINDING_HUMAN_TRAVERSE_JITTER_DEFAULT;
 	float           humanSpeedPct      = WINDING_HUMAN_SPEED_JITTER_DEFAULT;
+	// Position finale du chariot (aucune / butée haute / butée basse).
+	WindingEndPos   endPos             = WindingEndPos::NONE;
+	// Nombre de tours effectués sur la position finale avant l'arrêt.
+	int             endPosTurns        = 3;
 };
 
 struct TraversePlan {
