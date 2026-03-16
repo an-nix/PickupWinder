@@ -42,6 +42,7 @@ void WinderApp::_toIdle() {
     _pendingDisable        = true;
     _lowVerified           = false;
     _highVerified          = false;
+    _pendingVerify         = PendingVerifyBound::NONE;
     _endPosArmed           = false;
     _stepper.stop();
     _lateral.stopWinding();
@@ -54,17 +55,24 @@ void WinderApp::_toIdle() {
 }
 
 void WinderApp::_toVerifyLow() {
-    const bool fromWinding = (_state == WindingState::WINDING || _state == WindingState::PAUSED);
-    if (fromWinding) {
-        // During an active session: stop motor immediately, move carriage to low
-        // bound, stay in PAUSED. Pot →0 then ↑ resumes winding from that position.
-        _state          = WindingState::PAUSED;
-        _canStart       = false;
-        _pendingDisable = false;  // forceStop already cuts the driver
-        _stepper.forceStop();
+    if (_state == WindingState::WINDING) {
+        // In-session verify: stop on the next natural low bound, then switch to
+        // VERIFY_LOW once the carriage is actually sitting on that bound.
+        _pendingVerify = PendingVerifyBound::START;
+        _lateral.clearOneShotStops();
+        _lateral.armStopAtNextLow();
+        Diag::info("[VERIFY_LOW] Armed — will stop on next low bound for adjustment");
+        return;
+    }
+    if (_state == WindingState::PAUSED) {
+        _pendingVerify   = PendingVerifyBound::NONE;
+        _state           = WindingState::VERIFY_LOW;
+        _canStart        = false;
+        _pendingDisable  = true;
+        _lateral.clearOneShotStops();
         _lateral.stopWinding();
         _lateral.prepareStartPosition(_windingStartMm());
-        Diag::infof("[VERIFY_LOW] Quick check depuis bobinage — chariot → %.2f mm (butée basse)",
+        Diag::infof("[VERIFY_LOW] Paused-session verify — carriage → %.2f mm (low bound)",
                 _windingStartMm());
         return;
     }
@@ -80,17 +88,24 @@ void WinderApp::_toVerifyLow() {
 }
 
 void WinderApp::_toVerifyHigh() {
-    const bool fromWinding = (_state == WindingState::WINDING || _state == WindingState::PAUSED);
-    if (fromWinding) {
-        // During an active session: stop motor immediately, move carriage to high
-        // bound, stay in PAUSED. Pot →0 then ↑ resumes winding from that position.
-        _state          = WindingState::PAUSED;
-        _canStart       = false;
-        _pendingDisable = false;  // forceStop already cuts the driver
-        _stepper.forceStop();
+    if (_state == WindingState::WINDING) {
+        // In-session verify: stop on the next natural high bound, then switch to
+        // VERIFY_HIGH once the carriage is actually sitting on that bound.
+        _pendingVerify = PendingVerifyBound::END;
+        _lateral.clearOneShotStops();
+        _lateral.armStopAtNextHigh();
+        Diag::info("[VERIFY_HIGH] Armed — will stop on next high bound for adjustment");
+        return;
+    }
+    if (_state == WindingState::PAUSED) {
+        _pendingVerify   = PendingVerifyBound::NONE;
+        _state           = WindingState::VERIFY_HIGH;
+        _canStart        = false;
+        _pendingDisable  = true;
+        _lateral.clearOneShotStops();
         _lateral.stopWinding();
         _lateral.prepareStartPosition(_windingEndMm());
-        Diag::infof("[VERIFY_HIGH] Quick check depuis bobinage — chariot → %.2f mm (butée haute)",
+        Diag::infof("[VERIFY_HIGH] Paused-session verify — carriage → %.2f mm (high bound)",
                 _windingEndMm());
         return;
     }
@@ -110,7 +125,9 @@ void WinderApp::_toWinding() {
     _state          = WindingState::WINDING;
     _canStart     = false;
     _pendingDisable = false;
+    _pendingVerify  = PendingVerifyBound::NONE;
     _endPosArmed    = false;
+    _lateral.clearOneShotStops();
     // Do NOT reposition the carriage here. After verification the carriage is
     // already at the high bound (VERIFY_HIGH). startWinding() will choose the
     // correct initial direction based on the current position.
@@ -183,6 +200,24 @@ void WinderApp::_handleLateralEvents() {
     // The lateral stopped at the bound (_pausedAtReversal = true, state = HOMED).
     // Transition to PAUSED so the pot must return to 0 before winding resumes.
     if (_state == WindingState::WINDING && _lateral.consumePausedAtReversal()) {
+        if (_pendingVerify == PendingVerifyBound::END) {
+            _pendingVerify   = PendingVerifyBound::NONE;
+            _state           = WindingState::VERIFY_HIGH;
+            _canStart        = false;
+            _pendingDisable  = true;
+            _stepper.stop();
+            Diag::info("[VERIFY_HIGH] High bound reached — adjust with encoder/web, then resume");
+            return;
+        }
+        if (_pendingVerify == PendingVerifyBound::START) {
+            _pendingVerify   = PendingVerifyBound::NONE;
+            _state           = WindingState::VERIFY_LOW;
+            _canStart        = false;
+            _pendingDisable  = true;
+            _stepper.stop();
+            Diag::info("[VERIFY_LOW] Low bound reached — adjust with encoder/web, then resume");
+            return;
+        }
         _toPaused();
         Diag::info("[WINDING] Butée atteinte (stop armé) — passage en PAUSE.");
         return;
@@ -410,15 +445,26 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
     //    current traverse stroke, linearly scale speed down to 30% of its current
     //    value. This ensures a soft, synchronised stop at the flip point without
     //    stalling (the floor is always at least SPEED_HZ_MIN).
+    //    Crucially, we only apply this if the carriage is currently traveling
+    //    TOWARD the bound where the stop is actually requested.
     if (_lateral.hasStopAtNextBoundArmed()) {
-        float progress = _lateral.getTraversalProgress(); // 0..1 in the current direction
-        const float zoneStart  = 0.80f;  // start slowing at 80% of the traverse stroke
-        const float floorFactor = 0.30f; // never go below 30% of the current speed
-        if (progress >= zoneStart) {
-            float t = (progress - zoneStart) / (1.0f - zoneStart); // 0..1 inside the zone
-            t = constrain(t, 0.0f, 1.0f);
-            float factor = 1.0f - (1.0f - floorFactor) * t;
-            hz = max((uint32_t)SPEED_HZ_MIN, (uint32_t)((float)hz * factor));
+        bool applySlowdown = false;
+        if (_lateral.getState() == LatState::WINDING_FWD && _lateral.isStopOnNextHighArmed()) {
+            applySlowdown = true;
+        } else if (_lateral.getState() == LatState::WINDING_BWD && _lateral.isStopOnNextLowArmed()) {
+            applySlowdown = true;
+        }
+
+        if (applySlowdown) {
+            float progress = _lateral.getTraversalProgress(); // 0..1 in the current direction
+            const float zoneStart  = 0.80f;  // start slowing at 80% of the traverse stroke
+            const float floorFactor = 0.30f; // never go below 30% of the current speed
+            if (progress >= zoneStart) {
+                float t = (progress - zoneStart) / (1.0f - zoneStart); // 0..1 inside the zone
+                t = constrain(t, 0.0f, 1.0f);
+                float factor = 1.0f - (1.0f - floorFactor) * t;
+                hz = max((uint32_t)SPEED_HZ_MIN, (uint32_t)((float)hz * factor));
+            }
         }
     }
 
@@ -628,6 +674,7 @@ WinderStatus WinderApp::getStatus() const {
         _recipe.layerSpeedPct,
         _recipe.humanTraversePct,
         _recipe.humanSpeedPct,
+        _recipe.firstPassTraverseFactor,
         (int)_recipe.endPos,
         _recipe.endPosTurns,
         windingStateName(_state),
@@ -651,12 +698,22 @@ void WinderApp::_refreshCarriageForGeometryChange(bool startBoundChanged, bool e
 
     switch (_state) {
     case WindingState::VERIFY_LOW:
-    case WindingState::WINDING:
-    case WindingState::PAUSED:
         if (startBoundChanged) _lateral.prepareStartPosition(_windingStartMm());
         break;
     case WindingState::VERIFY_HIGH:
         if (endBoundChanged) _lateral.prepareStartPosition(_windingEndMm());
+        break;
+    case WindingState::WINDING:
+    case WindingState::PAUSED:
+        // Si le chariot est arrêté en cours de session (PAUSED) ou en attente pot (WINDING),
+        // on ne déplace physiquement le chariot QUE s'il est déjà positionné sur la butée
+        // que l'utilisateur est en train de modifier. Cela évite un travers traumatique
+        // de toute la bobine si un paramètre est changé alors que le chariot est au milieu.
+        if (startBoundChanged && fabsf(_lateral.getCurrentPositionMm() - _windingStartMm()) <= 1.0f) {
+            _lateral.prepareStartPosition(_windingStartMm());
+        } else if (endBoundChanged && fabsf(_lateral.getCurrentPositionMm() - _windingEndMm()) <= 1.0f) {
+            _lateral.prepareStartPosition(_windingEndMm());
+        }
         break;
     default:
         break;
@@ -883,17 +940,37 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
     }
 
     if (cmd == "geom_start_trim_nudge") {
+        if (_state != WindingState::VERIFY_LOW && _state != WindingState::PAUSED) {
+            Diag::info("[geom_start_trim_nudge] Ignored — only available while verifying the low bound or paused near it");
+            return true;
+        }
+        if (_lateral.isBusy() || fabsf(_lateral.getCurrentPositionMm() - _windingStartMm()) > 0.50f) {
+            Diag::info("[geom_start_trim_nudge] Ignored — carriage is not settled on the low bound");
+            return true;
+        }
         float delta = constrain(value.toFloat(), -1.0f, 1.0f);
-        _geom.windingStartTrim_mm = constrain(_geom.windingStartTrim_mm + delta, -5.0f, 5.0f);
-        _refreshCarriageForGeometryChange(true, false);
+        _lateral.jog(delta);
+        float newPos = _lateral.getTargetPositionMm();
+        _geom.windingStartTrim_mm = constrain(
+            newPos - (_geom.flangeBottom_mm + _geom.margin_mm), -5.0f, 5.0f);
         _saveRecipe();
         return true;
     }
 
     if (cmd == "geom_end_trim_nudge") {
+        if (_state != WindingState::VERIFY_HIGH && _state != WindingState::PAUSED) {
+            Diag::info("[geom_end_trim_nudge] Ignored — only available while verifying the high bound or paused near it");
+            return true;
+        }
+        if (_lateral.isBusy() || fabsf(_lateral.getCurrentPositionMm() - _windingEndMm()) > 0.50f) {
+            Diag::info("[geom_end_trim_nudge] Ignored — carriage is not settled on the high bound");
+            return true;
+        }
         float delta = constrain(value.toFloat(), -1.0f, 1.0f);
-        _geom.windingEndTrim_mm = constrain(_geom.windingEndTrim_mm + delta, -5.0f, 5.0f);
-        _refreshCarriageForGeometryChange(false, true);
+        _lateral.jog(delta);
+        float newPos = _lateral.getTargetPositionMm();
+        _geom.windingEndTrim_mm = constrain(
+            newPos - (_geom.totalWidth_mm - _geom.flangeTop_mm - _geom.margin_mm), -5.0f, 5.0f);
         _saveRecipe();
         return true;
     }
@@ -992,6 +1069,14 @@ bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
         return true;
     }
 
+    if (cmd == "winding_first_pass_traverse") {
+        _recipe.firstPassTraverseFactor = constrain(value.toFloat(), 0.40f, 1.80f);
+        _planner.setRecipe(_captureRecipe());
+        Diag::infof("First pass traverse factor: %.2f", _recipe.firstPassTraverseFactor);
+        _saveRecipe();
+        return true;
+    }
+
     return false;
 }
 
@@ -1026,6 +1111,27 @@ void WinderApp::handleEncoderDelta(int32_t delta) {
         _saveRecipe();
         Diag::infof("[Encoder] Butée haute: %.2f mm (trim %.2f)",
             newPos, _geom.windingEndTrim_mm);
+    } else if (_state == WindingState::PAUSED) {
+        // En pause, si le chariot est arrêté très proche d'une butée,
+        // l'utilisateur peut avoir envie de l'ajuster avec l'encodeur.
+        float currentPos = _lateral.getCurrentPositionMm();
+        if (fabsf(currentPos - _windingEndMm()) < 0.5f) {
+            float step = delta * ENC_STEP_MM;
+            _lateral.jog(step);
+            float newPos = _lateral.getTargetPositionMm();
+            _geom.windingEndTrim_mm = constrain(
+                newPos - (_geom.totalWidth_mm - _geom.flangeTop_mm - _geom.margin_mm), -5.0f, 5.0f);
+            _saveRecipe();
+            Diag::infof("[Encoder] Butée haute ajustée en PAUSE: %.2f mm", newPos);
+        } else if (fabsf(currentPos - _windingStartMm()) < 0.5f) {
+            float step = delta * ENC_STEP_MM;
+            _lateral.jog(step);
+            float newPos = _lateral.getTargetPositionMm();
+            _geom.windingStartTrim_mm = constrain(
+                newPos - (_geom.flangeBottom_mm + _geom.margin_mm), -5.0f, 5.0f);
+            _saveRecipe();
+            Diag::infof("[Encoder] Butée basse ajustée en PAUSE: %.2f mm", newPos);
+        }
     } else if (_state == WindingState::MANUAL) {
         // Pas rapide (x10) sur le premier passage pour traverser vite la fenêtre,
         // puis pas fins dès qu'une bute a été atteinte.

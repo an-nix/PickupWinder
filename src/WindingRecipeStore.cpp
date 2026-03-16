@@ -39,6 +39,7 @@ String WindingRecipeStore::toJson(const WindingRecipe& recipe) const {
 	doc["layerSpeedPct"] = recipe.layerSpeedPct;
 	doc["humanTraversePct"] = recipe.humanTraversePct;
 	doc["humanSpeedPct"] = recipe.humanSpeedPct;
+	doc["firstPassTraverseFactor"] = recipe.firstPassTraverseFactor;
 	doc["latOffsetMm"] = recipe.latOffsetMm;
 	doc["endPos"] = windingEndPosKey(recipe.endPos);
 	doc["endPosTurns"] = recipe.endPosTurns;
@@ -74,6 +75,7 @@ bool WindingRecipeStore::fromJson(const String& json, WindingRecipe& recipe) con
 	recipe.layerSpeedPct    = doc["layerSpeedPct"] | WINDING_LAYER_SPEED_JITTER_DEFAULT;
 	recipe.humanTraversePct = doc["humanTraversePct"] | WINDING_HUMAN_TRAVERSE_JITTER_DEFAULT;
 	recipe.humanSpeedPct    = doc["humanSpeedPct"] | WINDING_HUMAN_SPEED_JITTER_DEFAULT;
+	recipe.firstPassTraverseFactor = constrain((float)(doc["firstPassTraverseFactor"] | 1.0f), 0.40f, 1.80f);
 	recipe.latOffsetMm      = doc["latOffsetMm"] | LAT_HOME_OFFSET_DEFAULT_MM;
 	recipe.endPos           = windingEndPosFromString(String((const char*)(doc["endPos"] | "none")));
 	recipe.endPosTurns      = constrain((int)(doc["endPosTurns"] | 3), 1, 20);

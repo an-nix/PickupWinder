@@ -71,7 +71,10 @@ public:
     void armPauseOnNextReversal() { _pauseOnNextReversal = true; _pausedAtReversal = false; }
     void armStopAtNextHigh() { _stopOnNextHigh = true; _pausedAtReversal = false; }
     void armStopAtNextLow()  { _stopOnNextLow  = true; _pausedAtReversal = false; }
-    bool hasStopAtNextBoundArmed() const { return _stopOnNextHigh || _stopOnNextLow; }
+    bool isStopOnNextHighArmed() const { return _stopOnNextHigh; }
+    bool isStopOnNextLowArmed()  const { return _stopOnNextLow; }
+    void clearOneShotStops();
+    bool hasStopAtNextBoundArmed() const { return _stopOnNextHigh || _stopOnNextLow || _pauseOnNextReversal; }
     bool consumePausedAtReversal() {
         bool v = _pausedAtReversal;
         _pausedAtReversal = false;
