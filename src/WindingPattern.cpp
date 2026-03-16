@@ -69,6 +69,11 @@ TraversePlan WindingPatternPlanner::getPlan(long turnsDone, float progressInPass
 	}
 	}
 
+	// Optional dedicated multiplier for the very first traverse pass.
+	if (passIndex == 0) {
+		speedScale *= _recipe.firstPassTraverseFactor;
+	}
+
 	tppScale   = clampf(tppScale, 0.55f, 1.60f);
 	speedScale = clampf(speedScale, 0.55f, 1.60f);
 

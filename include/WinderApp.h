@@ -11,6 +11,7 @@
 
 // Winding direction seen from the front of the bobbin.
 enum class Direction { CW, CCW };
+enum class PendingVerifyBound : uint8_t { NONE = 0, START = 1, END = 2 };
 
 // ── WinderApp ─────────────────────────────────────────────────────────────────
 // Winding controller. Owns the bobbin motor, traverse axis, LED guide and
@@ -145,6 +146,7 @@ private:
     // Vrai jusqu'à ce que le chariot atteigne une butée en mode MANUAL.
     // Quand vrai, le pas encodeur est multiplié par MANUAL_FAST_STEP_MULT.
     bool   _manualFirstPass  = true;
+    PendingVerifyBound _pendingVerify = PendingVerifyBound::NONE;
     // ── Position finale de bobinage ──────────────────────────────────────
     // Vrai dès que le hook de fin de bobinage a repositionné le chariot.
     // Remis à false à chaque _toWinding() / _toIdle().

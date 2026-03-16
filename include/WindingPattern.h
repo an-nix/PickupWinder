@@ -46,6 +46,9 @@ struct WindingRecipe {
 	float           layerSpeedPct      = WINDING_LAYER_SPEED_JITTER_DEFAULT;
 	float           humanTraversePct   = WINDING_HUMAN_TRAVERSE_JITTER_DEFAULT;
 	float           humanSpeedPct      = WINDING_HUMAN_SPEED_JITTER_DEFAULT;
+	// Multiplier applied only to the first traverse pass speed.
+	// 1.0 = unchanged, <1 slower, >1 faster.
+	float           firstPassTraverseFactor = 1.0f;
 	// Position finale du chariot (aucune / butée haute / butée basse).
 	WindingEndPos   endPos             = WindingEndPos::NONE;
 	// Nombre de tours effectués sur la position finale avant l'arrêt.

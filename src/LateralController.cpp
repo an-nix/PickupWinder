@@ -475,6 +475,13 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 Diag::infof("[Lateral] Jog → %.2f mm", targetMm);
             }
 
+            void LateralController::clearOneShotStops() {
+                _pauseOnNextReversal = false;
+                _stopOnNextHigh = false;
+                _stopOnNextLow = false;
+                _pausedAtReversal = false;
+            }
+
             void LateralController::stopWinding() {
                 // POSITIONING : mouvement de repositionnement en cours (ex. phase finale
                 // de bobinage). Forcer l'arrêt et repasser en HOMED.
@@ -488,9 +495,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
                 if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
                 _lastDirFwd = (_state == LatState::WINDING_FWD);  // mémorise la direction
-                _pauseOnNextReversal = false;
-                _stopOnNextHigh = false;
-                _stopOnNextLow = false;
+                clearOneShotStops();
                 if (_stepper->isRunning()) {
                     _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
                 }

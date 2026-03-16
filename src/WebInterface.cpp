@@ -75,7 +75,7 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         "\"pass\":%d,\"activeTpp\":%ld,\"latScale\":%.3f,\"latProgress\":%.3f,\"latPos\":%.3f,\"wStart\":%.3f,\"wEnd\":%.3f,\"wStartTrim\":%.3f,\"wEndTrim\":%.3f,\"eff\":%.2f,"
         "\"gt\":%.2f,\"gb\":%.2f,\"gtp\":%.2f,\"gm\":%.2f,\"gw\":%.4f,"
         "\"latOfs\":%.2f,\"wStyle\":\"%s\",\"seed\":%lu,"
-        "\"layerJitter\":%.3f,\"layerSpeed\":%.3f,\"humanTraverse\":%.3f,\"humanSpeed\":%.3f,"
+        "\"layerJitter\":%.3f,\"layerSpeed\":%.3f,\"humanTraverse\":%.3f,\"humanSpeed\":%.3f,\"firstPassTraverse\":%.3f,"
         "\"manualMode\":%s,\"rodageMode\":%s,\"rodagePass\":%d,\"rodagePasses\":%d,\"rodageDist\":%.1f,"
         "\"endPos\":%d,\"endPosTurns\":%d}",
         s.rpm, s.speedHz, s.turns, s.targetTurns,
@@ -92,7 +92,7 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         s.latPositionMm, s.windingStartMm, s.windingEndMm, s.windingStartTrimMm, s.windingEndTrimMm, s.effectiveWidth_mm,
         s.geomTotal, s.geomBottom, s.geomTop, s.geomMargin, s.geomWire,
         s.latOffset, s.windingStyle, (unsigned long)s.seed,
-        s.layerJitterPct, s.layerSpeedPct, s.humanTraversePct, s.humanSpeedPct,
+        s.layerJitterPct, s.layerSpeedPct, s.humanTraversePct, s.humanSpeedPct, s.firstPassTraverseFactor,
         s.manualMode ? "true" : "false",
         s.rodageMode ? "true" : "false",
         s.rodagePassDone, s.rodagePasses, s.rodageDistMm,
