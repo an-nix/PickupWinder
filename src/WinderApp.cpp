@@ -939,6 +939,34 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
         return true;
     }
 
+    // Décalage global de la fenêtre : déplace les deux butées du même delta.
+    // Utilisable en cours de bobinage (PAUSED, WINDING, VERIFY_*).
+    // Positif = décale vers le haut (high), négatif = vers le bas (low).
+    if (cmd == "window_shift") {
+        float delta = constrain(value.toFloat(), -5.0f, 5.0f);
+        _geom.windingStartTrim_mm = constrain(_geom.windingStartTrim_mm + delta, -5.0f, 5.0f);
+        _geom.windingEndTrim_mm   = constrain(_geom.windingEndTrim_mm   + delta, -5.0f, 5.0f);
+        _refreshCarriageForGeometryChange(true, true);
+        _saveRecipe();
+        Diag::infof("[WINDOW_SHIFT] Décalage %.2f mm → start_trim=%.2f end_trim=%.2f  fenêtre [%.2f → %.2f mm]",
+            delta, _geom.windingStartTrim_mm, _geom.windingEndTrim_mm,
+            _windingStartMm(), _windingEndMm());
+        return true;
+    }
+
+    // Nudge : micro-décalage (+/- 0.05 mm) de toute la fenêtre.
+    // Fonctionne dans tous les états sauf IDLE.
+    if (cmd == "window_shift_nudge") {
+        float delta = constrain(value.toFloat(), -1.0f, 1.0f);
+        _geom.windingStartTrim_mm = constrain(_geom.windingStartTrim_mm + delta, -5.0f, 5.0f);
+        _geom.windingEndTrim_mm   = constrain(_geom.windingEndTrim_mm   + delta, -5.0f, 5.0f);
+        _refreshCarriageForGeometryChange(true, true);
+        _saveRecipe();
+        Diag::infof("[WINDOW_SHIFT] Nudge %.2f mm → fenêtre [%.2f → %.2f mm]",
+            delta, _windingStartMm(), _windingEndMm());
+        return true;
+    }
+
     if (cmd == "geom_start_trim_nudge") {
         if (_state != WindingState::VERIFY_LOW && _state != WindingState::PAUSED) {
             Diag::info("[geom_start_trim_nudge] Ignored — only available while verifying the low bound or paused near it");

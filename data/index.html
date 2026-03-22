@@ -1,441 +1,224 @@
 <!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Pickup Winder</title>
-<style>
-*{box-sizing:border-box}html,body{height:100%;margin:0;overflow:hidden}
-body{font-family:Inter,Segoe UI,system-ui,sans-serif;background:#0b1220;color:#e8edf7;padding:10px}
-.app{height:100%;max-width:1180px;margin:0 auto;display:grid;grid-template-rows:auto auto auto 1fr auto;gap:10px}
-.tab-bar{display:flex;gap:6px}
-.tab-btn{flex:1;background:#111b2f;border:1px solid #22314f;border-radius:10px;padding:9px 8px;font-size:14px;font-weight:600;color:#8ea0c0;cursor:pointer;text-align:center}
-.tab-btn.tab-active{border-color:#36d399;color:#fff;background:#14314a}
-.head{display:flex;justify-content:space-between;align-items:center;background:#111b2f;border:1px solid #22314f;border-radius:12px;padding:10px 14px}
-.title{font-weight:700;font-size:18px;letter-spacing:.4px}.mini{font-size:12px;color:#95a3bd}
-.dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:6px;background:#f66}
-.dot.ok{background:#36d399}.dot.warn{background:#fbbf24}
-.status{background:#111b2f;border:1px solid #22314f;border-radius:12px;padding:10px 14px;font-size:14px;color:#c9d4e8}
-.views{height:100%;min-height:0;overflow:auto}.view{display:none;min-height:100%}.view.show{display:grid;gap:10px}
-#setup{grid-template-rows:auto auto auto;align-content:start}
-#run{grid-template-rows:auto auto 1fr auto}
-.grid{display:grid;gap:10px}.g2{grid-template-columns:repeat(2,minmax(0,1fr))}.g3{grid-template-columns:repeat(3,minmax(0,1fr))}.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
-.card{background:#111b2f;border:1px solid #22314f;border-radius:12px;padding:10px;min-height:0}
-.label{font-size:11px;color:#8ea0c0;text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px}
-.val{font-size:30px;font-weight:700;line-height:1;color:#7dd3fc}.sub{font-size:12px;color:#95a3bd}
-input[type=number],input[type=range]{width:100%} input[type=number]{background:#0d1628;color:#e8edf7;border:1px solid #2a3b60;border-radius:8px;padding:9px;font-size:14px}
-.seg{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.seg3{grid-template-columns:repeat(3,1fr)}
-.seg input{display:none}.pill{display:block;text-align:center;padding:9px;border-radius:8px;background:#0d1628;border:1px solid #2a3b60;color:#b7c4dc;font-size:13px;font-weight:600;cursor:pointer}
-.seg input:checked + .pill{border-color:#36d399;color:#fff;background:#14314a}
-.row{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;align-items:end}
-.actions{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:10px}
-.btn{border:none;border-radius:10px;padding:12px 10px;font-size:15px;font-weight:700;cursor:pointer}
-.start{background:#16a34a;color:#fff}.stop{background:#dc2626;color:#fff}.reset{background:#334155;color:#e2e8f0}
-.bar{height:12px;background:#0d1628;border:1px solid #2a3b60;border-radius:20px;overflow:hidden}.fill{height:100%;width:0%;background:linear-gradient(90deg,#22d3ee,#34d399)}
-.kv{display:grid;grid-template-columns:1fr auto;gap:8px;padding:4px 0;font-size:14px;color:#c8d3e8}
-@media (max-width:1000px){.row{grid-template-columns:repeat(3,minmax(0,1fr))}.g4{grid-template-columns:repeat(2,minmax(0,1fr))}.actions{grid-template-columns:1fr 1fr}}
-@media (max-width:700px){.g3,.g2,.row{grid-template-columns:1fr}.actions{grid-template-columns:1fr}}
-</style></head><body>
+<link rel="stylesheet" href="style.css"></head><body>
 <div class="app">
-  <div class="head">
-    <div><div class="title">Pickup Winder — Production</div><div class="mini" id="phase">Setup</div></div>
-    <div class="mini"><span class="dot" id="ws-dot"></span><span id="ws-lbl">Connecting...</span></div>
+
+  <!-- ═══ TOP BAR ═══ -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="logo">⚡ Pickup Winder</span>
+      <span class="badge" id="state-badge">IDLE</span>
+    </div>
+    <div class="topbar-right">
+      <span class="dot" id="ws-dot"></span><span class="conn" id="ws-lbl">…</span>
+    </div>
+  </header>
+
+  <!-- ═══ STATUS ═══ -->
+  <div class="statusbar" id="status-line">Ready</div>
+
+  <!-- ═══ TABS ═══ -->
+  <nav class="tabs">
+    <button class="tab active" id="tab-operate" onclick="showTab('operate')">🎯 Operate</button>
+    <button class="tab" id="tab-setup" onclick="showTab('setup')">⚙ Setup</button>
+    <button class="tab" id="tab-tools" onclick="showTab('tools')">🔧 Tools</button>
+  </nav>
+
+  <!-- ═══ PANE: OPERATE ═══ -->
+  <div class="pane show" id="pane-operate">
+
+    <div class="gauge-row">
+      <div class="gauge"><div class="gauge-val" id="rpm">0</div><div class="gauge-lbl">RPM</div></div>
+      <div class="gauge accent"><div class="gauge-val" id="turns">0</div><div class="gauge-lbl">TURNS</div></div>
+      <div class="gauge"><div class="gauge-val" id="pass">0</div><div class="gauge-lbl">PASS</div></div>
+    </div>
+
+    <div class="progress-card">
+      <div class="progress-hdr"><span id="pct">0 %</span><span class="progress-tgt">/ <span id="tgt">0</span></span></div>
+      <div class="bar"><div class="fill" id="bar"></div></div>
+    </div>
+
+    <div class="telem">
+      <div class="t-i"><span class="t-k">Window</span><span class="t-v"><span id="w-start-run">0.00</span> → <span id="w-end-run">0.00</span> mm</span></div>
+      <div class="t-i"><span class="t-k">Carriage</span><span class="t-v" id="lat-pos-run">0.00 mm</span></div>
+      <div class="t-i"><span class="t-k">TPP</span><span class="t-v" id="active-tpp">0</span></div>
+      <div class="t-i"><span class="t-k">Scale</span><span class="t-v" id="lat-scale">1.00×</span></div>
+      <div class="t-i"><span class="t-k">Layer</span><span class="t-v" id="lat-progress">0 %</span></div>
+      <div class="t-i"><span class="t-k">Trim L / H</span><span class="t-v"><span id="w-start-trim-run">0.00</span> / <span id="w-end-trim-run">0.00</span></span></div>
+    </div>
+
+    <!-- CTX: IDLE -->
+    <div class="ctx" id="ctx-idle">
+      <button class="btn btn-go btn-xl" onclick="cmd('start')">▶ START</button>
+    </div>
+
+    <!-- CTX: WINDING / PAUSED -->
+    <div class="ctx" id="ctx-winding" style="display:none">
+      <div class="ctx-section">
+        <span class="ctx-title">Target</span>
+        <div class="row4">
+          <button class="btn btn-neutral btn-s" onclick="adjustTarget(-100)">−100</button>
+          <input id="ti-run" type="number" min="1" max="50000" step="1" class="inline-input" onchange="cmd('target',this.value)">
+          <button class="btn btn-neutral btn-s" onclick="adjustTarget(+100)">+100</button>
+        </div>
+      </div>
+      <div class="ctx-section">
+        <span class="ctx-title">Window shift</span>
+        <div class="row4">
+          <button class="btn btn-neutral btn-s" onclick="cmd('window_shift_nudge','-0.10')">◀ .10</button>
+          <button class="btn btn-neutral btn-s" onclick="cmd('window_shift_nudge','-0.05')">◁ .05</button>
+          <button class="btn btn-neutral btn-s" onclick="cmd('window_shift_nudge','0.05')">.05 ▷</button>
+          <button class="btn btn-neutral btn-s" onclick="cmd('window_shift_nudge','0.10')">.10 ▶</button>
+        </div>
+      </div>
+      <div class="ctx-section">
+        <span class="ctx-title">Soft stop / verify</span>
+        <div class="row4">
+          <button class="btn btn-warn btn-s" onclick="cmd('stop_next_low')">⏸ Low</button>
+          <button class="btn btn-warn btn-s" onclick="cmd('stop_next_high')">⏸ High</button>
+          <button class="btn btn-muted btn-s" onclick="cmd('verify_low')">🔍 Low</button>
+          <button class="btn btn-muted btn-s" onclick="cmd('verify_high')">🔍 High</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- CTX: VERIFY -->
+    <div class="ctx" id="ctx-verify" style="display:none">
+      <div class="ctx-section">
+        <span class="ctx-title" id="verify-title">Verifying bound</span>
+        <div class="row4">
+          <button class="btn btn-neutral btn-s" id="vn-a" onclick="cmd('geom_start_trim_nudge','-0.05')">◀ −.05</button>
+          <button class="btn btn-neutral btn-s" id="vn-b" onclick="cmd('geom_start_trim_nudge','0.05')">+.05 ▶</button>
+          <button class="btn btn-go btn-s" onclick="cmd('confirm')">✓ Confirm</button>
+          <button class="btn btn-muted btn-s" id="vn-switch"></button>
+        </div>
+      </div>
+    </div>
+
+    <!-- CTX: TARGET REACHED -->
+    <div class="ctx" id="ctx-target" style="display:none">
+      <div class="row4">
+        <button class="btn btn-neutral btn-s" onclick="adjustTarget(500)">+500 &amp; continue</button>
+        <button class="btn btn-danger btn-s" onclick="cmd('reset')">↺ Reset</button>
+      </div>
+    </div>
+
+    <!-- MASTER STOP -->
+    <div id="master-stop" style="display:none">
+      <button class="btn btn-danger btn-xl" onclick="cmd('stop')">■ STOP</button>
+    </div>
   </div>
 
-  <div class="status" id="status-line">Initializing...</div>
-
-  <div class="tab-bar">
-    <button class="tab-btn tab-active" id="tab-main" onclick="showTab('main')">&#127919; Winding</button>
-    <button class="tab-btn" id="tab-config" onclick="showTab('config')">&#9881; Configuration</button>
+  <!-- ═══ PANE: SETUP ═══ -->
+  <div class="pane" id="pane-setup">
+    <div class="lock-banner" id="lock-banner" style="display:none">🔒 Session active — <span class="lock-ok">highlighted</span> fields are editable, <span class="lock-no">grayed</span> ones are locked until Stop</div>
+    <div class="recipe-bar">
+      <a class="btn btn-neutral btn-s" href="/recipe.json" download="recipe.json">⬇ Export recipe</a>
+      <button class="btn btn-neutral btn-s" onclick="importRecipe()">⬆ Import recipe</button>
+      <input type="file" id="recipe-file" accept=".json" style="display:none" onchange="handleRecipeFile(this)">
+    </div>
+    <div class="cards2">
+      <div class="card">
+        <div class="card-title">Machine</div>
+        <div class="fg">
+          <label>Direction</label>
+          <div class="seg lockable" id="lock-dir"><label><input type="radio" name="dir" id="r-cw" onchange="cmd('direction','cw')"><span class="pill">CW</span></label><label><input type="radio" name="dir" id="r-ccw" onchange="cmd('direction','ccw')"><span class="pill">CCW</span></label></div>
+          <label>Mode</label>
+          <div class="seg lockable" id="lock-mode"><label><input type="radio" name="mode" id="m-target" onchange="cmd('freerun','false')"><span class="pill">Target</span></label><label><input type="radio" name="mode" id="m-free" onchange="cmd('freerun','true')"><span class="pill">FreeRun</span></label></div>
+          <label>Target</label><input id="ti" type="number" min="100" max="50000" step="100" onchange="cmd('target',this.value)">
+          <label>Seed</label><input id="w-seed" type="number" min="1" max="4294967295" step="1" class="lockable" onchange="cmd('winding_seed',this.value)">
+          <label>Final pos.</label>
+          <div class="seg seg3"><label><input type="radio" name="endpos" id="ep-none" onchange="cmd('end_pos','none')"><span class="pill">Free</span></label><label><input type="radio" name="endpos" id="ep-high" onchange="cmd('end_pos','high')"><span class="pill">High</span></label><label><input type="radio" name="endpos" id="ep-low" onchange="cmd('end_pos','low')"><span class="pill">Low</span></label></div>
+          <label>Hold turns</label><input id="ep-turns" type="number" min="1" max="20" step="1" onchange="cmd('end_pos_turns',this.value)">
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Geometry</div>
+        <div class="fg">
+          <label>Total width</label><input id="g-total" type="number" step="0.1" onchange="cmd('geom_total',this.value)">
+          <label>Margin</label><input id="g-margin" type="number" step="0.1" onchange="cmd('geom_margin',this.value)">
+          <label>Bottom flange</label><input id="g-bottom" type="number" step="0.1" onchange="cmd('geom_bottom',this.value)">
+          <label>Top flange</label><input id="g-top" type="number" step="0.1" onchange="cmd('geom_top',this.value)">
+          <label>Low trim</label><input id="g-start-trim" type="number" step="0.1" min="-5" max="5" onchange="cmd('geom_start_trim',this.value)">
+          <label>High trim</label><input id="g-end-trim" type="number" step="0.1" min="-5" max="5" onchange="cmd('geom_end_trim',this.value)">
+          <label>Wire ⌀ mm</label><input id="g-wire" type="number" step="0.001" onchange="cmd('geom_wire',this.value)">
+        </div>
+        <div class="info-line">
+          <span>Window <b><span id="w-start">0</span>→<span id="w-end">0</span></b> mm</span>
+          <span>TPP <b id="tpp">0</b></span>
+          <span>Pos <b id="lat-pos">0.00</b> mm</span>
+        </div>
+      </div>
+    </div>
+    <div class="card" id="card-profile">
+      <div class="card-title">Winding profile <span class="lock-tag lockable" id="lock-profile" style="display:none">🔒 locked</span></div>
+      <div class="seg seg3 lockable" style="margin-bottom:10px"><label><input type="radio" name="wstyle" id="ws-straight" checked onchange="cmd('winding_style','straight');updateSliderVisibility('straight')"><span class="pill">Straight</span></label><label><input type="radio" name="wstyle" id="ws-scatter" onchange="cmd('winding_style','scatter');updateSliderVisibility('scatter')"><span class="pill">Scatter</span></label><label><input type="radio" name="wstyle" id="ws-human" onchange="cmd('winding_style','human');updateSliderVisibility('human')"><span class="pill">Human</span></label></div>
+      <div class="sliders lockable">
+        <label>Scatter <b id="scatter-lbl">1.0</b></label><input id="g-scatter" type="range" min="0.5" max="4" step="0.1" oninput="byId('scatter-lbl').textContent=parseFloat(this.value).toFixed(1)" onchange="cmd('geom_scatter',this.value)">
+        <label>TPP offset <b id="tpp-ofs-lbl">0</b></label><input id="g-tpp-ofs" type="range" min="-80" max="80" step="1" oninput="byId('tpp-ofs-lbl').textContent=this.value" onchange="cmd('geom_tpp_ofs',this.value)">
+        <label class="sl-scatter">Layer jitter <b id="lj">0.10</b></label><input class="sl-scatter" id="w-layer-jitter" type="range" min="0" max="0.45" step="0.01" oninput="byId('lj').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_layer_jitter',this.value)">
+        <label class="sl-scatter">Layer speed <b id="ls">0.08</b></label><input class="sl-scatter" id="w-layer-speed" type="range" min="0" max="0.45" step="0.01" oninput="byId('ls').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_layer_speed',this.value)">
+        <label class="sl-human">Human traverse <b id="ht">0.16</b></label><input class="sl-human" id="w-human-traverse" type="range" min="0" max="0.45" step="0.01" oninput="byId('ht').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_human_traverse',this.value)">
+        <label class="sl-human">Human speed <b id="hs">0.12</b></label><input class="sl-human" id="w-human-speed" type="range" min="0" max="0.45" step="0.01" oninput="byId('hs').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_human_speed',this.value)">
+        <label>1st pass factor <b id="fp">1.00</b></label><input id="w-first-pass-traverse" type="range" min="0.40" max="1.80" step="0.01" oninput="byId('fp').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_first_pass_traverse',this.value)">
+      </div>
+    </div>
   </div>
 
-  <div class="views">
-    <div class="view show" id="setup">
+  <!-- ═══ PANE: TOOLS ═══ -->
+  <div class="pane" id="pane-tools">
+    <div class="cards2">
       <div class="card">
-        <div class="label">Machine settings (editable before Start)</div>
-        <div class="row">
-          <div><div class="label">Direction</div><div class="seg"><label><input type="radio" name="dir" id="r-cw" onchange="cmd('direction','cw')"><span class="pill">CW</span></label><label><input type="radio" name="dir" id="r-ccw" onchange="cmd('direction','ccw')"><span class="pill">CCW</span></label></div></div>
-          <div><div class="label">Mode</div><div class="seg"><label><input type="radio" name="mode" id="m-target" onchange="cmd('freerun','false')"><span class="pill">Target</span></label><label><input type="radio" name="mode" id="m-free" onchange="cmd('freerun','true')"><span class="pill">FreeRun</span></label></div></div>
-          <div><div class="label">Target turns</div><input id="ti" type="number" min="100" max="50000" step="100" onchange="cmd('target',this.value)"></div>
-          <div><div class="label">Seed</div><input id="w-seed" type="number" min="1" max="4294967295" step="1" onchange="cmd('winding_seed',this.value)"></div>
-          <div><div class="label">Final position</div><div class="seg seg3"><label><input type="radio" name="endpos" id="ep-none" onchange="cmd('end_pos','none')"><span class="pill">Free</span></label><label><input type="radio" name="endpos" id="ep-high" onchange="cmd('end_pos','high')"><span class="pill">High&nbsp;bound</span></label><label><input type="radio" name="endpos" id="ep-low" onchange="cmd('end_pos','low')"><span class="pill">Low&nbsp;bound</span></label></div></div>
-          <div><div class="label">Hold turns</div><input id="ep-turns" type="number" min="1" max="20" step="1" onchange="cmd('end_pos_turns',this.value)"></div>
-        </div>
-      </div>
-
-      <div class="grid g2">
-        <div class="card">
-          <div class="label">Geometry</div>
-          <div class="grid g2">
-            <div><div class="label">Total width</div><input id="g-total" type="number" step="0.1" onchange="cmd('geom_total',this.value)"></div>
-            <div><div class="label">Margin</div><input id="g-margin" type="number" step="0.1" onchange="cmd('geom_margin',this.value)"></div>
-            <div><div class="label">Bottom tonework</div><input id="g-bottom" type="number" step="0.1" onchange="cmd('geom_bottom',this.value)"></div>
-            <div><div class="label">Top tonework</div><input id="g-top" type="number" step="0.1" onchange="cmd('geom_top',this.value)"></div>
-            <div><div class="label">Low-bound trim</div><input id="g-start-trim" type="number" step="0.1" min="-5" max="5" onchange="cmd('geom_start_trim',this.value)"></div>
-            <div><div class="label">High-bound trim</div><input id="g-end-trim" type="number" step="0.1" min="-5" max="5" onchange="cmd('geom_end_trim',this.value)"></div>
-            <div><div class="label">Wire (mm)</div><input id="g-wire" type="number" step="0.001" onchange="cmd('geom_wire',this.value)"></div>
+        <div class="card-title">⚙ Manual mode</div>
+        <p class="hint">Encoder controls carriage, pot controls motor.</p>
+        <div id="manual-controls" style="display:none">
+          <div class="fg">
+            <label>Step (mm)</label>
+            <div class="row4">
+              <button class="btn btn-neutral btn-xs" onclick="setManualStep(0.05)">0.05</button>
+              <button class="btn btn-neutral btn-xs" onclick="setManualStep(0.1)">0.1</button>
+              <button class="btn btn-neutral btn-xs" onclick="setManualStep(0.5)">0.5</button>
+              <button class="btn btn-neutral btn-xs" onclick="setManualStep(1.0)">1.0</button>
+            </div>
+            <label>Position</label><span class="live-val" id="manual-pos">0.00 mm</span>
+            <label>Turns</label><span class="live-val" id="manual-turns">0</span>
           </div>
+          <div class="row4" style="margin-top:8px">
+            <button class="btn btn-s" id="btn-capture" style="background:#0369a1;color:#fff" onclick="toggleCapture()">⏺ Capture</button>
+            <button class="btn btn-neutral btn-s" id="btn-dl-capture" style="display:none" onclick="downloadCapture()">⬇ Download</button>
+          </div>
+          <div id="manual-cap-status" class="hint" style="margin-top:4px"></div>
         </div>
-        <div class="card">
-          <div class="label">Winding profile</div>
-          <div class="seg seg3" style="margin-bottom:8px"><label><input type="radio" name="wstyle" id="ws-straight" onchange="cmd('winding_style','straight')"><span class="pill">Straight</span></label><label><input type="radio" name="wstyle" id="ws-scatter" onchange="cmd('winding_style','scatter')"><span class="pill">Scatter</span></label><label><input type="radio" name="wstyle" id="ws-human" onchange="cmd('winding_style','human')"><span class="pill">Human</span></label></div>
-          <div class="label">Scatter <span id="scatter-lbl">1.0</span></div><input id="g-scatter" type="range" min="0.5" max="4" step="0.1" oninput="document.getElementById('scatter-lbl').textContent=parseFloat(this.value).toFixed(1)" onchange="cmd('geom_scatter',this.value)">
-          <div class="label">Turns/pass offset <span id="tpp-ofs-lbl">0</span></div><input id="g-tpp-ofs" type="range" min="-80" max="80" step="1" oninput="document.getElementById('tpp-ofs-lbl').textContent=this.value" onchange="cmd('geom_tpp_ofs',this.value)">
-          <div class="label">Layer jitter <span id="lj">0.10</span></div><input id="w-layer-jitter" type="range" min="0" max="0.45" step="0.01" oninput="document.getElementById('lj').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_layer_jitter',this.value)">
-          <div class="label">Layer speed jitter <span id="ls">0.08</span></div><input id="w-layer-speed" type="range" min="0" max="0.45" step="0.01" oninput="document.getElementById('ls').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_layer_speed',this.value)">
-          <div class="label">Human traverse jitter <span id="ht">0.16</span></div><input id="w-human-traverse" type="range" min="0" max="0.45" step="0.01" oninput="document.getElementById('ht').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_human_traverse',this.value)">
-          <div class="label">Human speed jitter <span id="hs">0.12</span></div><input id="w-human-speed" type="range" min="0" max="0.45" step="0.01" oninput="document.getElementById('hs').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_human_speed',this.value)">
-          <div class="label">First-pass traverse factor <span id="fp">1.00</span></div><input id="w-first-pass-traverse" type="range" min="0.40" max="1.80" step="0.01" oninput="document.getElementById('fp').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_first_pass_traverse',this.value)">
+        <div style="margin-top:10px">
+          <button class="btn btn-go btn-s" id="btn-manual-toggle" onclick="toggleManual()">▶ Enter manual</button>
         </div>
       </div>
-
       <div class="card">
-        <div class="grid g3">
-          <div class="kv"><span>Carriage position</span><b id="lat-pos">0.00 mm</b></div>
-          <div class="kv"><span>Winding window</span><b><span id="w-start">0.00</span> → <span id="w-end">0.00</span> mm</b></div>
-          <div class="kv"><span>Turns/pass</span><b id="tpp">0</b></div>
-        </div>
+        <div class="card-title">🏠 Home offset</div>
+        <p class="hint">Distance sensor → position 0. Change triggers rehoming.</p>
+        <div class="fg"><label>Offset (mm)</label><input id="lat-ofs-input" type="number" min="0" max="50" step="0.1" onchange="cmd('lat_offset',this.value)"></div>
       </div>
     </div>
-
-    <div class="view" id="run">
-      <div class="grid g4">
-        <div class="card"><div class="label">RPM</div><div class="val" id="rpm">0</div></div>
-        <div class="card"><div class="label">Hz</div><div class="val" id="spd">0</div></div>
-        <div class="card"><div class="label">Turns</div><div class="val" id="turns">0</div></div>
-        <div class="card"><div class="label">Pass</div><div class="val" id="pass">0</div></div>
+    <div class="card">
+      <div class="card-title">🔧 Lateral break-in</div>
+      <p class="hint">Back-and-forth passes for mechanical break-in.</p>
+      <div class="fg" style="max-width:360px">
+        <label>Distance (mm)</label><input id="rod-dist" type="number" min="5" max="100" step="1" value="80">
+        <label>Passes</label><input id="rod-passes" type="number" min="1" max="200" step="1" value="10">
       </div>
-      <div class="card">
-        <div class="kv"><span>Progress</span><b id="pct">0%</b></div>
-        <div class="bar"><div class="fill" id="bar"></div></div>
+      <div id="rod-progress" style="display:none;margin:10px 0">
+        <div class="t-i"><span class="t-k">Pass</span><span class="t-v" id="rod-pass-lbl">0 / 0</span></div>
+        <div class="bar"><div class="fill" id="rod-bar"></div></div>
       </div>
-      <div class="card grid g2">
-        <div>
-          <div class="kv"><span>Target</span><b id="tgt">0</b></div>
-          <div class="kv"><span>Carriage position</span><b id="lat-pos-run">0.00 mm</b></div>
-          <div class="kv"><span>Window</span><b><span id="w-start-run">0.00</span> → <span id="w-end-run">0.00</span> mm</b></div>
-          <div class="kv"><span>Active turns/pass</span><b id="active-tpp">0</b></div>
-        </div>
-        <div>
-          <div class="kv"><span>Lateral scale</span><b id="lat-scale">1.00×</b></div>
-          <div class="kv"><span>Layer progress</span><b id="lat-progress">0%</b></div>
-          <div class="kv"><span>Low / high trim</span><b><span id="w-start-trim-run">0.00</span> / <span id="w-end-trim-run">0.00</span> mm</b></div>
-          <div class="kv"><span>Mode</span><b id="run-mode">Target</b></div>
-        </div>
+      <div class="row4" style="margin-top:10px">
+        <button class="btn btn-go btn-s" id="btn-rod-start" onclick="startRodage()">▶ Start</button>
+        <button class="btn btn-danger btn-s" id="btn-rod-stop" style="display:none" onclick="cmd('stop')">■ Stop</button>
       </div>
-      <div class="card">
-        <div class="label">In-run actions</div>
-        <div class="grid g2" style="gap:10px">
-          <div>
-            <div class="sub" style="margin-bottom:6px">Adjust target while running</div>
-            <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
-              <button class="btn reset" onclick="cmd('target', String(Math.max(1, (parseInt(byId('ti-run').value||'0',10)-100))))">−100 turns</button>
-              <button class="btn reset" onclick="cmd('target', String((parseInt(byId('ti-run').value||'0',10)+100)))">+100 turns</button>
-            </div>
-            <div style="margin-top:8px"><input id="ti-run" type="number" min="1" max="50000" step="1" onchange="cmd('target',this.value)"></div>
-          </div>
-          <div>
-            <div class="sub" style="margin-bottom:6px">Stop at next bound (soft)</div>
-            <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
-              <button class="btn stop" onclick="cmd('stop_next_high')">Stop @ high bound</button>
-              <button class="btn stop" onclick="cmd('stop_next_low')">Stop @ low bound</button>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="label">Position correction (web/encoder)</div>
-        <div class="grid g2">
-          <div>
-            <div class="sub" style="margin-bottom:6px">Winding start</div>
-            <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
-              <button class="btn reset" onclick="cmd('geom_start_trim_nudge','-0.05')">−0.05 mm</button>
-              <button class="btn reset" onclick="cmd('geom_start_trim_nudge','0.05')">+0.05 mm</button>
-            </div>
-          </div>
-          <div>
-            <div class="sub" style="margin-bottom:6px">High bound</div>
-            <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
-              <button class="btn reset" onclick="cmd('geom_end_trim_nudge','-0.05')">−0.05 mm</button>
-              <button class="btn reset" onclick="cmd('geom_end_trim_nudge','0.05')">+0.05 mm</button>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="actions">
-        <button class="btn stop" onclick="cmd('stop')">■ Stop</button>
-        <button class="btn reset" onclick="cmd('reset')">↺ Reset turns</button>
-        <button class="btn reset" onclick="cmd('start')">↺ Re-arm Start</button>
-      </div>
+      <div id="rod-msg" class="hint" style="margin-top:6px;color:#36d399"></div>
     </div>
-    <div class="view" id="config">
-      <div class="card">
-        <div class="label">&#127968; Lateral axis home offset</div>
-        <div class="sub" style="margin-bottom:12px">Offset applied after homing: the carriage moves to this value instead of 0. Any change triggers an automatic rehoming.</div>
-        <div style="max-width:220px">
-          <div class="label">Offset (mm)</div>
-          <input id="lat-ofs-input" type="number" min="0" max="50" step="0.1" onchange="cmd('lat_offset',this.value)">
-        </div>
-      </div>
-      <div class="card">
-        <div class="label">&#128295; Lateral axis break-in</div>
-        <div class="sub" style="margin-bottom:12px">Runs N back-and-forth passes on the lateral axis between home (0) and the configured distance. Useful for mechanical break-in on a new or rebuilt axis.</div>
-        <div class="grid g2" style="gap:10px;margin-bottom:14px">
-          <div><div class="label">Max distance (mm)</div><input id="rod-dist" type="number" min="5" max="100" step="1" value="80"></div>
-          <div><div class="label">Passes (round trips)</div><input id="rod-passes" type="number" min="1" max="200" step="1" value="10"></div>
-        </div>
-        <div id="rod-progress" style="display:none;margin-bottom:12px">
-          <div class="kv"><span>Current pass</span><b id="rod-pass-lbl">0 / 0</b></div>
-          <div class="bar" style="margin-top:6px"><div class="fill" id="rod-bar"></div></div>
-        </div>
-        <div class="actions" style="grid-template-columns:1fr 1fr;gap:10px">
-          <button id="btn-rod-start" class="btn start" onclick="startRodage()">&#9654; Start break-in</button>
-          <button id="btn-rod-stop" class="btn stop" style="display:none" onclick="cmd('stop')">&#9632; Stop</button>
-        </div>
-        <div id="rod-msg" class="sub" style="margin-top:8px;color:#36d399"></div>
-      </div>
-    </div>  </div>
-
-  <div class="actions">
-    <button class="btn start" onclick="cmd('start')">▶ Start</button>
-    <button class="btn stop" onclick="cmd('stop')">■ Stop</button>
-    <button class="btn reset" onclick="cmd('reset')">↺ Reset</button>
-    <button class="btn" id="btn-manual" style="background:#7c3aed;color:#fff" onclick="toggleManual()">⚙ Manual</button>
   </div>
 
-  <!-- Manual mode panel (hidden by default) -->
-  <div id="manual-panel" style="display:none;background:#111b2f;border:1px solid #7c3aed;border-radius:12px;padding:12px;margin-top:8px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-      <span style="font-weight:700;color:#c4b5fd">⚙ Manual Mode</span>
-      <span id="manual-cap-dot" class="dot"></span>
-    </div>
-    <div class="grid g2" style="gap:8px;margin-bottom:10px">
-      <div>
-        <div class="label">Encoder step (mm/click)</div>
-        <div class="actions" style="grid-template-columns:1fr 1fr 1fr 1fr;gap:6px">
-          <button class="btn reset" onclick="setManualStep(0.05)">0.05</button>
-          <button class="btn reset" onclick="setManualStep(0.1)">0.1</button>
-          <button class="btn reset" onclick="setManualStep(0.5)">0.5</button>
-          <button class="btn reset" onclick="setManualStep(1.0)">1.0</button>
-        </div>
-        <div class="sub" style="margin-top:4px">Current: <b id="manual-step-lbl">0.05</b> mm</div>
-      </div>
-      <div>
-        <div class="label">Carriage position</div>
-        <div class="val" id="manual-pos" style="font-size:22px">0.00 mm</div>
-        <div class="sub">Motor turns: <b id="manual-turns">0</b></div>
-      </div>
-    </div>
-    <div class="actions" style="grid-template-columns:1fr 1fr;gap:8px">
-      <button class="btn" id="btn-capture" style="background:#0369a1;color:#fff" onclick="toggleCapture()">⏺ Start capture</button>
-      <button class="btn" id="btn-dl-capture" style="background:#334155;color:#e2e8f0;display:none" onclick="downloadCapture()">⬇ Download JSON</button>
-    </div>
-    <div id="manual-cap-status" class="sub" style="margin-top:6px"></div>
-  </div>
 </div>
-
-<script>
-let ws;
-let activeTab = 'main';
-let lastStatus = null;
-let rodageWasActive = false;
-let manualActive = false;
-let captureActive = false;
-let captureData = [];  // [{t, pos, turns}, ...]
-const byId = id => document.getElementById(id);
-
-function cmd(c,v=''){ if(ws && ws.readyState===1) ws.send(JSON.stringify({cmd:c,val:''+v})); }
-function syncInput(id,val){ const el=byId(id); if(el && document.activeElement!==el && val!==undefined) el.value=val; }
-function syncRange(id,val,labelId,fix){ const el=byId(id); if(el && document.activeElement!==el && val!==undefined) el.value=val; if(labelId&&val!==undefined) byId(labelId).textContent=parseFloat(val).toFixed(fix); }
-function setWs(ok){ byId('ws-dot').className='dot '+(ok?'ok':''); byId('ws-lbl').textContent=ok?'Connected':'Disconnected'; }
-
-function toggleManual() {
-  if (!manualActive) {
-    cmd('manual');
-    manualActive = true;
-    byId('manual-panel').style.display = 'block';
-    byId('btn-manual').textContent = '⚙ Exit Manual';
-    byId('btn-manual').style.background = '#dc2626';
-    byId('manual-step-lbl').textContent = '0.05';
-  } else {
-    if (captureActive) toggleCapture();
-    cmd('manual_stop');
-    manualActive = false;
-    byId('manual-panel').style.display = 'none';
-    byId('btn-manual').textContent = '⚙ Manual';
-    byId('btn-manual').style.background = '#7c3aed';
-  }
-}
-
-function setManualStep(s) {
-  cmd('manual_step', '' + s);
-  byId('manual-step-lbl').textContent = '' + s;
-}
-
-function toggleCapture() {
-  if (!captureActive) {
-    captureData = [];
-    captureActive = true;
-    cmd('manual_capture_start');
-    byId('btn-capture').textContent = '⏹ Stop capture';
-    byId('btn-capture').style.background = '#dc2626';
-    byId('manual-cap-dot').className = 'dot warn';
-    byId('btn-dl-capture').style.display = 'none';
-    byId('manual-cap-status').textContent = '⏺ Capture running — 0 points';
-  } else {
-    captureActive = false;
-    cmd('manual_capture_stop');
-    byId('btn-capture').textContent = '⏺ Start capture';
-    byId('btn-capture').style.background = '#0369a1';
-    byId('manual-cap-dot').className = 'dot';
-    byId('manual-cap-status').textContent = '✓ Capture complete — ' + captureData.length + ' points';
-    if (captureData.length > 0) byId('btn-dl-capture').style.display = '';
-  }
-}
-
-function downloadCapture() {
-  const blob = new Blob([JSON.stringify({capture: captureData}, null, 2)], {type:'application/json'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'capture_' + Date.now() + '.json';
-  a.click();
-}
-
-function connect(){
-  ws = new WebSocket('ws://' + location.host + '/ws');
-  ws.onopen=()=>setWs(true);
-  ws.onclose=()=>{setWs(false);setTimeout(connect,2000)};
-  ws.onmessage=e=>{
-    const d = JSON.parse(e.data);
-    if (d.type === 'cap') {
-      // Manual mode capture point
-      if (captureActive) {
-        captureData.push({t: d.t, pos: d.pos, turns: d.turns});
-        byId('manual-cap-status').textContent = '⏺ Capture running — ' + captureData.length + ' points';
-      }
-      byId('manual-pos').textContent = parseFloat(d.pos).toFixed(2) + ' mm';
-      byId('manual-turns').textContent = d.turns;
-      return;
-    }
-    update(d);
-  };
-}
-
-function update(d){
-  lastStatus = d;
-  const armed = !!d.startRequested;
-  const isManual = !!d.manualMode;
-  const isRodage = !!d.rodageMode;
-  // Switch views only when the Winding tab is active
-  if (activeTab === 'main') {
-    byId('setup').classList.toggle('show', !armed && !isManual && !isRodage);
-    byId('run').classList.toggle('show', (armed || isRodage) && !isManual);
-  }
-  byId('phase').textContent = isManual ? 'Manual Mode' : isRodage ? 'Axis Break-in' : (armed ? 'Production' : 'Setup');
-  // ── Break-in UI (always updated, regardless of active tab) ──
-  const rod = isRodage;
-  byId('btn-rod-start').style.display = rod ? 'none' : '';
-  byId('btn-rod-stop').style.display = rod ? '' : 'none';
-  byId('rod-dist').disabled = rod;
-  byId('rod-passes').disabled = rod;
-  byId('rod-progress').style.display = rod ? '' : 'none';
-  if (rod) {
-    const p = d.rodagePass || 0, t = d.rodagePasses || 1;
-    byId('rod-pass-lbl').textContent = p + ' / ' + t;
-    byId('rod-bar').style.width = Math.round(p / t * 100) + '%';
-    byId('rod-msg').textContent = '';
-  } else if (rodageWasActive) {
-    byId('rod-msg').textContent = '✓ Break-in complete — ' + (lastStatus && lastStatus.rodagePasses ? lastStatus.rodagePasses : '') + ' passes completed';
-  }
-  rodageWasActive = rod;
-
-  byId('rpm').textContent = Math.round(d.rpm||0);
-  byId('spd').textContent = d.hz||0;
-  byId('turns').textContent = d.turns||0;
-  byId('tgt').textContent = d.target||0;
-  byId('pass').textContent = d.pass||0;
-  byId('active-tpp').textContent = d.activeTpp ?? d.tpp ?? 0;
-  byId('lat-scale').textContent = ((d.latScale ?? 1)).toFixed(2) + '×';
-  byId('lat-progress').textContent = Math.round((d.latProgress ?? 0)*100) + '%';
-  byId('run-mode').textContent = d.freerun ? 'FreeRun' : 'Target';
-  byId('w-start-trim-run').textContent = ((d.wStartTrim ?? 0)).toFixed(2);
-  byId('w-end-trim-run').textContent = ((d.wEndTrim ?? 0)).toFixed(2);
-
-  const pos = parseFloat(d.latPos ?? 0);
-  byId('lat-pos').textContent = pos.toFixed(2) + ' mm';
-  byId('lat-pos-run').textContent = pos.toFixed(2) + ' mm';
-  byId('manual-pos').textContent = pos.toFixed(2) + ' mm';
-  byId('manual-turns').textContent = d.turns ?? 0;
-  byId('w-start').textContent = parseFloat(d.wStart ?? 0).toFixed(2);
-  byId('w-end').textContent = parseFloat(d.wEnd ?? 0).toFixed(2);
-  byId('w-start-run').textContent = parseFloat(d.wStart ?? 0).toFixed(2);
-  byId('w-end-run').textContent = parseFloat(d.wEnd ?? 0).toFixed(2);
-  byId('tpp').textContent = d.tpp ?? 0;
-
-  const pct = (d.target>0) ? Math.min(100,(d.turns/d.target)*100) : 0;
-  byId('bar').style.width = pct.toFixed(1)+'%';
-  byId('pct').textContent = pct.toFixed(1)+'%';
-
-  byId('r-cw').checked = !!d.cw;
-  byId('r-ccw').checked = !d.cw;
-  byId('m-target').checked = !d.freerun;
-  byId('m-free').checked = !!d.freerun;
-  byId('ti').disabled = !!d.freerun;
-  byId('ti-run').disabled = !!d.freerun;
-  if(d.wStyle){ byId('ws-straight').checked=d.wStyle==='straight'; byId('ws-scatter').checked=d.wStyle==='scatter'; byId('ws-human').checked=d.wStyle==='human'; }
-
-  // Final position
-  const epStr = ['none','high','low'][d.endPos ?? 0] || 'none';
-  byId('ep-none').checked = epStr==='none';
-  byId('ep-high').checked = epStr==='high';
-  byId('ep-low').checked  = epStr==='low';
-  byId('ep-turns').disabled = (epStr==='none');
-  syncInput('ep-turns', d.endPosTurns);
-
-  syncInput('ti', d.target);
-  syncInput('ti-run', d.target);
-  syncInput('lat-ofs-input', d.latOfs);
-  syncInput('w-seed', d.seed);
-  syncInput('g-total', d.gt); syncInput('g-margin', d.gm); syncInput('g-bottom', d.gb); syncInput('g-top', d.gtp);
-  syncInput('g-start-trim', d.wStartTrim);
-  syncInput('g-end-trim', d.wEndTrim); syncInput('g-wire', d.gw);
-  syncRange('g-scatter', d.scatter, 'scatter-lbl', 1);
-  if(byId('g-tpp-ofs') && document.activeElement!==byId('g-tpp-ofs') && d.tppOfs!==undefined) byId('g-tpp-ofs').value=d.tppOfs;
-  byId('tpp-ofs-lbl').textContent = d.tppOfs ?? 0;
-  syncRange('w-layer-jitter', d.layerJitter, 'lj', 2);
-  syncRange('w-layer-speed', d.layerSpeed, 'ls', 2);
-  syncRange('w-human-traverse', d.humanTraverse, 'ht', 2);
-  syncRange('w-human-speed', d.humanSpeed, 'hs', 2);
-  syncRange('w-first-pass-traverse', d.firstPassTraverse, 'fp', 2);
-
-  const atZero = Math.abs(pos) < 0.03;
-  const status = byId('status-line');
-  if (d.running) status.textContent = '▶ Winding in progress';
-  else if (d.firstPause) status.textContent = '⏸ Bound verification pause — raise the potentiometer to resume';
-  else if (d.startRequested && !d.carriageReady) status.textContent = '↔ Moving carriage to the start of the winding window';
-  else if (d.startRequested && d.carriageReady) status.textContent = '⏸ Ready: raise the potentiometer to start';
-  else if (!atZero) status.textContent = 'Return the carriage to position 0, then press Start';
-  else status.textContent = 'Ready: parameters validated, press Start';
-}
-
-function showTab(tab) {
-  activeTab = tab;
-  byId('tab-main').classList.toggle('tab-active', tab === 'main');
-  byId('tab-config').classList.toggle('tab-active', tab === 'config');
-  if (tab === 'config') {
-    byId('setup').classList.remove('show');
-    byId('run').classList.remove('show');
-    byId('config').classList.add('show');
-  } else {
-    byId('config').classList.remove('show');
-    if (lastStatus) update(lastStatus);
-  }
-}
-
-function startRodage() {
-  cmd('rodage_dist', byId('rod-dist').value);
-  cmd('rodage_passes', byId('rod-passes').value);
-  cmd('rodage');
-  byId('rod-msg').textContent = '';
-}
-
-connect();
-</script>
+<script src="script.js"></script>
 </body></html>
