@@ -1,5 +1,8 @@
 #include "SpeedInput.h"
 
+/**
+ * @brief Initialize ADC smoothing history.
+ */
 void SpeedInput::begin() {
     // Pre-fill the entire filter buffer with the current ADC reading.
     // Without this, the average would start near zero and ramp up over
@@ -10,6 +13,10 @@ void SpeedInput::begin() {
     Serial.println("[SpeedInput] OK");
 }
 
+/**
+ * @brief Read filtered potentiometer speed command.
+ * @return Requested speed in Hz (0 when in zero-band).
+ */
 uint32_t SpeedInput::readHz() {
     // Write the new sample into the circular buffer at the current index.
     _samples[_idx] = analogRead(POT_PIN);

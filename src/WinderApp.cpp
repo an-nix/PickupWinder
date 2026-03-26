@@ -2,6 +2,21 @@
 #include <Arduino.h>
 #include "Diag.h"
 
+namespace {
+uint32_t rpmToHz(uint16_t rpm) {
+    return (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL;
+}
+}
+
+/**
+ * @brief Initialize the winding application and subsystems.
+ *
+ * Loads recipe data from storage, applies it to runtime state, initializes
+ * motor/lateral/LED subsystems, and builds an initial traverse plan.
+ *
+ * @par Usage
+ * Called once during startup before the main loop starts calling `tick()`.
+ */
 void WinderApp::begin() {
     _recipeStore.begin();
     _recipe = _captureRecipe();
@@ -25,6 +40,16 @@ void WinderApp::begin() {
                   WindingPatternPlanner::styleName(_recipe.style));
 }
 
+/**
+ * @brief Run one control-loop iteration.
+ *
+ * Processes lateral events, pot-controlled state behavior, auto-stop logic,
+ * and deferred driver disable.
+ *
+ * @param potHz Filtered speed command from the potentiometer in Hz.
+ * @par Usage
+ * Called continuously from the Arduino loop.
+ */
 void WinderApp::tick(uint32_t potHz) {
     _handleLateralEvents();
     _handlePotCycle(potHz);
@@ -36,6 +61,15 @@ void WinderApp::tick(uint32_t potHz) {
 //
 // Every _toXxx() is self-contained: sets _state, adjusts hardware, clears flags.
 
+/**
+ * @brief Transition to IDLE and reset session-related runtime state.
+ *
+ * Stops motion, clears verification flags, resets turn count and planner state,
+ * and parks the lateral axis at home.
+ *
+ * @par Usage
+ * Used by stop/reset flows and at the end of a run.
+ */
 void WinderApp::_toIdle() {
     _state                 = WindingState::IDLE;
     _canStart              = false;
@@ -54,6 +88,15 @@ void WinderApp::_toIdle() {
     Diag::info("[IDLE] Stop -- carriage to home, counter reset");
 }
 
+/**
+ * @brief Transition to low-bound verification mode.
+ *
+ * Depending on current state, either arms a stop on next low bound or directly
+ * positions carriage at low bound for operator verification.
+ *
+ * @par Usage
+ * Triggered by startup flow and `verify_low` command.
+ */
 void WinderApp::_toVerifyLow() {
     if (_state == WindingState::WINDING) {
         // In-session verify: stop on the next natural low bound, then switch to
@@ -87,6 +130,15 @@ void WinderApp::_toVerifyLow() {
             _windingStartMm(), _lowVerified ? " [already confirmed]" : "");
 }
 
+/**
+ * @brief Transition to high-bound verification mode.
+ *
+ * Depending on current state, either arms a stop on next high bound or directly
+ * positions carriage at high bound for operator verification.
+ *
+ * @par Usage
+ * Triggered by startup flow and `verify_high` command.
+ */
 void WinderApp::_toVerifyHigh() {
     if (_state == WindingState::WINDING) {
         // In-session verify: stop on the next natural high bound, then switch to
@@ -121,6 +173,15 @@ void WinderApp::_toVerifyHigh() {
             _windingEndMm(), _highVerified ? " [already confirmed]" : "");
 }
 
+/**
+ * @brief Transition to winding-ready state.
+ *
+ * Clears transient verification/stop flags while preserving carriage position.
+ * Actual movement starts when potentiometer conditions allow.
+ *
+ * @par Usage
+ * Entered after both bounds are confirmed.
+ */
 void WinderApp::_toWinding() {
     _state          = WindingState::WINDING;
     _canStart     = false;
@@ -135,6 +196,14 @@ void WinderApp::_toWinding() {
             _windingStartMm(), _windingEndMm());
 }
 
+/**
+ * @brief Transition to paused state.
+ *
+ * Stops spindle and lateral motion while preserving current position.
+ *
+ * @par Usage
+ * Entered when operator drops pot to zero or a bound-stop pauses winding.
+ */
 void WinderApp::_toPaused() {
     _state          = WindingState::PAUSED;
     _canStart     = false;
@@ -144,6 +213,14 @@ void WinderApp::_toPaused() {
     Diag::info("[PAUSED] Resume from current position when pot goes up");
 }
 
+/**
+ * @brief Transition to target-reached state.
+ *
+ * Stops winding and clears final-position arm once target turns are reached.
+ *
+ * @par Usage
+ * Called by `_checkAutoStop()` when turns reach configured target.
+ */
 void WinderApp::_toTargetReached() {
     _state          = WindingState::TARGET_REACHED;
     _canStart     = false;
@@ -158,6 +235,15 @@ void WinderApp::_toTargetReached() {
             _stepper.getTurns());
 }
 
+/**
+ * @brief Transition to manual jogging mode.
+ *
+ * Disables automatic traverse behavior and enables encoder-driven carriage jog,
+ * with optional capture streaming.
+ *
+ * @par Usage
+ * Entered through `manual` flow.
+ */
 void WinderApp::_toManual() {
     // Accessible depuis n'importe quel état (sauf MANUAL lui-même).
     // Le moteur est arrêté / le chariot est libéré de la traverse.
@@ -175,6 +261,16 @@ void WinderApp::_toManual() {
     Diag::infof("[MANUAL] Mode manuel actif — fenêtre [%.2f → %.2f mm], pas: %.2f mm (x%d sur 1er passage)",
         _windingStartMm(), _windingEndMm(), _manualJogStepMm, MANUAL_FAST_STEP_MULT);
 }
+
+/**
+ * @brief Transition to lateral run-in (rodage) mode.
+ *
+ * Executes repeated shuttle passes on the lateral axis while spindle remains
+ * stopped.
+ *
+ * @par Usage
+ * Triggered by `rodage` command from IDLE.
+ */
 void WinderApp::_toRodage() {
     // Passe le syst\u00e8me en mode rodage : le chariot effectue N allers-retours
     // entre 0 et _rodageDistMm. Le moteur bobineur reste arr\u00eat\u00e9.
@@ -193,6 +289,15 @@ void WinderApp::_toRodage() {
     Diag::infof("[RODAGE] D\u00e9marrage: %d passes, dist=%.1f mm",
         _rodagePasses, _rodageDistMm);
 }
+
+/**
+ * @brief Process lateral-axis events and related state transitions.
+ *
+ * Handles stop-at-bound events, verify transitions, and rodage pass toggling.
+ *
+ * @par Usage
+ * Called from `tick()` every control-loop iteration.
+ */
 void WinderApp::_handleLateralEvents() {
     _lateral.update();
 
@@ -252,7 +357,23 @@ void WinderApp::_handleLateralEvents() {
     }}
 
 
+/**
+ * @brief Process potentiometer-driven state behavior.
+ *
+ * Applies mode-specific start/resume/pause behavior and dispatches to winding
+ * update logic when motion is allowed.
+ *
+ * @param hz Requested spindle speed in Hz.
+ * @par Usage
+ * Called from `tick()` every control-loop iteration.
+ */
 void WinderApp::_handlePotCycle(uint32_t hz) {
+    if (_rewindMode && _state == WindingState::WINDING) {
+        _runWindingAtHz(rpmToHz(_rewindBatchRpm));
+        _led.update(_stepper.getTurns(), max(1L, _activePlan.turnsPerPass), _stepper.isRunning());
+        return;
+    }
+
     // Arm flag (_canStart): requires the pot to physically return to zero before
     // every (re)start. This prevents unexpected motion if the pot is already
     // raised when entering a new state. Can also be set without a physical zero
@@ -346,11 +467,28 @@ void WinderApp::_handlePotCycle(uint32_t hz) {
     _led.update(_stepper.getTurns(), max(1L, _activePlan.turnsPerPass), _stepper.isRunning());
 }
 
+/**
+ * @brief Check whether spindle restart is currently safe.
+ *
+ * @return true when lateral axis is homed and idle.
+ * @par Usage
+ * Used as a guard for resume/start transitions.
+ */
 bool WinderApp::_readyForSpin() const {
     // Used to guard resume after pause: lateral must be homed and idle.
     return _lateral.isHomed() && !_lateral.isBusy();
 }
 
+/**
+ * @brief Run or update winding at requested spindle speed.
+ *
+ * Applies all dynamic speed constraints, requests/updates traverse plan,
+ * manages verify behavior, and pushes parameters to spindle/lateral control.
+ *
+ * @param hz Requested spindle speed in Hz.
+ * @par Usage
+ * Main runtime motor-control path used from `_handlePotCycle()`.
+ */
 void WinderApp::_runWindingAtHz(uint32_t hz) {
     // ── Speed caps (applied in priority order) ───────────────────────────────
     //
@@ -548,6 +686,15 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
     }
 }
 
+/**
+ * @brief Evaluate automatic stop and final-position behavior.
+ *
+ * Arms final bound stop when needed and transitions to TARGET_REACHED
+ * once target turns are reached.
+ *
+ * @par Usage
+ * Called every tick while winding is active.
+ */
 void WinderApp::_checkAutoStop() {
     if (_state != WindingState::WINDING || (bool)_freerun) return;
 
@@ -612,6 +759,14 @@ void WinderApp::_checkAutoStop() {
     }
 }
 
+/**
+ * @brief Safely disable stepper driver after stop is complete.
+ *
+ * Prevents cutting driver current during deceleration ramps.
+ *
+ * @par Usage
+ * Called each tick after stop transitions.
+ */
 void WinderApp::_applyDeferredDisable() {
     // The stepper driver must not be disabled mid-ramp: cutting power during
     // deceleration causes a mechanical jerk and loses position. _pendingDisable
@@ -624,6 +779,16 @@ void WinderApp::_applyDeferredDisable() {
     }
 }
 
+/**
+ * @brief Build the public runtime status payload.
+ *
+ * Maps internal state-machine status to transport-facing fields expected by
+ * WebSocket and serial links.
+ *
+ * @return Snapshot of current machine status.
+ * @par Usage
+ * Queried by telemetry/UI publishing paths.
+ */
 WinderStatus WinderApp::getStatus() const {
     // Map the current WindingState enum to the flat boolean fields expected by
     // the WebSocket protocol and the LinkSerial bridge. The protocol was designed
@@ -639,6 +804,9 @@ WinderStatus WinderApp::getStatus() const {
         _stepper.getSpeedHz(),
         _stepper.getTurns(),
         (long)_targetTurns,
+        (bool)_rewindMode,
+        (long)_rewindBatchTurns,
+        (uint16_t)_rewindBatchRpm,
         _stepper.isRunning(),
         motorEnabled,
         sessionActive,
@@ -681,6 +849,12 @@ WinderStatus WinderApp::getStatus() const {
     };
 }
 
+/**
+ * @brief Export current recipe as JSON.
+ * @return Serialized recipe JSON string.
+ * @par Usage
+ * Used by UI/remote clients for recipe export.
+ */
 String WinderApp::recipeJson() const {
     return _recipeStore.toJson(_captureRecipe());
 }
@@ -691,6 +865,17 @@ String WinderApp::recipeJson() const {
 // carriage to the affected bound immediately so the operator gets instant visual
 // feedback of the new position before starting or resuming.
 
+/**
+ * @brief Reposition carriage after geometry bounds update.
+ *
+ * Repositions only when safe (no spindle movement, lateral free) and only
+ * where movement is meaningful for current state.
+ *
+ * @param startBoundChanged true if low/start bound changed.
+ * @param endBoundChanged true if high/end bound changed.
+ * @par Usage
+ * Called by geometry command handlers after changing trims/dimensions.
+ */
 void WinderApp::_refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged) {
     // Never interrupt a running motor or an in-progress positioning move.
     if (_stepper.isRunning()) return;
@@ -723,6 +908,18 @@ void WinderApp::_refreshCarriageForGeometryChange(bool startBoundChanged, bool e
 // Processes state-machine lifecycle commands (start, stop, verify_low/high,
 // confirm, resume, stop_next_low/high). These are always accepted regardless
 // of parameter-lock state. Returns true if the command was consumed.
+/**
+ * @brief Handle immediate lifecycle commands.
+ *
+ * Processes commands that should always be available regardless of parameter
+ * lock state (start/stop/verify/confirm/manual/end-position/rodage).
+ *
+ * @param cmd Command key.
+ * @param value Command payload.
+ * @return true if command was consumed.
+ * @par Usage
+ * First stage of `handleCommand()` dispatch.
+ */
 bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) {
     if (cmd == "stop") {
         _toIdle();
@@ -736,6 +933,31 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
     }
 
     if (cmd == "start") {
+        if (_rewindMode) {
+            if (_state != WindingState::IDLE && _state != WindingState::TARGET_REACHED) {
+                Diag::info("[Start] Ignored -- rewind batch mode requires IDLE or TARGET_REACHED");
+                return true;
+            }
+            if (!_lateral.isHomed() || _lateral.isBusy()) {
+                Diag::error("[Start] Impossible -- lateral axis not ready");
+                return true;
+            }
+
+            const long batchTurns = constrain((long)_rewindBatchTurns, 1L, 5000L);
+            if (_state == WindingState::IDLE) {
+                _stepper.resetTurns();
+                _planner.reset();
+            }
+            _lowVerified = true;
+            _highVerified = true;
+            _targetTurns = _stepper.getTurns() + batchTurns;
+            _toWinding();
+            _runWindingAtHz(rpmToHz(_rewindBatchRpm));
+            Diag::infof("[REWIND] Batch start -- +%ld turns at %u RPM (target=%ld)",
+                        batchTurns, (unsigned)_rewindBatchRpm, (long)_targetTurns);
+            return true;
+        }
+
         if (_state != WindingState::IDLE && _state != WindingState::TARGET_REACHED) {
             Diag::info("[Start] Ignored -- session already active");
             return true;
@@ -924,6 +1146,18 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
 // Handles all coil geometry parameters (dimensions, wire diameter, trim offsets,
 // presets). Geometry can always be adjusted, even during a session — changes take
 // effect immediately and the carriage is repositioned if the machine is at rest.
+/**
+ * @brief Handle geometry-related commands.
+ *
+ * Applies dimension/trim/preset updates and triggers carriage refresh when
+ * appropriate.
+ *
+ * @param cmd Command key.
+ * @param value Command payload.
+ * @return true if command was consumed.
+ * @par Usage
+ * Second stage of `handleCommand()` dispatch.
+ */
 bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
     if (cmd == "geom_start_trim") {
         _geom.windingStartTrim_mm = constrain(value.toFloat(), -5.0f, 5.0f);
@@ -1049,6 +1283,18 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
     return false;
 }
 
+/**
+ * @brief Handle winding-pattern commands.
+ *
+ * Updates style/seed/jitter/humanization parameters and synchronizes planner
+ * and persistent recipe state.
+ *
+ * @param cmd Command key.
+ * @param value Command payload.
+ * @return true if command was consumed.
+ * @par Usage
+ * Called by `handleCommand()` for pattern-specific settings.
+ */
 bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
     if (cmd == "winding_style") {
         _recipe.style = WindingPatternPlanner::styleFromString(value);
@@ -1114,6 +1360,16 @@ bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
 //   2. Geometry commands (always editable — live feedback is useful mid-session)
 //   3. Turn target (always editable — operator may increase target while winding)
 //   4. All other parameters (freerun, direction, pattern…) — locked during session
+/**
+ * @brief Apply encoder delta to active editing/jog behavior.
+ *
+ * In VERIFY states updates trim bounds; in PAUSED allows near-bound tweaks;
+ * in MANUAL mode performs bounded carriage jogging.
+ *
+ * @param delta Encoder increment/decrement since previous call.
+ * @par Usage
+ * Called by encoder event consumer in the main loop.
+ */
 void WinderApp::handleEncoderDelta(int32_t delta) {
     if (delta == 0) return;
     // En mode vérification : l'encodeur contrôle directement le chariot.
@@ -1187,6 +1443,17 @@ void WinderApp::handleEncoderDelta(int32_t delta) {
     }
 }
 
+/**
+ * @brief Main command dispatcher.
+ *
+ * Routes incoming commands through immediate/geometric/pattern handlers and
+ * applies global command-lock rules for active sessions.
+ *
+ * @param cmd Command key.
+ * @param value Command payload.
+ * @par Usage
+ * Entry point for WebSocket and serial control commands.
+ */
 void WinderApp::handleCommand(const String& cmd, const String& value) {
     if (_handleImmediateCommand(cmd, value)) return;
     if (_handleGeometryCommand(cmd, value))  return;
@@ -1205,6 +1472,26 @@ void WinderApp::handleCommand(const String& cmd, const String& value) {
             t);
             _saveRecipe();
         }
+        return;
+    }
+
+    if (cmd == "rewind_mode") {
+        _rewindMode = (value == "true");
+        Diag::infof("[REWIND] Mode: %s", _rewindMode ? "enabled" : "disabled");
+        return;
+    }
+
+    if (cmd == "rewind_batch_turns") {
+        long t = constrain(value.toInt(), 1L, 5000L);
+        _rewindBatchTurns = t;
+        Diag::infof("[REWIND] Batch turns: %ld", (long)_rewindBatchTurns);
+        return;
+    }
+
+    if (cmd == "rewind_batch_rpm") {
+        long rpm = constrain(value.toInt(), 10L, 1500L);
+        _rewindBatchRpm = (uint16_t)rpm;
+        Diag::infof("[REWIND] Batch speed: %u RPM", (unsigned)_rewindBatchRpm);
         return;
     }
 
@@ -1265,6 +1552,14 @@ void WinderApp::handleCommand(const String& cmd, const String& value) {
 // speed scale). The planner may vary these over time to produce scatter, jitter or
 // human-like patterns. windingHz is forwarded for future adaptive-speed recipes;
 // it is currently unused and suppressed to avoid a compiler warning.
+/**
+ * @brief Query planner for current traverse parameters.
+ *
+ * @param windingHz Current spindle speed in Hz (reserved for future adaptive logic).
+ * @return Traverse plan for current turns/progress.
+ * @par Usage
+ * Called from `_runWindingAtHz()` each control update.
+ */
 TraversePlan WinderApp::_buildTraversePlan(uint32_t windingHz) const {
     (void)windingHz;
     return _planner.getPlan(_stepper.getTurns(), _lateral.getTraversalProgress());
@@ -1274,6 +1569,16 @@ TraversePlan WinderApp::_buildTraversePlan(uint32_t windingHz) const {
 // Always forces the machine to IDLE: applying a recipe mid-session would leave
 // subsystem state inconsistent (different geometry, wrong target, etc.).
 // The caller is responsible for issuing a new 'start' command once ready.
+/**
+ * @brief Apply recipe values to all live subsystems.
+ *
+ * Resets session state to IDLE to avoid inconsistent mixed-state execution.
+ *
+ * @param recipe Recipe snapshot to apply.
+ * @param persist true to save after apply.
+ * @par Usage
+ * Used at startup, recipe import, and settings synchronization points.
+ */
 void WinderApp::_applyRecipe(const WindingRecipe& recipe, bool persist) {
     _recipe      = recipe;
     _geom        = recipe.geometry;
@@ -1293,6 +1598,13 @@ void WinderApp::_applyRecipe(const WindingRecipe& recipe, bool persist) {
 // Takes a point-in-time snapshot of all mutable runtime parameters
 // (target, freerun, direction, geometry, lateral offset) and merges them
 // into a copy of _recipe. Used both for NVS persistence and JSON export.
+/**
+ * @brief Capture current runtime parameters into a recipe snapshot.
+ *
+ * @return A recipe containing current mutable runtime fields.
+ * @par Usage
+ * Used before save/export and when updating planner state.
+ */
 WindingRecipe WinderApp::_captureRecipe() const {
     WindingRecipe recipe = _recipe;
     recipe.targetTurns = _targetTurns;
@@ -1307,6 +1619,12 @@ WindingRecipe WinderApp::_captureRecipe() const {
 // recipe field so the planner and persistent store stay in sync. The capture
 // step is intentional: _recipe may lag behind volatile fields (direction,
 // targetTurns, freerun) that are mutated without going through _applyRecipe.
+/**
+ * @brief Persist current recipe and synchronize planner input.
+ *
+ * @par Usage
+ * Called after recipe-affecting command changes.
+ */
 void WinderApp::_saveRecipe() {
     _recipe = _captureRecipe();
     _planner.setRecipe(_recipe);

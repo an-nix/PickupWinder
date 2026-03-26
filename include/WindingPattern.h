@@ -27,12 +27,20 @@ inline const char* windingEndPosKey(WindingEndPos p) {
 	}
 }
 
+/**
+ * @brief Parse end-position key from string.
+ * @param s Input key (`none`, `high`, `low`).
+ * @return Parsed enum value, `NONE` on unknown input.
+ */
 inline WindingEndPos windingEndPosFromString(const String& s) {
 	if (s == "high") return WindingEndPos::TOP;
 	if (s == "low")  return WindingEndPos::BOTTOM;
 	return WindingEndPos::NONE;
 }
 
+/**
+ * @brief Complete winding recipe persisted to storage and used at runtime.
+ */
 struct WindingRecipe {
 	uint32_t        version            = 1;
 	long            targetTurns        = DEFAULT_TARGET_TURNS;
@@ -55,21 +63,47 @@ struct WindingRecipe {
 	int             endPosTurns        = 3;
 };
 
+/**
+ * @brief Per-pass traverse planning output.
+ */
 struct TraversePlan {
+	/** Turns to execute before lateral reversal. */
 	long     turnsPerPass = 1;
+	/** Multiplicative traverse speed factor. */
 	float    speedScale   = 1.0f;
+	/** Zero-based pass index currently planned. */
 	uint32_t passIndex    = 0;
 };
 
+/**
+ * @brief Planner generating winding traverse variations from recipe state.
+ */
 class WindingPatternPlanner {
 public:
+	/**
+	 * @brief Set active recipe used for planning.
+	 * @param recipe Recipe snapshot.
+	 */
 	void setRecipe(const WindingRecipe& recipe) { _recipe = recipe; }
+
+	/**
+	 * @brief Reset planner internal state.
+	 */
 	void reset() {}
 
+	/**
+	 * @brief Build current traverse plan.
+	 * @param turnsDone Total spindle turns already completed.
+	 * @param progressInPass Current normalized pass progress in `[0,1]`.
+	 * @return Traverse plan for the current pass.
+	 */
 	TraversePlan getPlan(long turnsDone, float progressInPass) const;
 
+	/** @brief Localized display name for style enum. */
 	static const char* styleName(WindingStyle style);
+	/** @brief Stable lowercase serialization key for style enum. */
 	static String      styleKey(WindingStyle style);
+	/** @brief Parse style key into enum value. */
 	static WindingStyle styleFromString(const String& value);
 
 private:

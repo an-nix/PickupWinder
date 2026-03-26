@@ -21,6 +21,9 @@ static const BobbinPreset BOBBIN_PRESETS[] = {
 static constexpr uint8_t BOBBIN_PRESET_COUNT = sizeof(BOBBIN_PRESETS) / sizeof(BOBBIN_PRESETS[0]);
 
 // ── Géométrie de bobinage ────────────────────────────────────────────────────
+/**
+ * @brief Geometric parameters used to compute winding bounds and spacing.
+ */
 struct WindingGeometry {
     float totalWidth_mm   = 17.0f;   // Épaisseur totale du bobbin (bord à bord)
     float flangeBottom_mm = 1.5f;    // Épaisseur du tonework bas
@@ -32,40 +35,54 @@ struct WindingGeometry {
     long  turnsPerPassOffset = 0;    // Offset applied to auto-calc (-N to +N)
     float scatterFactor = 1.0f;      // Facteur d'espacement de base (1.0=régulier, >1.0 plus aéré)
 
-    // Largeur de bobinage utile
+    /**
+     * @brief Compute usable winding width in millimeters.
+     * @return Positive width between end and start bounds.
+     */
     float effectiveWidth() const {
         return max(0.0f, windingEndMm() - windingStartMm());
     }
 
-    // Position du début de bobinage mesurée depuis la base du tonework.
-    // Le trim permet un ajustement fin ; la limite physique du rail (LAT_TRAVERSE_MM)
-    // est assurée par jog() et prepareStartPosition().
+    /**
+     * @brief Compute low/start bound in millimeters.
+     * @return Start position measured from bobbin base.
+     */
     float windingStartMm() const {
         float start = flangeBottom_mm + margin_mm + windingStartTrim_mm;
         return max(0.0f, start);
     }
 
-    // Position de la fin de bobinage mesurée depuis la base du tonework.
-    // Le trim peut dépasser totalWidth_mm pour couvrir les bobbins sous-dimensionnés.
+    /**
+     * @brief Compute high/end bound in millimeters.
+     * @return End position measured from bobbin base.
+     */
     float windingEndMm() const {
         float end = totalWidth_mm - flangeTop_mm - margin_mm + windingEndTrim_mm;
         return max(windingStartMm(), end);
     }
 
-    // Nombre de tours calculé automatiquement
-    // scatterFactor > 1 élargit l'espacement effectif entre fils (bobinage scatter)
+    /**
+     * @brief Compute nominal turns-per-pass from geometry and wire spacing.
+     * @return Calculated turns-per-pass before manual offset.
+     */
     long turnsPerPassCalc() const {
         if (wireDiameter_mm <= 0.0f) return 1;
         float spacing = wireDiameter_mm * max(0.5f, scatterFactor);
         return max(1L, (long)(effectiveWidth() / spacing));
     }
 
-    // Nombre de tours par aller (ou retour).
-    // Applique l'offset au calcul automatique (clampé à minimum 1).
+    /**
+     * @brief Compute effective turns-per-pass.
+     * @return Calculated turns-per-pass plus offset, clamped to at least 1.
+     */
     long turnsPerPass() const {
         return max(1L, turnsPerPassCalc() + turnsPerPassOffset);
     }
 
+    /**
+     * @brief Apply a predefined bobbin geometry preset.
+     * @param idx Preset index in `BOBBIN_PRESETS`.
+     */
     void applyPreset(uint8_t idx) {
         if (idx >= BOBBIN_PRESET_COUNT) return;
         totalWidth_mm   = BOBBIN_PRESETS[idx].total;

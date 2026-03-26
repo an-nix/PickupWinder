@@ -2,6 +2,9 @@
 #include <Arduino.h>
 #include "Diag.h"
 
+/**
+ * @brief Initialize lateral axis stepper, sensor IO, and homing sequence.
+ */
 void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm) 
 {
     pinMode(HOME_PIN_NO, INPUT_PULLUP);
@@ -45,6 +48,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
             }
 
+/**
+ * @brief Run non-blocking lateral-axis state machine.
+ */
             void LateralController::update() {
                 if (!_stepper) return;
 
@@ -191,6 +197,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
             }
 
+/**
+ * @brief Force restart of homing sequence.
+ */
             void LateralController::rehome() {
                 if (!_stepper) return;
                 if (!_sensorPresent()) {
@@ -214,6 +223,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 Diag::info("[Lateral] Rehoming lancé.");
             }
 
+/**
+ * @brief Return human-readable state label.
+ */
             const char* LateralController::stateStr() const {
                 switch (_state) {
                     case LatState::FAULT:         return "FAULT";
@@ -235,6 +247,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
             // target but a different speed; therefore both HOMED and POSITIONING
             // states are accepted so an in-flight move can be retimed without
             // changing the target or forcing a return to zero.
+/**
+ * @brief Position carriage to requested start bound.
+ */
             void LateralController::prepareStartPosition(float startMm, uint32_t speedHz) {
                 if (_state != LatState::HOMED && _state != LatState::POSITIONING) return;
 
@@ -261,6 +276,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
             }
 
+/** @brief Enter HOMING state and start moving toward home switch. */
             void LateralController::_startHoming() {
                 _attachHomeISR();
                 _enableDriver();
@@ -270,6 +286,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 _state = LatState::HOMING;
             }
 
+/** @brief Back off from active home switch before re-homing. */
             void LateralController::_startBackoff() {
                 _enableDriver();
                 _stepper->setSpeedInHz(LAT_HOME_SPEED_HZ);
@@ -278,10 +295,12 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 _state = LatState::BACKOFF;
             }
 
+/** @brief Enable lateral driver output stage. */
             void LateralController::_enableDriver() {
                 digitalWrite(ENABLE_PIN_LAT, LOW);
             }
 
+/** @brief Disable lateral driver, forcing stop if still moving. */
             void LateralController::_disableDriver() {
                 if (_stepper && _stepper->isRunning()) {
                     _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
@@ -289,12 +308,18 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 digitalWrite(ENABLE_PIN_LAT, HIGH);
             }
 
+/**
+ * @brief Set switch-to-zero home offset in mm.
+ */
             void LateralController::setHomeOffset(float mm) {
                 _homeOffsetMm = (mm < 0.0f) ? 0.0f : mm;
                 Diag::infof("[Lateral] Offset home enregistré : %.2f mm",
             _homeOffsetMm);
             }
 
+/**
+ * @brief Apply configured home offset move or transition directly to HOMED.
+ */
             void LateralController::_applyOffsetOrNext() {
                 int32_t offsetSteps = (int32_t)(_homeOffsetMm * (float)LAT_STEPS_PER_MM);
                 if (offsetSteps > 0) {
@@ -308,6 +333,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
             }
 
+/** @brief Finalize homing and enter HOMED state. */
             void LateralController::_gotoHomed() {
                 _state = LatState::HOMED;
                 _passCount = 0;
@@ -318,6 +344,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 Diag::info("[Lateral] ✓ Position 0 atteinte — axe latéral prêt.");
             }
 
+/**
+ * @brief Compute synchronized lateral speed in step-Hz.
+ */
             uint32_t LateralController::_calcLatHz(uint32_t windingHz, long tpp, float effWidthMm, float speedScale) const {
                 if (tpp <= 0 || windingHz == 0 || effWidthMm <= 0.0f) return 0;
                 float effSteps = effWidthMm * (float)LAT_STEPS_PER_MM;
@@ -326,6 +355,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 return (uint32_t)max(1.0f, hz);
             }
 
+/** @brief Arm reversal window used by spindle slow-down logic. */
             void LateralController::_onReversal() {
                 uint32_t ms = (_latHz > 0)
                     ? (uint32_t)(2000.0f * (float)_latHz / (float)LAT_ACCEL)
@@ -333,6 +363,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 _reversingUntilMs = millis() + max(100u, min(600u, ms));
             }
 
+/**
+ * @brief Start synchronized lateral traversal for winding.
+ */
             void LateralController::startWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale) {
                 if (_state == LatState::WINDING_FWD || _state == LatState::WINDING_BWD) {
                     updateWinding(windingHz, tpp, startMm, endMm, speedScale);
@@ -390,6 +423,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                               (_state == LatState::WINDING_FWD) ? "FWD" : "BWD");
             }
 
+/**
+ * @brief Update running traversal bounds and speed.
+ */
             void LateralController::updateWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale) {
                 if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
 
@@ -466,6 +502,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
             }
 
+/**
+ * @brief Perform relative manual jog move.
+ */
             void LateralController::jog(float deltaMm) {
                 if (_state != LatState::HOMED && _state != LatState::POSITIONING) return;
                 // Base = cible actuelle si on est déjà en mouvement, sinon position courante.
@@ -482,6 +521,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 Diag::infof("[Lateral] Jog → %.2f mm", targetMm);
             }
 
+/** @brief Clear one-shot stop/pause flags. */
             void LateralController::clearOneShotStops() {
                 _pauseOnNextReversal = false;
                 _stopOnNextHigh = false;
@@ -489,6 +529,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 _pausedAtReversal = false;
             }
 
+/**
+ * @brief Stop synchronized traversal and return to HOMED.
+ */
             void LateralController::stopWinding() {
                 // POSITIONING : mouvement de repositionnement en cours (ex. phase finale
                 // de bobinage). Forcer l'arrêt et repasser en HOMED.
@@ -511,6 +554,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 Diag::info("[Lateral] Bobinage arrêté.");
             }
 
+/** @brief Get normalized 0..1 progress in current traversal direction. */
             float LateralController::getTraversalProgress() const {
                 if (!_stepper || _latEndSteps <= _latStartSteps) return 0.0f;
                 float pos = ((float)_stepper->getCurrentPosition() - (float)_latStartSteps)
@@ -519,11 +563,13 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 return constrain(pos, 0.0f, 1.0f);
             }
 
+/** @brief Get current carriage position in mm. */
             float LateralController::getCurrentPositionMm() const {
                 if (!_stepper) return 0.0f;
                 return (float)_stepper->getCurrentPosition() / (float)LAT_STEPS_PER_MM;
             }
 
+/** @brief Get active target position in mm. */
             float LateralController::getTargetPositionMm() const {
                 if (!_stepper) return 0.0f;
                 // En POSITIONING, utiliser la cible (_latStartSteps) plutôt que la
@@ -534,11 +580,13 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 return (float)_stepper->getCurrentPosition() / (float)LAT_STEPS_PER_MM;
             }
 
+/** @brief Check if carriage is at configured start position tolerance. */
             bool LateralController::_isAtStartPosition() const {
                 if (!_stepper) return false;
                 return abs(_stepper->getCurrentPosition() - _latStartSteps) <= MICROSTEPPING;
             }
 
+/** @brief Convert mm bounds to step-space bounds. */
             void LateralController::_setTraverseBounds(float startMm, float endMm) {
                 float s = max(0.0f, startMm);
                 float e = max(s, endMm);
@@ -546,6 +594,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 _latEndSteps   = (int32_t)(e * (float)LAT_STEPS_PER_MM);
             }
 
+/** @brief ISR callback latching home event during homing. */
             void IRAM_ATTR LateralController::_homePinISR(void* arg) {
                 LateralController* self = static_cast<LateralController*>(arg);
                 if (self->_state == LatState::HOMING && !self->_homeFlag) {
@@ -553,11 +602,13 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
             }
 
+/** @brief Attach home switch interrupt on NO pin. */
             void LateralController::_attachHomeISR() {
                 _homeFlag = false;
                 attachInterruptArg(digitalPinToInterrupt(HOME_PIN_NO), _homePinISR, this, FALLING);
             }
 
+/** @brief Detach home switch interrupt. */
             void LateralController::_detachHomeISR() {
                 detachInterrupt(digitalPinToInterrupt(HOME_PIN_NO));
             }

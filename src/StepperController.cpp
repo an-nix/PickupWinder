@@ -2,6 +2,9 @@
 #include <Arduino.h>
 #include "Diag.h"
 
+/**
+ * @brief Initialize spindle stepper channel and safe startup state.
+ */
 void StepperController::begin(FastAccelStepperEngine& engine) {
     // Keep the driver disabled at startup so the motor coils are not energised
     // until the user explicitly starts winding.
@@ -26,6 +29,9 @@ void StepperController::begin(FastAccelStepperEngine& engine) {
     Diag::info("[Stepper] OK");
 }
 
+/**
+ * @brief Update spindle speed setpoint with runtime-safe behavior.
+ */
 void StepperController::setSpeedHz(uint32_t hz) {
     // Clamp the requested speed to the configured min/max range.
     uint32_t clamped = constrain(hz, SPEED_HZ_MIN, SPEED_HZ_MAX);
@@ -45,6 +51,9 @@ void StepperController::setSpeedHz(uint32_t hz) {
     }
 }
 
+/**
+ * @brief Start spindle rotation in selected direction.
+ */
 void StepperController::start(bool forward) {
     if (!_stepper) return;
     // Si le driver était éteint, l'activer et laisser le rotor se caler
@@ -67,6 +76,7 @@ void StepperController::start(bool forward) {
         _stepper->runBackward();
 }
 
+/** @brief Request controlled stop (deceleration ramp). */
 void StepperController::stop() {
     if (_stepper) {
         // Ramp speed down to zero following the configured ACCELERATION profile.
@@ -76,12 +86,14 @@ void StepperController::stop() {
     }
 }
 
+/** @brief Disable spindle driver output. */
 void StepperController::disableDriver() {
     // Only call this after the motor has fully stopped.
     digitalWrite(ENABLE_PIN, HIGH);
     _driverEnabled = false;
 }
 
+/** @brief Immediate stop without ramp, then disable driver. */
 void StepperController::forceStop() {
     if (_stepper) {
         // Freeze position immediately (no deceleration ramp).
@@ -94,11 +106,13 @@ void StepperController::forceStop() {
     }
 }
 
+/** @brief Check if spindle is currently moving. */
 bool StepperController::isRunning() const {
     // Returns true while steps are still being generated (including ramp-down).
     return _stepper && _stepper->isRunning();
 }
 
+/** @brief Get completed full turns from absolute step position. */
 long StepperController::getTurns() const {
     if (!_stepper) return 0;
     // Convert absolute step position to full revolutions.
@@ -106,11 +120,13 @@ long StepperController::getTurns() const {
     return abs(_stepper->getCurrentPosition()) / STEPS_PER_REV;
 }
 
+/** @brief Reset spindle turns counter to zero. */
 void StepperController::resetTurns() {
     // Reset the internal step counter to 0 — turn count starts fresh.
     if (_stepper) _stepper->setCurrentPosition(0);
 }
 
+/** @brief Get instantaneous spindle speed in RPM. */
 float StepperController::getRPM() const {
     if (!_stepper) return 0.0f;
     // getCurrentSpeedInMilliHz returns the real-time speed in mHz
@@ -119,6 +135,7 @@ float StepperController::getRPM() const {
     return abs((float)mhz) / 1000.0f * 60.0f / STEPS_PER_REV;
 }
 
+/** @brief Play one musical tone through spindle motor vibration. */
 void StepperController::playNote(uint16_t freqHz) {
     if (!_stepper) return;
     if (freqHz == 0) {
@@ -145,6 +162,7 @@ void StepperController::playNote(uint16_t freqHz) {
     }
 }
 
+/** @brief Stop note playback and restore normal acceleration profile. */
 void StepperController::stopNote() {
     if (!_stepper) return;
     _stepper->setAcceleration(350000);

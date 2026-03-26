@@ -19,28 +19,51 @@
 //   });
 class Diag {
 public:
+    /**
+     * @brief Log severity level.
+     */
     enum class Level { INFO, WARN, ERROR };
 
-    // Callback type: receives the level and the fully-formatted message.
+    /**
+     * @brief Sink callback signature.
+     *
+     * Receives log level and fully-formatted message.
+     */
     using Sink = std::function<void(Level, const String&)>;
 
-    // Register an additional output sink (called after Serial each time).
-    // Sinks are permanent; call only during setup() before any log calls from
-    // other cores.
+    /**
+     * @brief Register an additional output sink.
+     * @param sink Sink callback to add.
+     * @par Usage
+     * Register during setup before multi-core activity starts.
+     */
     static void addSink(Sink sink);
 
     // ── Logging API ───────────────────────────────────────────────────────────
+    /** @brief Log INFO message. */
     static void info (const char* msg);
+    /** @brief Log WARN message. */
     static void warn (const char* msg);
+    /** @brief Log ERROR message. */
     static void error(const char* msg);
 
+    /** @brief Log formatted INFO message. */
     static void infof (const char* fmt, ...);
+    /** @brief Log formatted WARN message. */
     static void warnf (const char* fmt, ...);
+    /** @brief Log formatted ERROR message. */
     static void errorf(const char* fmt, ...);
 
 private:
     static std::vector<Sink> _sinks;
 
+    /**
+     * @brief Dispatch one formatted message to Serial + all sinks.
+     */
     static void _dispatch(Level level, const char* msg);
+
+    /**
+     * @brief `va_list` formatter backend for `*f` logging methods.
+     */
     static void _vlogf(Level level, const char* fmt, va_list args);
 };

@@ -15,8 +15,14 @@ extern const uint8_t style_css_end[]   asm("_binary_data_style_css_end");
 extern const uint8_t script_js_start[] asm("_binary_data_script_js_start");
 extern const uint8_t script_js_end[]   asm("_binary_data_script_js_end");
 
+/**
+ * @brief Construct web server and websocket instances.
+ */
 WebInterface::WebInterface() : _server(WEB_PORT), _ws("/ws") {}
 
+/**
+ * @brief Initialize WiFi, routes and websocket server.
+ */
 void WebInterface::begin() {
     // Attempt WiFi connection with up to 20 retries (10 seconds total).
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -81,6 +87,9 @@ void WebInterface::begin() {
     Diag::info("[Web] Server started");
 }
 
+/**
+ * @brief Serialize and broadcast full machine status to WS clients.
+ */
 void WebInterface::sendUpdate(const WinderStatus& s) {
     // Skip if WiFi is down or no client is connected.
     if (!_wifiOk || _ws.count() == 0) return;
@@ -89,7 +98,7 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
     // The buffer size (400 bytes) is sized to fit all fields with margin.
     char buf[832];
     snprintf(buf, sizeof(buf),
-        "{\"rpm\":%.0f,\"hz\":%u,\"turns\":%ld,\"target\":%ld,"
+        "{\"rpm\":%.0f,\"hz\":%u,\"turns\":%ld,\"target\":%ld,\"rewindMode\":%s,\"rewindTurns\":%ld,\"rewindRpm\":%u,"
         "\"running\":%s,\"enabled\":%s,\"startRequested\":%s,\"carriageReady\":%s,\"freerun\":%s,\"cw\":%s,\"auto\":%s,"
         "\"tpp\":%ld,\"tppCalc\":%ld,\"tppOfs\":%ld,\"scatter\":%.2f,"
         "\"pass\":%d,\"activeTpp\":%ld,\"latScale\":%.3f,\"latProgress\":%.3f,\"latPos\":%.3f,\"wStart\":%.3f,\"wEnd\":%.3f,\"wStartTrim\":%.3f,\"wEndTrim\":%.3f,\"eff\":%.2f,"
@@ -100,6 +109,7 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         "\"endPos\":%d,\"endPosTurns\":%d,"
         "\"verifyLow\":%s,\"verifyHigh\":%s,\"state\":\"%s\"}",
         s.rpm, s.speedHz, s.turns, s.targetTurns,
+        s.rewindMode ? "true" : "false", s.rewindBatchTurns, (unsigned)s.rewindBatchRpm,
         s.running      ? "true" : "false",
         s.motorEnabled ? "true" : "false",
         s.startRequested ? "true" : "false",
@@ -124,6 +134,9 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
     _ws.textAll(buf);
 }
 
+/**
+ * @brief Broadcast one capture point sample over websocket.
+ */
 void WebInterface::sendCapture(uint32_t timestampMs, float posMm, long turns) {
     if (!_wifiOk || _ws.count() == 0) return;
     char buf[64];
@@ -132,18 +145,24 @@ void WebInterface::sendCapture(uint32_t timestampMs, float posMm, long turns) {
     _ws.textAll(buf);
 }
 
+/** @brief Register command callback used for incoming WS commands. */
 void WebInterface::setCommandCallback(CommandCallback cb) {
     _callback = cb;
 }
 
+/** @brief Register recipe provider callback used by HTTP export endpoint. */
 void WebInterface::setRecipeProvider(RecipeJsonProvider cb) {
     _recipeProvider = cb;
 }
 
+/** @brief Return local IP string when connected, otherwise `N/A`. */
 String WebInterface::getIP() const {
     return _wifiOk ? WiFi.localIP().toString() : "N/A";
 }
 
+/**
+ * @brief Handle websocket events and forward valid command frames.
+ */
 void WebInterface::_onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
                                AwsEventType type, void* arg, uint8_t* data, size_t len) {
     // We only care about data frames; ignore connect/disconnect/error events.

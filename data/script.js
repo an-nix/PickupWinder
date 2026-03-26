@@ -178,6 +178,10 @@ function update(d) {
   byId('r-ccw').checked = !d.cw;
   byId('m-target').checked = !d.freerun;
   byId('m-free').checked   = !!d.freerun;
+  byId('rewind-mode').checked = !!d.rewindMode;
+  byId('rewind-params').style.display = d.rewindMode ? '' : 'none';
+  syncInput('rewind-turns', d.rewindTurns);
+  syncInput('rewind-rpm', d.rewindRpm);
   syncInput('ti', d.target);
   syncInput('ti-run', d.target);
   syncInput('w-seed', d.seed);
@@ -252,6 +256,9 @@ function updateContextPanels(st, d) {
   byId('ctx-target').style.display  = target ? '' : 'none';
   byId('master-stop').style.display = session ? '' : 'none';
 
+  const rewindMode = !!d.rewindMode;
+  byId('btn-rewind-next').style.display = target && rewindMode ? '' : 'none';
+
   /* ── Verify: adapt nudge buttons to current bound ── */
   if (verify) {
     const isLow = st === 'VERIFY_LOW';
@@ -308,7 +315,9 @@ function updateStatusLine(st, d, pos) {
       s.textContent = '🔍 Verify HIGH bound — encoder/buttons to adjust, Confirm when ok';
       break;
     case 'TARGET_REACHED':
-      s.textContent = '✓ Target reached — raise target or reset';
+      s.textContent = d.rewindMode
+        ? '✓ Batch done — press Start to run another batch'
+        : '✓ Target reached — raise target or reset';
       break;
     case 'IDLE':
       if (d.manualMode)       s.textContent = '⚙ Manual mode — encoder = carriage, pot = motor';

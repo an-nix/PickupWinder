@@ -123,6 +123,8 @@
 
 // ── Bobinage ─────────────────────────────────────────────
 #define DEFAULT_TARGET_TURNS  8000
+#define DEFAULT_REWIND_BATCH_TURNS 200
+#define DEFAULT_REWIND_BATCH_RPM   350
 #define WINDING_DEFAULT_SEED   424242UL
 #define WINDING_LAYER_JITTER_DEFAULT          0.10f
 #define WINDING_LAYER_SPEED_JITTER_DEFAULT    0.08f
