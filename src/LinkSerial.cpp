@@ -2,6 +2,9 @@
 #include <Arduino.h>
 #include "Diag.h"
 
+/**
+ * @brief Initialize UART bridge to the display ESP.
+ */
 void LinkSerial::begin() {
     // SERIAL_8N1 : 8 bits de données, pas de parité, 1 bit de stop.
     // Les pins TX/RX sont définis dans Config.h.
@@ -9,6 +12,9 @@ void LinkSerial::begin() {
     Diag::info("[Link] UART2 OK");
 }
 
+/**
+ * @brief Send one compact status frame over UART.
+ */
 void LinkSerial::sendStatus(float    rpm,
                              uint32_t speedHz,
                              long     turns,
@@ -25,6 +31,10 @@ void LinkSerial::sendStatus(float    rpm,
                      (int)running, (int)motorEnabled, (int)freerun, (int)dirCW);
 }
 
+/**
+ * @brief Poll UART and dispatch full command lines.
+ * @param cb Callback receiving parsed command/value pairs.
+ */
 void LinkSerial::poll(CommandCallback cb) {
     // Lire tous les octets disponibles sans bloquer.
     while (LINK_UART.available()) {

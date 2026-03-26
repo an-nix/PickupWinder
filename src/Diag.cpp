@@ -12,6 +12,9 @@ static const char* levelTag(Diag::Level l) {
     }
 }
 
+/**
+ * @brief Dispatch message to Serial and registered sinks.
+ */
 void Diag::_dispatch(Level level, const char* msg) {
     // Serial is always the primary sink.
     Serial.print(levelTag(level));
@@ -24,12 +27,16 @@ void Diag::_dispatch(Level level, const char* msg) {
     }
 }
 
+/**
+ * @brief Format a variadic log message and dispatch it.
+ */
 void Diag::_vlogf(Level level, const char* fmt, va_list args) {
     char buf[256];
     vsnprintf(buf, sizeof(buf), fmt, args);
     _dispatch(level, buf);
 }
 
+/** @brief Register one additional logging sink. */
 void Diag::addSink(Sink sink) { _sinks.push_back(std::move(sink)); }
 
 void Diag::info (const char* msg) { _dispatch(Level::INFO,  msg); }

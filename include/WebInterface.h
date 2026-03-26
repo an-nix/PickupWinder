@@ -14,27 +14,54 @@
 // board_build.embed_txtfiles in platformio.ini and served as a binary symbol.
 class WebInterface {
 public:
+	/**
+	 * @brief Construct web interface objects.
+	 */
     WebInterface();
 
-    // Connect to WiFi, register WebSocket handler, start HTTP server.
+    /**
+     * @brief Start WiFi, HTTP server and WebSocket endpoint.
+     * @par Usage
+     * Call once at startup after command callbacks are configured.
+     */
     void   begin();
 
-    // Serialise a WinderStatus snapshot to JSON and broadcast to all WS clients.
+    /**
+     * @brief Broadcast machine status to all connected WebSocket clients.
+     * @param status Full status snapshot to serialize and send.
+     */
     void   sendUpdate(const WinderStatus& status);
 
-    // Envoie un point de capture de position au format compact vers tous les clients WS.
-    // Appelé uniquement en mode MANUAL quand la capture est active.
-    // Format : {"type":"cap","t":1234,"pos":12.34,"turns":1500}
+    /**
+     * @brief Broadcast one manual-capture sample.
+     * @param timestampMs Timestamp in milliseconds.
+     * @param posMm Carriage position in millimeters.
+     * @param turns Turns counter at sample time.
+     */
     void   sendCapture(uint32_t timestampMs, float posMm, long turns);
 
-    // Register the callback that will be invoked for each incoming WebSocket command.
+    /**
+     * @brief Register command dispatch callback for incoming WS commands.
+     * @param cb Callback receiving `(cmd, value)`.
+     */
     void   setCommandCallback(CommandCallback cb);
+
+    /**
+     * @brief Register JSON recipe provider used by export endpoint.
+     * @param cb Callback returning serialized recipe JSON.
+     */
     void   setRecipeProvider(RecipeJsonProvider cb);
 
-    // Returns the ESP32 local IP as a string (or "N/A" if not connected).
+    /**
+     * @brief Get local WiFi IP string.
+     * @return Local IP, or "N/A" when disconnected.
+     */
     String getIP()         const;
 
-    // Returns true if WiFi and the web server are up and running.
+    /**
+     * @brief Check whether web interface is online.
+     * @return true if WiFi + server are operational.
+     */
     bool   isConnected()   const { return _wifiOk; }
 
 private:
@@ -44,7 +71,11 @@ private:
     RecipeJsonProvider _recipeProvider; // Download current recipe as JSON
     bool            _wifiOk = false;  // Set to true once WiFi is connected
 
-    // Internal WebSocket event dispatcher; routes DATA frames to _callback.
+    /**
+     * @brief Internal WS event dispatcher.
+     *
+     * Routes text data frames to the registered command callback.
+     */
     void _onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* client,
                     AwsEventType type, void* arg, uint8_t* data, size_t len);
 };

@@ -33,6 +33,9 @@ static volatile uint8_t encLastAB  = 0;
 // humaines légitimes sont espacées de ≥ 3 ms (tourne rapide) → seuil : 1000 µs.
 static volatile uint32_t encLastUs = 0;
 
+/**
+ * @brief Quadrature encoder ISR with debounce and QEM decoding.
+ */
 void IRAM_ATTR encISR() {
     uint32_t now = micros();
     // Anti-rebond : ignore les transitions plus rapides que ENC_DEBOUNCE_US.
@@ -52,6 +55,9 @@ static uint32_t lastLinkMs = 0;
 static uint32_t lastPotMs  = 0;
 
 // ── setup ─────────────────────────────────────────────────────────────────────
+/**
+ * @brief Firmware setup entry point.
+ */
 void setup() {
     Serial.begin(115200);
     Diag::info("\n=== Pickup Winder ===");
@@ -84,6 +90,9 @@ void setup() {
 }
 
 // ── loop ──────────────────────────────────────────────────────────────────────
+/**
+ * @brief Main firmware loop.
+ */
 void loop() {
     const uint32_t now = millis();
     // Encodeur rotatif — affichage périodique + réglage des butées en mode verify

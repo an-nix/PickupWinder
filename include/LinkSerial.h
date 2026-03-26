@@ -15,11 +15,25 @@
 //                "geom_wire:0.0650\n", "reset:\n"
 class LinkSerial {
 public:
-    // Initialise UART2 sur LINK_TX_PIN / LINK_RX_PIN à LINK_BAUD bauds.
+    /**
+     * @brief Initialize UART2 link with display controller.
+     * @par Usage
+     * Called once at startup before any status exchange.
+     */
     void begin();
 
-    // Envoyer une ligne de statut vers l'ESP écran.
-    // Appelé périodiquement depuis WinderApp::run() (toutes les LINK_UPDATE_MS ms).
+    /**
+     * @brief Send one compact status line to the screen ESP.
+     *
+     * @param rpm Current spindle RPM.
+     * @param speedHz Current spindle speed in Hz.
+     * @param turns Current turns count.
+     * @param targetTurns Current target turns.
+     * @param running true if spindle stepper is running.
+     * @param motorEnabled true if motor command path is enabled.
+     * @param freerun true if freerun mode is active.
+     * @param dirCW true for clockwise winding direction.
+     */
     void sendStatus(float    rpm,
                     uint32_t speedHz,
                     long     turns,
@@ -29,9 +43,13 @@ public:
                     bool     freerun,
                     bool     dirCW);
 
-    // Lire les octets disponibles sur UART2 et dispatcher les commandes complètes
-    // vers le callback (même signature que WebSocket → _handleCommand réutilisé tel quel).
-    // Appelé à chaque itération de WinderApp::run().
+    /**
+     * @brief Read UART input and dispatch complete commands.
+     *
+     * @param cb Callback invoked for each parsed command line.
+     * @par Usage
+     * Called in each main-loop iteration.
+     */
     void poll(CommandCallback cb);
 
 private:

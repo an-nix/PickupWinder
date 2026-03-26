@@ -7,8 +7,16 @@ constexpr const char* RECIPE_NS  = "winder";
 constexpr const char* RECIPE_KEY = "recipe_json";
 }
 
+/**
+ * @brief Initialize recipe store backend.
+ */
 void WindingRecipeStore::begin() {}
 
+/**
+ * @brief Load recipe from NVS.
+ * @param recipe Output recipe.
+ * @return true if load + parse succeeded.
+ */
 bool WindingRecipeStore::load(WindingRecipe& recipe) {
 	Preferences prefs;
 	if (!prefs.begin(RECIPE_NS, true)) return false;
@@ -18,6 +26,11 @@ bool WindingRecipeStore::load(WindingRecipe& recipe) {
 	return fromJson(json, recipe);
 }
 
+/**
+ * @brief Save recipe to NVS.
+ * @param recipe Recipe to persist.
+ * @return true when write length matches serialized length.
+ */
 bool WindingRecipeStore::save(const WindingRecipe& recipe) {
 	String json = toJson(recipe);
 	Preferences prefs;
@@ -27,6 +40,11 @@ bool WindingRecipeStore::save(const WindingRecipe& recipe) {
 	return written == json.length();
 }
 
+/**
+ * @brief Serialize recipe to pretty JSON.
+ * @param recipe Recipe input.
+ * @return Pretty-printed JSON string.
+ */
 String WindingRecipeStore::toJson(const WindingRecipe& recipe) const {
 	JsonDocument doc;
 	doc["version"] = recipe.version;
@@ -60,6 +78,12 @@ String WindingRecipeStore::toJson(const WindingRecipe& recipe) const {
 	return out;
 }
 
+/**
+ * @brief Parse recipe from JSON and apply safe bounds.
+ * @param json JSON input.
+ * @param recipe Output recipe.
+ * @return true when JSON parsing succeeds.
+ */
 bool WindingRecipeStore::fromJson(const String& json, WindingRecipe& recipe) const {
 	JsonDocument doc;
 	DeserializationError err = deserializeJson(doc, json);
@@ -91,6 +115,7 @@ bool WindingRecipeStore::fromJson(const String& json, WindingRecipe& recipe) con
 	recipe.geometry.turnsPerPassOffset = geom["turnsPerPassOffset"] | 0;
 	recipe.geometry.scatterFactor     = geom["scatterFactor"] | 1.0f;
 
+	// Clamp externally provided values to safe runtime ranges.
 	recipe.layerJitterPct   = constrain(recipe.layerJitterPct, 0.0f, 0.45f);
 	recipe.layerSpeedPct    = constrain(recipe.layerSpeedPct, 0.0f, 0.45f);
 	recipe.humanTraversePct = constrain(recipe.humanTraversePct, 0.0f, 0.45f);

@@ -35,83 +35,128 @@ enum class LatState {
 //   Défaut    : NO=HIGH, NC=HIGH → capteur débranché (les deux tirés par pull-up)
 class LateralController {
 public:
-    // Initialise les GPIO, se connecte à l'engine partagée et démarre le homing.
-    // L'engine doit avoir été initialisée (engine.init()) avant cet appel.
+    /**
+     * @brief Initialize lateral axis and start homing sequence.
+     * @param engine Shared FastAccelStepper engine.
+     * @param homeOffsetMm Offset from switch trigger to logical position zero.
+     */
     void begin(FastAccelStepperEngine& engine, float homeOffsetMm = LAT_HOME_OFFSET_DEFAULT_MM);
 
-    // Machine d'états non-bloquante — appeler à chaque itération de loop().
+    /**
+     * @brief Non-blocking state-machine update.
+     * @par Usage
+     * Call on every main-loop iteration.
+     */
     void update();
 
-    // État courant de l'axe latéral.
+    /** @brief Get current lateral-axis state. */
     LatState    getState()  const { return _state; }
+    /** @brief Check if axis is homed or currently traversing. */
     bool        isHomed()   const {
         return _state == LatState::HOMED
             || _state == LatState::WINDING_FWD
             || _state == LatState::WINDING_BWD;
     }
+    /** @brief Check whether axis is in fault state. */
     bool        isFault()   const { return _state == LatState::FAULT;  }
+    /** @brief Human-readable state string. */
     const char* stateStr()  const;
 
-    // Relancer le homing manuellement (ex. depuis l'interface web).
-    // Sans effet si le capteur est absent.
+    /**
+     * @brief Restart homing sequence manually.
+     * @par Usage
+     * Used by service UI and recovery workflows.
+     */
     void rehome();
 
-    // Déplacer le chariot vers la position de départ de la fenêtre de bobinage.
-    // startMm est exprimé depuis la base du tonework.
+    /**
+     * @brief Move carriage to requested start position.
+     * @param startMm Target position in mm from bobbin base.
+     * @param speedHz Positioning speed in step-Hz.
+     */
     void prepareStartPosition(float startMm, uint32_t speedHz = LAT_TRAVERSE_SPEED_HZ);
+    /** @brief True when axis is homed exactly at configured start position. */
     bool isPositionedForStart() const { return _state == LatState::HOMED && _isAtStartPosition(); }
+    /** @brief Convenience helper parking carriage at 0 mm. */
     void parkAtZero() { prepareStartPosition(0.0f); }
+    /** @brief Check if carriage is at physical/electrical zero (home). */
     bool isAtZero() const { return _state == LatState::HOMED && _stepper && abs(_stepper->getCurrentPosition()) <= MICROSTEPPING; }
+    /** @brief True when lateral motor currently runs. */
     bool isBusy() const { return _stepper && _stepper->isRunning(); }
 
-    // Déplacement relatif depuis la position courante (ou depuis la cible en cours).
-    // Fonctionne en état HOMED ou POSITIONING — met à jour la cible à la volée.
-    // Utilisé par l'encodeur pour contrôle direct du chariot.
+    /**
+     * @brief Relative jog move from current/target position.
+     * @param deltaMm Relative displacement in mm.
+     */
     void jog(float deltaMm);
+    /** @brief Arm pause on next natural reversal. */
     void armPauseOnNextReversal() { _pauseOnNextReversal = true; _pausedAtReversal = false; }
+    /** @brief Arm one-shot stop at next high bound. */
     void armStopAtNextHigh() { _stopOnNextHigh = true; _pausedAtReversal = false; }
+    /** @brief Arm one-shot stop at next low bound. */
     void armStopAtNextLow()  { _stopOnNextLow  = true; _pausedAtReversal = false; }
+    /** @brief Check whether stop-on-high one-shot is armed. */
     bool isStopOnNextHighArmed() const { return _stopOnNextHigh; }
+    /** @brief Check whether stop-on-low one-shot is armed. */
     bool isStopOnNextLowArmed()  const { return _stopOnNextLow; }
+    /** @brief Clear all one-shot stop/pause flags. */
     void clearOneShotStops();
+    /** @brief True if any stop-at-next-bound or pause-at-reversal flag is armed. */
     bool hasStopAtNextBoundArmed() const { return _stopOnNextHigh || _stopOnNextLow || _pauseOnNextReversal; }
+    /**
+     * @brief Consume and reset paused-at-reversal event latch.
+     * @return true if a reversal pause event was pending.
+     */
     bool consumePausedAtReversal() {
         bool v = _pausedAtReversal;
         _pausedAtReversal = false;
         return v;
     }
 
-    // ── Bobinage synchronisé ──────────────────────────────────────
-    // Démarrer la traversée latérale synchronisée avec le moteur de bobinage.
-    //   windingHz : fréquence de pas du stepper bobinage (readHz() / SpeedInput)
-    //   tpp       : tours par passe (WindingGeometry::turnsPerPass())
-    //   effWidthMm: largeur utile de bobinage en mm (WindingGeometry::effectiveWidth())
-    // Sans effet si l'axe n'est pas en état HOMED.
+    /**
+     * @brief Start synchronized lateral traversal for winding.
+     * @param windingHz Spindle step frequency.
+     * @param tpp Active turns-per-pass.
+     * @param startMm Low bound in mm.
+     * @param endMm High bound in mm.
+     * @param speedScale Traverse speed multiplier.
+     */
     void startWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale = 1.0f);
 
-    // Mettre à jour la vitesse latérale en temps réel (appeler à chaque lecture du pot).
-    // Sans effet si l'axe n'est pas en état WINDING_FWD / WINDING_BWD.
+    /**
+     * @brief Update synchronized traversal parameters while running.
+     */
     void updateWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale = 1.0f);
 
-    // Arrêter la traversée latérale (décélération douce, retour à HOMED).
+    /** @brief Stop synchronized traversal and return to HOMED state. */
     void stopWinding();
 
-    // Vrai pendant la fenêtre de demi-tour (décél + accél du moteur latéral).
-    // WinderApp réduit la vitesse de bobinage pendant ce temps (LAT_REVERSAL_SLOWDOWN).
+    /** @brief True while lateral axis is inside reversal transition window. */
     bool isReversing() const { return millis() < _reversingUntilMs; }
+    /** @brief True while actively traversing forward/backward. */
     bool isTraversing() const {
         return _state == LatState::WINDING_FWD || _state == LatState::WINDING_BWD;
     }
+    /** @brief Number of completed half-passes since traversal start. */
     uint32_t getPassCount() const { return _passCount; }
+    /** @brief Normalized progress (0..1) in current traversal direction. */
     float    getTraversalProgress() const;
 
-    // Offset entre le hard-stop capteur et la vraie position 0.
-    // Valeur positive en mm.
+    /**
+     * @brief Set home offset between switch trigger and logical zero.
+     * @param mm Offset in mm.
+     */
     void  setHomeOffset(float mm);
+    /** @brief Get configured home offset in mm. */
     float getHomeOffset() const { return _homeOffsetMm; }
+    /** @brief Get current carriage position in mm. */
     float getCurrentPositionMm() const;
-    // Retourne la position cible actuelle (en mm). En POSITIONING, c'est la cible
-    // en cours de mouvement ; en HOMED, c'est la position physique courante.
+    /**
+     * @brief Get current target position in mm.
+     *
+     * In `POSITIONING`, returns in-flight target. In `HOMED`, returns current
+     * physical position.
+     */
     float getTargetPositionMm() const;
 
 private:

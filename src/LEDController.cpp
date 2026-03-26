@@ -1,11 +1,21 @@
 #include "LEDController.h"
 
+/**
+ * @brief Initialize LED output state.
+ */
 void LEDController::begin() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);  // Start with LED off
     Serial.println("[LED] OK");
 }
 
+/**
+ * @brief Update LED pass-indicator logic.
+ * @param currentTurns Current spindle turn counter.
+ * @param turnsPerPass Active turns-per-pass.
+ * @param motorRunning true when spindle is running.
+ * @return Current pass index.
+ */
 int LEDController::update(long currentTurns, long turnsPerPass, bool motorRunning) {
     // ── Auto-off: turn LED off once flash duration has elapsed ──
     if (_ledOn && (millis() - _flashStartMs >= LED_FLASH_MS)) {
@@ -44,6 +54,9 @@ int LEDController::update(long currentTurns, long turnsPerPass, bool motorRunnin
     return _currentPass;
 }
 
+/**
+ * @brief Reset LED and pass synchronization state.
+ */
 void LEDController::reset() {
     // Return to the initial state: LED off, pass counter cleared.
     _currentPass  = -1;

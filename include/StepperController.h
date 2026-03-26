@@ -8,57 +8,61 @@
 // turn counting (via step position), and driver enable/disable via ENABLE_PIN.
 class StepperController {
 public:
-    // Initialise GPIO pins and connect to the shared engine.
-    // The engine must have been initialised (engine.init()) before this call.
+    /**
+     * @brief Initialize spindle stepper driver and attach shared engine.
+     * @param engine Shared FastAccelStepper engine.
+     */
     void     begin(FastAccelStepperEngine& engine);
 
-    // Update target speed (Hz). Clamped to [SPEED_HZ_MIN, SPEED_HZ_MAX].
-    // applySpeedAcceleration() is called so the change takes effect immediately
-    // even while the motor is already running.
+    /**
+     * @brief Update target speed setpoint.
+     * @param hz Requested speed in Hz.
+     * @note Value is clamped to configured min/max.
+     */
     void     setSpeedHz(uint32_t hz);
 
-    // Enable the driver and start continuous rotation.
-    // forward=true → CW, forward=false → CCW.
+    /**
+     * @brief Start continuous spindle rotation.
+     * @param forward true for CW, false for CCW.
+     */
     void     start(bool forward = true);
 
-    // Initiate a controlled deceleration to zero (ramp-down).
-    // The driver stays enabled during the deceleration phase;
-    // call disableDriver() once isRunning() returns false.
+    /**
+     * @brief Request controlled deceleration stop.
+     */
     void     stop();
 
-    // Immediately freeze the motor at its current position (no ramp-down).
-    // Also disables the driver right away. Used for pot-to-zero and
-    // direction changes to avoid coasting through the resonance zone.
+    /**
+     * @brief Immediately stop spindle and disable driver.
+     */
     void     forceStop();
 
-    // Cut power to the motor driver (ENABLE_PIN HIGH).
-    // Should be called only after the motor has fully stopped (isRunning()==false)
-    // to avoid losing steps or making the motor jerk.
+    /**
+     * @brief Disable stepper driver output stage.
+     */
     void     disableDriver();
 
-    // Returns true while the motor is still moving (including deceleration ramp).
+    /** @brief Check whether motor is currently moving. */
     bool     isRunning()  const;
 
-    // Returns the absolute number of full revolutions completed since the last
-    // resetTurns() call. Derived from FastAccelStepper::getCurrentPosition().
+    /** @brief Get full-turn counter since last reset. */
     long     getTurns()   const;
 
-    // Reset the step position counter to 0 (turn counter back to zero).
+    /** @brief Reset turns counter to zero. */
     void     resetTurns();
 
-    // Returns the actual instantaneous speed in RPM using getCurrentSpeedInMilliHz().
+    /** @brief Get measured instantaneous speed in RPM. */
     float    getRPM()     const;
 
-    // Returns the last speed setpoint in Hz (may differ from actual speed
-    // while accelerating or decelerating).
+    /** @brief Get last commanded speed setpoint in Hz. */
     uint32_t getSpeedHz() const { return _speedHz; }
 
-    // ── Music mode ────────────────────────────────────────────────────────
-    // Play a single note at the given frequency (Hz). Bypasses normal speed
-    // limits so any audible frequency (100-1000 Hz) can be used.
-    // freq=0 → silence (motor stopped).
+    /**
+     * @brief Play one tone via the motor.
+     * @param freqHz Audible frequency in Hz (`0` means silence).
+     */
     void     playNote(uint16_t freqHz);
-    // Stop music playback and disable driver.
+    /** @brief Stop tone playback and disable driver. */
     void     stopNote();
 
 private:

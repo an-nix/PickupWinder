@@ -1,6 +1,9 @@
 #include "WindingSimulator.h"
 #include <Arduino.h>
 
+/**
+ * @brief Run a simple geometric winding simulation.
+ */
 SimulationSummary simulateWinding(const WindingGeometry& g, long targetTurns,
                                   float packingFactor, float lateralSlack_mm) {
     SimulationSummary s{};
@@ -23,6 +26,9 @@ SimulationSummary simulateWinding(const WindingGeometry& g, long targetTurns,
     return s;
 }
 
+/**
+ * @brief Print a simulation summary to Serial.
+ */
 void printSimulation(const SimulationSummary& s) {
     Serial.println("--- Winding simulation summary ---");
     Serial.printf("Target turns : %ld\n", s.targetTurns);

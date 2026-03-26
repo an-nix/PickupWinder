@@ -10,20 +10,33 @@
 // automatically — giving a clear, visible blink at every direction change.
 class LEDController {
 public:
-    // Configure LED_PIN as output and ensure the LED is off.
+    /**
+     * @brief Initialize LED GPIO and force LED off.
+     */
     void begin();
 
-    // Call this every loop iteration with the latest turn count.
-    // Computes the current pass number (currentTurns / turnsPerPass) and
-    // flashes the LED whenever the pass number increments.
-    // Also handles auto-off after LED_FLASH_MS.
-    // Returns the current pass number (0-based).
+    /**
+     * @brief Update LED guide state from winding progress.
+     *
+     * Computes current pass index and flashes on pass transitions.
+     * Also handles timed auto-off.
+     *
+     * @param currentTurns Current turns count.
+     * @param turnsPerPass Active turns-per-pass value.
+     * @param motorRunning true if spindle is currently running.
+     * @return Current zero-based pass index.
+     */
     int  update(long currentTurns, long turnsPerPass, bool motorRunning);
 
-    // Turn the LED off and reset the pass counter to -1.
+    /**
+     * @brief Turn LED off and reset pass tracking.
+     */
     void reset();
 
-    // Returns the most recently computed pass number.
+    /**
+     * @brief Get last computed pass index.
+     * @return Last pass index, or -1 if not started.
+     */
     int  getCurrentPass() const { return _currentPass; }
 
 private:

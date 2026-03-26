@@ -8,12 +8,22 @@
 // ADC1 must be used (GPIO 32-39) because ADC2 is disabled when WiFi is active.
 class SpeedInput {
 public:
-    // Pre-fill the filter buffer with the current ADC value to avoid
-    // a false ramp-up at startup.
+    /**
+     * @brief Initialize ADC smoothing buffer.
+     *
+     * Pre-fills the moving-average window with current ADC value to avoid
+     * startup transients.
+     */
     void     begin();
 
-    // Read one ADC sample, update the circular buffer, compute the average
-    // and map the result to [SPEED_HZ_MIN, SPEED_HZ_MAX].
+    /**
+     * @brief Read and filter potentiometer input.
+     *
+     * Reads one sample, updates moving average, then maps result to
+     * `[SPEED_HZ_MIN, SPEED_HZ_MAX]`.
+     *
+     * @return Filtered spindle speed command in Hz.
+     */
     uint32_t readHz();
 
 private:

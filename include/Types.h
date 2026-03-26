@@ -3,9 +3,11 @@
 #include <functional>
 
 // Callback invoqué quand une commande est reçue (WebSocket ou liaison série).
+/** @brief Command callback signature `(command, value)`. */
 using CommandCallback = std::function<void(const String&, const String&)>;
 
 // Provider de recette JSON — retourne la recette courante sérialisée.
+/** @brief Callback returning current recipe as JSON. */
 using RecipeJsonProvider = std::function<String(void)>;
 
 // ── WindingState ──────────────────────────────────────────────────────────────
@@ -33,6 +35,11 @@ enum class WindingState {
     RODAGE,         // Rodage axe latéral : aller-retour N passes sur distance configurée
 };
 
+/**
+ * @brief Convert `WindingState` to stable string label.
+ * @param s State enum value.
+ * @return Human-readable state name.
+ */
 inline const char* windingStateName(WindingState s) {
     switch (s) {
         case WindingState::IDLE:           return "IDLE";
@@ -51,10 +58,18 @@ inline const char* windingStateName(WindingState s) {
 // Full machine state snapshot sent to all connected WebSocket clients
 // every WS_UPDATE_MS milliseconds, and to the screen over LinkSerial.
 struct WinderStatus {
+	/** Instantaneous spindle RPM. */
     float    rpm;
+	/** Instantaneous spindle speed in Hz. */
     uint32_t speedHz;
+	/** Current turns counter. */
     long     turns;
+	/** Target turns. */
     long     targetTurns;
+    bool     rewindMode;
+    long     rewindBatchTurns;
+    uint16_t rewindBatchRpm;
+	/** true if spindle motor is currently running. */
     bool     running;
     bool     motorEnabled;        // True while motor is (or was) actively commanded this session
     bool     startRequested;      // True from Armed onwards (session active)
