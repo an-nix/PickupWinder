@@ -400,7 +400,7 @@ WinderStatus WinderApp::getStatus() const {
         _stepper.getSpeedHz(),
         _stepper.getTurns(),
         (long)_targetTurns,
-        (uint16_t)(_maxSpeedHz * 60 / STEPS_PER_REV),
+        (uint16_t)((_maxSpeedHz * 60UL + (STEPS_PER_REV / 2)) / STEPS_PER_REV),
         _stepper.isRunning(),
         motorEnabled,
         sessionActive,
@@ -509,6 +509,16 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
             _startButtonMax = true;
             _canStart       = true;
             return true;
+        }
+        return true;
+    }
+
+    if (cmd == "pause") {
+        if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
+            Diag::info("[Pause] Ignored — no active session");
+        } else {
+            _toPaused();
+            Diag::info("[Pause] Paused by command");
         }
         return true;
     }
@@ -888,6 +898,15 @@ void WinderApp::handleCommand(const String& cmd, const String& value) {
     if (_parametersLocked()) {
         Diag::infof("[Lock] Ignored during session (%s): %s",
             windingStateName(_state), cmd.c_str());
+        return;
+    }
+
+    // Update maximum spindle speed (RPM -> stepper Hz)
+    if (cmd == "max_rpm" || cmd == "max-rpm") {
+        // allow lower minimum (10 RPM) and cap at 1500
+        int rpm = constrain(value.toInt(), 10, 1500);
+        _maxSpeedHz = (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL;
+        Diag::infof("[MaxRPM] Set %d RPM -> %u Hz", rpm, (unsigned)_maxSpeedHz);
         return;
     }
 
