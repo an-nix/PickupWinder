@@ -22,47 +22,47 @@ SessionController::SessionController(WinderApp& winder)
 // -----------------------------------------------------------------------------
 void SessionController::recordIntent(ControlIntent intent, InputSource src) {
     // Last event always overrides any previous pending intent.
-    _pendingIntent = intent; // Store the latest intent to apply.
-    _pendingSource = src;    // Remember who produced that intent.
-    _lastInput = src;        // Keep latest observed input source for diagnostics.
+    _pendingControlIntent = intent; // Store the latest intent to apply.
+    _pendingIntentSource = src;     // Remember who produced that intent.
+    _lastEventSource = src;         // Keep latest observed input source for diagnostics.
 
     // If another source takes control while pot is non-zero, require a pot
     // return-to-zero before pot can start the machine again.
-    if (src != InputSource::Pot && _potRunning) {
+    if (src != InputSource::Pot && _potAboveZero) {
         _potNeedsRearm = true; // Arm pot lock until next explicit zero crossing.
     }
 }
 
 void SessionController::applyPendingIntent() {
-    if (_pendingIntent == ControlIntent::None) return; // Nothing to apply this tick.
+    if (_pendingControlIntent == ControlIntent::None) return; // Nothing to apply this tick.
 
     // Snapshot source to preserve traceability after pending fields are cleared.
-    const InputSource src = _pendingSource; // Local copy for state attribution.
+    const InputSource src = _pendingIntentSource; // Local copy for state attribution.
 
-    switch (_pendingIntent) {
+    switch (_pendingControlIntent) {
     case ControlIntent::Stop:
         // Hard session stop: return to IDLE and stop winding domain.
         _winder.stopWinding();      // Delegate full stop to domain controller.
-        _state = SessionState::IDLE; // Reflect stop at session layer.
-        _activeSource = src;        // Mark source that produced effective state.
+        _sessionState = SessionState::IDLE; // Reflect stop at session layer.
+        _appliedSource = src;              // Mark source that produced effective state.
         break;
 
     case ControlIntent::Pause:
         // Pause is idempotent; avoid duplicate pause commands.
-        if (_state != SessionState::PAUSED) {
+        if (_sessionState != SessionState::PAUSED) {
             _winder.pauseWinding();      // Request domain pause only on transition.
-            _state = SessionState::PAUSED; // Persist paused session state.
+            _sessionState = SessionState::PAUSED; // Persist paused session state.
         }
-        _activeSource = src; // Mark effective source even if already paused.
+        _appliedSource = src; // Mark effective source even if already paused.
         break;
 
     case ControlIntent::Start:
         // Start is also idempotent; only trigger transition when needed.
-        if (_state != SessionState::RUNNING) {
+        if (_sessionState != SessionState::ARMED_OR_RUNNING) {
             _winder.handleCommand("start", ""); // Reuse start path in WinderApp.
-            _state = SessionState::RUNNING;       // Persist running session state.
+            _sessionState = SessionState::ARMED_OR_RUNNING; // Persist armed/running session state.
         }
-        _activeSource = src; // Mark effective source even if already running.
+        _appliedSource = src; // Mark effective source even if already running.
         if (src == InputSource::Pot) {
             // Pot regained control explicitly.
             _potNeedsRearm = false; // Clear lock because pot intentionally restarted.
@@ -73,8 +73,8 @@ void SessionController::applyPendingIntent() {
         break; // Defensive branch, should be filtered by early return.
     }
 
-    _pendingIntent = ControlIntent::None; // Clear one-shot intent after application.
-    _pendingSource = InputSource::None;   // Clear source paired with consumed intent.
+    _pendingControlIntent = ControlIntent::None; // Clear one-shot intent after application.
+    _pendingIntentSource = InputSource::None;    // Clear source paired with consumed intent.
 }
 
 // -----------------------------------------------------------------------------
@@ -134,16 +134,24 @@ bool SessionController::handleCommand(const String& cmd, const String& value) {
 // -----------------------------------------------------------------------------
 // Output application
 // -----------------------------------------------------------------------------
-void SessionController::applyPower() {
-    if (_state == SessionState::RUNNING) {
-        // While running, speed command follows potentiometer proportionally.
-        uint32_t speedHz = (uint32_t)(_potLevel * (float)_winder.getMaxSpeedHz()); // Scale max speed by normalized pot.
-        _winder.setControlHz(speedHz); // Push speed command to winding domain.
-        Serial.printf("[Session] run speedHz=%u pot=%.3f source=%d\n", speedHz, _potLevel, (int)_lastInput); // Debug trace.
-    } else {
-        // Any non-running state forces zero speed command.
-        _winder.setControlHz(0); // Guarantee no speed command outside RUNNING.
-        Serial.printf("[Session] paused source=%d pot=%.3f\n", (int)_lastInput, _potLevel); // Debug trace.
+void SessionController::applyPower() 
+{
+    if (_sessionState == SessionState::ARMED_OR_RUNNING) 
+    {
+        // ARMED_OR_RUNNING means the session is ready for or actively running motion.
+        // Always use the same logic for both fresh start and resume:
+        // - If the start came from the UI or footswitch while the pot is still at zero,
+        //   the commanded speed remains zero here, so the spindle will not move until the pot rises.
+        // - WinderApp will be positioned/armed, but not spinning.
+        uint32_t commandedSpeedHz = (uint32_t)(_potLevel * (float)_winder.getMaxSpeedHz()); // Scale max speed by normalized pot.
+        _winder.setControlHz(commandedSpeedHz); // Push speed command to winding domain.
+        Serial.printf("[Session] ARMED_OR_RUNNING speedHz=%u pot=%.3f source=%d\n", commandedSpeedHz, _potLevel, (int)_lastEventSource); // Debug trace.
+    }
+    else
+    {
+        // Any non-armed state forces zero speed command.
+        _winder.setControlHz(0); // Guarantee no speed command outside ARMED_OR_RUNNING.
+        Serial.printf("[Session] paused source=%d pot=%.3f\n", (int)_lastEventSource, _potLevel); // Debug trace.
     }
 }
 
@@ -151,6 +159,11 @@ void SessionController::applyPower() {
 // Tick update (single deterministic update step)
 // -----------------------------------------------------------------------------
 void SessionController::tick(const TickInput& in) {
+    // 0) Handle encoder delta (if any) for paused-position trim.
+    if (in.encoderDelta != 0) {
+        _winder.handleEncoderDelta(in.encoderDelta);
+    }
+
     // 1) Integrate pot input and detect zero/non-zero edges.
     if (in.hasPot) {
         float newLevel = constrain(in.potLevel, 0.0f, 1.0f); // Keep pot value normalized.
@@ -158,16 +171,16 @@ void SessionController::tick(const TickInput& in) {
             _potLevel = newLevel; // Update cached pot level when change is meaningful.
         }
 
-        const bool running = (_potLevel > POT_RUN_THRESHOLD); // Digital state derived from analog level.
-        if (!_potSeen) {
-            _potSeen = true;      // Initialize edge detector on first valid sample.
-            _potRunning = running; // Store baseline digital pot state.
-        } else if (running != _potRunning) {
+        const bool potAboveZero = (_potLevel > POT_RUN_THRESHOLD); // Digital state derived from analog level.
+        if (!_hasPotSample) {
+            _hasPotSample = true;       // Initialize edge detector on first valid sample.
+            _potAboveZero = potAboveZero; // Store baseline digital pot state.
+        } else if (potAboveZero != _potAboveZero) {
             // Pot transitions are the only moments allowed to trigger
             // start/pause intents from analog input.
-            _potRunning = running; // Latch the new pot digital state.
+            _potAboveZero = potAboveZero; // Latch the new pot digital state.
 
-            if (!running) {
+            if (!potAboveZero) {
                 // Pot reached zero: clear ownership lock and request pause.
                 _potNeedsRearm = false; // Pot is now rearmed for future takeovers.
                 recordIntent(ControlIntent::Pause, InputSource::Pot); // Pot falling edge requests pause.
@@ -180,8 +193,8 @@ void SessionController::tick(const TickInput& in) {
 
     // 2) Integrate footswitch edge events.
     if (in.hasFootswitch) {
-        if (!_footswitchSeen || _footswitch != in.footswitch) {
-            _footswitchSeen = true; // Baseline becomes valid after first sample.
+        if (!_hasFootswitchSample || _footswitch != in.footswitch) {
+            _hasFootswitchSample = true; // Baseline becomes valid after first sample.
             _footswitch = in.footswitch; // Store latest footswitch state.
             recordIntent(_footswitch ? ControlIntent::Start : ControlIntent::Pause,
                 InputSource::Footswitch); // Press->start, release->pause.

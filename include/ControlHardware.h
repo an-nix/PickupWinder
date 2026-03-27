@@ -1,7 +1,6 @@
 #pragma once
 #include <Arduino.h>
 #include "Config.h"
-#include "SpeedInput.h"
 #include "SessionController.h"
 
 class WinderApp;
@@ -16,9 +15,8 @@ class ControlHardware {
 public:
     /**
      * @brief Construct the hardware input helper.
-     * @param winder Non-owning reference used for encoder-driven trim events.
      */
-    ControlHardware(WinderApp& winder);
+    ControlHardware();
 
     /** @brief Initialize potentiometer, footswitch and encoder IO. */
     void begin();
@@ -30,12 +28,27 @@ public:
      */
     void tick(uint32_t now, SessionController::TickInput& out);
 
-private:
-    // Winding domain callback target used for encoder trim interaction.
-    WinderApp& _winder;
 
-    // Potentiometer reader with internal smoothing and transfer function.
-    SpeedInput _pot;
+
+    // --- Inlined SpeedInput logic ---
+    /**
+     * @brief Potentiometer smoothing buffer and transfer logic (was SpeedInput).
+     */
+    uint32_t _potSamples[POT_FILTER_SIZE] = {};
+    uint8_t  _potIdx = 0;
+    uint32_t _potLastHz = 0;
+
+    /**
+     * @brief Initialize ADC smoothing buffer for the potentiometer.
+     * Pre-fills the moving-average window with current ADC value to avoid startup transients.
+     */
+    void _initPotSmoothing();
+
+    /**
+     * @brief Read and filter potentiometer input, returning filtered Hz value.
+     * Reads one sample, updates moving average, then maps result to [SPEED_HZ_MIN, SPEED_HZ_MAX].
+     */
+    uint32_t _readPotHz();
 
     // Debounce state for the digital footswitch input.
     bool _lastFootswitchRaw = false;

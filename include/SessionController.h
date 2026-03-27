@@ -9,7 +9,12 @@
  * used to arbitrate user intents (start/pause/stop) coming from multiple input
  * sources.
  */
-enum class SessionState { IDLE, RUNNING, PAUSED };
+/**
+ * @brief Session state: IDLE, ARMED_OR_RUNNING, PAUSED.
+ *
+ * ARMED_OR_RUNNING means the session is either actively running or armed for motion (e.g. after a start command, even if pot is zero).
+ */
+enum class SessionState { IDLE, ARMED_OR_RUNNING, PAUSED };
 
 /**
  * @brief Multi-source session arbiter for winding control.
@@ -84,6 +89,8 @@ public:
         bool hasFootswitch = false;
         /** Monotonic timestamp provided by caller (`millis()`). */
         uint32_t now = 0;
+        /** Encoder delta (detents since last tick, bounded). */
+        int32_t encoderDelta = 0;
         /** Max number of commands accepted per tick. */
         static constexpr int MAX_CMDS = 16;
         /** Fixed-size command array (shared command representation). */
@@ -118,23 +125,23 @@ private:
     /** Non-owning reference to winding application logic. */
     WinderApp& _winder;
     /** Current high-level session state. */
-    SessionState _state = SessionState::IDLE;
+    SessionState _sessionState = SessionState::IDLE;
     /** Source that last produced an applied transition. */
-    InputSource _activeSource = InputSource::None;
+    InputSource _appliedSource = InputSource::None;
     /** Source of latest observed event, even before application. */
-    InputSource _lastInput = InputSource::None;
+    InputSource _lastEventSource = InputSource::None;
 
     /** Latest normalized potentiometer value. */
     float _potLevel = 0.0f;
     /** Cached digital state derived from pot threshold crossing. */
-    bool _potRunning = false;
+    bool _potAboveZero = false;
     /** Latest footswitch sampled value. */
     bool _footswitch = false;
 
     /** Guards first pot sample to initialize edge detector safely. */
-    bool _potSeen = false;
+    bool _hasPotSample = false;
     /** Guards first footswitch sample to initialize edge detector safely. */
-    bool _footswitchSeen = false;
+    bool _hasFootswitchSample = false;
 
     /**
      * @brief Pot ownership lock.
@@ -145,9 +152,9 @@ private:
     bool _potNeedsRearm = false;
 
     /** Pending intent selected by last-event arbitration. */
-    ControlIntent _pendingIntent = ControlIntent::None;
-    /** Source attached to `_pendingIntent`. */
-    InputSource _pendingSource = InputSource::None;
+    ControlIntent _pendingControlIntent = ControlIntent::None;
+    /** Source attached to `_pendingControlIntent`. */
+    InputSource _pendingIntentSource = InputSource::None;
 
     /**
      * @brief Record a new intent and override previously pending one.

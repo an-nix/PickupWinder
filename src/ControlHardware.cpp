@@ -10,15 +10,15 @@ const int8_t ControlHardware::QEM[16] = { 0,-1, 1, 0,
                                         -1, 0, 0, 1,
                                          0, 1,-1, 0 };
 
-ControlHardware::ControlHardware(WinderApp& winder)
-    : _winder(winder)
+
+ControlHardware::ControlHardware()
 {
 }
 
 void ControlHardware::begin()
 {
-    // Initialize the filtered potentiometer input pipeline.
-    _pot.begin();
+    // Initialize the filtered potentiometer input pipeline (inlined SpeedInput logic).
+    _initPotSmoothing();
 
     // Initialize footswitch input as active-low with internal pull-up.
     pinMode(FOOTSWITCH_PIN, INPUT_PULLUP);
@@ -53,8 +53,7 @@ void ControlHardware::tick(uint32_t now, SessionController::TickInput& out)
         out.footswitch = _footswitchStable;
     }
 
-    // Convert raw quadrature count into a bounded delta and forward it to the
-    // winding domain for paused-position trim adjustments.
+    // Convert raw quadrature count into a bounded delta and propagate via TickInput.
     int32_t cur = _encCount;
     int32_t delta = cur - _lastEncConsumed;
     if (delta != 0) {
@@ -62,7 +61,9 @@ void ControlHardware::tick(uint32_t now, SessionController::TickInput& out)
         if (delta >  MAX_ENC_DELTA) delta =  MAX_ENC_DELTA;
         if (delta < -MAX_ENC_DELTA) delta = -MAX_ENC_DELTA;
         _lastEncConsumed = cur;
-        _winder.handleEncoderDelta(delta);
+        out.encoderDelta = delta;
+    } else {
+        out.encoderDelta = 0;
     }
     if (now - _lastEncMs >= 50) {
         _lastEncMs = now;
@@ -72,14 +73,62 @@ void ControlHardware::tick(uint32_t now, SessionController::TickInput& out)
         }
     }
 
+
     // Sample the potentiometer at a controlled rate to avoid excessive ADC work.
     if (now - _lastPotMs >= POT_READ_INTERVAL) {
         _lastPotMs = now;
-        _lastPotHz = _pot.readHz();
+        _lastPotHz = _readPotHz();
         float level = (float)_lastPotHz / (float)SPEED_HZ_MAX;
         out.hasPot = true;
         out.potLevel = level;
     }
+
+// --- Inlined SpeedInput logic ---
+
+void ControlHardware::_initPotSmoothing() {
+    // Pre-fill the entire filter buffer with the current ADC reading.
+    for (uint8_t i = 0; i < POT_FILTER_SIZE; i++) {
+        _potSamples[i] = analogRead(POT_PIN);
+    }
+    _potIdx = 0;
+    _potLastHz = 0;
+    Serial.println("[ControlHardware] Pot smoothing initialized");
+}
+
+uint32_t ControlHardware::_readPotHz() {
+    // Write the new sample into the circular buffer at the current index.
+    _potSamples[_potIdx] = analogRead(POT_PIN);
+    _potIdx = (_potIdx + 1) % POT_FILTER_SIZE;
+
+    // Compute the mean of all samples in the buffer.
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < POT_FILTER_SIZE; i++) sum += _potSamples[i];
+    uint32_t avg = sum / POT_FILTER_SIZE;
+
+    // Invert ADC reading if the pot is wired in reverse.
+#if POT_INVERTED
+    avg = 4095 - avg;
+#endif
+
+    // Zero band: when the pot is physically at the low stop, return zero immediately.
+    if (avg <= POT_ADC_ZERO_BAND) {
+        _potLastHz = 0;
+        return 0;
+    }
+
+    uint32_t hz;
+    if (avg >= POT_ADC_FULL_BAND) {
+        hz = SPEED_HZ_MAX;
+    } else {
+        // Exponential response curve for finer low-speed control.
+        float t = (float)(avg - POT_ADC_ZERO_BAND) / (float)(POT_ADC_FULL_BAND - POT_ADC_ZERO_BAND);
+        t = constrain(t, 0.0f, 1.0f);
+        static const float invDenom = 1.0f / (expf(POT_EXP_K) - 1.0f);
+        hz = (uint32_t)((expf(POT_EXP_K * t) - 1.0f) * invDenom * (float)SPEED_HZ_MAX);
+    }
+    _potLastHz = hz;
+    return hz;
+}
 
     // Always propagate the control-loop timestamp.
     out.now = now;
