@@ -142,7 +142,7 @@ function update(d) {
   badge.textContent = isManual ? 'MANUAL' : st;
   badge.className = 'badge' +
     (st === 'WINDING' ? ' run' : '') +
-    (st === 'PAUSED' || st === 'VERIFY_LOW' || st === 'VERIFY_HIGH' ? ' warn' : '') +
+    (st === 'PAUSED' ? ' warn' : '') +
     (st === 'TARGET_REACHED' ? ' err' : '');
 
   /* ── Gauges ── */
@@ -178,10 +178,7 @@ function update(d) {
   byId('r-ccw').checked = !d.cw;
   byId('m-target').checked = !d.freerun;
   byId('m-free').checked   = !!d.freerun;
-  byId('rewind-mode').checked = !!d.rewindMode;
-  byId('rewind-params').style.display = d.rewindMode ? '' : 'none';
-  syncInput('rewind-turns', d.rewindTurns);
-  syncInput('rewind-rpm', d.rewindRpm);
+  syncInput('max-rpm', d.maxRpm);
   syncInput('ti', d.target);
   syncInput('ti-run', d.target);
   syncInput('w-seed', d.seed);
@@ -245,36 +242,18 @@ function update(d) {
 /* ── Context panels: show only what's relevant ─────────── */
 function updateContextPanels(st, d) {
   const idle    = st === 'IDLE' && !d.manualMode;
-  const winding = st === 'WINDING' || st === 'PAUSED';
-  const verify  = st === 'VERIFY_LOW' || st === 'VERIFY_HIGH';
+  const isRunning = !!d.running;
+  const paused = (st === 'PAUSED') && !isRunning;
+  const winding = st === 'WINDING' || st === 'PAUSED' || isRunning;
   const target  = st === 'TARGET_REACHED';
-  const session = d.startRequested || d.rodageMode;
 
-  byId('ctx-idle').style.display    = idle ? '' : 'none';
+  byId('ctx-idle').style.display    = idle    ? '' : 'none';
   byId('ctx-winding').style.display = winding ? '' : 'none';
-  byId('ctx-verify').style.display  = verify ? '' : 'none';
-  byId('ctx-target').style.display  = target ? '' : 'none';
-  byId('master-stop').style.display = session ? '' : 'none';
-
-  const rewindMode = !!d.rewindMode;
-  byId('btn-rewind-next').style.display = target && rewindMode ? '' : 'none';
-
-  /* ── Verify: adapt nudge buttons to current bound ── */
-  if (verify) {
-    const isLow = st === 'VERIFY_LOW';
-    byId('verify-title').textContent = isLow ? 'Verifying LOW bound' : 'Verifying HIGH bound';
-    const nudgeCmd = isLow ? 'geom_start_trim_nudge' : 'geom_end_trim_nudge';
-    byId('vn-a').onclick = () => cmd(nudgeCmd, '-0.05');
-    byId('vn-b').onclick = () => cmd(nudgeCmd, '0.05');
-    const switchBtn = byId('vn-switch');
-    if (isLow) {
-      switchBtn.textContent = 'Go High →';
-      switchBtn.onclick = () => cmd('verify_high');
-    } else {
-      switchBtn.textContent = '← Go Low';
-      switchBtn.onclick = () => cmd('verify_low');
-    }
-  }
+  byId('ctx-target').style.display  = target  ? '' : 'none';
+  byId('btn-start-run').style.display = winding ? '' : 'none';
+  byId('btn-start-run').textContent = paused ? '▶ Resume' : '▶ Start';
+  byId('btn-pause-run').style.display = isRunning ? '' : 'none';
+  byId('btn-stop-paused').style.display = paused ? '' : 'none';
 }
 
 /* ── Style-dependent slider visibility ─────────────────── */
@@ -301,23 +280,23 @@ function updateLockState(st, d) {
 /* ── Status line ───────────────────────────────────────── */
 function updateStatusLine(st, d, pos) {
   const s = byId('status-line');
+  if (d.running) {
+    s.textContent = '▶ Winding…';
+    return;
+  }
   switch (st) {
     case 'WINDING':
-      s.textContent = d.running ? '▶ Winding…' : '⏸ Pot at zero — raise to resume';
+      if (d.verifyLow) s.textContent = '🔍 Going to LOW bound…';
+      else if (d.verifyHigh) s.textContent = '🔍 Going to HIGH bound…';
+      else s.textContent = d.running ? '▶ Winding…' : '⏸ Pot at zero — raise to resume';
       break;
     case 'PAUSED':
-      s.textContent = '⏸ Paused — raise pot to resume';
-      break;
-    case 'VERIFY_LOW':
-      s.textContent = '🔍 Verify LOW bound — encoder/buttons to adjust, pot to spin, Confirm when ok';
-      break;
-    case 'VERIFY_HIGH':
-      s.textContent = '🔍 Verify HIGH bound — encoder/buttons to adjust, Confirm when ok';
+      if (d.verifyLow) s.textContent = '🔍 Positioning to low bound…';
+      else if (d.verifyHigh) s.textContent = '⏸ High bound reached — Resume to start winding';
+      else s.textContent = '⏸ Paused — raise pot to resume';
       break;
     case 'TARGET_REACHED':
-      s.textContent = d.rewindMode
-        ? '✓ Batch done — press Start to run another batch'
-        : '✓ Target reached — raise target or reset';
+      s.textContent = '✓ Target reached — raise target or reset';
       break;
     case 'IDLE':
       if (d.manualMode)       s.textContent = '⚙ Manual mode — encoder = carriage, pot = motor';

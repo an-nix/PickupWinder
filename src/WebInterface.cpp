@@ -98,7 +98,7 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
     // The buffer size (400 bytes) is sized to fit all fields with margin.
     char buf[832];
     snprintf(buf, sizeof(buf),
-        "{\"rpm\":%.0f,\"hz\":%u,\"turns\":%ld,\"target\":%ld,\"rewindMode\":%s,\"rewindTurns\":%ld,\"rewindRpm\":%u,"
+        "{\"rpm\":%.0f,\"hz\":%u,\"turns\":%ld,\"target\":%ld,\"maxRpm\":%u,"
         "\"running\":%s,\"enabled\":%s,\"startRequested\":%s,\"carriageReady\":%s,\"freerun\":%s,\"cw\":%s,\"auto\":%s,"
         "\"tpp\":%ld,\"tppCalc\":%ld,\"tppOfs\":%ld,\"scatter\":%.2f,"
         "\"pass\":%d,\"activeTpp\":%ld,\"latScale\":%.3f,\"latProgress\":%.3f,\"latPos\":%.3f,\"wStart\":%.3f,\"wEnd\":%.3f,\"wStartTrim\":%.3f,\"wEndTrim\":%.3f,\"eff\":%.2f,"
@@ -109,7 +109,7 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         "\"endPos\":%d,\"endPosTurns\":%d,"
         "\"verifyLow\":%s,\"verifyHigh\":%s,\"state\":\"%s\"}",
         s.rpm, s.speedHz, s.turns, s.targetTurns,
-        s.rewindMode ? "true" : "false", s.rewindBatchTurns, (unsigned)s.rewindBatchRpm,
+        (unsigned)s.maxRpm,
         s.running      ? "true" : "false",
         s.motorEnabled ? "true" : "false",
         s.startRequested ? "true" : "false",
