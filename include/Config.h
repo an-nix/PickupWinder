@@ -101,13 +101,20 @@
 #define POT_EXP_K           4.5f
 
 // ── Footswitch ───────────────────────────────────────────
-// Recommended wiring: normally-open footswitch between GPIO 4 and GND.
-// GPIO 4 is a good fit here because it supports INPUT_PULLUP, is not used by
-// the current design, and avoids the input-only / ADC-only limitations of the
-// high GPIO range.
-#define FOOTSWITCH_PIN      4
-// Active-low wiring with internal pull-up enabled.
-#define FOOTSWITCH_ACTIVE_LOW true
+// Recommended wiring: normally-open footswitch between GPIO 13 and GND.
+// Change the pin here if you prefer a different GPIO.
+//
+// The macro `FOOTSWITCH_ACTIVE_LOW` selects the electrical polarity the
+// firmware expects at the sampled GPIO level:
+//  - true  => pressed = LOW (use INPUT_PULLUP, common for NO to GND wiring)
+//  - false => pressed = HIGH (use INPUT_PULLUP but interpret logic inverted)
+// This lets you compile for either NO (normally-open) or NC (normally-closed)
+// wiring without changing code elsewhere.
+#define FOOTSWITCH_PIN      13
+// Invert footswitch polarity to match wiring: your switch is CLOSED when
+// released and OPEN when pressed (NC wiring). Set to `false` so `pressed` maps
+// to HIGH when using `INPUT_PULLUP` sampling logic.
+#define FOOTSWITCH_ACTIVE_LOW false
 // Debounce time for mechanical contact stabilization.
 #define FOOTSWITCH_DEBOUNCE_MS 20
 
