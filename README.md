@@ -292,28 +292,7 @@ Use this after:
 
 ---
 
-## Manual mode
-
-Manual mode decouples carriage motion from automatic traverse logic.
-
-### Encoder step (mm/click)
-Distance commanded by each encoder click.
-
-### Carriage position
-Current lateral position.
-
-### Motor turns
-Current main motor turn count.
-
-### Capture
-Records manual-mode carriage points and motor turns, then exports them as JSON.
-
-Use this to:
-- study manual movements
-- capture a motion trace
-- build future recipe tools offline
-
----
+<!-- Manual mode removed from firmware and UI -->
 
 ## Final-position logic
 

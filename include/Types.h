@@ -22,7 +22,6 @@ enum class WindingState {
     WINDING,
     PAUSED,
     TARGET_REACHED,
-    MANUAL,
     RODAGE,
 };
 
@@ -32,7 +31,6 @@ inline const char* windingStateName(WindingState s) {
         case WindingState::WINDING:        return "WINDING";
         case WindingState::PAUSED:         return "PAUSED";
         case WindingState::TARGET_REACHED: return "TARGET_REACHED";
-        case WindingState::MANUAL:         return "MANUAL";
         case WindingState::RODAGE:         return "RODAGE";
         default:                           return "UNKNOWN";
     }
@@ -51,7 +49,6 @@ struct WinderStatus {
     bool     carriageReady;
     bool     verifyLow;
     bool     verifyHigh;
-    bool     manualMode;
     bool     rodageMode;
     int      rodagePassDone;
     int      rodagePasses;
@@ -85,4 +82,12 @@ struct WinderStatus {
     int      endPos;
     int      endPosTurns;
     const char* stateName;
+};
+
+// Bounded command entry for embedded-friendly command passing (no dynamic alloc)
+struct CommandEntry {
+    static constexpr size_t CMD_SZ = 16;
+    static constexpr size_t VAL_SZ = 48;
+    char cmd[CMD_SZ];
+    char val[VAL_SZ];
 };

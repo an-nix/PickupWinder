@@ -52,6 +52,19 @@ public:
      */
     void poll(CommandCallback cb);
 
+    /**
+     * @brief Store a command callback to be used by `poll()` without args.
+     */
+    void setCommandCallback(CommandCallback cb);
+
+    /**
+     * @brief Poll UART and dispatch using previously registered callback.
+     *
+     * This overload allows calling `poll()` without passing the callback each time.
+     */
+    void poll();
+
 private:
     String _rxBuf;  // Buffer d'accumulation pour la ligne en cours de réception
+    CommandCallback _callback = nullptr;
 };

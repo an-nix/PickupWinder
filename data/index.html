@@ -156,31 +156,7 @@
   <!-- ═══ PANE: TOOLS ═══ -->
   <div class="pane" id="pane-tools">
     <div class="cards2">
-      <div class="card">
-        <div class="card-title">⚙ Manual mode</div>
-        <p class="hint">Encoder controls carriage, pot controls motor.</p>
-        <div id="manual-controls" style="display:none">
-          <div class="fg">
-            <label>Step (mm)</label>
-            <div class="row4">
-              <button class="btn btn-neutral btn-xs" onclick="setManualStep(0.05)">0.05</button>
-              <button class="btn btn-neutral btn-xs" onclick="setManualStep(0.1)">0.1</button>
-              <button class="btn btn-neutral btn-xs" onclick="setManualStep(0.5)">0.5</button>
-              <button class="btn btn-neutral btn-xs" onclick="setManualStep(1.0)">1.0</button>
-            </div>
-            <label>Position</label><span class="live-val" id="manual-pos">0.00 mm</span>
-            <label>Turns</label><span class="live-val" id="manual-turns">0</span>
-          </div>
-          <div class="row4" style="margin-top:8px">
-            <button class="btn btn-s" id="btn-capture" style="background:#0369a1;color:#fff" onclick="toggleCapture()">⏺ Capture</button>
-            <button class="btn btn-neutral btn-s" id="btn-dl-capture" style="display:none" onclick="downloadCapture()">⬇ Download</button>
-          </div>
-          <div id="manual-cap-status" class="hint" style="margin-top:4px"></div>
-        </div>
-        <div style="margin-top:10px">
-          <button class="btn btn-go btn-s" id="btn-manual-toggle" onclick="toggleManual()">▶ Enter manual</button>
-        </div>
-      </div>
+      <!-- Manual mode removed -->
       <div class="card">
         <div class="card-title">🏠 Home offset</div>
         <p class="hint">Distance sensor → position 0. Change triggers rehoming.</p>

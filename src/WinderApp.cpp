@@ -93,21 +93,7 @@ void WinderApp::_toTargetReached() {
 }
 
 void WinderApp::_toManual() {
-    _state              = WindingState::MANUAL;
-    _canStart           = false;
-    _pendingDisable     = true;
-    _pendingManual      = false;
-    _startButtonMax     = false;
-    _verifyLowPending   = false;
-    _verifyHighPending  = false;
-    _positioningToLow   = false;
-    _manualFirstPass    = true;
-    _stepper.stop();
-    _lateral.stopWinding();
-    _captureActive      = false;
-    _captureLastPosMm   = -999.0f;
-    Diag::infof("[MANUAL] Window [%.2f -> %.2f mm], step: %.2f mm",
-            _windingStartMm(), _windingEndMm(), _manualJogStepMm);
+    // manual mode removed
 }
 
 void WinderApp::_toRodage() {
@@ -214,24 +200,12 @@ void WinderApp::_handlePotCycle(uint32_t hz) {
         }
         break;
 
-    case WindingState::MANUAL:
-        if (driveHz == 0) {
-            _canStart = true;
-            if (_stepper.isRunning()) {
-                _pendingDisable = true;
-                _stepper.stop();
-            }
-        } else if (_canStart) {
-            bool forward = (_direction == Direction::CW) != (bool)WINDING_MOTOR_INVERTED;
-            _stepper.setSpeedHz(driveHz);
-            if (!_stepper.isRunning()) _stepper.start(forward);
-        }
-        break;
 
     case WindingState::TARGET_REACHED:
     case WindingState::RODAGE:
         break;
     }
+        // WindingState::MANUAL removed
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -414,7 +388,6 @@ WinderStatus WinderApp::getStatus() const {
         _lateral.isPositionedForStart(),
         (_verifyLowPending || _positioningToLow),   // verifyLow
         _verifyHighPending,                          // verifyHigh
-        (_state == WindingState::MANUAL),
         (_state == WindingState::RODAGE),
         _rodagePassDone,
         _rodagePasses,
@@ -563,55 +536,7 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         return true;
     }
 
-    // ── Mode manuel ──────────────────────────────────────────────────────────
-    if (cmd == "manual") {
-        if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
-            _pendingManual = true;
-            _verifyLowPending  = true;
-            _verifyHighPending = false; // No high verify needed for manual
-            _positioningToLow  = true;
-            _state             = WindingState::PAUSED;
-            _pendingDisable    = false;
-            if (_state == WindingState::TARGET_REACHED) _stepper.resetTurns();
-            _lateral.prepareStartPosition(_windingStartMm());
-            Diag::info("[MANUAL] Positioning to low bound before manual mode...");
-        } else {
-            _toManual();
-        }
-        return true;
-    }
-
-    if (cmd == "manual_stop") {
-        if (_state == WindingState::MANUAL) {
-            _toIdle();
-            Diag::info("[MANUAL] Mode manuel termine -> IDLE");
-        }
-        return true;
-    }
-
-    if (cmd == "manual_step") {
-        float s = value.toFloat();
-        if (s > 0.0f && s <= 5.0f) {
-            _manualJogStepMm = s;
-            Diag::infof("[MANUAL] Pas jog: %.3f mm/cran", _manualJogStepMm);
-        }
-        return true;
-    }
-
-    if (cmd == "manual_capture_start") {
-        if (_state == WindingState::MANUAL) {
-            _captureActive    = true;
-            _captureLastPosMm = -999.0f;
-            Diag::info("[MANUAL] Capture demarree");
-        }
-        return true;
-    }
-
-    if (cmd == "manual_capture_stop") {
-        _captureActive = false;
-        Diag::info("[MANUAL] Capture arretee");
-        return true;
-    }
+    // manual mode / capture commands removed
 
     // ── Position finale de bobinage ──────────────────────────────────────────
     if (cmd == "end_pos") {
@@ -865,25 +790,6 @@ void WinderApp::handleEncoderDelta(int32_t delta) {
                 newPos - (_geom.flangeBottom_mm + _geom.margin_mm), -5.0f, 5.0f);
             _saveRecipe();
             Diag::infof("[Encoder] Butee basse ajustee en PAUSE: %.2f mm", newPos);
-        }
-    } else if (_state == WindingState::MANUAL) {
-        float stepMm = _manualFirstPass
-            ? (_manualJogStepMm * (float)MANUAL_FAST_STEP_MULT)
-            : _manualJogStepMm;
-
-        float baseMm    = _lateral.getTargetPositionMm();
-        float newTarget = constrain(baseMm + delta * stepMm,
-                                    _windingStartMm(), _windingEndMm());
-        float actualDelta = newTarget - baseMm;
-        if (fabsf(actualDelta) > 0.001f) {
-            _lateral.jog(actualDelta);
-            if (_manualFirstPass &&
-                (newTarget >= _windingEndMm()   - 0.2f ||
-                 newTarget <= _windingStartMm() + 0.2f)) {
-                _manualFirstPass = false;
-                Diag::infof("[MANUAL] Premiere bute atteinte — passage aux pas fins (%.2f mm)",
-                    _manualJogStepMm);
-            }
         }
     }
 }
