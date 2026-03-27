@@ -22,6 +22,13 @@ void WinderApp::begin() {
 }
 
 void WinderApp::tick(uint32_t potHz) {
+    if (_pauseRequested) {
+        _pauseRequested = false;
+        if (_state != WindingState::IDLE && _state != WindingState::TARGET_REACHED) {
+            _toPaused();
+        }
+    }
+
     _handleLateralEvents();
     _handlePotCycle(potHz);
     _checkAutoStop();
@@ -517,8 +524,10 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
             Diag::info("[Pause] Ignored — no active session");
         } else {
-            _toPaused();
-            Diag::info("[Pause] Paused by command");
+            // Handle pause inside tick() to avoid cross-task race with control loop.
+            _startButtonMax = false;
+            _pauseRequested = true;
+            Diag::info("[Pause] Pause requested");
         }
         return true;
     }
@@ -531,6 +540,14 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         } else {
             Diag::infof("[Resume] Ignored in state %s", windingStateName(_state));
         }
+        return true;
+    }
+
+    // Allow changing max RPM even while a session is active.
+    if (cmd == "max_rpm" || cmd == "max-rpm") {
+        int rpm = constrain(value.toInt(), 10, 1500);
+        _maxSpeedHz = (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL;
+        Diag::infof("[MaxRPM] (immediate) Set %d RPM -> %u Hz", rpm, (unsigned)_maxSpeedHz);
         return true;
     }
 
@@ -902,13 +919,7 @@ void WinderApp::handleCommand(const String& cmd, const String& value) {
     }
 
     // Update maximum spindle speed (RPM -> stepper Hz)
-    if (cmd == "max_rpm" || cmd == "max-rpm") {
-        // allow lower minimum (10 RPM) and cap at 1500
-        int rpm = constrain(value.toInt(), 10, 1500);
-        _maxSpeedHz = (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL;
-        Diag::infof("[MaxRPM] Set %d RPM -> %u Hz", rpm, (unsigned)_maxSpeedHz);
-        return;
-    }
+    // (handled as immediate command) -- nothing to do here
 
     if (cmd == "freerun") {
         _freerun = (value == "true");

@@ -56,6 +56,7 @@ private:
     bool _canStart       = false;   // Arm: pot must return to 0 before (re)start
     bool _pendingDisable = false;   // Deferred driver disable after stop
     bool _startButtonMax = false;   // Start button latch: drive at _maxSpeedHz
+    volatile bool _pauseRequested = false; // Cross-task pause request, consumed in tick()
 
     // ── Verify flags (modify startup, NOT separate states) ──
     bool _verifyLowPending  = false;  // Waiting for low-bound positioning

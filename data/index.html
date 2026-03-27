@@ -112,7 +112,7 @@
           <label>Mode</label>
           <div class="seg lockable" id="lock-mode"><label><input type="radio" name="mode" id="m-target" onchange="cmd('freerun','false')"><span class="pill">Target</span></label><label><input type="radio" name="mode" id="m-free" onchange="cmd('freerun','true')"><span class="pill">FreeRun</span></label></div>
           <label>Target</label><input id="ti" type="number" min="100" max="50000" step="100" onchange="cmd('target',this.value)">
-          <label>Max RPM</label><input id="max-rpm" type="number" min="100" max="1500" step="10" class="lockable" onchange="cmd('max_rpm',this.value)">
+          <label>Max RPM</label><input id="max-rpm" type="number" min="10" max="1500" step="10" onchange="cmd('max_rpm',this.value)">
 
           <label>Seed</label><input id="w-seed" type="number" min="1" max="4294967295" step="1" class="lockable" onchange="cmd('winding_seed',this.value)">
           <label>Final pos.</label>
