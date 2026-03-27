@@ -56,6 +56,11 @@ struct WinderStatus {
     bool     freerun;
     bool     directionCW;
     bool     autoMode;
+    bool     burstEnabled;
+    bool     burstActive;
+    long     burstConfiguredTurns;
+    long     burstTargetTurns;
+    long     burstRemainingTurns;
     long     turnsPerPass;
     long     turnsPerPassCalc;
     long     turnsPerPassOffset;

@@ -26,6 +26,24 @@ void SessionController::recordIntent(ControlIntent intent, InputSource src) {
     _pendingIntentSource = src;     // Remember who produced that intent.
     _lastEventSource = src;         // Keep latest observed input source for diagnostics.
 
+    // Debug tracing for last-event-wins arbitration.
+    const char* intentName = "None";
+    const char* srcName = "None";
+    switch (intent) {
+        case ControlIntent::Start: intentName = "Start"; break;
+        case ControlIntent::Pause: intentName = "Pause"; break;
+        case ControlIntent::Stop: intentName = "Stop"; break;
+        default: break;
+    }
+    switch (src) {
+        case InputSource::Pot: srcName = "Pot"; break;
+        case InputSource::IHM: srcName = "IHM"; break;
+        case InputSource::Footswitch: srcName = "Footswitch"; break;
+        default: break;
+    }
+    Serial.printf("[Session] recordIntent intent=%s src=%s potAboveZero=%.3f potNeedsRearm=%d\n",
+                  intentName, srcName, _potLevel, _potNeedsRearm);
+
     // If another source takes control while pot is non-zero, require a pot
     // return-to-zero before pot can start the machine again.
     if (src != InputSource::Pot && _potAboveZero) {
@@ -41,31 +59,35 @@ void SessionController::applyPendingIntent() {
 
     switch (_pendingControlIntent) {
     case ControlIntent::Stop:
-        // Hard session stop: return to IDLE and stop winding domain.
         _winder.stopWinding();      // Delegate full stop to domain controller.
-        _sessionState = SessionState::IDLE; // Reflect stop at session layer.
-        _appliedSource = src;              // Mark source that produced effective state.
+        _sessionState = SessionState::IDLE;
+        _appliedSource = src;
+        _runMode = RunMode::None;
         break;
 
     case ControlIntent::Pause:
-        // Pause is idempotent; avoid duplicate pause commands.
         if (_sessionState != SessionState::PAUSED) {
-            _winder.pauseWinding();      // Request domain pause only on transition.
-            _sessionState = SessionState::PAUSED; // Persist paused session state.
+            _winder.pauseWinding();
+            _sessionState = SessionState::PAUSED;
         }
-        _appliedSource = src; // Mark effective source even if already paused.
+        _appliedSource = src;
+        _runMode = RunMode::None;
         break;
 
     case ControlIntent::Start:
-        // Start is also idempotent; only trigger transition when needed.
-        if (_sessionState != SessionState::ARMED_OR_RUNNING) {
-            _winder.handleCommand("start", ""); // Reuse start path in WinderApp.
-            _sessionState = SessionState::ARMED_OR_RUNNING; // Persist armed/running session state.
-        }
-        _appliedSource = src; // Mark effective source even if already running.
+        // Always forward explicit Start intents to WinderApp so UI/footswitch can
+        // resume from PAUSED even if the session is already marked ARMED_OR_RUNNING.
+        _winder.handleCommand("start", "");
+        _sessionState = SessionState::ARMED_OR_RUNNING;
+        _appliedSource = src;
         if (src == InputSource::Pot) {
-            // Pot regained control explicitly.
-            _potNeedsRearm = false; // Clear lock because pot intentionally restarted.
+            _potNeedsRearm = false;
+            _runMode = RunMode::Pot;
+        } else {
+            // Start via UI/footswitch re-arms pot so pot can immediately take over
+            // if the user moves it after pressing Start.
+            _potNeedsRearm = false;
+            _runMode = RunMode::Max;
         }
         break;
 
@@ -138,14 +160,22 @@ void SessionController::applyPower()
 {
     if (_sessionState == SessionState::ARMED_OR_RUNNING) 
     {
-        // ARMED_OR_RUNNING means the session is ready for or actively running motion.
-        // Always use the same logic for both fresh start and resume:
-        // - If the start came from the UI or footswitch while the pot is still at zero,
-        //   the commanded speed remains zero here, so the spindle will not move until the pot rises.
-        // - WinderApp will be positioned/armed, but not spinning.
-        uint32_t commandedSpeedHz = (uint32_t)(_potLevel * (float)_winder.getMaxSpeedHz()); // Scale max speed by normalized pot.
-        _winder.setControlHz(commandedSpeedHz); // Push speed command to winding domain.
-        Serial.printf("[Session] ARMED_OR_RUNNING speedHz=%u pot=%.3f source=%d\n", commandedSpeedHz, _potLevel, (int)_lastEventSource); // Debug trace.
+        uint32_t commandedSpeedHz;
+        switch (_runMode) {
+        case RunMode::Pot:
+            commandedSpeedHz = (uint32_t)(_potLevel * (float)_winder.getMaxSpeedHz());
+            break;
+        case RunMode::Max:
+            commandedSpeedHz = _winder.getMaxSpeedHz();
+            break;
+        default:
+            commandedSpeedHz = 0;
+            break;
+        }
+
+        _winder.setControlHz(commandedSpeedHz);
+        Serial.printf("[Session] ARMED_OR_RUNNING speedHz=%u pot=%.3f source=%d runMode=%d\n",
+            commandedSpeedHz, _potLevel, (int)_lastEventSource, (int)_runMode);
     }
     else
     {
@@ -166,31 +196,32 @@ void SessionController::tick(const TickInput& in) {
 
     // 1) Integrate pot input and detect zero/non-zero edges.
     if (in.hasPot) {
-        float newLevel = constrain(in.potLevel, 0.0f, 1.0f); // Keep pot value normalized.
-        if (fabsf(newLevel - _potLevel) >= 0.001f) {
-            _potLevel = newLevel; // Update cached pot level when change is meaningful.
-        }
+            float newLevel = constrain(in.potLevel, 0.0f, 1.0f); // Keep pot value normalized.
+            const bool levelChanged = (fabsf(newLevel - _potLevel) >= 0.001f);
+            if (levelChanged) {
+                _potLevel = newLevel;
+            }
 
-        const bool potAboveZero = (_potLevel > POT_RUN_THRESHOLD); // Digital state derived from analog level.
-        if (!_hasPotSample) {
-            _hasPotSample = true;       // Initialize edge detector on first valid sample.
-            _potAboveZero = potAboveZero; // Store baseline digital pot state.
-        } else if (potAboveZero != _potAboveZero) {
-            // Pot transitions are the only moments allowed to trigger
-            // start/pause intents from analog input.
-            _potAboveZero = potAboveZero; // Latch the new pot digital state.
+            const bool potAboveZero = (_potLevel > POT_RUN_THRESHOLD);
+            if (!_hasPotSample) {
+                _hasPotSample = true;
+                _potAboveZero = potAboveZero;
+            } else if (potAboveZero != _potAboveZero) {
+                _potAboveZero = potAboveZero;
 
-            if (!potAboveZero) {
-                // Pot reached zero: clear ownership lock and request pause.
-                _potNeedsRearm = false; // Pot is now rearmed for future takeovers.
-                recordIntent(ControlIntent::Pause, InputSource::Pot); // Pot falling edge requests pause.
-            } else if (!_potNeedsRearm) {
-                // Pot rising edge above zero can start only when rearmed.
-                recordIntent(ControlIntent::Start, InputSource::Pot); // Pot rising edge requests start.
+                if (!potAboveZero) {
+                    _potNeedsRearm = false;
+                    recordIntent(ControlIntent::Pause, InputSource::Pot);
+                } else if (!_potNeedsRearm) {
+                    recordIntent(ControlIntent::Start, InputSource::Pot);
+                }
+            }
+
+            if (_sessionState == SessionState::ARMED_OR_RUNNING && potAboveZero) {
+                // Pot changes override previous source once in run state.
+                _runMode = RunMode::Pot;
             }
         }
-    }
-
     // 2) Integrate footswitch edge events.
     if (in.hasFootswitch) {
         if (!_hasFootswitchSample || _footswitch != in.footswitch) {

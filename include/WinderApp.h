@@ -81,10 +81,15 @@ private:
     volatile bool         _freerun      = false;
 
     // ── Control flags ──
-    bool _canStart       = false;   // Arm: pot must return to 0 before (re)start
     bool _pendingDisable = false;   // Deferred driver disable after stop
-    bool _startButtonMax = false;   // Start button latch: drive at _maxSpeedHz
     volatile bool _pauseRequested = false; // Cross-task pause request, consumed in tick()
+
+    // ── Burst mode (non-persistent, user-settable) ──
+    bool _burstEnabled = false;          // checkbox in setup (When true, next start is burst)
+    bool _burstActive = false;           // internal running burst state
+    bool _burstCompleted = false;        // true after burst auto-stop until next explicit start
+    long _burstConfiguredTurns = 1;      // value settable in setup
+    long _burstTargetTurns = 0;          // absolute turn target for current burst
 
     // ── Verify flags (modify startup, NOT separate states) ──
     bool _verifyLowPending  = false;  // Waiting for low-bound positioning
@@ -105,7 +110,7 @@ private:
     float _windingStartMm() const { return _geom.windingStartMm(); }
     float _windingEndMm()   const { return _geom.windingEndMm(); }
     void  _handleLateralEvents();
-    void  _handlePotCycle(uint32_t hz);
+    void  _processInputHz(uint32_t hz); // NEW: input commands (from session controller)
     void  _runWindingAtHz(uint32_t hz);
     void  _checkAutoStop();
     void  _applyDeferredDisable();
