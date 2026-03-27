@@ -31,7 +31,7 @@ static LinkSerial      serialLink;
 static WinderApp       winder;
 static SessionController session(winder);
 static CommandController cmdController(serialLink, web);
-static ControlHardware control(winder);
+static ControlHardware control;
 
 // ── Shared status (control → comms) ──────────────────────────────────────────
 static SemaphoreHandle_t statusMutex = nullptr;
