@@ -399,9 +399,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 _stepper->applySpeedAcceleration();
 
                 int32_t pos = _stepper->getCurrentPosition();
-                // Si arrêté en cours de passe (ni à la butée start ni à la butée end),
-                // reprendre dans la même direction qu'avant la pause.
-                // Sinon, décider par position (cas normal : départ depuis start).
+                // If winding was paused mid-pass, resume in the same direction.
+                // Otherwise choose a direction from the current position, which is
+                // the normal behavior when starting from a bound.
                 bool goFwd;
                 if (pos > _latStartSteps && pos < _latEndSteps) {
                     goFwd = _lastDirFwd;
@@ -418,7 +418,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 
                 float mmPerSec = (float)_latHz / (float)LAT_STEPS_PER_MM;
                 float passDuration = (mmPerSec > 0.0f) ? ((endMm - startMm) / mmPerSec) : 0.0f;
-                Diag::infof("[Lateral] ▶ Bobinage démarré : %u Hz (%.2f mm/s)  passe=%.1fs  dir=%s",
+                Diag::infof("[Lateral] Traversal started: %u Hz (%.2f mm/s) pass=%.1fs dir=%s",
             _latHz, mmPerSec, passDuration,
                               (_state == LatState::WINDING_FWD) ? "FWD" : "BWD");
             }
@@ -507,7 +507,8 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
  */
             void LateralController::jog(float deltaMm) {
                 if (_state != LatState::HOMED && _state != LatState::POSITIONING) return;
-                // Base = cible actuelle si on est déjà en mouvement, sinon position courante.
+                // Use the active target while already positioning, otherwise use the
+                // current physical position as the jog base.
                 float baseMm = (_state == LatState::POSITIONING)
                     ? (float)_latStartSteps / (float)LAT_STEPS_PER_MM
                     : getCurrentPositionMm();
@@ -533,8 +534,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
  * @brief Stop synchronized traversal and return to HOMED.
  */
             void LateralController::stopWinding() {
-                // POSITIONING : mouvement de repositionnement en cours (ex. phase finale
-                // de bobinage). Forcer l'arrêt et repasser en HOMED.
+                // POSITIONING means the carriage is executing a reposition move,
+                // for example during final end-position handling. Force-stop it
+                // and return to HOMED.
                 if (_state == LatState::POSITIONING) {
                     if (_stepper->isRunning()) {
                         _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
@@ -544,7 +546,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                     return;
                 }
                 if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
-                _lastDirFwd = (_state == LatState::WINDING_FWD);  // mémorise la direction
+                _lastDirFwd = (_state == LatState::WINDING_FWD);  // Remember direction across a pause.
                 clearOneShotStops();
                 if (_stepper->isRunning()) {
                     _stepper->forceStopAndNewPosition(_stepper->getCurrentPosition());
@@ -572,9 +574,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 /** @brief Get active target position in mm. */
             float LateralController::getTargetPositionMm() const {
                 if (!_stepper) return 0.0f;
-                // En POSITIONING, utiliser la cible (_latStartSteps) plutôt que la
-                // position physique pour éviter l'accumulation d'erreur lors d'appels
-                // répétés alors que le chariot est encore en mouvement.
+                // While POSITIONING, report the requested target rather than the
+                // live physical position so repeated callers do not accumulate
+                // error while the carriage is still in flight.
                 if (_state == LatState::POSITIONING)
                     return (float)_latStartSteps / (float)LAT_STEPS_PER_MM;
                 return (float)_stepper->getCurrentPosition() / (float)LAT_STEPS_PER_MM;

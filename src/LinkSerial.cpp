@@ -6,8 +6,8 @@
  * @brief Initialize UART bridge to the display ESP.
  */
 void LinkSerial::begin() {
-    // SERIAL_8N1 : 8 bits de données, pas de parité, 1 bit de stop.
-    // Les pins TX/RX sont définis dans Config.h.
+    // SERIAL_8N1 means 8 data bits, no parity and 1 stop bit.
+    // TX/RX pins are configured in Config.h.
     LINK_UART.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
     Diag::info("[Link] UART2 OK");
 }
@@ -23,9 +23,9 @@ void LinkSerial::sendStatus(float    rpm,
                              bool     motorEnabled,
                              bool     freerun,
                              bool     dirCW) {
-    // Format compact pipe-separated, terminé par '\n'.
-    // L'ESP écran parse en splitant sur '|' et en vérifiant le préfixe 'S'.
-    // Champs : S | turns | targetTurns | rpm | speedHz | running | motorEnabled | freerun | dirCW
+    // Compact pipe-separated frame terminated by '\n'.
+    // The display ESP parses the frame by splitting on '|' after checking the
+    // leading 'S' marker.
     LINK_UART.printf("S|%ld|%ld|%.1f|%u|%d|%d|%d|%d\n",
                      turns, targetTurns, rpm, speedHz,
                      (int)running, (int)motorEnabled, (int)freerun, (int)dirCW);
@@ -36,12 +36,12 @@ void LinkSerial::sendStatus(float    rpm,
  * @param cb Callback receiving parsed command/value pairs.
  */
 void LinkSerial::poll(CommandCallback cb) {
-    // Lire tous les octets disponibles sans bloquer.
+    // Consume all available bytes without blocking the control flow.
     while (LINK_UART.available()) {
         char c = (char)LINK_UART.read();
 
         if (c == '\n') {
-            // Ligne complète reçue — chercher le séparateur ':'
+            // A full line was received; split it around the ':' separator.
             int sep = _rxBuf.indexOf(':');
             if (sep > 0 && cb) {
                 String cmd = _rxBuf.substring(0, sep);
@@ -52,9 +52,17 @@ void LinkSerial::poll(CommandCallback cb) {
             }
             _rxBuf = "";
         } else if (c != '\r') {
-            // Protéger contre les buffers trop longs (ligne corrompue).
+            // Protect against corrupted or runaway lines.
             if (_rxBuf.length() < 128) _rxBuf += c;
-            else                        _rxBuf = "";  // reset silencieux
+            else                        _rxBuf = "";  // Silent reset on overflow.
         }
     }
+}
+
+void LinkSerial::setCommandCallback(CommandCallback cb) {
+    _callback = cb;
+}
+
+void LinkSerial::poll() {
+    poll(_callback);
 }

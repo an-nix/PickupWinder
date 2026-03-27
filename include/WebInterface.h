@@ -33,14 +33,6 @@ public:
     void   sendUpdate(const WinderStatus& status);
 
     /**
-     * @brief Broadcast one manual-capture sample.
-     * @param timestampMs Timestamp in milliseconds.
-     * @param posMm Carriage position in millimeters.
-     * @param turns Turns counter at sample time.
-     */
-    void   sendCapture(uint32_t timestampMs, float posMm, long turns);
-
-    /**
      * @brief Register command dispatch callback for incoming WS commands.
      * @param cb Callback receiving `(cmd, value)`.
      */

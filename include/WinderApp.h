@@ -10,29 +10,56 @@
 
 enum class Direction { CW, CCW };
 
-// ── WinderApp ─────────────────────────────────────────────────────────────────
-// Simplified winding controller.
-// States: IDLE, WINDING, PAUSED, TARGET_REACHED, MANUAL, RODAGE.
-// Verify is NOT a separate state — just flags during normal PAUSED→WINDING flow.
-// Start button = pot at max. Pause button = pot at zero.
+/**
+ * @brief Main winding domain controller.
+ *
+ * `WinderApp` owns the spindle, lateral axis, recipe state and the winding
+ * state machine. It does not read raw hardware inputs directly; higher layers
+ * convert user intent into commands and speed setpoints.
+ */
 class WinderApp {
 public:
+    /** @brief Initialize motors, recipe storage and derived runtime state. */
     void begin();
-    void tick(uint32_t potHz);
+
+    /** @brief Advance the winding state machine by one deterministic step. */
+    void tick();
+
+    /** @brief Set the live spindle speed command in step-Hz. */
+    void setControlHz(uint32_t hz) { _inputHz = hz; }
+
+    /** @brief Set the requested target turns count. */
+    void setTargetTurns(long t) { _targetTurns = t; }
+
+    /** @brief Enable or disable freerun mode. */
+    void setFreerun(bool f) { _freerun = f; }
+
+    /** @brief Set spindle direction. */
+    void setDirection(Direction d) { _direction = d; }
+
+    /** @brief Set the maximum spindle speed in RPM. */
+    void setMaxRpm(uint16_t rpm) { _maxSpeedHz = (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL; }
+
+    /** @brief Return the current configured spindle speed ceiling in step-Hz. */
+    uint32_t getMaxSpeedHz() const { return _maxSpeedHz; }
+
+    /** @brief Request transition to paused state. */
+    void pauseWinding() { _toPaused(); }
+
+    /** @brief Request transition to idle state. */
+    void stopWinding() { _toIdle(); }
+
+    /** @brief Dispatch a user or transport command into the winding domain. */
     void handleCommand(const String& cmd, const String& value);
+
+    /** @brief Apply one encoder delta to the interactive trim logic. */
     void handleEncoderDelta(int32_t delta);
+
+    /** @brief Build a snapshot of all UI-facing status fields. */
     WinderStatus getStatus() const;
+
+    /** @brief Serialize the active recipe to JSON. */
     String recipeJson() const;
-    bool isCaptureActive() const { return _captureActive; }
-    bool getCapturePoint(float& posMm, long& turns) {
-        if (!_captureActive) return false;
-        float cur = _lateral.getCurrentPositionMm();
-        if (fabsf(cur - _captureLastPosMm) < 0.05f) return false;
-        _captureLastPosMm = cur;
-        posMm = cur;
-        turns = _stepper.getTurns();
-        return true;
-    }
 
 private:
     // ── Hardware subsystems ──
@@ -50,13 +77,19 @@ private:
     volatile Direction    _direction    = Direction::CW;
     volatile long         _targetTurns  = DEFAULT_TARGET_TURNS;
     volatile uint32_t     _maxSpeedHz   = SPEED_HZ_MAX;
+    volatile uint32_t     _inputHz      = 0;
     volatile bool         _freerun      = false;
 
     // ── Control flags ──
-    bool _canStart       = false;   // Arm: pot must return to 0 before (re)start
     bool _pendingDisable = false;   // Deferred driver disable after stop
-    bool _startButtonMax = false;   // Start button latch: drive at _maxSpeedHz
     volatile bool _pauseRequested = false; // Cross-task pause request, consumed in tick()
+
+    // ── Burst mode (non-persistent, user-settable) ──
+    bool _burstEnabled = false;          // checkbox in setup (When true, next start is burst)
+    bool _burstActive = false;           // internal running burst state
+    bool _burstCompleted = false;        // true after burst auto-stop until next explicit start
+    long _burstConfiguredTurns = 1;      // value settable in setup
+    long _burstTargetTurns = 0;          // absolute turn target for current burst
 
     // ── Verify flags (modify startup, NOT separate states) ──
     bool _verifyLowPending  = false;  // Waiting for low-bound positioning
@@ -71,14 +104,13 @@ private:
     void _toWinding();
     void _toPaused();
     void _toTargetReached();
-    void _toManual();
     void _toRodage();
 
     // ── Tick helpers ──
     float _windingStartMm() const { return _geom.windingStartMm(); }
     float _windingEndMm()   const { return _geom.windingEndMm(); }
     void  _handleLateralEvents();
-    void  _handlePotCycle(uint32_t hz);
+    void  _processInputHz(uint32_t hz); // NEW: input commands (from session controller)
     void  _runWindingAtHz(uint32_t hz);
     void  _checkAutoStop();
     void  _applyDeferredDisable();
@@ -96,13 +128,6 @@ private:
     void          _applyRecipe(const WindingRecipe& recipe, bool persist);
     WindingRecipe _captureRecipe() const;
     void          _saveRecipe();
-
-    // ── Manual mode ──
-    float  _manualJogStepMm  = 0.05f;
-    bool   _captureActive    = false;
-    float  _captureLastPosMm = -999.0f;
-    bool   _pendingManual    = false;
-    bool   _manualFirstPass  = true;
 
     // ── Rodage ──
     int    _rodagePasses   = 10;

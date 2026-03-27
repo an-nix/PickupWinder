@@ -1,7 +1,6 @@
 /* ── Pickup Winder — UI Controller ──────────────────────── */
 let ws, lastStatus = null, activeTab = 'operate';
 let rodageWasActive = false;
-let manualActive = false, captureActive = false, captureData = [];
 const byId = id => document.getElementById(id);
 
 /* ── WebSocket ─────────────────────────────────────────── */
@@ -13,11 +12,7 @@ function connect() {
   ws = new WebSocket('ws://' + location.host + '/ws');
   ws.onopen  = () => setWs(true);
   ws.onclose = () => { setWs(false); setTimeout(connect, 2000); };
-  ws.onmessage = e => {
-    const d = JSON.parse(e.data);
-    if (d.type === 'cap') { onCapture(d); return; }
-    update(d);
-  };
+  ws.onmessage = e => { update(JSON.parse(e.data)); };
 }
 
 function setWs(ok) {
@@ -51,61 +46,6 @@ function adjustTarget(delta) {
   cmd('target', String(Math.max(1, cur + delta)));
 }
 
-/* ── Manual mode ───────────────────────────────────────── */
-function toggleManual() {
-  if (!manualActive) {
-    cmd('manual');
-    manualActive = true;
-    byId('manual-controls').style.display = '';
-    byId('btn-manual-toggle').textContent = '■ Exit manual';
-    byId('btn-manual-toggle').className = 'btn btn-danger btn-s';
-  } else {
-    if (captureActive) toggleCapture();
-    cmd('manual_stop');
-    manualActive = false;
-    byId('manual-controls').style.display = 'none';
-    byId('btn-manual-toggle').textContent = '▶ Enter manual';
-    byId('btn-manual-toggle').className = 'btn btn-go btn-s';
-  }
-}
-function setManualStep(s) {
-  cmd('manual_step', '' + s);
-}
-
-/* ── Capture ───────────────────────────────────────────── */
-function toggleCapture() {
-  if (!captureActive) {
-    captureData = [];
-    captureActive = true;
-    cmd('manual_capture_start');
-    byId('btn-capture').textContent = '⏹ Stop capture';
-    byId('btn-capture').style.background = '#dc2626';
-    byId('btn-dl-capture').style.display = 'none';
-    byId('manual-cap-status').textContent = '⏺ 0 pts';
-  } else {
-    captureActive = false;
-    cmd('manual_capture_stop');
-    byId('btn-capture').textContent = '⏺ Capture';
-    byId('btn-capture').style.background = '#0369a1';
-    byId('manual-cap-status').textContent = '✓ ' + captureData.length + ' pts';
-    if (captureData.length > 0) byId('btn-dl-capture').style.display = '';
-  }
-}
-function onCapture(d) {
-  if (captureActive) {
-    captureData.push({ t: d.t, pos: d.pos, turns: d.turns });
-    byId('manual-cap-status').textContent = '⏺ ' + captureData.length + ' pts';
-  }
-  byId('manual-pos').textContent = parseFloat(d.pos).toFixed(2) + ' mm';
-  byId('manual-turns').textContent = d.turns;
-}
-function downloadCapture() {
-  const blob = new Blob([JSON.stringify({ capture: captureData }, null, 2)], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'capture_' + Date.now() + '.json';
-  a.click();
-}
 
 /* ── Recipe import/export ──────────────────────────────── */
 function importRecipe() {
@@ -134,12 +74,11 @@ function startRodage() {
 function update(d) {
   lastStatus = d;
   const st = d.state || 'IDLE';
-  const isManual = !!d.manualMode;
   const isRodage = !!d.rodageMode;
 
   /* ── State badge ── */
   const badge = byId('state-badge');
-  badge.textContent = isManual ? 'MANUAL' : st;
+  badge.textContent = st;
   badge.className = 'badge' +
     (st === 'WINDING' ? ' run' : '') +
     (st === 'PAUSED' ? ' warn' : '') +
@@ -157,8 +96,7 @@ function update(d) {
   const pos = parseFloat(d.latPos ?? 0);
   byId('lat-pos-run').textContent = pos.toFixed(2) + ' mm';
   byId('lat-pos').textContent = pos.toFixed(2);
-  byId('manual-pos').textContent = pos.toFixed(2) + ' mm';
-  byId('manual-turns').textContent = d.turns ?? 0;
+  // manual display removed
 
   byId('w-start-run').textContent = parseFloat(d.wStart ?? 0).toFixed(2);
   byId('w-end-run').textContent   = parseFloat(d.wEnd ?? 0).toFixed(2);
@@ -202,6 +140,12 @@ function update(d) {
   byId('ep-turns').disabled = (epStr === 'none');
   syncInput('ep-turns', d.endPosTurns);
 
+  const burstEnabledEl = byId('burst-enabled');
+  if (burstEnabledEl && d.burstEnabled !== undefined) {
+    burstEnabledEl.checked = d.burstEnabled;
+  }
+  syncInput('burst-turns', d.burstConfiguredTurns);
+
   syncRange('g-scatter', d.scatter, 'scatter-lbl', 1);
   if (byId('g-tpp-ofs') && document.activeElement !== byId('g-tpp-ofs') && d.tppOfs !== undefined)
     byId('g-tpp-ofs').value = d.tppOfs;
@@ -241,7 +185,7 @@ function update(d) {
 
 /* ── Context panels: show only what's relevant ─────────── */
 function updateContextPanels(st, d) {
-  const idle    = st === 'IDLE' && !d.manualMode;
+  const idle    = st === 'IDLE';
   const isRunning = !!d.running;
   const paused = (st === 'PAUSED') && !isRunning;
   const winding = st === 'WINDING' || st === 'PAUSED' || isRunning;
@@ -285,6 +229,11 @@ function updateStatusLine(st, d, pos) {
     s.textContent = '▶ Winding…';
     return;
   }
+  if (d.burstActive) {
+    s.textContent = '⚡ Burst running: ' + (d.burstRemainingTurns || 0) + ' turns remaining';
+    return;
+  }
+
   switch (st) {
     case 'WINDING':
       if (d.verifyLow) s.textContent = '🔍 Going to LOW bound…';
@@ -300,8 +249,7 @@ function updateStatusLine(st, d, pos) {
       s.textContent = '✓ Target reached — raise target or reset';
       break;
     case 'IDLE':
-      if (d.manualMode)       s.textContent = '⚙ Manual mode — encoder = carriage, pot = motor';
-      else if (d.rodageMode)  s.textContent = '🔧 Break-in in progress…';
+      if (d.rodageMode)  s.textContent = '🔧 Break-in in progress…';
       else if (Math.abs(pos) > 0.03) s.textContent = 'Carriage not at home — press Start to begin';
       else                    s.textContent = 'Ready — press Start';
       break;

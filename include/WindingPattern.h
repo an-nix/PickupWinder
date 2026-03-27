@@ -9,14 +9,14 @@ enum class WindingStyle : uint8_t {
 	HUMAN    = 2,
 };
 
-// Position finale du chariot en fin de bobinage.
-// HIGH/LOW : le chariot est ramené sur la bute correspondante N tours avant
-// la fin pour bloquer le fil ; ces derniers tours se font sur place (no traverse).
-// NOTE : éviter HIGH/LOW qui sont des macros Arduino (#define HIGH 0x1 / LOW 0x0)
+// Desired final carriage position at the end of winding.
+// HIGH/LOW return the carriage to the corresponding bound a few turns before
+// completion so the final turns are wound in place without traversal.
+// NOTE: avoid using HIGH/LOW as enum values because Arduino defines them as macros.
 enum class WindingEndPos : uint8_t {
-	NONE  = 0,  // Comportement actuel : aucune position finale imposée
-	TOP   = 1,  // Terminer sur la butée haute (bloquer le fil)
-	BOTTOM = 2, // Terminer sur la butée basse (bloquer le fil)
+	NONE  = 0,  // Default behavior: no forced final position.
+	TOP   = 1,  // Finish on the high bound to lock the wire.
+	BOTTOM = 2, // Finish on the low bound to lock the wire.
 };
 
 inline const char* windingEndPosKey(WindingEndPos p) {
@@ -57,9 +57,9 @@ struct WindingRecipe {
 	// Multiplier applied only to the first traverse pass speed.
 	// 1.0 = unchanged, <1 slower, >1 faster.
 	float           firstPassTraverseFactor = 1.0f;
-	// Position finale du chariot (aucune / butée haute / butée basse).
+	// Desired final carriage location (none / high bound / low bound).
 	WindingEndPos   endPos             = WindingEndPos::NONE;
-	// Nombre de tours effectués sur la position finale avant l'arrêt.
+	// Number of turns executed while holding the final position before stop.
 	int             endPosTurns        = 3;
 };
 
@@ -102,7 +102,7 @@ public:
 	/** @brief Localized display name for style enum. */
 	static const char* styleName(WindingStyle style);
 	/** @brief Stable lowercase serialization key for style enum. */
-	static String      styleKey(WindingStyle style);
+	static const char*  styleKey(WindingStyle style);
 	/** @brief Parse style key into enum value. */
 	static WindingStyle styleFromString(const String& value);
 

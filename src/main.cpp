@@ -1,24 +1,45 @@
 // ── main.cpp ──────────────────────────────────────────────────────────────────
 // Entry point for the Pickup Winder firmware.
 //
-// Infrastructure (Serial, WiFi, UART link to display) is owned here.
-// WinderApp owns only the winding logic (motor, traverse, pot, LED, recipe).
+// FreeRTOS task architecture:
+//   controlTask (Core 1, prio 5): sensor read + command drain + session tick
+//   commsTask   (Core 0, prio 2): UART poll + status publishing (UART + WS)
+//
+// Inter-task communication:
+//   Commands:  FreeRTOS queue (comms → control) inside CommandController
+//   Status:    mutex-protected WinderStatus snapshot (control → comms)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <Arduino.h>
 #include "Config.h"
-#include "SpeedInput.h"
+
 #include "WebInterface.h"
 #include "LinkSerial.h"
 #include "WinderApp.h"
+#include "SessionController.h"
+#include "CommandController.h"
 #include "Diag.h"
+#include "ControlHardware.h"
 #include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // ── Subsystem instances ───────────────────────────────────────────────────────
-static SpeedInput   pot;
-static WebInterface web;
-static LinkSerial   serialLink;
-static WinderApp    winder;
+static WebInterface    web;
+static LinkSerial      serialLink;
+static WinderApp       winder;
+static SessionController session(winder);
+static CommandController cmdController(serialLink, web);
+static ControlHardware control;
+
+// ── Shared status (control → comms) ──────────────────────────────────────────
+static SemaphoreHandle_t statusMutex = nullptr;
+static WinderStatus      sharedStatus = {};
+
+// ── Task handles ─────────────────────────────────────────────────────────────
+static TaskHandle_t controlTaskHandle = nullptr;
+static TaskHandle_t commsTaskHandle   = nullptr;
 
 RTC_DATA_ATTR static uint32_t s_bootCount = 0;
 
@@ -39,147 +60,111 @@ static const char* resetReasonStr(esp_reset_reason_t r) {
     }
 }
 
-// ── Encodeur rotatif — décodage quadrature complet (A+B CHANGE) ───────────────────
-// Table d'état quadrature : index = (prevAB << 2) | currAB
-// +1 sens horaire, -1 anti-horaire, 0 bruit/rebond
-static const int8_t ENC_QEM[16] = { 0,-1, 1, 0,
-                                     1, 0, 0,-1,
-                                    -1, 0, 0, 1,
-                                     0, 1,-1, 0 };
-static volatile int32_t encCount   = 0;
-static volatile uint8_t encLastAB  = 0;
-// Horodatage (µs) de la dernière ISR acceptée — filtre le bruit EMI du moteur.
-// Les impulsions step du moteur génèrent du bruit <10 µs ; les transitions
-// humaines légitimes sont espacées de ≥ 3 ms (tourne rapide) → seuil : 1000 µs.
-static volatile uint32_t encLastUs = 0;
+// ═════════════════════════════════════════════════════════════════════════════
+// controlTask — Core 1, high priority
+//   Deterministic 10 ms period: read sensors, drain commands, run session/motor.
+// ═════════════════════════════════════════════════════════════════════════════
+static void controlTask(void*) {
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        const uint32_t now = millis();
 
-/**
- * @brief Quadrature encoder ISR with debounce and QEM decoding.
- */
-void IRAM_ATTR encISR() {
-    uint32_t now = micros();
-    // Anti-rebond : ignore les transitions plus rapides que ENC_DEBOUNCE_US.
-    // Protège contre le bruit EMI des impulsions step du moteur principal.
-    if (now - encLastUs < ENC_DEBOUNCE_US) return;
-    encLastUs = now;
-    uint8_t a = digitalRead(ENC1_CLK);
-    uint8_t b = digitalRead(ENC1_DT);
-    uint8_t ab = (a << 1) | b;
-    encCount += ENC_QEM[(encLastAB << 2) | ab];
-    encLastAB = ab;
+        // 1. Read sensors (pot + encoder) and fill TickInput
+        SessionController::TickInput ti;
+        control.tick(now, ti);
+
+        // 2. Drain commands from FreeRTOS queue into TickInput
+        cmdController.drain(ti);
+
+        // 3. Run session state machine + motor control
+        session.tick(ti);
+
+        // 4. Snapshot status for comms task
+        WinderStatus snap = winder.getStatus();
+        if (xSemaphoreTake(statusMutex, 0) == pdTRUE) {
+            sharedStatus = snap;
+            xSemaphoreGive(statusMutex);
+        }
+
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(10));
+    }
 }
 
-// ── Timing ────────────────────────────────────────────────────────────────────
-static uint32_t lastWsMs   = 0;
-static uint32_t lastLinkMs = 0;
-static uint32_t lastPotMs  = 0;
+// ═════════════════════════════════════════════════════════════════════════════
+// commsTask — Core 0, low priority
+//   UART polling, UART status, WebSocket status.
+// ═════════════════════════════════════════════════════════════════════════════
+static void commsTask(void*) {
+    uint32_t lastLinkMs = 0;
+    uint32_t lastWsMs   = 0;
+    for (;;) {
+        const uint32_t now = millis();
+
+        // Poll UART for incoming commands (pushed to queue via callback)
+        serialLink.poll();
+
+        // Periodic UART status
+        if (now - lastLinkMs >= LINK_UPDATE_MS) {
+            lastLinkMs = now;
+            WinderStatus s;
+            if (xSemaphoreTake(statusMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                s = sharedStatus;
+                xSemaphoreGive(statusMutex);
+            }
+            serialLink.sendStatus(s.rpm, s.speedHz, s.turns, s.targetTurns,
+                                  s.running, s.motorEnabled, s.freerun, s.directionCW);
+        }
+
+        // Periodic WebSocket status
+        if (now - lastWsMs >= WS_UPDATE_MS) {
+            lastWsMs = now;
+            WinderStatus s;
+            if (xSemaphoreTake(statusMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                s = sharedStatus;
+                xSemaphoreGive(statusMutex);
+            }
+            web.sendUpdate(s);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
 
 // ── setup ─────────────────────────────────────────────────────────────────────
-/**
- * @brief Firmware setup entry point.
- */
 void setup() {
     Serial.begin(115200);
     ++s_bootCount;
     const esp_reset_reason_t rr = esp_reset_reason();
     Diag::infof("[BOOT] count=%lu reset=%s(%d)",
         (unsigned long)s_bootCount, resetReasonStr(rr), (int)rr);
-    Diag::info("\n=== Pickup Winder ===");
+    Diag::info("\n=== Pickup Winder (FreeRTOS) ===");
 
-    pot.begin();   // Pre-fill ADC filter buffer
-    web.begin();   // WiFi + WebSocket (blocks ~2-5 s during association)
-    serialLink.begin();  // UART2 liaison vers ESP écran
+    // Initialize subsystems (all on Arduino core before tasks start)
+    control.begin();
+    web.begin();
+    serialLink.begin();
     winder.begin();
-
-    // Encodeur rotatif
-    pinMode(ENC1_CLK, INPUT_PULLUP);
-    pinMode(ENC1_DT,  INPUT_PULLUP);
-    encLastAB = ((uint8_t)digitalRead(ENC1_CLK) << 1) | (uint8_t)digitalRead(ENC1_DT);
-    attachInterrupt(digitalPinToInterrupt(ENC1_CLK), encISR, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(ENC1_DT),  encISR, CHANGE);
-    Diag::info("[Encoder] ISR quadrature attachée (GPIO " __XSTRING(ENC1_CLK) " + " __XSTRING(ENC1_DT) ")");
-
-    // Both WebSocket and LinkSerial share the same command dispatcher.
-    web.setCommandCallback([](const String& cmd, const String& val) {
-        winder.handleCommand(cmd, val);
-    });
+    cmdController.begin();
     web.setRecipeProvider([]() {
         return winder.recipeJson();
     });
 
     if (web.isConnected()) {
-        Diag::infof("→ Web interface: http://%s",
-            web.getIP().c_str());
+        Diag::infof("→ Web interface: http://%s", web.getIP().c_str());
     }
+
+    // Create inter-task synchronization
+    statusMutex = xSemaphoreCreateMutex();
+
+    // Create tasks pinned to specific cores
+    xTaskCreatePinnedToCore(controlTask, "control", 8192, nullptr, 5, &controlTaskHandle, 1);
+    xTaskCreatePinnedToCore(commsTask,   "comms",   8192, nullptr, 2, &commsTaskHandle,   0);
+
+    Diag::info("[RTOS] Tasks started — control@core1 comms@core0");
 }
 
-// ── loop ──────────────────────────────────────────────────────────────────────
-/**
- * @brief Main firmware loop.
- */
+// ── loop (idle — all work done in tasks) ──────────────────────────────────────
 void loop() {
-    const uint32_t now = millis();
-    // Encodeur rotatif — affichage périodique + réglage des butées en mode verify
-    static uint32_t lastEncMs  = 0;
-    static int32_t  lastPrinted = 1;
-    static int32_t  lastEncConsumed = 0;
-    {
-        // Snapshot atomique du compteur (lecture 32-bit alignée = atomique sur ESP32)
-        int32_t cur = encCount;
-        int32_t delta = cur - lastEncConsumed;
-        if (delta != 0) {
-            // Plafonner le delta par tick pour limiter l'effet d'un burst de
-            // bruit résiduel (EMI) qui aurait quand même franchi l'anti-rebond.
-            // Un humain tourne rarement plus de 3-4 crans entre deux passages
-            // dans le loop (< 1 ms). Un delta > MAX_ENC_DELTA signale du bruit.
-            constexpr int32_t MAX_ENC_DELTA = 4;
-            if (delta >  MAX_ENC_DELTA) delta =  MAX_ENC_DELTA;
-            if (delta < -MAX_ENC_DELTA) delta = -MAX_ENC_DELTA;
-            lastEncConsumed = cur;  // consomme TOUT (évite accumulation)
-            winder.handleEncoderDelta(delta);
-        }
-        if (now - lastEncMs >= 50) {
-            lastEncMs = now;
-            if (cur != lastPrinted) {
-                lastPrinted = cur;
-                Serial.printf("[Encoder] count = %ld\n", (long)cur);
-            }
-        }
-    }
-    // Potentiometer: read at POT_READ_INTERVAL, pass filtered Hz to winder.
-    // lastPotHz is retained between cycles so winder always sees the current value.
-    static uint32_t lastPotHz = 0;
-    if (now - lastPotMs >= POT_READ_INTERVAL) {
-        lastPotMs = now;
-        lastPotHz = pot.readHz();
-    }
-
-    // Winding logic (motor, traverse, auto-stop).
-    winder.tick(lastPotHz);
-
-    // Mode manuel : streaming WebSocket de la position toutes les 50 ms.
-    static uint32_t lastCapMs = 0;
-    if (winder.isCaptureActive() && now - lastCapMs >= 50) {
-        lastCapMs = now;
-        float posMm; long capTurns;
-        if (winder.getCapturePoint(posMm, capTurns))
-            web.sendCapture(now, posMm, capTurns);
-    }
-
-    // UART link: receive commands from display, push status periodically.
-    serialLink.poll([](const String& cmd, const String& val) {
-        winder.handleCommand(cmd, val);
-    });
-    if (now - lastLinkMs >= LINK_UPDATE_MS) {
-        lastLinkMs = now;
-        const WinderStatus s = winder.getStatus();
-        serialLink.sendStatus(s.rpm, s.speedHz, s.turns, s.targetTurns,
-                        s.running, s.motorEnabled, s.freerun, s.directionCW);
-    }
-
-    // WebSocket: push full status snapshot periodically.
-    if (now - lastWsMs >= WS_UPDATE_MS) {
-        lastWsMs = now;
-        web.sendUpdate(winder.getStatus());
-    }
+    vTaskDelay(portMAX_DELAY);
 }
+

@@ -258,6 +258,32 @@ Use these to fine-tune the real carriage position without editing raw recipe dat
 ### Reset turns
 Resets the turn counter.
 
+---
+
+## Local build and debugging
+
+- build command:
+
+```bash
+./build.sh
+```
+
+- tools:
+  - `platformio` CLI
+  - `pio` (alias dans certains environnements)
+
+- debug trace (session input arbitration):
+  - `src/SessionController.cpp` a maintenant des `Serial.printf` dans
+    `recordIntent` (`intent`, `src`, `potAboveZero`, `potNeedsRearm`).
+
+- flow :
+  1. `ControlHardware` lit pot/footswitch/encodeur.
+  2. `CommandController` draine les commandes série/WebSocket.
+  3. `SessionController::tick()` intègre toutes les sources et applique
+     un `ControlIntent` selon le **dernier événement reçu**.
+  4. `WinderApp` reçoit `setControlHz` et avance le modèle.
+
+
 ### Re-arm Start
 Re-enters the startup flow.
 
@@ -292,28 +318,6 @@ Use this after:
 
 ---
 
-## Manual mode
-
-Manual mode decouples carriage motion from automatic traverse logic.
-
-### Encoder step (mm/click)
-Distance commanded by each encoder click.
-
-### Carriage position
-Current lateral position.
-
-### Motor turns
-Current main motor turn count.
-
-### Capture
-Records manual-mode carriage points and motor turns, then exports them as JSON.
-
-Use this to:
-- study manual movements
-- capture a motion trace
-- build future recipe tools offline
-
----
 
 ## Final-position logic
 
