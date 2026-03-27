@@ -32,10 +32,10 @@ uint32_t SpeedInput::readHz() {
         avg = 4095 - avg;
     #endif
 
-    // ── Zone zéro ────────────────────────────────────────────────────────
-    // Pot en butée physique basse : retourner 0 directement.
-    // Détection sur counts ADC bruts (robuste même si le pot ne touche pas
-    // exactement le rail électrique en butée).
+    // ── Zero band ─────────────────────────────────────────────────────────
+    // When the pot is physically at the low stop, return zero immediately.
+    // Raw ADC counts are used here because that remains robust even when the
+    // pot does not quite reach the electrical rail.
     if (avg <= POT_ADC_ZERO_BAND) {
         _lastHz = 0;
         return 0;
@@ -45,25 +45,25 @@ uint32_t SpeedInput::readHz() {
     if (avg >= POT_ADC_FULL_BAND) {
         hz = SPEED_HZ_MAX;
     } else {
-        // Courbe exponentielle : progression lente en début de course,
-        // rapide en fin — idéal pour contrôler finement les basses vitesses.
-        // Formule : hz = SPEED_HZ_MAX × (e^(k·t) − 1) / (e^k − 1)
+        // Exponential response curve: gentle progression at the bottom end and
+        // faster growth near the top end, which gives finer low-speed control.
+        // Formula: hz = SPEED_HZ_MAX * (e^(k*t) - 1) / (e^k - 1)
         //   t = 0 → hz = 0   |   t = 1 → hz = SPEED_HZ_MAX
-        // Avec k=4.5 : ~50 RPM à 30% de course, ~375 RPM à 70%, 1500 RPM à 100%.
+        // With k=4.5: about 50 RPM at 30% travel, 375 RPM at 70%, and 1500 RPM at 100%.
         float t = (float)(avg - POT_ADC_ZERO_BAND)
                 / (float)(POT_ADC_FULL_BAND - POT_ADC_ZERO_BAND);
         t = constrain(t, 0.0f, 1.0f);
-        // Le dénominateur est constant (k fixe) : calculé une seule fois.
+        // The denominator is constant for a fixed k and can be cached once.
         static const float invDenom = 1.0f / (expf(POT_EXP_K) - 1.0f);
         hz = (uint32_t)((expf(POT_EXP_K * t) - 1.0f) * invDenom * (float)SPEED_HZ_MAX);
     }
 
-    // Hystérésis : ne mettre à jour _lastHz que si la variation dépasse le seuil.
-    // Exception : toujours réactif en zone basse et proche du maximum.
+    // Hysteresis: only update the output if the delta crosses the configured threshold.
+    // Exception: stay responsive near zero and near the maximum command.
     uint32_t delta = (hz > _lastHz) ? (hz - _lastHz) : (_lastHz - hz);
     if (delta >= POT_HYSTERESIS_HZ
-        || hz < 3000                                   // zone basse : toujours réactif
-        || hz >= SPEED_HZ_MAX - POT_HYSTERESIS_HZ) {  // proche du max : toujours réactif
+        || hz < 3000                                   // Low-speed region stays responsive.
+        || hz >= SPEED_HZ_MAX - POT_HYSTERESIS_HZ) {  // High-speed region also stays responsive.
         _lastHz = hz;
     }
 

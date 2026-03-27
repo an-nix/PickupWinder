@@ -292,7 +292,6 @@ Use this after:
 
 ---
 
-<!-- Manual mode removed from firmware and UI -->
 
 ## Final-position logic
 

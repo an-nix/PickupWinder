@@ -92,10 +92,6 @@ void WinderApp::_toTargetReached() {
             _stepper.getTurns());
 }
 
-void WinderApp::_toManual() {
-    // manual mode removed
-}
-
 void WinderApp::_toRodage() {
     _state              = WindingState::RODAGE;
     _canStart           = false;
@@ -142,7 +138,7 @@ void WinderApp::_handleLateralEvents() {
         return;
     }
 
-    // Rodage
+    // Break-in shuttle mode.
     if (_state == WindingState::RODAGE && _lateral.isHomed()) {
         if (_rodageFwd) {
             _rodageFwd = false;
@@ -205,7 +201,6 @@ void WinderApp::_handlePotCycle(uint32_t hz) {
     case WindingState::RODAGE:
         break;
     }
-        // WindingState::MANUAL removed
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -535,8 +530,6 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         Diag::info("[Mode] Stop armed on next low bound");
         return true;
     }
-
-    // manual mode / capture commands removed
 
     // ── Position finale de bobinage ──────────────────────────────────────────
     if (cmd == "end_pos") {

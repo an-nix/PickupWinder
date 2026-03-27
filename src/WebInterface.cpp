@@ -133,8 +133,6 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
     _ws.textAll(buf);
 }
 
-// Manual capture removed: no sendCapture implementation
-
 /** @brief Register command callback used for incoming WS commands. */
 void WebInterface::setCommandCallback(CommandCallback cb) {
     _callback = cb;

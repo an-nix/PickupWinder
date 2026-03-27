@@ -17,21 +17,44 @@ ControlHardware::ControlHardware(WinderApp& winder)
 
 void ControlHardware::begin()
 {
-    // initialize pot
+    // Initialize the filtered potentiometer input pipeline.
     _pot.begin();
 
-    // initialize encoder pins and ISR
+    // Initialize footswitch input as active-low with internal pull-up.
+    pinMode(FOOTSWITCH_PIN, INPUT_PULLUP);
+    const bool initialFootswitchPressed =
+        (digitalRead(FOOTSWITCH_PIN) == (FOOTSWITCH_ACTIVE_LOW ? LOW : HIGH));
+    _lastFootswitchRaw = initialFootswitchPressed;
+    _footswitchStable = initialFootswitchPressed;
+    _lastFootswitchChangeMs = millis();
+
+    // Initialize encoder pins and attach the quadrature ISR on both channels.
     pinMode(ENC1_CLK, INPUT_PULLUP);
     pinMode(ENC1_DT,  INPUT_PULLUP);
     _encLastAB = ((uint8_t)digitalRead(ENC1_CLK) << 1) | (uint8_t)digitalRead(ENC1_DT);
     attachInterrupt(digitalPinToInterrupt(ENC1_CLK), ControlHardware::_encISR, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC1_DT),  ControlHardware::_encISR, CHANGE);
-    Diag::info("[ControlHardware] initialized (pot + encoder)");
+    Diag::info("[ControlHardware] initialized (pot + footswitch + encoder)");
 }
 
 void ControlHardware::tick(uint32_t now, SessionController::TickInput& out)
 {
-    // Encoder processing
+    // Footswitch processing with simple time-based debounce.
+    const bool footswitchPressed =
+        (digitalRead(FOOTSWITCH_PIN) == (FOOTSWITCH_ACTIVE_LOW ? LOW : HIGH));
+    if (footswitchPressed != _lastFootswitchRaw) {
+        _lastFootswitchRaw = footswitchPressed;
+        _lastFootswitchChangeMs = now;
+    }
+    if (_footswitchStable != _lastFootswitchRaw &&
+        now - _lastFootswitchChangeMs >= FOOTSWITCH_DEBOUNCE_MS) {
+        _footswitchStable = _lastFootswitchRaw;
+        out.hasFootswitch = true;
+        out.footswitch = _footswitchStable;
+    }
+
+    // Convert raw quadrature count into a bounded delta and forward it to the
+    // winding domain for paused-position trim adjustments.
     int32_t cur = _encCount;
     int32_t delta = cur - _lastEncConsumed;
     if (delta != 0) {
@@ -49,7 +72,7 @@ void ControlHardware::tick(uint32_t now, SessionController::TickInput& out)
         }
     }
 
-    // Potentiometer reading
+    // Sample the potentiometer at a controlled rate to avoid excessive ADC work.
     if (now - _lastPotMs >= POT_READ_INTERVAL) {
         _lastPotMs = now;
         _lastPotHz = _pot.readHz();
@@ -58,27 +81,13 @@ void ControlHardware::tick(uint32_t now, SessionController::TickInput& out)
         out.potLevel = level;
     }
 
-    // propagate timestamp
+    // Always propagate the control-loop timestamp.
     out.now = now;
-}
-
-uint32_t ControlHardware::readPotHz()
-{
-    return _lastPotHz;
-}
-
-int32_t ControlHardware::getEncoderCount()
-{
-    return _encCount;
-}
-
-void ControlHardware::resetEncoderCount(int32_t v)
-{
-    _encCount = v;
 }
 
 void IRAM_ATTR ControlHardware::_encISR()
 {
+    // Keep the ISR minimal: debounce, decode one quadrature step, and exit.
     uint32_t now = micros();
     if (now - _encLastUs < ENC_DEBOUNCE_US) return;
     _encLastUs = now;

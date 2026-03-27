@@ -56,19 +56,18 @@ void StepperController::setSpeedHz(uint32_t hz) {
  */
 void StepperController::start(bool forward) {
     if (!_stepper) return;
-    // Si le driver était éteint, l'activer et laisser le rotor se caler
-    // sur la position de pas la plus proche avant d'émettre des impulsions.
+    // If the driver was disabled, enable it first and let the rotor settle on
+    // the nearest electrical step before emitting pulses.
     if (!_driverEnabled) {
         digitalWrite(ENABLE_PIN, LOW);
         _driverEnabled = true;
-        delay(30);  // 30 ms — calement silencieux du rotor
+        delay(30);  // Allow a short silent rotor settle before motion.
     }
-    // Démarrer directement à la vitesse cible : FastAccelStepper accélère de 0
-    // à _speedHz en utilisant setAcceleration(). SPEED_HZ_START était un contournement
-    // de l'ancien bug où setSpeedHz() pré-committait la vitesse via applySpeedAcceleration()
-    // même quand le moteur était arrêté. Ce bug est corrigé : setSpeedHz() n'appelle
-    // plus applySpeedAcceleration() quand isRunning()==false, donc la bibliothèque
-    // reçoit toujours un état propre (vitesse=0) à l'appel de runForward/runBackward.
+    // Start directly with the requested target speed. FastAccelStepper will ramp
+    // from zero using the configured acceleration profile. Earlier revisions used
+    // SPEED_HZ_START as a workaround for a pre-commit bug in setSpeedHz(); that
+    // workaround is no longer needed because setSpeedHz() now avoids applying a
+    // live speed change when the motor is stopped.
     _stepper->setSpeedInHz(_speedHz);
     if (forward)
         _stepper->runForward();
@@ -133,41 +132,4 @@ float StepperController::getRPM() const {
     // (0 when stopped, reflects actual ramp state during accel/decel).
     int32_t mhz = _stepper->getCurrentSpeedInMilliHz();
     return abs((float)mhz) / 1000.0f * 60.0f / STEPS_PER_REV;
-}
-
-/** @brief Play one musical tone through spindle motor vibration. */
-void StepperController::playNote(uint16_t freqHz) {
-    if (!_stepper) return;
-    if (freqHz == 0) {
-        // Rest: decelerate smoothly (no violent forceStop).
-        _stepper->stopMove();
-        return;
-    }
-    // Convert musical note frequency to step frequency.
-    // The motor's audible vibration = step_freq / MOTOR_NOTE_MULT.
-    uint32_t stepHz = (uint32_t)freqHz * MOTOR_NOTE_MULT;
-    // Acceleration of 350k gives ~100ms ramp to any note — smooth enough
-    // to avoid a startup clunk while still tracking note changes cleanly.
-    if (!_driverEnabled) {
-        digitalWrite(ENABLE_PIN, LOW);
-        _driverEnabled = true;
-        delay(20);  // Coil settle before first note
-    }
-    _stepper->setAcceleration(350000);
-    _stepper->setSpeedInHz(stepHz);
-    if (!_stepper->isRunning()) {
-        _stepper->runForward();
-    } else {
-        _stepper->applySpeedAcceleration();
-    }
-}
-
-/** @brief Stop note playback and restore normal acceleration profile. */
-void StepperController::stopNote() {
-    if (!_stepper) return;
-    _stepper->setAcceleration(350000);
-    _stepper->stopMove();
-    // Restore normal winding acceleration.
-    _stepper->setAcceleration(ACCELERATION);
-    digitalWrite(ENABLE_PIN, HIGH);
 }

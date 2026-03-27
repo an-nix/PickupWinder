@@ -2,17 +2,16 @@
 #include "Types.h"
 #include "Config.h"
 
-// ── LinkSerial ────────────────────────────────────────────────────────────────
-// Liaison UART2 entre le winder ESP32 et l'ESP32 écran.
+// UART2 link between the winding controller ESP32 and the display ESP32.
 //
-// Protocole :
-//   TX (winder → écran)  : ligne de statut compacte toutes les LINK_UPDATE_MS ms
-//     Format : "S|<turns>|<targetTurns>|<rpm>|<speedHz>|<running>|<motorEnabled>|<freerun>|<dirCW>\n"
+// Protocol:
+//   TX (winder -> display): compact status line every LINK_UPDATE_MS.
+//     Format: "S|<turns>|<targetTurns>|<rpm>|<speedHz>|<running>|<motorEnabled>|<freerun>|<dirCW>\n"
 //
-//   RX (écran → winder)  : commandes au format "cmd:valeur\n"
-//     Identique au protocole WebSocket — réutilise directement _handleCommand().
-//     Exemples : "target:8000\n", "freerun:true\n", "direction:cw\n",
-//                "geom_wire:0.0650\n", "reset:\n"
+//   RX (display -> winder): commands formatted as "cmd:value\n".
+//     The payload is intentionally aligned with the WebSocket command format.
+//     Examples: "target:8000\n", "freerun:true\n", "direction:cw\n",
+//               "geom_wire:0.0650\n", "reset:\n"
 class LinkSerial {
 public:
     /**
@@ -65,6 +64,6 @@ public:
     void poll();
 
 private:
-    String _rxBuf;  // Buffer d'accumulation pour la ligne en cours de réception
+    String _rxBuf;  // Receive buffer for the current in-flight line.
     CommandCallback _callback = nullptr;
 };

@@ -2,37 +2,32 @@
 #include <FastAccelStepper.h>
 #include "Config.h"
 
-// États de la machine d'état du homing latéral.
+// States used by the lateral-axis homing and traversal state machine.
 enum class LatState {
-    FAULT,          // Capteur absent ou défaillant — tout mouvement latéral bloqué
-    BACKOFF,        // Capteur actif au démarrage — recul jusqu'à libération du capteur
-    HOMING,         // Déplacement vers la position initiale (home)
-    HOMING_DECEL,   // Capteur atteint — décélération normale en cours avant arrêt
-    HOMING_ALIGN,   // Alignement sur le pas complet le plus proche (supprime le grésillement)
-    HOMING_OFFSET,  // Déplacement de l'offset entre le capteur et la vraie position 0
-    HOMED,          // Position initiale atteinte — driver maintenu actif en permanence
-    POSITIONING,    // Déplacement vers la position de départ avant autorisation du bobinage
-    WINDING_FWD,    // Bobinage réel : aller (0 → effWidth), synchronisé sur la vitesse de bobinage
-    WINDING_BWD,    // Bobinage réel : retour (effWidth → 0), synchronisé sur la vitesse de bobinage
+    FAULT,          // Sensor missing or invalid, all lateral motion blocked.
+    BACKOFF,        // Sensor already active at boot, moving away until released.
+    HOMING,         // Moving toward the home switch.
+    HOMING_DECEL,   // Home reached, waiting for normal deceleration stop.
+    HOMING_ALIGN,   // Aligning to a clean full-step position to avoid buzzing.
+    HOMING_OFFSET,  // Applying switch-to-zero offset travel.
+    HOMED,          // Logical zero established, driver kept enabled.
+    POSITIONING,    // Moving to the requested winding start position.
+    WINDING_FWD,    // Forward synchronized traversal (0 -> end bound).
+    WINDING_BWD,    // Backward synchronized traversal (end bound -> 0).
 };
 
-// ── LateralController ─────────────────────────────────────────────────────────
-// Gère le stepper de l'axe latéral (guide-fil) avec homing automatique.
+// Controls the lateral wire guide stepper with automatic homing.
 //
-// Séquence de démarrage :
-//   1. Vérification de la présence du capteur (NO et NC complémentaires).
-//      En cas d'absence → état FAULT, mouvement impossible.
-//   2. Si le capteur est déjà actif (axe déjà en home) → recul jusqu'à libération,
-//      puis homing normal.
-//   3. Déplacement vers le home (LAT_HOME_DIR) à vitesse réduite (LAT_HOME_SPEED_HZ).
-//   4. Dès que le capteur détecte la position, arrêt + position remise à zéro.
-//      Le driver reste ACTIF en permanence après homing (ne jamais appeler disableDriver
-//      sur l'axe latéral une fois homé).
+// Startup sequence:
+//   1. Validate the NO/NC sensor pair.
+//   2. If already on the switch, back off until the sensor releases.
+//   3. Run toward home at LAT_HOME_SPEED_HZ.
+//   4. Stop on sensor hit, align, apply the configured home offset, then enter HOMED.
 //
-// Protocole capteur (INPUT_PULLUP, capteur connecté à GND) :
-//   Hors home : NO=HIGH (ouvert), NC=LOW  (fermé sur GND)
-//   En home   : NO=LOW  (fermé sur GND),  NC=HIGH (ouvert)
-//   Défaut    : NO=HIGH, NC=HIGH → capteur débranché (les deux tirés par pull-up)
+// Sensor protocol (INPUT_PULLUP, sensor closes to GND):
+//   Away from home: NO=HIGH, NC=LOW
+//   At home:        NO=LOW,  NC=HIGH
+//   Fault:          NO=HIGH, NC=HIGH (typically disconnected sensor)
 class LateralController {
 public:
     /**
@@ -163,51 +158,51 @@ private:
     FastAccelStepper*      _stepper         = nullptr;
     LatState               _state           = LatState::FAULT;
     uint32_t               _lastCheckMs     = 0;
-    float                  _homeOffsetMm    = LAT_HOME_OFFSET_DEFAULT_MM;  // Offset chargé depuis NVS
+    float                  _homeOffsetMm    = LAT_HOME_OFFSET_DEFAULT_MM;  // Switch-to-zero offset loaded from NVS
     volatile bool          _homeFlag        = false;
 
-    // ── Bobinage réel : état de la traversée synchronisée ────────────────────
-    uint32_t               _latHz           = 0;    // Vitesse latérale courante (steps/s)
-    int32_t                _latStartSteps   = 0;    // Début réel de la fenêtre de bobinage
-    int32_t                _latEndSteps     = 0;    // Fin réelle de la fenêtre de bobinage
-    uint32_t               _reversingUntilMs = 0;  // Fin de la fenêtre de ralentissement
-    uint32_t               _passCount       = 0;    // Nombre de demi-couches réellement effectuées
+    // Active synchronized traversal state during winding.
+    uint32_t               _latHz           = 0;    // Current lateral speed in steps/s
+    int32_t                _latStartSteps   = 0;    // Effective low bound in steps
+    int32_t                _latEndSteps     = 0;    // Effective high bound in steps
+    uint32_t               _reversingUntilMs = 0;   // End of the spindle slowdown window
+    uint32_t               _passCount       = 0;    // Completed half-passes
     bool                   _pauseOnNextReversal = false;
     bool                   _stopOnNextHigh      = false;
     bool                   _stopOnNextLow       = false;
     bool                   _pausedAtReversal    = false;
-    bool                   _lastDirFwd          = true;   // Direction mémorisée au dernier stopWinding()
+    bool                   _lastDirFwd          = true;   // Direction remembered across pauses
 
-    // Calcule la vitesse latérale (steps/s) synchronisée sur la vitesse de bobinage.
-    // lat_Hz = effWidth_steps × windingHz / (tpp × STEPS_PER_REV)
+    // Compute synchronized lateral speed in steps/s from spindle speed and geometry.
+    // lat_Hz = effWidth_steps * windingHz / (tpp * STEPS_PER_REV)
     uint32_t _calcLatHz(uint32_t windingHz, long tpp, float widthMm, float speedScale) const;
     bool     _isAtStartPosition() const;
     void     _setTraverseBounds(float startMm, float endMm);
 
-    // Déclenche la fenêtre de ralentissement bobinage au demi-tour latéral.
+    // Start the spindle slowdown window that covers a lateral reversal.
     void _onReversal();
 
-    // ── Lecture capteur (INPUT_PULLUP, contact à GND = LOW) ───────────────
-    // NO actif (contact fermé = en home) : pin LOW
+    // ── Sensor reads (INPUT_PULLUP, closed contact to GND = LOW) ───────────
+    // NO active means the normally-open contact is closed at home.
     bool _noActive()       const { return digitalRead(HOME_PIN_NO) == LOW; }
-    // NC actif (contact fermé = hors home) : pin LOW
+    // NC active means the normally-closed contact is closed away from home.
     bool _ncActive()       const { return digitalRead(HOME_PIN_NC) == LOW; }
-    // Capteur présent : NO et NC doivent être complémentaires (l'un HIGH, l'autre LOW)
+    // A valid sensor presents complementary NO/NC levels.
     bool _sensorPresent()  const { return _noActive() != _ncActive(); }
-    // En home : NO fermé (LOW) ET NC ouvert (HIGH)
+    // At home the NO contact is closed and the NC contact is open.
     bool _atHome()         const { return _noActive() && !_ncActive(); }
 
-    // ── ISR GPIO pour détection immédiate du capteur ──────────────────────
-    // Attachée sur FALLING de HOME_PIN_NO uniquement pendant la phase HOMING.
-    // Utilise attachInterruptArg() pour accéder à l'instance sans variable globale.
+    // ── GPIO ISR used for low-latency home detection ───────────────────────
+    // Attached to HOME_PIN_NO FALLING only while HOMING is active.
+    // attachInterruptArg() is used to reach the instance without a global singleton.
     static void IRAM_ATTR _homePinISR(void* arg);
     void _attachHomeISR();
     void _detachHomeISR();
 
     void _startHoming();
     void _startBackoff();
-    void _applyOffsetOrNext(); // Après alignement : déplacement offset ou HOMED direct
-    void _gotoHomed();         // Transition finale : axe prêt pour le bobinage
+    void _applyOffsetOrNext(); // After alignment: apply offset or enter HOMED directly.
+    void _gotoHomed();         // Final transition: axis ready for winding.
     void _enableDriver();
     void _disableDriver();
 };

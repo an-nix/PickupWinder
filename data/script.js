@@ -46,7 +46,6 @@ function adjustTarget(delta) {
   cmd('target', String(Math.max(1, cur + delta)));
 }
 
-/* Manual mode and capture removed from UI */
 
 /* ── Recipe import/export ──────────────────────────────── */
 function importRecipe() {

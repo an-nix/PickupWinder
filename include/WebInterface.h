@@ -32,8 +32,6 @@ public:
      */
     void   sendUpdate(const WinderStatus& status);
 
-    // Manual capture removed: no sendCapture API
-
     /**
      * @brief Register command dispatch callback for incoming WS commands.
      * @param cb Callback receiving `(cmd, value)`.

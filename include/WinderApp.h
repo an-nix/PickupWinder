@@ -10,26 +10,55 @@
 
 enum class Direction { CW, CCW };
 
-// ── WinderApp ─────────────────────────────────────────────────────────────────
-// Simplified winding controller.
-// States: IDLE, WINDING, PAUSED, TARGET_REACHED, RODAGE.
-// Verify is NOT a separate state — just flags during normal PAUSED→WINDING flow.
-// Start button = pot at max. Pause button = pot at zero.
+/**
+ * @brief Main winding domain controller.
+ *
+ * `WinderApp` owns the spindle, lateral axis, recipe state and the winding
+ * state machine. It does not read raw hardware inputs directly; higher layers
+ * convert user intent into commands and speed setpoints.
+ */
 class WinderApp {
 public:
+    /** @brief Initialize motors, recipe storage and derived runtime state. */
     void begin();
+
+    /** @brief Advance the winding state machine by one deterministic step. */
     void tick();
+
+    /** @brief Set the live spindle speed command in step-Hz. */
     void setControlHz(uint32_t hz) { _inputHz = hz; }
+
+    /** @brief Set the requested target turns count. */
     void setTargetTurns(long t) { _targetTurns = t; }
+
+    /** @brief Enable or disable freerun mode. */
     void setFreerun(bool f) { _freerun = f; }
+
+    /** @brief Set spindle direction. */
     void setDirection(Direction d) { _direction = d; }
+
+    /** @brief Set the maximum spindle speed in RPM. */
     void setMaxRpm(uint16_t rpm) { _maxSpeedHz = (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL; }
+
+    /** @brief Return the current configured spindle speed ceiling in step-Hz. */
     uint32_t getMaxSpeedHz() const { return _maxSpeedHz; }
+
+    /** @brief Request transition to paused state. */
     void pauseWinding() { _toPaused(); }
+
+    /** @brief Request transition to idle state. */
     void stopWinding() { _toIdle(); }
+
+    /** @brief Dispatch a user or transport command into the winding domain. */
     void handleCommand(const String& cmd, const String& value);
+
+    /** @brief Apply one encoder delta to the interactive trim logic. */
     void handleEncoderDelta(int32_t delta);
+
+    /** @brief Build a snapshot of all UI-facing status fields. */
     WinderStatus getStatus() const;
+
+    /** @brief Serialize the active recipe to JSON. */
     String recipeJson() const;
 
 private:
@@ -70,7 +99,6 @@ private:
     void _toWinding();
     void _toPaused();
     void _toTargetReached();
-    // manual mode removed
     void _toRodage();
 
     // ── Tick helpers ──
@@ -95,8 +123,6 @@ private:
     void          _applyRecipe(const WindingRecipe& recipe, bool persist);
     WindingRecipe _captureRecipe() const;
     void          _saveRecipe();
-
-    // Manual mode removed
 
     // ── Rodage ──
     int    _rodagePasses   = 10;
