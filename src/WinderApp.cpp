@@ -21,7 +21,7 @@ void WinderApp::begin() {
             WindingPatternPlanner::styleName(_recipe.style));
 }
 
-void WinderApp::tick(uint32_t potHz) {
+void WinderApp::tick() {
     if (_pauseRequested) {
         _pauseRequested = false;
         if (_state != WindingState::IDLE && _state != WindingState::TARGET_REACHED) {
@@ -30,7 +30,7 @@ void WinderApp::tick(uint32_t potHz) {
     }
 
     _handleLateralEvents();
-    _handlePotCycle(potHz);
+    _handlePotCycle(_inputHz);
     _checkAutoStop();
     _applyDeferredDisable();
 }

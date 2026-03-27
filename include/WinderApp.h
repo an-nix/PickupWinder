@@ -18,7 +18,15 @@ enum class Direction { CW, CCW };
 class WinderApp {
 public:
     void begin();
-    void tick(uint32_t potHz);
+    void tick();
+    void setControlHz(uint32_t hz) { _inputHz = hz; }
+    void setTargetTurns(long t) { _targetTurns = t; }
+    void setFreerun(bool f) { _freerun = f; }
+    void setDirection(Direction d) { _direction = d; }
+    void setMaxRpm(uint16_t rpm) { _maxSpeedHz = (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL; }
+    uint32_t getMaxSpeedHz() const { return _maxSpeedHz; }
+    void pauseWinding() { _toPaused(); }
+    void stopWinding() { _toIdle(); }
     void handleCommand(const String& cmd, const String& value);
     void handleEncoderDelta(int32_t delta);
     WinderStatus getStatus() const;
@@ -50,6 +58,7 @@ private:
     volatile Direction    _direction    = Direction::CW;
     volatile long         _targetTurns  = DEFAULT_TARGET_TURNS;
     volatile uint32_t     _maxSpeedHz   = SPEED_HZ_MAX;
+    volatile uint32_t     _inputHz      = 0;
     volatile bool         _freerun      = false;
 
     // ── Control flags ──

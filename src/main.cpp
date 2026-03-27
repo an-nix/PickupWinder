@@ -11,14 +11,16 @@
 #include "WebInterface.h"
 #include "LinkSerial.h"
 #include "WinderApp.h"
+#include "SessionController.h"
 #include "Diag.h"
 #include <esp_system.h>
 
 // ── Subsystem instances ───────────────────────────────────────────────────────
-static SpeedInput   pot;
-static WebInterface web;
-static LinkSerial   serialLink;
-static WinderApp    winder;
+static SpeedInput      pot;
+static WebInterface    web;
+static LinkSerial      serialLink;
+static WinderApp       winder;
+static SessionController session(winder);
 
 RTC_DATA_ATTR static uint32_t s_bootCount = 0;
 
@@ -101,7 +103,7 @@ void setup() {
 
     // Both WebSocket and LinkSerial share the same command dispatcher.
     web.setCommandCallback([](const String& cmd, const String& val) {
-        winder.handleCommand(cmd, val);
+        session.handleCommand(cmd, val);
     });
     web.setRecipeProvider([]() {
         return winder.recipeJson();
@@ -154,8 +156,10 @@ void loop() {
         lastPotHz = pot.readHz();
     }
 
-    // Winding logic (motor, traverse, auto-stop).
-    winder.tick(lastPotHz);
+    // Winding session controller (source=potentiel, start/pause, etc.).
+    float level = (float)lastPotHz / (float)SPEED_HZ_MAX;
+    session.setPotLevel(level);
+    session.tick();
 
     // Mode manuel : streaming WebSocket de la position toutes les 50 ms.
     static uint32_t lastCapMs = 0;
@@ -168,7 +172,7 @@ void loop() {
 
     // UART link: receive commands from display, push status periodically.
     serialLink.poll([](const String& cmd, const String& val) {
-        winder.handleCommand(cmd, val);
+        session.handleCommand(cmd, val);
     });
     if (now - lastLinkMs >= LINK_UPDATE_MS) {
         lastLinkMs = now;
