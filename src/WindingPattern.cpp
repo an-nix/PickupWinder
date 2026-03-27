@@ -203,10 +203,8 @@ const char* WindingPatternPlanner::styleName(WindingStyle style) {
  * Used by `WinderApp::getStatus()` to expose the current style to the UI
  * and by `WindingRecipeStore` when serializing recipes to JSON.
  */
-String WindingPatternPlanner::styleKey(WindingStyle style) {
+const char* WindingPatternPlanner::styleKey(WindingStyle style) {
 	switch (style) {
-		// Return a stable key string for each style used in settings or JSON
-		// serialization. Keys are lower-case and consistent.
 		case WindingStyle::STRAIGHT: return "straight";
 		case WindingStyle::SCATTER:  return "scatter";
 		case WindingStyle::HUMAN:    return "human";

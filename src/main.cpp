@@ -1,8 +1,13 @@
 // ── main.cpp ──────────────────────────────────────────────────────────────────
 // Entry point for the Pickup Winder firmware.
 //
-// Infrastructure (Serial, WiFi, UART link to display) is owned here.
-// WinderApp owns only the winding logic (motor, traverse, pot, LED, recipe).
+// FreeRTOS task architecture:
+//   controlTask (Core 1, prio 5): sensor read + command drain + session tick
+//   commsTask   (Core 0, prio 2): UART poll + status publishing (UART + WS)
+//
+// Inter-task communication:
+//   Commands:  FreeRTOS queue (comms → control) inside CommandController
+//   Status:    mutex-protected WinderStatus snapshot (control → comms)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <Arduino.h>
@@ -16,6 +21,9 @@
 #include "Diag.h"
 #include "ControlHardware.h"
 #include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // ── Subsystem instances ───────────────────────────────────────────────────────
 static WebInterface    web;
@@ -23,7 +31,15 @@ static LinkSerial      serialLink;
 static WinderApp       winder;
 static SessionController session(winder);
 static CommandController cmdController(serialLink, web);
-static ControlHardware control(session, winder);
+static ControlHardware control(winder);
+
+// ── Shared status (control → comms) ──────────────────────────────────────────
+static SemaphoreHandle_t statusMutex = nullptr;
+static WinderStatus      sharedStatus = {};
+
+// ── Task handles ─────────────────────────────────────────────────────────────
+static TaskHandle_t controlTaskHandle = nullptr;
+static TaskHandle_t commsTaskHandle   = nullptr;
 
 RTC_DATA_ATTR static uint32_t s_bootCount = 0;
 
@@ -44,77 +60,111 @@ static const char* resetReasonStr(esp_reset_reason_t r) {
     }
 }
 
-// Encoder handled inside `ControlHardware`.
+// ═════════════════════════════════════════════════════════════════════════════
+// controlTask — Core 1, high priority
+//   Deterministic 10 ms period: read sensors, drain commands, run session/motor.
+// ═════════════════════════════════════════════════════════════════════════════
+static void controlTask(void*) {
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        const uint32_t now = millis();
 
-// ── Timing ────────────────────────────────────────────────────────────────────
-static uint32_t lastWsMs   = 0;
-static uint32_t lastLinkMs = 0;
-static uint32_t lastPotMs  = 0;
+        // 1. Read sensors (pot + encoder) and fill TickInput
+        SessionController::TickInput ti;
+        control.tick(now, ti);
+
+        // 2. Drain commands from FreeRTOS queue into TickInput
+        cmdController.drain(ti);
+
+        // 3. Run session state machine + motor control
+        session.tick(ti);
+
+        // 4. Snapshot status for comms task
+        WinderStatus snap = winder.getStatus();
+        if (xSemaphoreTake(statusMutex, 0) == pdTRUE) {
+            sharedStatus = snap;
+            xSemaphoreGive(statusMutex);
+        }
+
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(10));
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// commsTask — Core 0, low priority
+//   UART polling, UART status, WebSocket status.
+// ═════════════════════════════════════════════════════════════════════════════
+static void commsTask(void*) {
+    uint32_t lastLinkMs = 0;
+    uint32_t lastWsMs   = 0;
+    for (;;) {
+        const uint32_t now = millis();
+
+        // Poll UART for incoming commands (pushed to queue via callback)
+        serialLink.poll();
+
+        // Periodic UART status
+        if (now - lastLinkMs >= LINK_UPDATE_MS) {
+            lastLinkMs = now;
+            WinderStatus s;
+            if (xSemaphoreTake(statusMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                s = sharedStatus;
+                xSemaphoreGive(statusMutex);
+            }
+            serialLink.sendStatus(s.rpm, s.speedHz, s.turns, s.targetTurns,
+                                  s.running, s.motorEnabled, s.freerun, s.directionCW);
+        }
+
+        // Periodic WebSocket status
+        if (now - lastWsMs >= WS_UPDATE_MS) {
+            lastWsMs = now;
+            WinderStatus s;
+            if (xSemaphoreTake(statusMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                s = sharedStatus;
+                xSemaphoreGive(statusMutex);
+            }
+            web.sendUpdate(s);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
 
 // ── setup ─────────────────────────────────────────────────────────────────────
-/**
- * @brief Firmware setup entry point.
- */
 void setup() {
     Serial.begin(115200);
     ++s_bootCount;
     const esp_reset_reason_t rr = esp_reset_reason();
     Diag::infof("[BOOT] count=%lu reset=%s(%d)",
         (unsigned long)s_bootCount, resetReasonStr(rr), (int)rr);
-    Diag::info("\n=== Pickup Winder ===");
+    Diag::info("\n=== Pickup Winder (FreeRTOS) ===");
 
-    // Initialize control peripherals (potentiometer + encoder)
+    // Initialize subsystems (all on Arduino core before tasks start)
     control.begin();
-    web.begin();   // WiFi + WebSocket (blocks ~2-5 s during association)
-    serialLink.begin();  // UART2 liaison vers ESP écran
+    web.begin();
+    serialLink.begin();
     winder.begin();
-
-    // Command handling is drained into SessionController::TickInput; listeners removed.
-    // Start command dispatcher callbacks
     cmdController.begin();
     web.setRecipeProvider([]() {
         return winder.recipeJson();
     });
 
     if (web.isConnected()) {
-        Diag::infof("→ Web interface: http://%s",
-            web.getIP().c_str());
+        Diag::infof("→ Web interface: http://%s", web.getIP().c_str());
     }
-    // Transport handled in main loop (no FreeRTOS task)
+
+    // Create inter-task synchronization
+    statusMutex = xSemaphoreCreateMutex();
+
+    // Create tasks pinned to specific cores
+    xTaskCreatePinnedToCore(controlTask, "control", 8192, nullptr, 5, &controlTaskHandle, 1);
+    xTaskCreatePinnedToCore(commsTask,   "comms",   8192, nullptr, 2, &commsTaskHandle,   0);
+
+    Diag::info("[RTOS] Tasks started — control@core1 comms@core0");
 }
 
-// ── loop ──────────────────────────────────────────────────────────────────────
-/**
- * @brief Main firmware loop.
- */
+// ── loop (idle — all work done in tasks) ──────────────────────────────────────
 void loop() {
-    const uint32_t now = millis();
- 
-        // Let ControlHardware handle encoder + pot periodic work and fill TickInput
-         SessionController::TickInput ti;
-         control.tick(now, ti);
-
-         // UART link: receive commands from display (pushes into CommandController buffer)
-         serialLink.poll();
-
-         // Retrieve current commands from CommandController buffer and put into TickInput for SessionController
-         cmdController.drain(ti);
-
-         // Run the session controller.
-         session.tick(ti);
-
-    // Periodic status publishing: retrieve snapshot from SessionController, send in main
-    if (now - lastLinkMs >= LINK_UPDATE_MS) {
-        lastLinkMs = now;
-        const WinderStatus s = winder.getStatus();
-        serialLink.sendStatus(s.rpm, s.speedHz, s.turns, s.targetTurns,
-                        s.running, s.motorEnabled, s.freerun, s.directionCW);
-    }
-
-    // WebSocket: push full status snapshot periodically.
-    if (now - lastWsMs >= WS_UPDATE_MS) {
-        lastWsMs = now;
-        web.sendUpdate(winder.getStatus());
-    }
+    vTaskDelay(portMAX_DELAY);
 }
 

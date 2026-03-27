@@ -102,7 +102,7 @@ public:
 	/** @brief Localized display name for style enum. */
 	static const char* styleName(WindingStyle style);
 	/** @brief Stable lowercase serialization key for style enum. */
-	static String      styleKey(WindingStyle style);
+	static const char*  styleKey(WindingStyle style);
 	/** @brief Parse style key into enum value. */
 	static WindingStyle styleFromString(const String& value);
 

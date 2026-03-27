@@ -10,8 +10,8 @@ const int8_t ControlHardware::QEM[16] = { 0,-1, 1, 0,
                                         -1, 0, 0, 1,
                                          0, 1,-1, 0 };
 
-ControlHardware::ControlHardware(SessionController& session, WinderApp& winder)
-    : _session(session), _winder(winder)
+ControlHardware::ControlHardware(WinderApp& winder)
+    : _winder(winder)
 {
 }
 
