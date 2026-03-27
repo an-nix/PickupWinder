@@ -25,9 +25,7 @@
 // en tournant vite → 1 000 µs est un choix confortable.
 #define ENC_DEBOUNCE_US     1000// Déplacement de la butée par cran d'encodeur (mm) pendant la phase de vérification.
 #define ENC_STEP_MM         0.05f
-// Multiplicateur de pas appliqué au premier passage en mode MANUAL (avant qu'une bute soit atteinte).
-// Permet de traverser rapidement la fenêtre en début de bobinage.
-#define MANUAL_FAST_STEP_MULT  10
+// (Removed manual-mode fast step multiplier — manual mode deprecated)
 // ── Capteur position initiale axe latéral ────────────────
 // Le capteur est connecté à la masse, entrées en INPUT_PULLUP.
 // Contact fermé (pin à GND) = LOW. Contact ouvert (pull-up) = HIGH.

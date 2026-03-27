@@ -58,3 +58,11 @@ void LinkSerial::poll(CommandCallback cb) {
         }
     }
 }
+
+void LinkSerial::setCommandCallback(CommandCallback cb) {
+    _callback = cb;
+}
+
+void LinkSerial::poll() {
+    poll(_callback);
+}

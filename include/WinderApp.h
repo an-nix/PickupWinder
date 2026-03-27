@@ -12,7 +12,7 @@ enum class Direction { CW, CCW };
 
 // ── WinderApp ─────────────────────────────────────────────────────────────────
 // Simplified winding controller.
-// States: IDLE, WINDING, PAUSED, TARGET_REACHED, MANUAL, RODAGE.
+// States: IDLE, WINDING, PAUSED, TARGET_REACHED, RODAGE.
 // Verify is NOT a separate state — just flags during normal PAUSED→WINDING flow.
 // Start button = pot at max. Pause button = pot at zero.
 class WinderApp {
@@ -31,16 +31,6 @@ public:
     void handleEncoderDelta(int32_t delta);
     WinderStatus getStatus() const;
     String recipeJson() const;
-    bool isCaptureActive() const { return _captureActive; }
-    bool getCapturePoint(float& posMm, long& turns) {
-        if (!_captureActive) return false;
-        float cur = _lateral.getCurrentPositionMm();
-        if (fabsf(cur - _captureLastPosMm) < 0.05f) return false;
-        _captureLastPosMm = cur;
-        posMm = cur;
-        turns = _stepper.getTurns();
-        return true;
-    }
 
 private:
     // ── Hardware subsystems ──
@@ -80,7 +70,7 @@ private:
     void _toWinding();
     void _toPaused();
     void _toTargetReached();
-    void _toManual();
+    // manual mode removed
     void _toRodage();
 
     // ── Tick helpers ──
@@ -106,12 +96,7 @@ private:
     WindingRecipe _captureRecipe() const;
     void          _saveRecipe();
 
-    // ── Manual mode ──
-    float  _manualJogStepMm  = 0.05f;
-    bool   _captureActive    = false;
-    float  _captureLastPosMm = -999.0f;
-    bool   _pendingManual    = false;
-    bool   _manualFirstPass  = true;
+    // Manual mode removed
 
     // ── Rodage ──
     int    _rodagePasses   = 10;

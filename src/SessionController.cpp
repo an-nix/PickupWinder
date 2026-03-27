@@ -1,5 +1,6 @@
 #include "SessionController.h"
 #include "Diag.h"
+#include "Types.h"
 
 SessionController::SessionController(WinderApp& winder)
     : _winder(winder)
@@ -67,9 +68,8 @@ bool SessionController::handleCommand(const String& cmd, const String& value) {
         return true;
     }
 
-    // Toutes les autres commandes vont à WinderApp par défaut.
-    _winder.handleCommand(cmd, value);
-    return true;
+    
+    return false;
 }
 
 void SessionController::applyPower() {
@@ -83,8 +83,33 @@ void SessionController::applyPower() {
     }
 }
 
-void SessionController::tick() {
-    Serial.printf("[Session] tick state=%d lastInput=%d pot=%.3f foot=%d reqS=%d reqP=%d reqT=%d\n", (int)_state, (int)_lastInput, _potLevel, (int)_footswitch, (int)_reqStart, (int)_reqPause, (int)_reqStop);
+void SessionController::tick(const TickInput& in) {
+    // Integrate runtime inputs passed in via TickInput
+    if (in.hasPot) {
+        float newLevel = constrain(in.potLevel, 0.0f, 1.0f);
+        if (fabs(newLevel - _potLevel) >= 0.001f) {
+            _potLevel = newLevel;
+            _lastInput = InputSource::Pot;
+        }
+    }
+    if (in.hasFootswitch) {
+        _footswitch = in.footswitch;
+        _lastInput = InputSource::Footswitch;
+        if (_footswitch) requestStart();
+        else requestPause();
+    }
+
+    // Process commands provided in TickInput (bounded, no dynamic alloc)
+    for (int i = 0; i < in.cmdCount; ++i) {
+        const char* c = in.commands[i].cmd;
+        const char* v = in.commands[i].val;
+        // Construct lightweight Strings for existing handler API
+        String sc(c);
+        String sv(v);
+        handleCommand(sc, sv);
+    }
+
+    //Serial.printf("[Session] tick state=%d lastInput=%d pot=%.3f foot=%d reqS=%d reqP=%d reqT=%d\n", (int)_state, (int)_lastInput, _potLevel, (int)_footswitch, (int)_reqStart, (int)_reqPause, (int)_reqStop);
     if (_reqStop) {
         _winder.stopWinding();
         _state = SessionState::IDLE;
@@ -129,3 +154,5 @@ void SessionController::tick() {
     applyPower();
     _winder.tick();
 }
+
+// populateStatus removed; status retrieval handled directly from WinderApp in main
