@@ -7,6 +7,11 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void WinderApp::begin() {
+    _burstEnabled = false;
+    _burstActive = false;
+    _burstConfiguredTurns = 1;
+    _burstTargetTurns = 0;
+
     _recipeStore.begin();
     _recipe = _captureRecipe();
     if (_recipeStore.load(_recipe)) Diag::info("[Recipe] Recipe restored from NVS.");
@@ -30,7 +35,7 @@ void WinderApp::tick() {
     }
 
     _handleLateralEvents();
-    _handlePotCycle(_inputHz);
+    _processInputHz(_inputHz);
     _checkAutoStop();
     _applyDeferredDisable();
 }
@@ -42,9 +47,11 @@ void WinderApp::tick() {
 void WinderApp::_toIdle() {
     const WindingState prev = _state;
     _state              = WindingState::IDLE;
-    _canStart           = false;
     _pendingDisable     = true;
-    _startButtonMax     = false;
+    _burstEnabled       = false;
+    _burstActive        = false;
+    _burstCompleted     = false;
+    _burstTargetTurns   = 0;
     _verifyLowPending   = false;
     _verifyHighPending  = false;
     _positioningToLow   = false;
@@ -61,8 +68,6 @@ void WinderApp::_toIdle() {
 
 void WinderApp::_toWinding() {
     _state              = WindingState::WINDING;
-    _canStart           = false;
-    _startButtonMax     = false;
     _pendingDisable     = false;
     _positioningToLow   = false;
     _endPosArmed        = false;
@@ -72,8 +77,6 @@ void WinderApp::_toWinding() {
 
 void WinderApp::_toPaused() {
     _state              = WindingState::PAUSED;
-    _canStart           = false;
-    _startButtonMax     = false;
     _pendingDisable     = true;
     _stepper.stop();
     _lateral.stopWinding();
@@ -82,8 +85,6 @@ void WinderApp::_toPaused() {
 
 void WinderApp::_toTargetReached() {
     _state              = WindingState::TARGET_REACHED;
-    _canStart           = false;
-    _startButtonMax     = false;
     _pendingDisable     = true;
     _stepper.stop();
     _lateral.stopWinding();
@@ -94,7 +95,6 @@ void WinderApp::_toTargetReached() {
 
 void WinderApp::_toRodage() {
     _state              = WindingState::RODAGE;
-    _canStart           = false;
     _pendingDisable     = true;
     _stepper.stop();
     _lateral.stopWinding();
@@ -117,7 +117,6 @@ void WinderApp::_handleLateralEvents() {
         _positioningToLow   = false;
         _verifyLowPending   = false;
         _state              = WindingState::PAUSED;
-        _canStart           = true;
         _pendingDisable     = true;
         Diag::infof("[VERIFY] Low bound reached at %.2f mm — press Start to wind toward high",
                 _windingStartMm());
@@ -161,18 +160,7 @@ void WinderApp::_handleLateralEvents() {
 // Pot cycle — Start button = pot at max, Pause button = pot at zero
 // ═══════════════════════════════════════════════════════════════════════════════
 
-void WinderApp::_handlePotCycle(uint32_t hz) {
-    uint32_t driveHz = hz;
-    if (_startButtonMax) {
-        if (hz > 0) {
-            _startButtonMax = false;
-            driveHz = hz;
-        } else {
-            driveHz = _maxSpeedHz;
-        }
-    }
-    if (driveHz == 0) _canStart = true;
-
+void WinderApp::_processInputHz(uint32_t hz) {
     switch (_state) {
     case WindingState::IDLE:
         if (_lateral.isHomed() && !_lateral.isBusy() && !_lateral.isAtZero())
@@ -180,22 +168,16 @@ void WinderApp::_handlePotCycle(uint32_t hz) {
         break;
 
     case WindingState::WINDING:
-        if (driveHz > 0)
-            _runWindingAtHz(driveHz);
-        else
+        if (hz > 0) {
+            _runWindingAtHz(hz);
+        } else {
             _toPaused();
-        break;
-
-    case WindingState::PAUSED:
-        if (driveHz > 0 && _canStart && _lateral.isHomed() && !_lateral.isBusy()) {
-            if (_verifyHighPending) {
-                _lateral.clearOneShotStops();
-                _lateral.armStopAtNextHigh();
-            }
-            _runWindingAtHz(driveHz);
         }
         break;
 
+    case WindingState::PAUSED:
+        // Pot level is handled by SessionController; do not auto-start from WinderApp.
+        break;
 
     case WindingState::TARGET_REACHED:
     case WindingState::RODAGE:
@@ -345,6 +327,16 @@ void WinderApp::_checkAutoStop() {
         }
     }
 
+    // Burst auto-stop (non-persistent scenario)
+    if (_burstActive && _stepper.getTurns() >= _burstTargetTurns) {
+        _burstActive = false;
+        _burstCompleted = true;
+        _burstTargetTurns = 0;
+        _toPaused();
+        Diag::infof("[BURST] Completed %ld turns, auto-paused", _burstConfiguredTurns);
+        return;
+    }
+
     // Auto-stop at target
     if (_stepper.getTurns() >= (long)_targetTurns) {
         _toTargetReached();
@@ -390,6 +382,11 @@ WinderStatus WinderApp::getStatus() const {
         (bool)_freerun,
         (_direction == Direction::CW),
         false,   // autoMode — reserved
+        _burstEnabled,
+        _burstActive,
+        _burstConfiguredTurns,
+        _burstTargetTurns,
+        (_burstActive ? max(0L, _burstTargetTurns - _stepper.getTurns()) : 0L),
         _geom.turnsPerPass(),
         _geom.turnsPerPassCalc(),
         _geom.turnsPerPassOffset,
@@ -467,6 +464,14 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
                 Diag::error("[Start] Lateral axis not ready");
                 return true;
             }
+
+            // Burst target is relative to the fresh counter after reset
+            if (_burstEnabled) {
+                _burstActive = true;
+                _burstTargetTurns = _burstConfiguredTurns;
+                Diag::infof("[BURST] Enabled for %ld turns => target %ld", _burstConfiguredTurns, _burstTargetTurns);
+            }
+
             // Fresh session — reset and begin verify sequence
             _stepper.resetTurns();
             _planner.reset();
@@ -480,9 +485,14 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
             return true;
         }
         if (_state == WindingState::PAUSED) {
-            // Resume — equivalent to pot at max
-            _startButtonMax = true;
-            _canStart       = true;
+            // Resume via explicit Start command (from SessionController) and allow current pot-based speed.
+            if (_burstEnabled && !_burstActive) {
+                _burstActive = true;
+                _burstCompleted = false;
+                _burstTargetTurns = _stepper.getTurns() + _burstConfiguredTurns;
+                Diag::infof("[BURST] Resuming burst to target %ld", _burstTargetTurns);
+            }
+            _toWinding();
             return true;
         }
         return true;
@@ -492,8 +502,6 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
             Diag::info("[Pause] Ignored — no active session");
         } else {
-            // Handle pause inside tick() to avoid cross-task race with control loop.
-            _startButtonMax = false;
             _pauseRequested = true;
             Diag::info("[Pause] Pause requested");
         }
@@ -502,9 +510,12 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
 
     if (cmd == "resume") {
         if (_state == WindingState::PAUSED) {
-            _startButtonMax = true;
-            _canStart       = true;
-            Diag::info("[Resume] Armed — starting at max speed");
+            if (_burstCompleted && _burstEnabled) {
+                Diag::info("[Resume] Ignored — burst completed, use Start to begin a new burst");
+                return true;
+            }
+            _toWinding();
+            Diag::info("[Resume] Armed — transitioning to winding");
         } else {
             Diag::infof("[Resume] Ignored in state %s", windingStateName(_state));
         }
@@ -545,6 +556,37 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         return true;
     }
 
+    // ── Burst mode (non-persistent) ─────────────────────────────────────────
+    if (cmd == "burst_turns") {
+        long n = constrain(value.toInt(), 1L, 10000L);
+        _burstConfiguredTurns = n;
+        Diag::infof("[BURST] Configured %ld turns", n);
+        return true;
+    }
+
+    if (cmd == "burst") {
+        // Compatibility helper: enables burst mode and starts with a specified count.
+        long n = (_burstConfiguredTurns > 0) ? _burstConfiguredTurns : 1;
+        if (value.length() > 0) n = constrain(value.toInt(), 1, 10000);
+        _burstConfiguredTurns = n;
+        _burstEnabled = true;
+
+        if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
+            _burstActive = true;
+            _burstTargetTurns = n;
+            Diag::infof("[BURST] Starting burst %ld turns from zero", n);
+            _handleImmediateCommand("start", "");
+        } else {
+            _burstActive = true;
+            _burstTargetTurns = _stepper.getTurns() + n;
+            Diag::infof("[BURST] Starting burst %ld turns from %ld", n, _stepper.getTurns());
+            if (_state == WindingState::PAUSED) {
+                _toWinding();
+            }
+        }
+        return true;
+    }
+
     // ── Rodage axe lateral ───────────────────────────────────────────────────
     if (cmd == "rodage_dist") {
         _rodageDistMm = constrain(value.toFloat(), 5.0f, (float)LAT_TRAVERSE_MM);
@@ -556,6 +598,22 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         Diag::infof("[RODAGE] Passes: %d", _rodagePasses);
         return true;
     }
+    if (cmd == "burst_enable") {
+        _burstEnabled = (value == "true");
+        if (!_burstEnabled) {
+            _burstActive = false;
+            _burstTargetTurns = 0;
+        }
+        Diag::infof("[BURST] Enabled=%s", _burstEnabled ? "true" : "false");
+        return true;
+    }
+
+    if (cmd == "burst_turns") {
+        _burstConfiguredTurns = constrain(value.toInt(), 1L, 10000L);
+        Diag::infof("[BURST] Configured %ld turns", _burstConfiguredTurns);
+        return true;
+    }
+
     if (cmd == "rodage") {
         if (_state == WindingState::IDLE) {
             _toRodage();
@@ -879,7 +937,6 @@ void WinderApp::_applyRecipe(const WindingRecipe& recipe, bool persist) {
     _freerun     = recipe.freerun;
     _direction   = recipe.directionCW ? Direction::CW : Direction::CCW;
     _state       = WindingState::IDLE;
-    _canStart    = false;
     _pendingDisable = false;
     _lateral.setHomeOffset(recipe.latOffsetMm);
     _planner.setRecipe(_recipe);

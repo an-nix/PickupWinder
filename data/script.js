@@ -140,6 +140,12 @@ function update(d) {
   byId('ep-turns').disabled = (epStr === 'none');
   syncInput('ep-turns', d.endPosTurns);
 
+  const burstEnabledEl = byId('burst-enabled');
+  if (burstEnabledEl && d.burstEnabled !== undefined) {
+    burstEnabledEl.checked = d.burstEnabled;
+  }
+  syncInput('burst-turns', d.burstConfiguredTurns);
+
   syncRange('g-scatter', d.scatter, 'scatter-lbl', 1);
   if (byId('g-tpp-ofs') && document.activeElement !== byId('g-tpp-ofs') && d.tppOfs !== undefined)
     byId('g-tpp-ofs').value = d.tppOfs;
@@ -223,6 +229,11 @@ function updateStatusLine(st, d, pos) {
     s.textContent = '▶ Winding…';
     return;
   }
+  if (d.burstActive) {
+    s.textContent = '⚡ Burst running: ' + (d.burstRemainingTurns || 0) + ' turns remaining';
+    return;
+  }
+
   switch (st) {
     case 'WINDING':
       if (d.verifyLow) s.textContent = '🔍 Going to LOW bound…';

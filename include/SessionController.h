@@ -156,6 +156,11 @@ private:
     /** Source attached to `_pendingControlIntent`. */
     InputSource _pendingIntentSource = InputSource::None;
 
+    enum class RunMode { None, Max, Pot };
+
+    /** Current run mode used by applyPower. */
+    RunMode _runMode = RunMode::None;
+
     /**
      * @brief Record a new intent and override previously pending one.
      * @param intent Intent to stage.
