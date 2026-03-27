@@ -83,6 +83,10 @@ void ControlHardware::tick(uint32_t now, SessionController::TickInput& out)
         out.potLevel = level;
     }
 
+    // Always propagate the control-loop timestamp.
+    out.now = now;
+}
+
 // --- Inlined SpeedInput logic ---
 
 void ControlHardware::_initPotSmoothing() {
@@ -128,10 +132,6 @@ uint32_t ControlHardware::_readPotHz() {
     }
     _potLastHz = hz;
     return hz;
-}
-
-    // Always propagate the control-loop timestamp.
-    out.now = now;
 }
 
 void IRAM_ATTR ControlHardware::_encISR()
