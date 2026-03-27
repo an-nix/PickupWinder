@@ -1,0 +1,59 @@
+name: PlatformIO Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - esp32dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/.cache
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            ~/.platformio/penv
+          key: ${{ runner.os }}-platformio-${{ matrix.environment }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-platformio-${{ matrix.environment }}-
+            ${{ runner.os }}-platformio-
+
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+
+      - name: Build firmware
+        run: pio run -e ${{ matrix.environment }}
+
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.environment }}
+          path: |
+            .pio/build/${{ matrix.environment }}/firmware.bin
+            .pio/build/${{ matrix.environment }}/bootloader.bin
+            .pio/build/${{ matrix.environment }}/partitions.bin
+            .pio/build/${{ matrix.environment }}/firmware.elf
+          if-no-files-found: warn

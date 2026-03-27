@@ -9,9 +9,11 @@ CommandController::CommandController(LinkSerial& serial, WebInterface& web)
 
 void CommandController::begin()
 {
+    // Allocate the fixed-size queue once at startup.
     _cmdQueue = xQueueCreate(CMD_QUEUE_SIZE, sizeof(CommandEntry));
 
-    // Register command callbacks centrally for both WebSocket and Serial.
+    // Register both transports against the same push path so all commands are
+    // normalized before reaching the control task.
     _web.setCommandCallback([this](const String& cmd, const String& val) {
         CommandEntry c;
         cmd.toCharArray(c.cmd, sizeof(c.cmd));
@@ -28,7 +30,7 @@ void CommandController::begin()
 
 void CommandController::drain(SessionController::TickInput& out)
 {
-    // Drain up to MAX_CMDS from the FreeRTOS queue (non-blocking)
+    // Drain without blocking so the control task remains deterministic.
     CommandEntry entry;
     while (out.cmdCount < SessionController::TickInput::MAX_CMDS &&
            xQueueReceive(_cmdQueue, &entry, 0) == pdTRUE) {
@@ -40,6 +42,7 @@ void CommandController::pushCommand(const CommandEntry& c)
 {
     if (!_cmdQueue) return;
     if (xQueueSend(_cmdQueue, &c, 0) != pdTRUE) {
+        // Dropping is preferable to blocking a transport callback or async task.
         Diag::warnf("Command queue full, dropping '%s'", c.cmd);
     }
 }

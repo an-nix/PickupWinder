@@ -57,14 +57,6 @@ public:
     /** @brief Get last commanded speed setpoint in Hz. */
     uint32_t getSpeedHz() const { return _speedHz; }
 
-    /**
-     * @brief Play one tone via the motor.
-     * @param freqHz Audible frequency in Hz (`0` means silence).
-     */
-    void     playNote(uint16_t freqHz);
-    /** @brief Stop tone playback and disable driver. */
-    void     stopNote();
-
 private:
     FastAccelStepper*      _stepper = nullptr;  // Pointer to the stepper instance
     uint32_t               _speedHz = SPEED_HZ_MIN;  // Current speed setpoint in Hz

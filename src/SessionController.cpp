@@ -2,159 +2,208 @@
 #include "Diag.h"
 #include "Types.h"
 
+namespace {
+// Pot is considered active above this normalized threshold.
+// This is intentionally tiny: we only need robust zero/non-zero edge detection.
+constexpr float POT_RUN_THRESHOLD = 0.001f;
+}
+
+// -----------------------------------------------------------------------------
+// Construction
+// -----------------------------------------------------------------------------
 SessionController::SessionController(WinderApp& winder)
     : _winder(winder)
 {
+    // No runtime initialization required here.
 }
 
-void SessionController::setPotLevel(float level) {
-    float newLevel = constrain(level, 0.0f, 1.0f);
-    if (fabs(newLevel - _potLevel) >= 0.001f) {
-        _potLevel = newLevel;
-        _lastInput = InputSource::Pot;
+// -----------------------------------------------------------------------------
+// Intent arbitration
+// -----------------------------------------------------------------------------
+void SessionController::recordIntent(ControlIntent intent, InputSource src) {
+    // Last event always overrides any previous pending intent.
+    _pendingIntent = intent; // Store the latest intent to apply.
+    _pendingSource = src;    // Remember who produced that intent.
+    _lastInput = src;        // Keep latest observed input source for diagnostics.
+
+    // If another source takes control while pot is non-zero, require a pot
+    // return-to-zero before pot can start the machine again.
+    if (src != InputSource::Pot && _potRunning) {
+        _potNeedsRearm = true; // Arm pot lock until next explicit zero crossing.
     }
 }
 
-void SessionController::setFootswitch(bool pressed) {
-    _footswitch = pressed;
-    _lastInput = InputSource::Footswitch;
-    if (pressed) requestStart();
-    else requestPause();
+void SessionController::applyPendingIntent() {
+    if (_pendingIntent == ControlIntent::None) return; // Nothing to apply this tick.
+
+    // Snapshot source to preserve traceability after pending fields are cleared.
+    const InputSource src = _pendingSource; // Local copy for state attribution.
+
+    switch (_pendingIntent) {
+    case ControlIntent::Stop:
+        // Hard session stop: return to IDLE and stop winding domain.
+        _winder.stopWinding();      // Delegate full stop to domain controller.
+        _state = SessionState::IDLE; // Reflect stop at session layer.
+        _activeSource = src;        // Mark source that produced effective state.
+        break;
+
+    case ControlIntent::Pause:
+        // Pause is idempotent; avoid duplicate pause commands.
+        if (_state != SessionState::PAUSED) {
+            _winder.pauseWinding();      // Request domain pause only on transition.
+            _state = SessionState::PAUSED; // Persist paused session state.
+        }
+        _activeSource = src; // Mark effective source even if already paused.
+        break;
+
+    case ControlIntent::Start:
+        // Start is also idempotent; only trigger transition when needed.
+        if (_state != SessionState::RUNNING) {
+            _winder.handleCommand("start", ""); // Reuse start path in WinderApp.
+            _state = SessionState::RUNNING;       // Persist running session state.
+        }
+        _activeSource = src; // Mark effective source even if already running.
+        if (src == InputSource::Pot) {
+            // Pot regained control explicitly.
+            _potNeedsRearm = false; // Clear lock because pot intentionally restarted.
+        }
+        break;
+
+    case ControlIntent::None:
+        break; // Defensive branch, should be filtered by early return.
+    }
+
+    _pendingIntent = ControlIntent::None; // Clear one-shot intent after application.
+    _pendingSource = InputSource::None;   // Clear source paired with consumed intent.
 }
 
+// -----------------------------------------------------------------------------
+// Public requests (UI / command side)
+// -----------------------------------------------------------------------------
 void SessionController::requestStart() {
-    _reqStart = true;
-    _lastInput = InputSource::IHM;
+    recordIntent(ControlIntent::Start, InputSource::IHM); // UI requests start.
 }
 
 void SessionController::requestPause() {
-    _reqPause = true;
-    _lastInput = InputSource::IHM;
+    recordIntent(ControlIntent::Pause, InputSource::IHM); // UI requests pause.
 }
 
 void SessionController::requestStop() {
-    _reqStop = true;
-    _lastInput = InputSource::IHM;
+    recordIntent(ControlIntent::Stop, InputSource::IHM); // UI requests stop.
 }
 
+// -----------------------------------------------------------------------------
+// Command decoding
+// -----------------------------------------------------------------------------
 bool SessionController::handleCommand(const String& cmd, const String& value) {
+    // Session lifecycle commands are converted to intents.
     if (cmd == "start") {
-        requestStart();
-        return true;
+        requestStart(); // Convert transport command into start intent.
+        return true;    // Mark as consumed by SessionController.
     }
     if (cmd == "pause") {
-        requestPause();
-        return true;
+        requestPause(); // Convert transport command into pause intent.
+        return true;    // Mark as consumed by SessionController.
     }
     if (cmd == "stop") {
-        requestStop();
-        return true;
+        requestStop(); // Convert transport command into stop intent.
+        return true;   // Mark as consumed by SessionController.
     }
     if (cmd == "target") {
-        long t = value.toInt();
-        if (t > 0) _winder.setTargetTurns(t);
-        return true;
+        long t = value.toInt();         // Parse new target turns.
+        if (t > 0) _winder.setTargetTurns(t); // Apply only valid positive targets.
+        return true;                    // Command handled at session/domain boundary.
     }
     if (cmd == "freerun") {
-        _winder.setFreerun(value == "true");
-        return true;
+        _winder.setFreerun(value == "true"); // Map text flag to boolean mode.
+        return true;                           // Command consumed.
     }
     if (cmd == "direction") {
-        _winder.setDirection(value == "cw" ? Direction::CW : Direction::CCW);
-        return true;
+        _winder.setDirection(value == "cw" ? Direction::CW : Direction::CCW); // Select spindle direction.
+        return true; // Command consumed.
     }
     if (cmd == "max_rpm" || cmd == "max-rpm") {
-        _winder.setMaxRpm((uint16_t)constrain(value.toInt(), 10, 1500));
-        return true;
+        _winder.setMaxRpm((uint16_t)constrain(value.toInt(), 10, 1500)); // Clamp safe operating range.
+        return true; // Command consumed.
     }
 
-    
+    // Unknown command for SessionController: caller may forward it.
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// Output application
+// -----------------------------------------------------------------------------
 void SessionController::applyPower() {
     if (_state == SessionState::RUNNING) {
-        uint32_t speedHz = (uint32_t)(_potLevel * (float)_winder.getMaxSpeedHz());
-        _winder.setControlHz(speedHz);
-        Serial.printf("[Session] run speedHz=%u pot=%.3f source=%d\n", speedHz, _potLevel, (int)_lastInput);
+        // While running, speed command follows potentiometer proportionally.
+        uint32_t speedHz = (uint32_t)(_potLevel * (float)_winder.getMaxSpeedHz()); // Scale max speed by normalized pot.
+        _winder.setControlHz(speedHz); // Push speed command to winding domain.
+        Serial.printf("[Session] run speedHz=%u pot=%.3f source=%d\n", speedHz, _potLevel, (int)_lastInput); // Debug trace.
     } else {
-        _winder.setControlHz(0);
-        Serial.printf("[Session] paused source=%d pot=%.3f\n", (int)_lastInput, _potLevel);
+        // Any non-running state forces zero speed command.
+        _winder.setControlHz(0); // Guarantee no speed command outside RUNNING.
+        Serial.printf("[Session] paused source=%d pot=%.3f\n", (int)_lastInput, _potLevel); // Debug trace.
     }
 }
 
+// -----------------------------------------------------------------------------
+// Tick update (single deterministic update step)
+// -----------------------------------------------------------------------------
 void SessionController::tick(const TickInput& in) {
-    // Integrate runtime inputs passed in via TickInput
+    // 1) Integrate pot input and detect zero/non-zero edges.
     if (in.hasPot) {
-        float newLevel = constrain(in.potLevel, 0.0f, 1.0f);
-        if (fabs(newLevel - _potLevel) >= 0.001f) {
-            _potLevel = newLevel;
-            _lastInput = InputSource::Pot;
+        float newLevel = constrain(in.potLevel, 0.0f, 1.0f); // Keep pot value normalized.
+        if (fabsf(newLevel - _potLevel) >= 0.001f) {
+            _potLevel = newLevel; // Update cached pot level when change is meaningful.
+        }
+
+        const bool running = (_potLevel > POT_RUN_THRESHOLD); // Digital state derived from analog level.
+        if (!_potSeen) {
+            _potSeen = true;      // Initialize edge detector on first valid sample.
+            _potRunning = running; // Store baseline digital pot state.
+        } else if (running != _potRunning) {
+            // Pot transitions are the only moments allowed to trigger
+            // start/pause intents from analog input.
+            _potRunning = running; // Latch the new pot digital state.
+
+            if (!running) {
+                // Pot reached zero: clear ownership lock and request pause.
+                _potNeedsRearm = false; // Pot is now rearmed for future takeovers.
+                recordIntent(ControlIntent::Pause, InputSource::Pot); // Pot falling edge requests pause.
+            } else if (!_potNeedsRearm) {
+                // Pot rising edge above zero can start only when rearmed.
+                recordIntent(ControlIntent::Start, InputSource::Pot); // Pot rising edge requests start.
+            }
         }
     }
+
+    // 2) Integrate footswitch edge events.
     if (in.hasFootswitch) {
-        _footswitch = in.footswitch;
-        _lastInput = InputSource::Footswitch;
-        if (_footswitch) requestStart();
-        else requestPause();
+        if (!_footswitchSeen || _footswitch != in.footswitch) {
+            _footswitchSeen = true; // Baseline becomes valid after first sample.
+            _footswitch = in.footswitch; // Store latest footswitch state.
+            recordIntent(_footswitch ? ControlIntent::Start : ControlIntent::Pause,
+                InputSource::Footswitch); // Press->start, release->pause.
+        }
     }
 
-    // Process commands provided in TickInput (bounded, no dynamic alloc)
+    // 3) Decode commands provided in TickInput (bounded, no dynamic alloc).
     for (int i = 0; i < in.cmdCount; ++i) {
-        const char* c = in.commands[i].cmd;
-        const char* v = in.commands[i].val;
-        String sc(c);
-        String sv(v);
-        // Session-level commands handled here; others forwarded to WinderApp
+        const char* c = in.commands[i].cmd; // Raw command key from queue.
+        const char* v = in.commands[i].val; // Raw command value from queue.
+        String sc(c); // Build String view used by existing command handlers.
+        String sv(v); // Build String view used by existing command handlers.
+        // Session-level commands handled here; others forwarded to WinderApp.
         if (!handleCommand(sc, sv)) {
-            _winder.handleCommand(sc, sv);
+            _winder.handleCommand(sc, sv); // Forward unknown session command.
         }
     }
 
-    //Serial.printf("[Session] tick state=%d lastInput=%d pot=%.3f foot=%d reqS=%d reqP=%d reqT=%d\n", (int)_state, (int)_lastInput, _potLevel, (int)_footswitch, (int)_reqStart, (int)_reqPause, (int)_reqStop);
-    if (_reqStop) {
-        _winder.stopWinding();
-        _state = SessionState::IDLE;
-        _reqStop = false;
-    } else if (_reqPause) {
-        _winder.pauseWinding();
-        _state = SessionState::PAUSED;
-        _reqPause = false;
-    } else if (_reqStart) {
-        if (_state != SessionState::RUNNING) {
-            _winder.handleCommand("start", "");
-            _state = SessionState::RUNNING;
-        }
-        _reqStart = false;
-    } else {
-        // Priority to latest input source.
-        if (_lastInput == InputSource::IHM) {
-            // iHM was already processed by reqStart/reqPause.
-        } else if (_lastInput == InputSource::Footswitch) {
-            if (_footswitch) {
-                if (_state != SessionState::RUNNING) {
-                    _winder.handleCommand("start", "");
-                    _state = SessionState::RUNNING;
-                }
-            } else if (_state != SessionState::PAUSED) {
-                _winder.pauseWinding();
-                _state = SessionState::PAUSED;
-            }
-        } else if (_lastInput == InputSource::Pot) {
-            if (_potLevel > 0.001f) {
-                if (_state != SessionState::RUNNING) {
-                    _winder.handleCommand("start", "");
-                    _state = SessionState::RUNNING;
-                }
-            } else if (_state != SessionState::PAUSED) {
-                _winder.pauseWinding();
-                _state = SessionState::PAUSED;
-            }
-        }
-    }
+    // 4) Apply exactly one resolved intent (last event wins).
+    applyPendingIntent(); // Commit the most recent pending intent.
 
-    applyPower();
-    _winder.tick();
+    // 5) Push output command and let winding domain advance one step.
+    applyPower();  // Update spindle speed command for this cycle.
+    _winder.tick(); // Advance domain state machine and motor/lateral logic.
 }
-
-// populateStatus removed; status retrieval handled directly from WinderApp in main
