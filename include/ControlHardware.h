@@ -4,9 +4,11 @@
 #include "SpeedInput.h"
 #include "SessionController.h"
 
+class WinderApp;
+
 class ControlHardware {
 public:
-    ControlHardware(SessionController& session, WinderApp& winder);
+    ControlHardware(WinderApp& winder);
     void begin();
     void tick(uint32_t now, SessionController::TickInput& out);
     uint32_t readPotHz();
@@ -15,7 +17,6 @@ public:
 
 private:
     // External controllers
-    SessionController& _session;
     WinderApp& _winder;
 
     // Potentiometer input (speed sensor)

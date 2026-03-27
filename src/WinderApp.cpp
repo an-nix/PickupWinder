@@ -410,7 +410,7 @@ WinderStatus WinderApp::getStatus() const {
         _geom.totalWidth_mm, _geom.flangeBottom_mm, _geom.flangeTop_mm,
         _geom.margin_mm, _geom.wireDiameter_mm,
         _lateral.getHomeOffset(),
-        WindingPatternPlanner::styleKey(_recipe.style).c_str(),
+        WindingPatternPlanner::styleKey(_recipe.style),
         _recipe.seed,
         _recipe.layerJitterPct,
         _recipe.layerSpeedPct,

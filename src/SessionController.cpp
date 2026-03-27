@@ -103,10 +103,12 @@ void SessionController::tick(const TickInput& in) {
     for (int i = 0; i < in.cmdCount; ++i) {
         const char* c = in.commands[i].cmd;
         const char* v = in.commands[i].val;
-        // Construct lightweight Strings for existing handler API
         String sc(c);
         String sv(v);
-        handleCommand(sc, sv);
+        // Session-level commands handled here; others forwarded to WinderApp
+        if (!handleCommand(sc, sv)) {
+            _winder.handleCommand(sc, sv);
+        }
     }
 
     //Serial.printf("[Session] tick state=%d lastInput=%d pot=%.3f foot=%d reqS=%d reqP=%d reqT=%d\n", (int)_state, (int)_lastInput, _potLevel, (int)_footswitch, (int)_reqStart, (int)_reqPause, (int)_reqStop);
