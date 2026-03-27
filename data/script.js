@@ -250,9 +250,10 @@ function updateContextPanels(st, d) {
   byId('ctx-idle').style.display    = idle    ? '' : 'none';
   byId('ctx-winding').style.display = winding ? '' : 'none';
   byId('ctx-target').style.display  = target  ? '' : 'none';
-  byId('btn-start-run').style.display = winding ? '' : 'none';
-  byId('btn-start-run').textContent = paused ? '▶ Resume' : '▶ Start';
-  byId('btn-pause-run').style.display = isRunning ? '' : 'none';
+  // While running: only Pause. While paused: Resume + Stop. Never show Start and Pause together.
+  byId('btn-start-run').style.display  = paused ? '' : 'none';
+  byId('btn-start-run').textContent    = '▶ Resume';
+  byId('btn-pause-run').style.display  = isRunning ? '' : 'none';
   byId('btn-stop-paused').style.display = paused ? '' : 'none';
 }
 
