@@ -12,12 +12,32 @@
 #include "LinkSerial.h"
 #include "WinderApp.h"
 #include "Diag.h"
+#include <esp_system.h>
 
 // ── Subsystem instances ───────────────────────────────────────────────────────
 static SpeedInput   pot;
 static WebInterface web;
 static LinkSerial   serialLink;
 static WinderApp    winder;
+
+RTC_DATA_ATTR static uint32_t s_bootCount = 0;
+
+static const char* resetReasonStr(esp_reset_reason_t r) {
+    switch (r) {
+    case ESP_RST_UNKNOWN:   return "UNKNOWN";
+    case ESP_RST_POWERON:   return "POWERON";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT_WDT";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "OTHER";
+    }
+}
 
 // ── Encodeur rotatif — décodage quadrature complet (A+B CHANGE) ───────────────────
 // Table d'état quadrature : index = (prevAB << 2) | currAB
@@ -60,6 +80,10 @@ static uint32_t lastPotMs  = 0;
  */
 void setup() {
     Serial.begin(115200);
+    ++s_bootCount;
+    const esp_reset_reason_t rr = esp_reset_reason();
+    Diag::infof("[BOOT] count=%lu reset=%s(%d)",
+        (unsigned long)s_bootCount, resetReasonStr(rr), (int)rr);
     Diag::info("\n=== Pickup Winder ===");
 
     pot.begin();   // Pre-fill ADC filter buffer

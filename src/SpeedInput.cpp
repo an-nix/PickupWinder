@@ -42,14 +42,17 @@ uint32_t SpeedInput::readHz() {
     }
 
     uint32_t hz;
-    {
+    if (avg >= POT_ADC_FULL_BAND) {
+        hz = SPEED_HZ_MAX;
+    } else {
         // Courbe exponentielle : progression lente en début de course,
         // rapide en fin — idéal pour contrôler finement les basses vitesses.
         // Formule : hz = SPEED_HZ_MAX × (e^(k·t) − 1) / (e^k − 1)
         //   t = 0 → hz = 0   |   t = 1 → hz = SPEED_HZ_MAX
         // Avec k=4.5 : ~50 RPM à 30% de course, ~375 RPM à 70%, 1500 RPM à 100%.
         float t = (float)(avg - POT_ADC_ZERO_BAND)
-                / (float)(4095 - POT_ADC_ZERO_BAND);
+                / (float)(POT_ADC_FULL_BAND - POT_ADC_ZERO_BAND);
+        t = constrain(t, 0.0f, 1.0f);
         // Le dénominateur est constant (k fixe) : calculé une seule fois.
         static const float invDenom = 1.0f / (expf(POT_EXP_K) - 1.0f);
         hz = (uint32_t)((expf(POT_EXP_K * t) - 1.0f) * invDenom * (float)SPEED_HZ_MAX);

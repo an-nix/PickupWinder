@@ -109,6 +109,10 @@
 // Détection zéro sur counts ADC bruts (après inversion).
 // Augmenter si le moteur ne s'arrête pas quand le pot est en butée basse.
 #define POT_ADC_ZERO_BAND   150    // ≈ 11° sur un pot 300° (150/4095 ≈ 3.7%)
+// Bande haute de saturation ADC : au-dessus de ce seuil, la commande est
+// considérée à 100% (SPEED_HZ_MAX). Utile si le pot n'atteint jamais 4095.
+// Ajuster entre 3600 et 4000 selon le câblage/ADC réel.
+#define POT_ADC_FULL_BAND   3700
 // Courbe exponentielle sur toute la course du pot.
 // Formule : hz = SPEED_HZ_MAX × (e^(k·t) − 1) / (e^k − 1)  avec t ∈ [0..1]
 // Plus k est grand, plus la progression est lente au début et rapide en fin de course.
