@@ -161,6 +161,11 @@ private:
     /** Current run mode used by applyPower. */
     RunMode _runMode = RunMode::None;
 
+    // Last values emitted to the log to avoid flooding serial with repeated lines.
+    SessionState _lastLoggedSessionState = SessionState::IDLE;
+    RunMode _lastLoggedRunMode = RunMode::None;
+    InputSource _lastLoggedSource = InputSource::None;
+
     /**
      * @brief Record a new intent and override previously pending one.
      * @param intent Intent to stage.

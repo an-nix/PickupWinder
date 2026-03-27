@@ -198,7 +198,12 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
 
     // 1. Approach zone slowdown (near target)
     if (!_freerun && _stepper.isRunning()) {
-        long remaining = (long)_targetTurns - _stepper.getTurns();
+        // Consider burst target as a temporary nearby stop target so that
+        // approach/deceleration logic can engage early and avoid overshoot
+        // when performing short bursts.
+        long effectiveTarget = (long)_targetTurns;
+        if (_burstActive) effectiveTarget = min(effectiveTarget, _burstTargetTurns);
+        long remaining = effectiveTarget - _stepper.getTurns();
         if (remaining > 0 && remaining <= APPROACH_TURNS) {
             float ratio = (float)remaining / APPROACH_TURNS;
             uint32_t maxHz = APPROACH_SPEED_HZ_FLOOR

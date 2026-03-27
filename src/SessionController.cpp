@@ -41,8 +41,13 @@ void SessionController::recordIntent(ControlIntent intent, InputSource src) {
         case InputSource::Footswitch: srcName = "Footswitch"; break;
         default: break;
     }
-    Serial.printf("[Session] recordIntent intent=%s src=%s potAboveZero=%.3f potNeedsRearm=%d\n",
-                  intentName, srcName, _potLevel, _potNeedsRearm);
+    // Reduce chatter: only log non-pot events (UI/footswitch) which are more
+    // informative for debugging; pot-level changes are frequent and not helpful
+    // in normal operation.
+    if (src != InputSource::Pot) {
+        Diag::infof("[Session] recordIntent intent=%s src=%s pot=%.3f potNeedsRearm=%d",
+                    intentName, srcName, _potLevel, _potNeedsRearm);
+    }
 
     // If another source takes control while pot is non-zero, require a pot
     // return-to-zero before pot can start the machine again.
@@ -174,14 +179,25 @@ void SessionController::applyPower()
         }
 
         _winder.setControlHz(commandedSpeedHz);
-        Serial.printf("[Session] ARMED_OR_RUNNING speedHz=%u pot=%.3f source=%d runMode=%d\n",
-            commandedSpeedHz, _potLevel, (int)_lastEventSource, (int)_runMode);
+        // Log only on meaningful changes to avoid spamming the serial console.
+        if (_sessionState != _lastLoggedSessionState || _runMode != _lastLoggedRunMode
+            || _lastEventSource != _lastLoggedSource) {
+            Diag::infof("[Session] ARMED speedHz=%u pot=%.3f source=%d runMode=%d",
+                        commandedSpeedHz, _potLevel, (int)_lastEventSource, (int)_runMode);
+            _lastLoggedSessionState = _sessionState;
+            _lastLoggedRunMode = _runMode;
+            _lastLoggedSource = _lastEventSource;
+        }
     }
     else
     {
         // Any non-armed state forces zero speed command.
         _winder.setControlHz(0); // Guarantee no speed command outside ARMED_OR_RUNNING.
-        Serial.printf("[Session] paused source=%d pot=%.3f\n", (int)_lastEventSource, _potLevel); // Debug trace.
+        if (_sessionState != _lastLoggedSessionState || _lastEventSource != _lastLoggedSource) {
+            Diag::infof("[Session] PAUSED source=%d pot=%.3f", (int)_lastEventSource, _potLevel);
+            _lastLoggedSessionState = _sessionState;
+            _lastLoggedSource = _lastEventSource;
+        }
     }
 }
 
