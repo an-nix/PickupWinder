@@ -4,6 +4,7 @@
 #include <functional>
 #include "Config.h"
 #include "Types.h"
+#include "WifiManager.h"
 
 // WinderStatus and RecipeJsonProvider are defined in Types.h.
 // CommandCallback is defined in Types.h.
@@ -48,7 +49,7 @@ public:
      * @brief Get local WiFi IP string.
      * @return Local IP, or "N/A" when disconnected.
      */
-    String getIP()         const;
+    String getIP() const;
 
     /**
      * @brief Check whether web interface is online.
@@ -56,12 +57,18 @@ public:
      */
     bool   isConnected()   const { return _wifiOk; }
 
+    /**
+     * @brief Configure WiFi manager instance used for connectivity.
+     */
+    void setWifiManager(WifiManager* manager);
+
 private:
     AsyncWebServer  _server;    // ESPAsyncWebServer instance on WEB_PORT
     AsyncWebSocket  _ws;        // WebSocket handler mounted at /ws
     CommandCallback _callback;  // Registered command handler (set by WinderApp)
     RecipeJsonProvider _recipeProvider; // Download current recipe as JSON
     bool            _wifiOk = false;  // Set to true once WiFi is connected
+    WifiManager*    _wifiManager = nullptr; // WiFi manager instance used for connectivity
 
     /**
      * @brief Internal WS event dispatcher.

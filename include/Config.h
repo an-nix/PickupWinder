@@ -1,5 +1,12 @@
 #pragma once
 
+// Wi-Fi credential default values (edit here directly).
+// If NVS contains saved values, they are used at runtime.
+#define WIFI_SSID "your_ssid_here"
+#define WIFI_PASSWORD "your_password_here"
+
+
+
 // ── Main spindle stepper ──────────────────────────────────
 #define STEP_PIN            26
 #define DIR_PIN             27
@@ -118,39 +125,15 @@
 // Debounce time for mechanical contact stabilization.
 #define FOOTSWITCH_DEBOUNCE_MS 20
 
-// Wi-Fi credentials may come from (in priority):
-// 1) Build-time definitions via -D BUILD_WIFI_SSID="..." / -D BUILD_WIFI_PASSWORD="..."
-// 2) Secrets.h (included if available)
-// 3) Defaults (fallback, for local testing only)
+// Wi-Fi credential default values (edit here directly).
+// If NVS contains saved values, they are used at runtime.
 
 #ifndef WIFI_SSID
-  #ifdef BUILD_WIFI_SSID
-    #define WIFI_SSID BUILD_WIFI_SSID
-  #else
-    #if defined(__has_include)
-      #if __has_include("Secrets.h")
-        #include "Secrets.h"
-      #endif
-    #endif
-    #ifndef WIFI_SSID
-      #define WIFI_SSID "<redacted>"
-    #endif
-  #endif
+  #define WIFI_SSID "your_ssid_here"
 #endif
 
 #ifndef WIFI_PASSWORD
-  #ifdef BUILD_WIFI_PASSWORD
-    #define WIFI_PASSWORD BUILD_WIFI_PASSWORD
-  #else
-    #if defined(__has_include)
-      #if __has_include("Secrets.h")
-        #include "Secrets.h"
-      #endif
-    #endif
-    #ifndef WIFI_PASSWORD
-      #define WIFI_PASSWORD "<redacted>"
-    #endif
-  #endif
+  #define WIFI_PASSWORD "your_password_here"
 #endif
 
 #define WEB_PORT            80

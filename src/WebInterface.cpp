@@ -1,6 +1,6 @@
 #include "WebInterface.h"
+#include "WifiManager.h"
 #include <ArduinoJson.h>
-#include <WiFi.h>
 #include "Diag.h"
 
 // The HTML file is embedded into the firmware binary at compile time.
@@ -18,32 +18,26 @@ extern const uint8_t script_js_end[]   asm("_binary_data_script_js_end");
 /**
  * @brief Construct web server and websocket instances.
  */
-WebInterface::WebInterface() : _server(WEB_PORT), _ws("/ws") {}
+WebInterface::WebInterface() : _server(WEB_PORT), _ws("/ws"), _wifiManager(nullptr) {}
 
 /**
  * @brief Initialize WiFi, routes and websocket server.
  */
 void WebInterface::begin() {
-    // Attempt WiFi connection with up to 20 retries (10 seconds total).
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.print("[WiFi] Connecting");
-
-    uint8_t tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 20) {
-        delay(500);
-        Serial.print(".");
-        tries++;
+    if (!_wifiManager) {
+        Diag::error("[Web] WifiManager not set, cannot start WiFi");
+        return;
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-        // WiFi failure is non-fatal: the motor still works via the potentiometer.
-        Diag::error("\n[WiFi] Failed — web interface disabled. Motor still works.");
+    _wifiManager->begin();
+
+    if (!_wifiManager->isConnected()) {
+        Diag::error("[Web] WiFi not connected; web interface disabled.");
         return;
     }
 
     _wifiOk = true;
-    Diag::infof("\n[WiFi] Connected — IP: %s",
-            WiFi.localIP().toString().c_str());
+    Diag::infof("[Web] WiFi connected, IP %s", _wifiManager->getIP().c_str());
 
     // Register the WebSocket event handler using a lambda to forward calls
     // to the private _onWsEvent method (captures `this`).
@@ -145,7 +139,11 @@ void WebInterface::setRecipeProvider(RecipeJsonProvider cb) {
 
 /** @brief Return local IP string when connected, otherwise `N/A`. */
 String WebInterface::getIP() const {
-    return _wifiOk ? WiFi.localIP().toString() : "N/A";
+    return _wifiManager ? _wifiManager->getIP() : String("N/A");
+}
+
+void WebInterface::setWifiManager(WifiManager* manager) {
+    _wifiManager = manager;
 }
 
 /**
