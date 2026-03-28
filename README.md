@@ -138,8 +138,9 @@ The following constants can be tuned in `include/Config.h` and related headers:
 - `STEP_PIN_LAT`, `DIR_PIN_LAT`, `ENABLE_PIN_LAT`: lateral carriage stepper pins.
 - `HOME_PIN_NO`, `HOME_PIN_NC`: homing switches.
 - `ENC1_CLK`, `ENC1_DT`: encoder signals for manual trim in PAUSED mode.
-- `POT_PIN`, `POT_INVERTED`: speed potentiometer input.
+- `POT_PIN`, `POT_INVERTED`: speed potentiometer input and inversion flag.
 - `FOOTSWITCH_PIN`, `FOOTSWITCH_ACTIVE_LOW`: physical footswitch pin/polarity.
+- `STEP_PIN`, `DIR_PIN`, `ENABLE_PIN`: stepper pins (swap `DIR_PIN` signal to invert motor direction)
 - `MICROSTEPPING`: microstepping factor (32 by default).
 - `LAT_HOME_OFFSET_DEFAULT_MM`: carriage offset after homing.
 - `LAT_TRAVERSE_MM`: total lateral travel range used for calibration.
