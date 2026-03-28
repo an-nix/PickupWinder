@@ -118,8 +118,25 @@
 // Debounce time for mechanical contact stabilization.
 #define FOOTSWITCH_DEBOUNCE_MS 20
 
-#define WIFI_SSID "<redacted>"
-#define WIFI_PASSWORD "<redacted>"
+// Wi-Fi credential management.
+//
+// For security, define these in a local non-versioned file:
+//   include/Secrets.h
+// and exclude it from git via .gitignore.
+// If undefined, defaults are used for backward compatibility.
+
+#ifndef WIFI_SSID
+# include "Secrets.h"
+#endif
+
+#ifndef WIFI_SSID
+# define WIFI_SSID "meba"
+#endif
+
+#ifndef WIFI_PASSWORD
+# define WIFI_PASSWORD "welcome@th0me4.0"
+#endif
+
 #define WEB_PORT            80
 #define WS_UPDATE_MS        200     // WebSocket status update period in ms
 
