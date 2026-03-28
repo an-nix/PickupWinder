@@ -130,11 +130,11 @@
 #endif
 
 #ifndef WIFI_SSID
-# define WIFI_SSID "meba"
+# define WIFI_SSID "YOUR_WIFI_SSID"
 #endif
 
 #ifndef WIFI_PASSWORD
-# define WIFI_PASSWORD "welcome@th0me4.0"
+# define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #endif
 
 #define WEB_PORT            80
