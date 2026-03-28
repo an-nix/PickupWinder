@@ -388,12 +388,11 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 _passCount = 0;
                     _pausedAtReversal = false;
 
-                // Arm the reversal-slowdown window for the very first pass so the
-                // main motor is throttled while the carriage accelerates from rest,
-                // just like every subsequent reversal.  Without this, the first pass
-                // (always starting from the high bound after VERIFY_HIGH) would lay
-                // wire at double density in the first ~0.01 mm near that bound.
-                _onReversal();
+                // Previously we armed the reversal slowdown window for the very
+                // first pass to throttle the spindle while the carriage
+                // accelerated. That caused an immediate half-speed plateau on
+                // startup in some setups. Skip the initial throttle and only
+                // apply reversal slowdown on actual reversal events.
 
                 _stepper->setSpeedInHz(_latHz);
                 _stepper->applySpeedAcceleration();

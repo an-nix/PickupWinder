@@ -69,10 +69,24 @@ void StepperController::start(bool forward) {
     // workaround is no longer needed because setSpeedHz() now avoids applying a
     // live speed change when the motor is stopped.
     _stepper->setSpeedInHz(_speedHz);
+    // Diagnostic logging: sample actuator speed for a short window after
+    // starting so we can observe any transient plateau before reaching the
+    // configured target. These logs are lightweight and intended for
+    // troubleshooting; remove them once the root cause is identified.
+    Diag::infof("[Stepper] start(): targetHz=%u driverEnabled=%d", _speedHz, (int)_driverEnabled);
+    _stepper->applySpeedAcceleration();
     if (forward)
         _stepper->runForward();
     else
         _stepper->runBackward();
+
+    // Sample current speed (milliHz) a few times immediately after start.
+    // This helps reveal transient plateaus produced by the driver/library.
+    for (int i = 0; i < 5; ++i) {
+        int32_t mhz = _stepper->getCurrentSpeedInMilliHz();
+        Diag::infof("[Stepper] post-start sample %d: speed_mHz=%ld (%.3f Hz)", i, (long)mhz, (float)mhz / 1000.0f);
+        delay(10);
+    }
 }
 
 /** @brief Request controlled stop (deceleration ramp). */
