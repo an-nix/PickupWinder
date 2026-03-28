@@ -102,6 +102,34 @@ ESP32/PlatformIO pickup winding controller with:
 - recipe persistence in NVS
 - predictive final-position handling
 
+## Hardware pinout
+
+This project uses the following pins on an ESP32:
+
+```
+   +-------------------+    
+   |  ESP32            |    
+   |                   |    
+   |  D26  STEP        |--> Spindle stepper STEP
+   |  D27  DIR         |--> Spindle stepper DIR
+   |  D14  ENABLE      |--> Spindle stepper ENABLE (LOW = on)
+   |                   |    
+   |  D32  STEP_LAT    |--> Lateral stepper STEP
+   |  D33  DIR_LAT     |--> Lateral stepper DIR
+   |  D25  ENABLE_LAT  |--> Lateral stepper ENABLE (LOW = on)
+   |                   |    
+   |  D23  HOME_NO     |--> Lateral home sensor NO
+   |  D22  HOME_NC     |--> Lateral home sensor NC
+   |                   |    
+   |  D19  ENC1_CLK    |--> Encoder A
+   |  D18  ENC1_DT     |--> Encoder B
+   |                   |    
+   |  D34  POT        |--> Potentiometer ADC (speed control)
+   |  D13  FOOTSWITCH |--> Footswitch input
+   |  D02  LED        |--> Status LED
+   +-------------------+
+```
+
 ## Web UI overview
 
 The web UI is split into two tabs:
