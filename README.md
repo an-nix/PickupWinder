@@ -2,7 +2,66 @@
 
 ESP32/PlatformIO pickup winding controller with:
 
+- winding motor speed control from potentiometer
+- lateral carriage homing and synchronized traverse
+- web UI (browser)
+- window shift & trim controls in run mode
+- session pause/resume and target tracking
+- recipe persistence in NVS
+- safe Wi-Fi credential handling for CI
+
+## Quickstart
+
+1. Install PlatformIO and dependencies.
+2. Open repository and build with `platformio run`.
+3. Flash with `platformio run --target upload`.
+4. Connect to device Wi-Fi or set your own in `include/Secrets.h`.
+5. Open http://<device-ip>/ in browser.
+
 ## Secure Wi-Fi config for CI
+
+This project can load Wi-Fi credentials from multiple sources:
+
+1. Build-time defines (preferred for CI):
+   - `BUILD_WIFI_SSID` (e.g. `-D BUILD_WIFI_SSID=\"mi-ssid\"`)
+   - `BUILD_WIFI_PASSWORD` (e.g. `-D BUILD_WIFI_PASSWORD=\"mi-password\"`)
+2. Optional local `include/Secrets.h` (ignored by git via `.gitignore`).
+3. Fallback placeholders (`<redacted>`) to prevent hard-coding unsafe values.
+
+Example PlatformIO command in CI:
+
+```bash
+platformio run -e esp32dev \
+  -D BUILD_WIFI_SSID=\"your_ssid\" \
+  -D BUILD_WIFI_PASSWORD=\"your_password\"
+```
+
+If using local development:
+
+```cpp
+// include/Secrets.h
+#define WIFI_SSID "your_ssid"
+#define WIFI_PASSWORD "your_password"
+```
+
+The file is in `.gitignore` so it won’t be stored in the repo.
+
+## Build and flash (local)
+
+```bash
+platformio run -e esp32dev
+platformio run -e esp32dev --target upload
+```
+
+## Runtime modes
+
+- `IDLE`
+- `PAUSED`
+- `WINDING`
+- `TARGET_REACHED`
+ - `RODAGE` (break-in)
+
+## Web UI overview
 
 This project can load Wi-Fi credentials from multiple sources:
 
