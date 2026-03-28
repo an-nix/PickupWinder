@@ -2,7 +2,66 @@
 
 ESP32/PlatformIO pickup winding controller with:
 
+- winding motor speed control from potentiometer
+- lateral carriage homing and synchronized traverse
+- web UI (browser)
+- window shift & trim controls in run mode
+- session pause/resume and target tracking
+- recipe persistence in NVS
+- safe Wi-Fi credential handling for CI
+
+## Quickstart
+
+1. Install PlatformIO and dependencies.
+2. Open repository and build with `platformio run`.
+3. Flash with `platformio run --target upload`.
+4. Connect to device Wi-Fi or set your own in `include/Secrets.h`.
+5. Open http://<device-ip>/ in browser.
+
 ## Secure Wi-Fi config for CI
+
+This project can load Wi-Fi credentials from multiple sources:
+
+1. Build-time defines (preferred for CI):
+   - `BUILD_WIFI_SSID` (e.g. `-D BUILD_WIFI_SSID=\"mi-ssid\"`)
+   - `BUILD_WIFI_PASSWORD` (e.g. `-D BUILD_WIFI_PASSWORD=\"mi-password\"`)
+2. Optional local `include/Secrets.h` (ignored by git via `.gitignore`).
+3. Fallback placeholders (`<redacted>`) to prevent hard-coding unsafe values.
+
+Example PlatformIO command in CI:
+
+```bash
+platformio run -e esp32dev \
+  -D BUILD_WIFI_SSID=\"your_ssid\" \
+  -D BUILD_WIFI_PASSWORD=\"your_password\"
+```
+
+If using local development:
+
+```cpp
+// include/Secrets.h
+#define WIFI_SSID "your_ssid"
+#define WIFI_PASSWORD "your_password"
+```
+
+The file is in `.gitignore` so it won’t be stored in the repo.
+
+## Build and flash (local)
+
+```bash
+platformio run -e esp32dev
+platformio run -e esp32dev --target upload
+```
+
+## Runtime modes
+
+- `IDLE`
+- `PAUSED`
+- `WINDING`
+- `TARGET_REACHED`
+ - `RODAGE` (break-in)
+
+## Web UI overview
 
 This project can load Wi-Fi credentials from multiple sources:
 
@@ -42,6 +101,65 @@ ESP32/PlatformIO pickup winding controller with:
 - lateral-axis break-in mode
 - recipe persistence in NVS
 - predictive final-position handling
+
+## Hardware pinout
+
+This project uses the following pins on an ESP32:
+
+```
+   +-------------------+    
+   |  ESP32            |    
+   |                   |    
+   |  D26  STEP        |--> Spindle stepper STEP
+   |  D27  DIR         |--> Spindle stepper DIR
+   |  D14  ENABLE      |--> Spindle stepper ENABLE (LOW = on)
+   |                   |    
+   |  D32  STEP_LAT    |--> Lateral stepper STEP
+   |  D33  DIR_LAT     |--> Lateral stepper DIR
+   |  D25  ENABLE_LAT  |--> Lateral stepper ENABLE (LOW = on)
+   |                   |    
+   |  D23  HOME_NO     |--> Lateral home sensor NO
+   |  D22  HOME_NC     |--> Lateral home sensor NC
+   |                   |    
+   |  D19  ENC1_CLK    |--> Encoder A
+   |  D18  ENC1_DT     |--> Encoder B
+   |                   |    
+   |  D34  POT        |--> Potentiometer ADC (speed control)
+   |  D13  FOOTSWITCH |--> Footswitch input
+   |  D02  LED        |--> Status LED
+   +-------------------+
+```
+
+## Variable machine parameters
+
+The following constants can be tuned in `include/Config.h` and related headers:
+
+- `STEP_PIN`, `DIR_PIN`, `ENABLE_PIN`: main spindle stepper pins.
+- `STEP_PIN_LAT`, `DIR_PIN_LAT`, `ENABLE_PIN_LAT`: lateral carriage stepper pins.
+- `HOME_PIN_NO`, `HOME_PIN_NC`: homing switches.
+- `ENC1_CLK`, `ENC1_DT`: encoder signals for manual trim in PAUSED mode.
+- `POT_PIN`, `POT_INVERTED`: speed potentiometer input and inversion flag.
+- `FOOTSWITCH_PIN`, `FOOTSWITCH_ACTIVE_LOW`: physical footswitch pin/polarity.
+- `STEP_PIN`, `DIR_PIN`, `ENABLE_PIN`: stepper pins (swap `DIR_PIN` signal to invert motor direction)
+- `MICROSTEPPING`: microstepping factor (32 by default).
+- `LAT_HOME_OFFSET_DEFAULT_MM`: carriage offset after homing.
+- `LAT_TRAVERSE_MM`: total lateral travel range used for calibration.
+- `LAT_ACCEL`, `LAT_HOME_SPEED_HZ`, `LAT_TRAVERSE_SPEED_HZ`: lateral motor motion profile.
+
+### Axis geometry and drive ratio
+
+- `LAT_MOTOR_STEPS` and `MICROSTEPPING` define the steps/mm for lateral movement.
+- For 1 mm screw pitch and 96-step motor:
+  - `LAT_STEPS_PER_MM = LAT_MOTOR_STEPS * MICROSTEPPING` (default 3072).
+- Adjust `MICROSTEPPING` and mechanical setup as needed for your specific carriage.
+
+### Winding geometry
+
+Variable in `include/WindingGeometry.h` and runtime commands:
+- `totalWidth_mm`, `flangeBottom_mm`, `flangeTop_mm`, `margin_mm`
+- `windingStartTrim_mm`, `windingEndTrim_mm`
+- `wireDiameter_mm` (used for TPP calculations)
+- UI controls under **Configuration** > **Geometry** reflect these.
 
 ## Web UI overview
 
