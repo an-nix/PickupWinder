@@ -130,6 +130,36 @@ This project uses the following pins on an ESP32:
    +-------------------+
 ```
 
+## Variable machine parameters
+
+The following constants can be tuned in `include/Config.h` and related headers:
+
+- `STEP_PIN`, `DIR_PIN`, `ENABLE_PIN`: main spindle stepper pins.
+- `STEP_PIN_LAT`, `DIR_PIN_LAT`, `ENABLE_PIN_LAT`: lateral carriage stepper pins.
+- `HOME_PIN_NO`, `HOME_PIN_NC`: homing switches.
+- `ENC1_CLK`, `ENC1_DT`: encoder signals for manual trim in PAUSED mode.
+- `POT_PIN`, `POT_INVERTED`: speed potentiometer input.
+- `FOOTSWITCH_PIN`, `FOOTSWITCH_ACTIVE_LOW`: physical footswitch pin/polarity.
+- `MICROSTEPPING`: microstepping factor (32 by default).
+- `LAT_HOME_OFFSET_DEFAULT_MM`: carriage offset after homing.
+- `LAT_TRAVERSE_MM`: total lateral travel range used for calibration.
+- `LAT_ACCEL`, `LAT_HOME_SPEED_HZ`, `LAT_TRAVERSE_SPEED_HZ`: lateral motor motion profile.
+
+### Axis geometry and drive ratio
+
+- `LAT_MOTOR_STEPS` and `MICROSTEPPING` define the steps/mm for lateral movement.
+- For 1 mm screw pitch and 96-step motor:
+  - `LAT_STEPS_PER_MM = LAT_MOTOR_STEPS * MICROSTEPPING` (default 3072).
+- Adjust `MICROSTEPPING` and mechanical setup as needed for your specific carriage.
+
+### Winding geometry
+
+Variable in `include/WindingGeometry.h` and runtime commands:
+- `totalWidth_mm`, `flangeBottom_mm`, `flangeTop_mm`, `margin_mm`
+- `windingStartTrim_mm`, `windingEndTrim_mm`
+- `wireDiameter_mm` (used for TPP calculations)
+- UI controls under **Configuration** > **Geometry** reflect these.
+
 ## Web UI overview
 
 The web UI is split into two tabs:
