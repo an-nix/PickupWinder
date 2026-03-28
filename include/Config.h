@@ -13,6 +13,9 @@
 
 #define LED_PIN             2       // Pass indicator LED, mapped to the on-board LED on GPIO 2
 
+// Wi-Fi credential policy is managed in WifiConfig.h
+#include "WifiConfig.h"
+
 // ── Rotary encoder ───────────────────────────────────────
 // Both pins support interrupts and internal pull-ups.
 // GPIO 18/19 are dedicated to the encoder; 22/23 are used by the lateral home sensor.
