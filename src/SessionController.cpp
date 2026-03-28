@@ -22,6 +22,15 @@ SessionController::SessionController(WinderApp& winder)
 // -----------------------------------------------------------------------------
 void SessionController::recordIntent(ControlIntent intent, InputSource src) {
     // Last event always overrides any previous pending intent.
+    // If we're IDLE, only accept an explicit Start from the UI. Reject any
+    // Start intents originating from Pot or Footswitch to avoid accidental
+    // validation while idle.
+    if (intent == ControlIntent::Start && _sessionState == SessionState::IDLE
+        && src != InputSource::IHM) {
+        Diag::infof("[Session] recordIntent: rejected non-UI Start while IDLE (src=%d)", (int)src);
+        return;
+    }
+
     _pendingControlIntent = intent; // Store the latest intent to apply.
     _pendingIntentSource = src;     // Remember who produced that intent.
     _lastEventSource = src;         // Keep latest observed input source for diagnostics.
@@ -41,13 +50,9 @@ void SessionController::recordIntent(ControlIntent intent, InputSource src) {
         case InputSource::Footswitch: srcName = "Footswitch"; break;
         default: break;
     }
-    // Reduce chatter: only log non-pot events (UI/footswitch) which are more
-    // informative for debugging; pot-level changes are frequent and not helpful
-    // in normal operation.
-    if (src != InputSource::Pot) {
-        Diag::infof("[Session] recordIntent intent=%s src=%s pot=%.3f potNeedsRearm=%d",
-                    intentName, srcName, _potLevel, _potNeedsRearm);
-    }
+    // Log all intent observations for debugging the start/arm flow.
+    Diag::infof("[Session] recordIntent observed intent=%s src=%s pot=%.3f potNeedsRearm=%d session=%d",
+                intentName, srcName, _potLevel, _potNeedsRearm, (int)_sessionState);
 
     // If another source takes control while pot is non-zero, require a pot
     // return-to-zero before pot can start the machine again.
@@ -80,8 +85,20 @@ void SessionController::applyPendingIntent() {
         break;
 
     case ControlIntent::Start:
-        // Always forward explicit Start intents to WinderApp so UI/footswitch can
-        // resume from PAUSED even if the session is already marked ARMED_OR_RUNNING.
+        // If we're currently IDLE, require an explicit UI start: ignore Start
+        // intents coming from Pot or Footswitch to avoid accidental validation
+        // when the user is only adjusting controls.
+        if (_sessionState == SessionState::IDLE && src != InputSource::IHM) {
+            Diag::infof("[Session] Ignoring non-UI Start while IDLE (src=%d)", (int)src);
+            break; // Do not transition out of IDLE
+        }
+
+        // Diagnostic: log intent application for tracing race conditions.
+        Diag::infof("[Session] applyPendingIntent applying Start src=%d sessionBefore=%d",
+                (int)src, (int)_sessionState);
+
+        // Forward Start intents to WinderApp so UI/footswitch can resume from
+        // PAUSED or re-arm the session when appropriate.
         _winder.handleCommand("start", "");
         _sessionState = SessionState::ARMED_OR_RUNNING;
         _appliedSource = src;
@@ -225,11 +242,17 @@ void SessionController::tick(const TickInput& in) {
             } else if (potAboveZero != _potAboveZero) {
                 _potAboveZero = potAboveZero;
 
-                if (!potAboveZero) {
-                    _potNeedsRearm = false;
-                    recordIntent(ControlIntent::Pause, InputSource::Pot);
-                } else if (!_potNeedsRearm) {
-                    recordIntent(ControlIntent::Start, InputSource::Pot);
+                // When IDLE, do not emit pot-derived intents — just update baseline
+                // so moving the pot doesn't arm or pause the session unexpectedly.
+                if (_sessionState == SessionState::IDLE) {
+                    Diag::infof("[Session] Ignoring pot event while IDLE (aboveZero=%d)", (int)potAboveZero);
+                } else {
+                    if (!potAboveZero) {
+                        _potNeedsRearm = false;
+                        recordIntent(ControlIntent::Pause, InputSource::Pot);
+                    } else if (!_potNeedsRearm) {
+                        recordIntent(ControlIntent::Start, InputSource::Pot);
+                    }
                 }
             }
 
@@ -240,11 +263,21 @@ void SessionController::tick(const TickInput& in) {
         }
     // 2) Integrate footswitch edge events.
     if (in.hasFootswitch) {
-        if (!_hasFootswitchSample || _footswitch != in.footswitch) {
-            _hasFootswitchSample = true; // Baseline becomes valid after first sample.
-            _footswitch = in.footswitch; // Store latest footswitch state.
-            recordIntent(_footswitch ? ControlIntent::Start : ControlIntent::Pause,
-                InputSource::Footswitch); // Press->start, release->pause.
+        // Establish baseline on first sample and skip intent emission while IDLE
+        // so that release (and its Pause) cannot flip the session into PAUSED
+        // causing the next press to be accepted. While IDLE we simply sample
+        // the input without producing intents.
+        if (!_hasFootswitchSample) {
+            _hasFootswitchSample = true;
+            _footswitch = in.footswitch;
+        } else if (_footswitch != in.footswitch) {
+            _footswitch = in.footswitch; // update latest state
+            if (_sessionState == SessionState::IDLE) {
+                Diag::infof("[Session] Ignoring footswitch event while IDLE (pressed=%d)", (int)_footswitch);
+            } else {
+                recordIntent(_footswitch ? ControlIntent::Start : ControlIntent::Pause,
+                             InputSource::Footswitch); // Press->start, release->pause.
+            }
         }
     }
 
