@@ -11,6 +11,21 @@ ESP32/PlatformIO pickup winding controller with:
 - recipe persistence in NVS
 - predictive final-position handling
 
+## Wi-Fi configuration (secure)
+
+To avoid embedding credentials in source code, Wi-Fi credentials are now stored in a local file:
+
+- `include/Secrets.h` (ignored by git via `.gitignore`)
+
+Add your network values there:
+
+```cpp
+#define WIFI_SSID "your_ssid_here"
+#define WIFI_PASSWORD "your_password_here"
+```
+
+The code falls back to defaults in `include/Config.h` only if `Secrets.h` does not define them.
+
 ## Web UI overview
 
 The web UI is split into two tabs:
