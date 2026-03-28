@@ -121,8 +121,6 @@
 // Debounce time for mechanical contact stabilization.
 #define FOOTSWITCH_DEBOUNCE_MS 20
 
-// Wi-Fi credential policy is located in WifiConfig.h
-#include "WifiConfig.h"
 
 #define WEB_PORT            80
 #define WS_UPDATE_MS        200     // WebSocket status update period in ms
