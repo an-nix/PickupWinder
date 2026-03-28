@@ -26,6 +26,7 @@
 #include <freertos/semphr.h>
 
 // ── Subsystem instances ───────────────────────────────────────────────────────
+static WifiManager      wifiManager;
 static WebInterface    web;
 static LinkSerial      serialLink;
 static WinderApp       winder;
@@ -141,6 +142,7 @@ void setup() {
 
     // Initialize subsystems (all on Arduino core before tasks start)
     control.begin();
+    web.setWifiManager(&wifiManager);
     web.begin();
     serialLink.begin();
     winder.begin();

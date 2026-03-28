@@ -15,36 +15,39 @@ ESP32/PlatformIO pickup winding controller with:
 1. Install PlatformIO and dependencies.
 2. Open repository and build with `platformio run`.
 3. Flash with `platformio run --target upload`.
-4. Connect to device Wi-Fi or set your own in `include/Secrets.h`.
+4. Connect to device Wi-Fi or set your own in `include/Config.h`.
 5. Open http://<device-ip>/ in browser.
 
 ## Secure Wi-Fi config for CI
 
-This project can load Wi-Fi credentials from multiple sources:
+Wi-Fi credential resolution behavior:
 
-1. Build-time defines (preferred for CI):
-   - `BUILD_WIFI_SSID` (e.g. `-D BUILD_WIFI_SSID=\"mi-ssid\"`)
-   - `BUILD_WIFI_PASSWORD` (e.g. `-D BUILD_WIFI_PASSWORD=\"mi-password\"`)
-2. Optional local `include/Secrets.h` (ignored by git via `.gitignore`).
-3. Fallback placeholders (`<redacted>`) to prevent hard-coding unsafe values.
+1. Try NVS credentials (namespace `wifi`, keys `ssid` + `pwd`).
+2. If NVS exists, use it; if config `WIFI_SSID`/`WIFI_PASSWORD` are non-default and differ from NVS, persist new values to NVS (overwrite) then use them.
+3. If no NVS exists:
+   - if config `WIFI_SSID`/`WIFI_PASSWORD` are default placeholders (`your_ssid_here` / `your_password_here`) or empty: Wi-Fi does not start.
+   - else persist config values to NVS and use them.
 
-Example PlatformIO command in CI:
+This is implemented in `src/WifiManager.cpp` and used by `src/WebInterface.cpp`.
 
-```bash
-platformio run -e esp32dev \
-  -D BUILD_WIFI_SSID=\"your_ssid\" \
-  -D BUILD_WIFI_PASSWORD=\"your_password\"
-```
+### Decoupled WiFi service
 
-If using local development:
+`WebInterface` uses `WifiManager` as a dependency for connectivity. This keeps WiFi/NVS handling independent from WebSocket/HTTP routing, allowing future non-web consumers to reuse WiFi.
 
-```cpp
-// include/Secrets.h
-#define WIFI_SSID "your_ssid"
-#define WIFI_PASSWORD "your_password"
-```
+### Runtime NVS (post-flash, without rebuild)
 
-The file is in `.gitignore` so it won’t be stored in the repo.
+At startup, the firmware checks NVS namespace `wifi` for stored credentials:
+
+- If NVS contains `ssid` and `pwd`, they are used.
+- Otherwise `WIFI_SSID` / `WIFI_PASSWORD` from `include/Config.h` are used.
+- Upload via `cmd('wifi_set', 'ssid|password')` updates NVS.
+- If new values are identical to existing NVS values, write is skipped (idempotent).
+Runtime update command:
+
+`cmd('wifi_set', 'ssid|password')`
+
+- Saves to NVS keys `ssid` and `pwd` in namespace `wifi`.
+- Effective on next reboot.
 
 ## Build and flash (local)
 
