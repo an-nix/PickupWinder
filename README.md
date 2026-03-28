@@ -2,6 +2,38 @@
 
 ESP32/PlatformIO pickup winding controller with:
 
+## Secure Wi-Fi config for CI
+
+This project can load Wi-Fi credentials from multiple sources:
+
+1. Build-time defines (preferred for CI):
+   - `BUILD_WIFI_SSID` (e.g. `-D BUILD_WIFI_SSID=\"mi-ssid\"`)
+   - `BUILD_WIFI_PASSWORD` (e.g. `-D BUILD_WIFI_PASSWORD=\"mi-password\"`)
+2. Optional local `include/Secrets.h` (ignored by git via `.gitignore`).
+3. Fallback placeholders (`<redacted>`) to prevent hard-coding unsafe values.
+
+Example PlatformIO command in CI:
+
+```bash
+platformio run -e esp32dev \
+  -D BUILD_WIFI_SSID=\"your_ssid\" \
+  -D BUILD_WIFI_PASSWORD=\"your_password\"
+```
+
+If using local development:
+
+```cpp
+// include/Secrets.h
+#define WIFI_SSID "your_ssid"
+#define WIFI_PASSWORD "your_password"
+```
+
+The file is in `.gitignore` so it won’t be stored in the repo.
+
+# PickupWinder
+
+ESP32/PlatformIO pickup winding controller with:
+
 - winding motor speed control from potentiometer
 - lateral carriage homing and synchronized traverse
 - web UI
