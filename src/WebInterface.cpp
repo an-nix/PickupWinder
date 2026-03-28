@@ -170,6 +170,7 @@ void WebInterface::_onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* clie
 
     // Forward to the registered command handler (WinderApp::_handleCommand).
     if (cmd.length() > 0 && _callback) {
+        Diag::infof("[WS-CMD] cmd='%s' val='%s'", cmd.c_str(), val.c_str());
         _callback(cmd, val);
     }
 }

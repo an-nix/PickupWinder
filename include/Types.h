@@ -91,7 +91,7 @@ struct WinderStatus {
 
 // Bounded command entry for embedded-friendly command passing (no dynamic alloc)
 struct CommandEntry {
-    static constexpr size_t CMD_SZ = 16;
+    static constexpr size_t CMD_SZ = 32;  // Long enough for window_shift_nudge, geom_*_nudge, etc.
     static constexpr size_t VAL_SZ = 48;
     char cmd[CMD_SZ];
     char val[VAL_SZ];

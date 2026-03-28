@@ -69,12 +69,21 @@
         </div>
       </div>
       <div class="ctx-section">
-        <span class="ctx-title">Window shift</span>
+        <span class="ctx-title">Window shift (global)</span>
         <div class="row4">
           <button class="btn btn-neutral btn-s" onclick="cmd('window_shift_nudge','-0.10')">◀ .10</button>
           <button class="btn btn-neutral btn-s" onclick="cmd('window_shift_nudge','-0.05')">◁ .05</button>
           <button class="btn btn-neutral btn-s" onclick="cmd('window_shift_nudge','0.05')">.05 ▷</button>
           <button class="btn btn-neutral btn-s" onclick="cmd('window_shift_nudge','0.10')">.10 ▶</button>
+        </div>
+      </div>
+      <div class="ctx-section">
+        <span class="ctx-title">Start / End trim</span>
+        <div class="row4">
+          <button class="btn btn-neutral btn-s" onclick="cmd('geom_start_trim_nudge','-0.10')">◀ Low</button>
+          <button class="btn btn-neutral btn-s" onclick="cmd('geom_start_trim_nudge','0.10')">Low ▶</button>
+          <button class="btn btn-neutral btn-s" onclick="cmd('geom_end_trim_nudge','-0.10')">◀ High</button>
+          <button class="btn btn-neutral btn-s" onclick="cmd('geom_end_trim_nudge','0.10')">High ▶</button>
         </div>
       </div>
       <div class="ctx-section">

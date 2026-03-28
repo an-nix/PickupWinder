@@ -368,6 +368,7 @@ WinderStatus WinderApp::getStatus() const {
     const bool sessionActive = (_state != WindingState::IDLE);
     const bool motorEnabled  = (_state == WindingState::WINDING);
 
+    // (debug trim log déplacé dans _handleGeometryCommand)
     return {
         _stepper.getRPM(),
         _stepper.getSpeedHz(),
@@ -429,8 +430,14 @@ String WinderApp::recipeJson() const {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void WinderApp::_refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged) {
-    if (_stepper.isRunning()) return;
     if (!_lateral.isHomed() || _lateral.isBusy()) return;
+
+    if (_stepper.isRunning()) {
+        // While winding, the geometry update is applied to the target window,
+        // and lateral traversal will use the new window bounds on the next tick.
+        Diag::info("[WINDOW_SHIFT] Running — geometry updated, reposition deferred");
+        return;
+    }
 
     switch (_state) {
     case WindingState::PAUSED:
@@ -441,6 +448,12 @@ void WinderApp::_refreshCarriageForGeometryChange(bool startBoundChanged, bool e
             _lateral.prepareStartPosition(_windingEndMm());
         }
         break;
+
+    case WindingState::TARGET_REACHED:
+    case WindingState::IDLE:
+        // When idle/target reached, change will take effect at next start.
+        break;
+
     default:
         break;
     }
@@ -656,61 +669,46 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
         return true;
     }
 
-    if (cmd == "window_shift") {
-        float delta = constrain(value.toFloat(), -5.0f, 5.0f);
-        _geom.windingStartTrim_mm = constrain(_geom.windingStartTrim_mm + delta, -5.0f, 5.0f);
-        _geom.windingEndTrim_mm   = constrain(_geom.windingEndTrim_mm   + delta, -5.0f, 5.0f);
-        _refreshCarriageForGeometryChange(true, true);
-        _saveRecipe();
-        Diag::infof("[WINDOW_SHIFT] %.2f mm -> fenetre [%.2f -> %.2f mm]",
-            delta, _windingStartMm(), _windingEndMm());
-        return true;
-    }
+    auto applyTrimShift = [&](float dStart, float dEnd, const char* label) {
+        float prevStart = _geom.windingStartTrim_mm;
+        float prevEnd   = _geom.windingEndTrim_mm;
+        _geom.windingStartTrim_mm = constrain(prevStart + dStart, -5.0f, 5.0f);
+        _geom.windingEndTrim_mm   = constrain(prevEnd   + dEnd,   -5.0f, 5.0f);
 
-    if (cmd == "window_shift_nudge") {
-        float delta = constrain(value.toFloat(), -1.0f, 1.0f);
-        _geom.windingStartTrim_mm = constrain(_geom.windingStartTrim_mm + delta, -5.0f, 5.0f);
-        _geom.windingEndTrim_mm   = constrain(_geom.windingEndTrim_mm   + delta, -5.0f, 5.0f);
-        _refreshCarriageForGeometryChange(true, true);
+        // Harmony with window_shift: update geometry values and defer carriage readjust
+        // to _refreshCarriageForGeometryChange.
+        _refreshCarriageForGeometryChange(dStart != 0.0f, dEnd != 0.0f);
         _saveRecipe();
-        Diag::infof("[WINDOW_SHIFT] Nudge %.2f mm -> fenetre [%.2f -> %.2f mm]",
-            delta, _windingStartMm(), _windingEndMm());
+
+        Diag::infof("[%s] startTrim old=%.3f -> new=%.3f endTrim old=%.3f -> new=%.3f",
+            label,
+            prevStart, _geom.windingStartTrim_mm,
+            prevEnd,   _geom.windingEndTrim_mm);
+    };
+
+    auto isWindowShift = [&](const String &key) {
+        return key == "window_shift" || key == "windows_shift" || key.startsWith("window_shift");
+    };
+
+    if (isWindowShift(cmd)) {
+        float delta = constrain(value.toFloat(), -5.0f, 5.0f);
+        if (cmd.indexOf("nudge") != -1) delta = constrain(delta, -1.0f, 1.0f);
+
+        applyTrimShift(delta, delta, "WINDOW_SHIFT");
         return true;
     }
 
     if (cmd == "geom_start_trim_nudge") {
-        if (_state != WindingState::PAUSED) {
-            Diag::info("[geom_start_trim_nudge] Ignored — only available while paused near bound");
-            return true;
-        }
-        if (_lateral.isBusy() || fabsf(_lateral.getCurrentPositionMm() - _windingStartMm()) > 0.50f) {
-            Diag::info("[geom_start_trim_nudge] Ignored — carriage is not settled on the low bound");
-            return true;
-        }
         float delta = constrain(value.toFloat(), -1.0f, 1.0f);
-        _lateral.jog(delta);
-        float newPos = _lateral.getTargetPositionMm();
-        _geom.windingStartTrim_mm = constrain(
-            newPos - (_geom.flangeBottom_mm + _geom.margin_mm), -5.0f, 5.0f);
-        _saveRecipe();
+        Diag::infof("[DEBUG] geom_start_trim_nudge: value=%.3f, prev=%.3f", delta, _geom.windingStartTrim_mm);
+        applyTrimShift(delta, 0.0f, "STRT_TRIM_NUDGE");
         return true;
     }
 
     if (cmd == "geom_end_trim_nudge") {
-        if (_state != WindingState::PAUSED) {
-            Diag::info("[geom_end_trim_nudge] Ignored — only available while paused near bound");
-            return true;
-        }
-        if (_lateral.isBusy() || fabsf(_lateral.getCurrentPositionMm() - _windingEndMm()) > 0.50f) {
-            Diag::info("[geom_end_trim_nudge] Ignored — carriage is not settled on the high bound");
-            return true;
-        }
         float delta = constrain(value.toFloat(), -1.0f, 1.0f);
-        _lateral.jog(delta);
-        float newPos = _lateral.getTargetPositionMm();
-        _geom.windingEndTrim_mm = constrain(
-            newPos - (_geom.totalWidth_mm - _geom.flangeTop_mm - _geom.margin_mm), -5.0f, 5.0f);
-        _saveRecipe();
+        Diag::infof("[DEBUG] geom_end_trim_nudge: value=%.3f, prev=%.3f", delta, _geom.windingEndTrim_mm);
+        applyTrimShift(0.0f, delta, "END_TRIM_NUDGE");
         return true;
     }
 
@@ -855,6 +853,8 @@ void WinderApp::handleEncoderDelta(int32_t delta) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void WinderApp::handleCommand(const String& cmd, const String& value) {
+    Diag::infof("[APP-CMD] cmd='%s' val='%s'", cmd.c_str(), value.c_str());
+
     if (_handleImmediateCommand(cmd, value)) return;
     if (_handleGeometryCommand(cmd, value))  return;
 
