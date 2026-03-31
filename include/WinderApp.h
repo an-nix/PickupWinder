@@ -50,7 +50,7 @@ public:
     void stopWinding() { _toIdle(); }
 
     /** @brief Dispatch a user or transport command into the winding domain. */
-    void handleCommand(const String& cmd, const String& value);
+    void handleCommand(const char* cmd, const char* value);
 
     /** @brief Apply one encoder delta to the interactive trim logic. */
     void handleEncoderDelta(int32_t delta);
@@ -58,8 +58,8 @@ public:
     /** @brief Build a snapshot of all UI-facing status fields. */
     WinderStatus getStatus() const;
 
-    /** @brief Serialize the active recipe to JSON. */
-    String recipeJson() const;
+    /** @brief Serialize the active recipe to JSON into caller buffer. */
+    void recipeJson(char* buf, size_t len) const;
 
 private:
     // ── Hardware subsystems ──
@@ -84,12 +84,7 @@ private:
     bool _pendingDisable = false;   // Deferred driver disable after stop
     volatile bool _pauseRequested = false; // Cross-task pause request, consumed in tick()
 
-    // ── Burst mode (non-persistent, user-settable) ──
-    bool _burstEnabled = false;          // checkbox in setup (When true, next start is burst)
-    bool _burstActive = false;           // internal running burst state
-    bool _burstCompleted = false;        // true after burst auto-stop until next explicit start
-    long _burstConfiguredTurns = 1;      // value settable in setup
-    long _burstTargetTurns = 0;          // absolute turn target for current burst
+    // Burst mode removed: simpler single-mode winding
 
     // ── Verify flags (modify startup, NOT separate states) ──
     bool _verifyLowPending  = false;  // Waiting for low-bound positioning
@@ -119,9 +114,9 @@ private:
 
     // ── Command handlers ──
     bool _parametersLocked() const { return _state != WindingState::IDLE; }
-    bool _handleImmediateCommand(const String& cmd, const String& value);
-    bool _handleGeometryCommand(const String& cmd, const String& value);
-    bool _handlePatternCommand(const String& cmd, const String& value);
+    bool _handleImmediateCommand(const char* cmd, const char* value);
+    bool _handleGeometryCommand(const char* cmd, const char* value);
+    bool _handlePatternCommand(const char* cmd, const char* value);
     void _refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged);
 
     // ── Recipe helpers ──
@@ -134,4 +129,11 @@ private:
     float  _rodageDistMm   = 80.0f;
     int    _rodagePassDone = 0;
     bool   _rodageFwd      = true;
+
+    // ── Calibration status (telemetry fields expected by WinderStatus)
+    bool   _calibInProgress       = false;
+    int    _calibCurrent          = 0;
+    int    _calibRepeats          = 0; // total repeats requested
+    float  _calibMeasuredTPP      = 0.0f;
+    long   _calibSuggestedOffset  = 0;
 };

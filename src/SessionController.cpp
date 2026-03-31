@@ -139,35 +139,35 @@ void SessionController::requestStop() {
 // -----------------------------------------------------------------------------
 // Command decoding
 // -----------------------------------------------------------------------------
-bool SessionController::handleCommand(const String& cmd, const String& value) {
+bool SessionController::handleCommand(const char* cmd, const char* value) {
     // Session lifecycle commands are converted to intents.
-    if (cmd == "start") {
+    if (strcmp(cmd, "start") == 0) {
         requestStart(); // Convert transport command into start intent.
         return true;    // Mark as consumed by SessionController.
     }
-    if (cmd == "pause") {
+    if (strcmp(cmd, "pause") == 0) {
         requestPause(); // Convert transport command into pause intent.
         return true;    // Mark as consumed by SessionController.
     }
-    if (cmd == "stop") {
+    if (strcmp(cmd, "stop") == 0) {
         requestStop(); // Convert transport command into stop intent.
         return true;   // Mark as consumed by SessionController.
     }
-    if (cmd == "target") {
-        long t = value.toInt();         // Parse new target turns.
+    if (strcmp(cmd, "target") == 0) {
+        long t = strtol(value, nullptr, 10);         // Parse new target turns.
         if (t > 0) _winder.setTargetTurns(t); // Apply only valid positive targets.
         return true;                    // Command handled at session/domain boundary.
     }
-    if (cmd == "freerun") {
-        _winder.setFreerun(value == "true"); // Map text flag to boolean mode.
+    if (strcmp(cmd, "freerun") == 0) {
+        _winder.setFreerun(strcmp(value, "true") == 0); // Map text flag to boolean mode.
         return true;                           // Command consumed.
     }
-    if (cmd == "direction") {
-        _winder.setDirection(value == "cw" ? Direction::CW : Direction::CCW); // Select spindle direction.
+    if (strcmp(cmd, "direction") == 0) {
+        _winder.setDirection(strcmp(value, "cw") == 0 ? Direction::CW : Direction::CCW); // Select spindle direction.
         return true; // Command consumed.
     }
-    if (cmd == "max_rpm" || cmd == "max-rpm") {
-        _winder.setMaxRpm((uint16_t)constrain(value.toInt(), 10, 1500)); // Clamp safe operating range.
+    if (strcmp(cmd, "max_rpm") == 0 || strcmp(cmd, "max-rpm") == 0) {
+        _winder.setMaxRpm((uint16_t)constrain((int)strtol(value, nullptr, 10), 10, 1500)); // Clamp safe operating range.
         return true; // Command consumed.
     }
 
@@ -285,11 +285,9 @@ void SessionController::tick(const TickInput& in) {
     for (int i = 0; i < in.cmdCount; ++i) {
         const char* c = in.commands[i].cmd; // Raw command key from queue.
         const char* v = in.commands[i].val; // Raw command value from queue.
-        String sc(c); // Build String view used by existing command handlers.
-        String sv(v); // Build String view used by existing command handlers.
         // Session-level commands handled here; others forwarded to WinderApp.
-        if (!handleCommand(sc, sv)) {
-            _winder.handleCommand(sc, sv); // Forward unknown session command.
+        if (!handleCommand(c, v)) {
+            _winder.handleCommand(c, v); // Forward unknown session command.
         }
     }
 

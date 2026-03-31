@@ -224,10 +224,10 @@ const char* WindingPatternPlanner::styleKey(WindingStyle style) {
  * Used when importing recipes from JSON (`WindingRecipeStore::fromJson`) and
  * when receiving pattern commands in `WinderApp::_handlePatternCommand()`.
  */
-WindingStyle WindingPatternPlanner::styleFromString(const String& value) {
+WindingStyle WindingPatternPlanner::styleFromString(const char* value) {
 	// Parse a style key string back into the enum. Unknown values default
 	// to `STRAIGHT` to ensure safe behavior.
-	if (value == "scatter") return WindingStyle::SCATTER;
-	if (value == "human")   return WindingStyle::HUMAN;
+	if (strcmp(value, "scatter") == 0) return WindingStyle::SCATTER;
+	if (strcmp(value, "human") == 0)   return WindingStyle::HUMAN;
 	return WindingStyle::STRAIGHT;
 }

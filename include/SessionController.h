@@ -101,12 +101,12 @@ public:
 
     /**
      * @brief Handle one textual command if it belongs to session scope.
-     * @param cmd Command key.
-     * @param value Command value payload.
+     * @param cmd Command key (null-terminated).
+     * @param value Command value payload (null-terminated).
      * @return true if consumed by `SessionController`, false if caller should
      *         forward to domain-specific handlers (e.g. `WinderApp`).
      */
-    bool handleCommand(const String& cmd, const String& value);
+    bool handleCommand(const char* cmd, const char* value);
 
     /**
      * @brief Run one session update cycle.

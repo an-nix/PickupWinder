@@ -7,10 +7,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void WinderApp::begin() {
-    _burstEnabled = false;
-    _burstActive = false;
-    _burstConfiguredTurns = 1;
-    _burstTargetTurns = 0;
+    // burst mode removed
 
     _recipeStore.begin();
     _recipe = _captureRecipe();
@@ -48,10 +45,7 @@ void WinderApp::_toIdle() {
     const WindingState prev = _state;
     _state              = WindingState::IDLE;
     _pendingDisable     = true;
-    _burstEnabled       = false;
-    _burstActive        = false;
-    _burstCompleted     = false;
-    _burstTargetTurns   = 0;
+    // burst mode removed
     _verifyLowPending   = false;
     _verifyHighPending  = false;
     _positioningToLow   = false;
@@ -198,12 +192,7 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
 
     // 1. Approach zone slowdown (near target)
     if (!_freerun && _stepper.isRunning()) {
-        // Consider burst target as a temporary nearby stop target so that
-        // approach/deceleration logic can engage early and avoid overshoot
-        // when performing short bursts.
-        long effectiveTarget = (long)_targetTurns;
-        if (_burstActive) effectiveTarget = min(effectiveTarget, _burstTargetTurns);
-        long remaining = effectiveTarget - _stepper.getTurns();
+        long remaining = (long)_targetTurns - _stepper.getTurns();
         if (remaining > 0 && remaining <= APPROACH_TURNS) {
             float ratio = (float)remaining / APPROACH_TURNS;
             uint32_t maxHz = APPROACH_SPEED_HZ_FLOOR
@@ -332,15 +321,7 @@ void WinderApp::_checkAutoStop() {
         }
     }
 
-    // Burst auto-stop (non-persistent scenario)
-    if (_burstActive && _stepper.getTurns() >= _burstTargetTurns) {
-        _burstActive = false;
-        _burstCompleted = true;
-        _burstTargetTurns = 0;
-        _toPaused();
-        Diag::infof("[BURST] Completed %ld turns, auto-paused", _burstConfiguredTurns);
-        return;
-    }
+    // burst mode removed
 
     // Auto-stop at target
     if (_stepper.getTurns() >= (long)_targetTurns) {
@@ -387,15 +368,9 @@ WinderStatus WinderApp::getStatus() const {
         _rodageDistMm,
         (bool)_freerun,
         (_direction == Direction::CW),
-        false,   // autoMode — reserved
-        _burstEnabled,
-        _burstActive,
-        _burstConfiguredTurns,
-        _burstTargetTurns,
-        (_burstActive ? max(0L, _burstTargetTurns - _stepper.getTurns()) : 0L),
-        _geom.turnsPerPass(),
-        _geom.turnsPerPassCalc(),
-        _geom.turnsPerPassOffset,
+        (float)_geom.turnsPerPass(),
+        (float)_geom.turnsPerPassCalc(),
+        (float)_geom.turnsPerPassOffset,
         _geom.scatterFactor,
         (int)_lateral.getPassCount(),
         _activePlan.turnsPerPass,
@@ -421,8 +396,9 @@ WinderStatus WinderApp::getStatus() const {
     };
 }
 
-String WinderApp::recipeJson() const {
-    return _recipeStore.toJson(_captureRecipe());
+void WinderApp::recipeJson(char* buf, size_t len) const {
+    if (!buf || len == 0) return;
+    _recipeStore.toJson(_captureRecipe(), buf, len);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -463,32 +439,27 @@ void WinderApp::_refreshCarriageForGeometryChange(bool startBoundChanged, bool e
 // Immediate commands
 // ═══════════════════════════════════════════════════════════════════════════════
 
-bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) {
-    if (cmd == "stop") {
+bool WinderApp::_handleImmediateCommand(const char* cmd, const char* value) {
+    if (strcmp(cmd, "stop") == 0) {
         _toIdle();
         return true;
     }
 
-    if (cmd == "reset") {
+    if (strcmp(cmd, "reset") == 0) {
         _toIdle();
         Diag::info("[IDLE] Turn counter reset");
         return true;
     }
 
     // ── Start: position to low bound with verify flags, or resume ────────────
-    if (cmd == "start") {
+    if (strcmp(cmd, "start") == 0) {
         if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
             if (!_lateral.isHomed() || _lateral.isBusy()) {
                 Diag::error("[Start] Lateral axis not ready");
                 return true;
             }
 
-            // Burst target is relative to the fresh counter after reset
-            if (_burstEnabled) {
-                _burstActive = true;
-                _burstTargetTurns = _burstConfiguredTurns;
-                Diag::infof("[BURST] Enabled for %ld turns => target %ld", _burstConfiguredTurns, _burstTargetTurns);
-            }
+            // start: Fresh session — reset and begin verify sequence
 
             // Fresh session — reset and begin verify sequence
             _stepper.resetTurns();
@@ -504,19 +475,13 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         }
         if (_state == WindingState::PAUSED) {
             // Resume via explicit Start command (from SessionController) and allow current pot-based speed.
-            if (_burstEnabled && !_burstActive) {
-                _burstActive = true;
-                _burstCompleted = false;
-                _burstTargetTurns = _stepper.getTurns() + _burstConfiguredTurns;
-                Diag::infof("[BURST] Resuming burst to target %ld", _burstTargetTurns);
-            }
             _toWinding();
             return true;
         }
         return true;
     }
 
-    if (cmd == "pause") {
+    if (strcmp(cmd, "pause") == 0) {
         if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
             Diag::info("[Pause] Ignored — no active session");
         } else {
@@ -526,12 +491,8 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         return true;
     }
 
-    if (cmd == "resume") {
+    if (strcmp(cmd, "resume") == 0) {
         if (_state == WindingState::PAUSED) {
-            if (_burstCompleted && _burstEnabled) {
-                Diag::info("[Resume] Ignored — burst completed, use Start to begin a new burst");
-                return true;
-            }
             _toWinding();
             Diag::info("[Resume] Armed — transitioning to winding");
         } else {
@@ -541,98 +502,55 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
     }
 
     // Allow changing max RPM even while a session is active.
-    if (cmd == "max_rpm" || cmd == "max-rpm") {
-        int rpm = constrain(value.toInt(), 10, 1500);
+    if (strcmp(cmd, "max_rpm") == 0 || strcmp(cmd, "max-rpm") == 0) {
+        int rpm = constrain((int)strtol(value, nullptr, 10), 10, 1500);
         _maxSpeedHz = (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL;
         Diag::infof("[MaxRPM] (immediate) Set %d RPM -> %u Hz", rpm, (unsigned)_maxSpeedHz);
         return true;
     }
 
-    if (cmd == "stop_next_high") {
+    if (strcmp(cmd, "stop_next_high") == 0) {
         _lateral.armStopAtNextHigh();
         Diag::info("[Mode] Stop armed on next high bound");
         return true;
     }
 
-    if (cmd == "stop_next_low") {
+    if (strcmp(cmd, "stop_next_low") == 0) {
         _lateral.armStopAtNextLow();
         Diag::info("[Mode] Stop armed on next low bound");
         return true;
     }
 
     // ── Position finale de bobinage ──────────────────────────────────────────
-    if (cmd == "end_pos") {
+    if (strcmp(cmd, "end_pos") == 0) {
         _recipe.endPos = windingEndPosFromString(value);
         _saveRecipe();
         Diag::infof("[END_POS] Position finale: %s", windingEndPosKey(_recipe.endPos));
         return true;
     }
-    if (cmd == "end_pos_turns") {
-        _recipe.endPosTurns = (int)constrain(value.toInt(), 1L, 20L);
+    if (strcmp(cmd, "end_pos_turns") == 0) {
+        _recipe.endPosTurns = (int)constrain((int)strtol(value, nullptr, 10), 1, 20);
         _saveRecipe();
         Diag::infof("[END_POS] Tours finaux: %d", _recipe.endPosTurns);
         return true;
     }
 
-    // ── Burst mode (non-persistent) ─────────────────────────────────────────
-    if (cmd == "burst_turns") {
-        long n = constrain(value.toInt(), 1L, 10000L);
-        _burstConfiguredTurns = n;
-        Diag::infof("[BURST] Configured %ld turns", n);
-        return true;
-    }
-
-    if (cmd == "burst") {
-        // Compatibility helper: enables burst mode and starts with a specified count.
-        long n = (_burstConfiguredTurns > 0) ? _burstConfiguredTurns : 1;
-        if (value.length() > 0) n = constrain(value.toInt(), 1, 10000);
-        _burstConfiguredTurns = n;
-        _burstEnabled = true;
-
-        if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
-            _burstActive = true;
-            _burstTargetTurns = n;
-            Diag::infof("[BURST] Starting burst %ld turns from zero", n);
-            _handleImmediateCommand("start", "");
-        } else {
-            _burstActive = true;
-            _burstTargetTurns = _stepper.getTurns() + n;
-            Diag::infof("[BURST] Starting burst %ld turns from %ld", n, _stepper.getTurns());
-            if (_state == WindingState::PAUSED) {
-                _toWinding();
-            }
-        }
-        return true;
-    }
+    // (no burst commands) -- simplified command set
 
     // ── Rodage axe lateral ───────────────────────────────────────────────────
-    if (cmd == "rodage_dist") {
-        _rodageDistMm = constrain(value.toFloat(), 5.0f, (float)LAT_TRAVERSE_MM);
+    if (strcmp(cmd, "rodage_dist") == 0) {
+        _rodageDistMm = constrain(atof(value), 5.0f, (float)LAT_TRAVERSE_MM);
         Diag::infof("[RODAGE] Distance: %.1f mm", _rodageDistMm);
         return true;
     }
-    if (cmd == "rodage_passes") {
-        _rodagePasses = (int)constrain(value.toInt(), 1L, 200L);
+    if (strcmp(cmd, "rodage_passes") == 0) {
+        _rodagePasses = (int)constrain((int)strtol(value, nullptr, 10), 1, 200);
         Diag::infof("[RODAGE] Passes: %d", _rodagePasses);
         return true;
     }
-    if (cmd == "burst_enable") {
-        _burstEnabled = (value == "true");
-        if (!_burstEnabled) {
-            _burstActive = false;
-            _burstTargetTurns = 0;
-        }
-        Diag::infof("[BURST] Enabled=%s", _burstEnabled ? "true" : "false");
-        return true;
-    }
+    // burst commands removed
 
-    if (cmd == "burst_turns") {
-        _burstConfiguredTurns = constrain(value.toInt(), 1L, 10000L);
-        Diag::infof("[BURST] Configured %ld turns", _burstConfiguredTurns);
-        return true;
-    }
-
-    if (cmd == "rodage") {
+    if (strcmp(cmd, "rodage") == 0) {
         if (_state == WindingState::IDLE) {
             _toRodage();
         } else {
@@ -640,7 +558,7 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         }
         return true;
     }
-    if (cmd == "rodage_stop") {
+    if (strcmp(cmd, "rodage_stop") == 0) {
         if (_state == WindingState::RODAGE) {
             _toIdle();
             Diag::info("[RODAGE] Arret demande par l'operateur");
@@ -654,16 +572,20 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
 // Geometry commands
 // ═══════════════════════════════════════════════════════════════════════════════
 
-bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
-    if (cmd == "geom_start_trim") {
-        _geom.windingStartTrim_mm = constrain(value.toFloat(), -5.0f, 5.0f);
+static bool startsWith(const char* str, const char* prefix) {
+    return strncmp(str, prefix, strlen(prefix)) == 0;
+}
+
+bool WinderApp::_handleGeometryCommand(const char* cmd, const char* value) {
+    if (strcmp(cmd, "geom_start_trim") == 0) {
+        _geom.windingStartTrim_mm = constrain(atof(value), -5.0f, 5.0f);
         _refreshCarriageForGeometryChange(true, false);
         _saveRecipe();
         return true;
     }
 
-    if (cmd == "geom_end_trim") {
-        _geom.windingEndTrim_mm = constrain(value.toFloat(), -5.0f, 5.0f);
+    if (strcmp(cmd, "geom_end_trim") == 0) {
+        _geom.windingEndTrim_mm = constrain((float)atof(value), -5.0f, 5.0f);
         _refreshCarriageForGeometryChange(false, true);
         _saveRecipe();
         return true;
@@ -686,34 +608,36 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
             prevEnd,   _geom.windingEndTrim_mm);
     };
 
-    auto isWindowShift = [&](const String &key) {
-        return key == "window_shift" || key == "windows_shift" || key.startsWith("window_shift");
+    auto isWindowShift = [&](const char* key) {
+        return strcmp(key, "window_shift") == 0
+            || strcmp(key, "windows_shift") == 0
+            || strncmp(key, "window_shift", strlen("window_shift")) == 0;
     };
 
     if (isWindowShift(cmd)) {
-        float delta = constrain(value.toFloat(), -5.0f, 5.0f);
-        if (cmd.indexOf("nudge") != -1) delta = constrain(delta, -1.0f, 1.0f);
+        float delta = constrain(atof(value), -5.0f, 5.0f);
+        if (strstr(cmd, "nudge") != nullptr) delta = constrain(delta, -1.0f, 1.0f);
 
         applyTrimShift(delta, delta, "WINDOW_SHIFT");
         return true;
     }
 
-    if (cmd == "geom_start_trim_nudge") {
-        float delta = constrain(value.toFloat(), -1.0f, 1.0f);
+    if (strcmp(cmd, "geom_start_trim_nudge") == 0) {
+        float delta = constrain(atof(value), -1.0f, 1.0f);
         Diag::infof("[DEBUG] geom_start_trim_nudge: value=%.3f, prev=%.3f", delta, _geom.windingStartTrim_mm);
         applyTrimShift(delta, 0.0f, "STRT_TRIM_NUDGE");
         return true;
     }
 
-    if (cmd == "geom_end_trim_nudge") {
-        float delta = constrain(value.toFloat(), -1.0f, 1.0f);
+    if (strcmp(cmd, "geom_end_trim_nudge") == 0) {
+        float delta = constrain(atof(value), -1.0f, 1.0f);
         Diag::infof("[DEBUG] geom_end_trim_nudge: value=%.3f, prev=%.3f", delta, _geom.windingEndTrim_mm);
         applyTrimShift(0.0f, delta, "END_TRIM_NUDGE");
         return true;
     }
 
-    if (cmd == "geom_preset") {
-        uint8_t idx = (uint8_t)value.toInt();
+    if (strcmp(cmd, "geom_preset") == 0) {
+        uint8_t idx = (uint8_t)strtol(value, nullptr, 10);
         _geom.applyPreset(idx);
         _refreshCarriageForGeometryChange(true, true);
         Diag::infof("Bobbin preset: %s — %ld turns/pass",
@@ -722,29 +646,29 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
         return true;
     }
 
-    if (cmd == "geom_total")  { _geom.totalWidth_mm   = value.toFloat(); _refreshCarriageForGeometryChange(true, true); _saveRecipe(); return true; }
-    if (cmd == "geom_bottom") { _geom.flangeBottom_mm = value.toFloat(); _refreshCarriageForGeometryChange(true, false); _saveRecipe(); return true; }
-    if (cmd == "geom_top")    { _geom.flangeTop_mm    = value.toFloat(); _saveRecipe(); return true; }
-    if (cmd == "geom_margin") { _geom.margin_mm       = value.toFloat(); _refreshCarriageForGeometryChange(true, true); _saveRecipe(); return true; }
+    if (strcmp(cmd, "geom_total") == 0)  { _geom.totalWidth_mm   = atof(value); _refreshCarriageForGeometryChange(true, true); _saveRecipe(); return true; }
+    if (strcmp(cmd, "geom_bottom") == 0) { _geom.flangeBottom_mm = atof(value); _refreshCarriageForGeometryChange(true, false); _saveRecipe(); return true; }
+    if (strcmp(cmd, "geom_top") == 0)    { _geom.flangeTop_mm    = atof(value); _saveRecipe(); return true; }
+    if (strcmp(cmd, "geom_margin") == 0) { _geom.margin_mm       = atof(value); _refreshCarriageForGeometryChange(true, true); _saveRecipe(); return true; }
 
-    if (cmd == "geom_wire") {
-        _geom.wireDiameter_mm = value.toFloat();
+    if (strcmp(cmd, "geom_wire") == 0) {
+        _geom.wireDiameter_mm = atof(value);
         Diag::infof("Wire: %.4f mm — %ld turns/pass (calc: %ld)",
             _geom.wireDiameter_mm, _geom.turnsPerPass(), _geom.turnsPerPassCalc());
         _saveRecipe();
         return true;
     }
 
-    if (cmd == "geom_tpp_ofs") {
-        _geom.turnsPerPassOffset = value.toInt();
+    if (strcmp(cmd, "geom_tpp_ofs") == 0) {
+        _geom.turnsPerPassOffset = (int)strtol(value, nullptr, 10);
         Diag::infof("Turns/pass offset: %+ld (calc %ld -> effective %ld)",
             _geom.turnsPerPassOffset, _geom.turnsPerPassCalc(), _geom.turnsPerPass());
         _saveRecipe();
         return true;
     }
 
-    if (cmd == "geom_scatter") {
-        float f = value.toFloat();
+    if (strcmp(cmd, "geom_scatter") == 0) {
+        float f = atof(value);
         if (f >= 0.5f && f <= 5.0f) {
             _geom.scatterFactor = f;
             Diag::infof("Scatter factor: %.2f -> %ld turns/pass",
@@ -761,8 +685,8 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
 // Pattern commands
 // ═══════════════════════════════════════════════════════════════════════════════
 
-bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
-    if (cmd == "winding_style") {
+bool WinderApp::_handlePatternCommand(const char* cmd, const char* value) {
+    if (strcmp(cmd, "winding_style") == 0) {
         _recipe.style = WindingPatternPlanner::styleFromString(value);
         _planner.setRecipe(_captureRecipe());
         Diag::infof("Winding style: %s", WindingPatternPlanner::styleName(_recipe.style));
@@ -770,8 +694,9 @@ bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
         return true;
     }
 
-    if (cmd == "winding_seed") {
-        uint32_t seed = (uint32_t)((value.toInt() > 0) ? value.toInt() : 1);
+    if (strcmp(cmd, "winding_seed") == 0) {
+        long parsed = strtol(value, nullptr, 10);
+        uint32_t seed = (uint32_t)((parsed > 0) ? parsed : 1);
         _recipe.seed = seed;
         _planner.setRecipe(_captureRecipe());
         Diag::infof("Winding seed: %lu", (unsigned long)_recipe.seed);
@@ -779,36 +704,36 @@ bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
         return true;
     }
 
-    if (cmd == "winding_layer_jitter") {
-        _recipe.layerJitterPct = constrain(value.toFloat(), 0.0f, 0.45f);
+    if (strcmp(cmd, "winding_layer_jitter") == 0) {
+        _recipe.layerJitterPct = constrain(atof(value), 0.0f, 0.45f);
         _planner.setRecipe(_captureRecipe());
         _saveRecipe();
         return true;
     }
 
-    if (cmd == "winding_layer_speed") {
-        _recipe.layerSpeedPct = constrain(value.toFloat(), 0.0f, 0.45f);
+    if (strcmp(cmd, "winding_layer_speed") == 0) {
+        _recipe.layerSpeedPct = constrain(atof(value), 0.0f, 0.45f);
         _planner.setRecipe(_captureRecipe());
         _saveRecipe();
         return true;
     }
 
-    if (cmd == "winding_human_traverse") {
-        _recipe.humanTraversePct = constrain(value.toFloat(), 0.0f, 0.45f);
+    if (strcmp(cmd, "winding_human_traverse") == 0) {
+        _recipe.humanTraversePct = constrain(atof(value), 0.0f, 0.45f);
         _planner.setRecipe(_captureRecipe());
         _saveRecipe();
         return true;
     }
 
-    if (cmd == "winding_human_speed") {
-        _recipe.humanSpeedPct = constrain(value.toFloat(), 0.0f, 0.45f);
+    if (strcmp(cmd, "winding_human_speed") == 0) {
+        _recipe.humanSpeedPct = constrain(atof(value), 0.0f, 0.45f);
         _planner.setRecipe(_captureRecipe());
         _saveRecipe();
         return true;
     }
 
-    if (cmd == "winding_first_pass_traverse") {
-        _recipe.firstPassTraverseFactor = constrain(value.toFloat(), 0.40f, 1.80f);
+    if (strcmp(cmd, "winding_first_pass_traverse") == 0) {
+        _recipe.firstPassTraverseFactor = constrain(atof(value), 0.40f, 1.80f);
         _planner.setRecipe(_captureRecipe());
         Diag::infof("First pass traverse factor: %.2f", _recipe.firstPassTraverseFactor);
         _saveRecipe();
@@ -852,15 +777,15 @@ void WinderApp::handleEncoderDelta(int32_t delta) {
 // Command dispatch
 // ═══════════════════════════════════════════════════════════════════════════════
 
-void WinderApp::handleCommand(const String& cmd, const String& value) {
-    Diag::infof("[APP-CMD] cmd='%s' val='%s'", cmd.c_str(), value.c_str());
+void WinderApp::handleCommand(const char* cmd, const char* value) {
+    Diag::infof("[APP-CMD] cmd='%s' val='%s'", cmd, value);
 
     if (_handleImmediateCommand(cmd, value)) return;
     if (_handleGeometryCommand(cmd, value))  return;
 
     // Turn target: modifiable at any time.
-    if (cmd == "target") {
-        long t = value.toInt();
+    if (strcmp(cmd, "target") == 0) {
+        long t = strtol(value, nullptr, 10);
         if (t > 0) {
             _targetTurns = t;
             if (_state == WindingState::TARGET_REACHED && t > _stepper.getTurns()) {
@@ -876,25 +801,25 @@ void WinderApp::handleCommand(const String& cmd, const String& value) {
     // Parameters locked during active session
     if (_parametersLocked()) {
         Diag::infof("[Lock] Ignored during session (%s): %s",
-            windingStateName(_state), cmd.c_str());
+            windingStateName(_state), cmd);
         return;
     }
 
     // Update maximum spindle speed (RPM -> stepper Hz)
     // (handled as immediate command) -- nothing to do here
 
-    if (cmd == "freerun") {
-        _freerun = (value == "true");
+    if (strcmp(cmd, "freerun") == 0) {
+        _freerun = (strcmp(value, "true") == 0);
         Diag::infof("Mode: %s", _freerun ? "FreeRun" : "Target");
         _saveRecipe();
         return;
     }
 
-    if (cmd == "direction") {
-        Direction newDir = (value == "cw") ? Direction::CW : Direction::CCW;
+    if (strcmp(cmd, "direction") == 0) {
+        Direction newDir = (strcmp(value, "cw") == 0) ? Direction::CW : Direction::CCW;
         if (newDir != _direction) {
             _direction = newDir;
-            Diag::infof("Direction: %s", value.c_str());
+            Diag::infof("Direction: %s", value);
             _saveRecipe();
         }
         return;
@@ -902,7 +827,7 @@ void WinderApp::handleCommand(const String& cmd, const String& value) {
 
     if (_handlePatternCommand(cmd, value)) return;
 
-    if (cmd == "recipe_import") {
+    if (strcmp(cmd, "recipe_import") == 0) {
         WindingRecipe imported;
         if (_recipeStore.fromJson(value, imported)) {
             _applyRecipe(imported, true);
@@ -913,8 +838,8 @@ void WinderApp::handleCommand(const String& cmd, const String& value) {
         return;
     }
 
-    if (cmd == "lat_offset") {
-        float mm = value.toFloat();
+    if (strcmp(cmd, "lat_offset") == 0) {
+        float mm = atof(value);
         if (mm >= 0.0f) {
             _lateral.setHomeOffset(mm);
             _toIdle();

@@ -1,9 +1,8 @@
 #pragma once
 #include <Arduino.h>
-#include <functional>
 
-using CommandCallback = std::function<void(const String&, const String&)>;
-using RecipeJsonProvider = std::function<String(void)>;
+using CommandCallback = void (*)(const char* cmd, const char* value);
+using RecipeJsonProvider = void (*)(char* outBuf, size_t outBufLen);
 
 // ── WindingState ──────────────────────────────────────────────────────────────
 // Simplified state machine. Verify is NOT a state — it uses flags during the
@@ -55,15 +54,10 @@ struct WinderStatus {
     float    rodageDistMm;
     bool     freerun;
     bool     directionCW;
-    bool     autoMode;
-    bool     burstEnabled;
-    bool     burstActive;
-    long     burstConfiguredTurns;
-    long     burstTargetTurns;
-    long     burstRemainingTurns;
-    long     turnsPerPass;
-    long     turnsPerPassCalc;
-    long     turnsPerPassOffset;
+    // Burst mode removed — fields eliminated to simplify status
+    float    turnsPerPass;
+    float    turnsPerPassCalc;
+    float    turnsPerPassOffset;
     float    scatterFactor;
     int      currentPass;
     long     activeTurnsPerPass;

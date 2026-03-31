@@ -147,8 +147,8 @@ void setup() {
     serialLink.begin();
     winder.begin();
     cmdController.begin();
-    web.setRecipeProvider([]() {
-        return winder.recipeJson();
+    web.setRecipeProvider([](char* buf, size_t len) {
+        winder.recipeJson(buf, len);
     });
 
     if (web.isConnected()) {

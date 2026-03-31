@@ -32,9 +32,9 @@ inline const char* windingEndPosKey(WindingEndPos p) {
  * @param s Input key (`none`, `high`, `low`).
  * @return Parsed enum value, `NONE` on unknown input.
  */
-inline WindingEndPos windingEndPosFromString(const String& s) {
-	if (s == "high") return WindingEndPos::TOP;
-	if (s == "low")  return WindingEndPos::BOTTOM;
+inline WindingEndPos windingEndPosFromString(const char* s) {
+	if (strcmp(s, "high") == 0) return WindingEndPos::TOP;
+	if (strcmp(s, "low") == 0)  return WindingEndPos::BOTTOM;
 	return WindingEndPos::NONE;
 }
 
@@ -104,7 +104,7 @@ public:
 	/** @brief Stable lowercase serialization key for style enum. */
 	static const char*  styleKey(WindingStyle style);
 	/** @brief Parse style key into enum value. */
-	static WindingStyle styleFromString(const String& value);
+	static WindingStyle styleFromString(const char* value);
 
 private:
 	WindingRecipe _recipe;
