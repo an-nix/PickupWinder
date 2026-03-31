@@ -19,11 +19,10 @@ void WinderApp::begin() {
     _applyRecipe(_recipe, false);
     _engine.init();
     _stepper.begin(_engine);
-    _lateral.begin(_engine, _recipe.latOffsetMm);
+    _lateral.begin(_engine, _recipe.latOffset_mm);
     _activePlan = _planner.getPlan(0, 0.0f);
-    Diag::infof("[Winder] Ready — %.1fmm usable, %ld tpp, profile=%s",
-            _geom.effectiveWidth(), _geom.turnsPerPass(),
-            WindingPatternPlanner::styleName(_recipe.style));
+        Diag::infof("[Winder] Ready — %.1fmm usable, %ld tpp",
+            _geom.effectiveWidth(), _geom.turnsPerPass());
 }
 
 void WinderApp::tick() {
@@ -101,8 +100,8 @@ void WinderApp::_toRodage() {
     _rodagePassDone     = 0;
     _rodageFwd          = true;
     if (_lateral.isHomed())
-        _lateral.prepareStartPosition(_rodageDistMm, LAT_RODAGE_SPEED_HZ);
-    Diag::infof("[RODAGE] %d passes, dist=%.1f mm", _rodagePasses, _rodageDistMm);
+        _lateral.prepareStartPosition(_rodageDist_mm, LAT_RODAGE_SPEED_HZ);
+    Diag::infof("[RODAGE] %d passes, dist=%.1f mm", _rodagePasses, _rodageDist_mm);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -150,7 +149,7 @@ void WinderApp::_handleLateralEvents() {
                 _toIdle();
             } else {
                 _rodageFwd = true;
-                _lateral.prepareStartPosition(_rodageDistMm, LAT_RODAGE_SPEED_HZ);
+                _lateral.prepareStartPosition(_rodageDist_mm, LAT_RODAGE_SPEED_HZ);
             }
         }
     }
@@ -278,9 +277,9 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
     if (!_stepper.isRunning()) {
         bool forward = (_direction == Direction::CW) != (bool)WINDING_MOTOR_INVERTED;
         _state = WindingState::WINDING;
-        Diag::infof("[WINDING] %s — %u Hz — tpp=%ld scale=%.2f",
-                forward ? "CW" : "CCW", hz,
-                _activePlan.turnsPerPass, _activePlan.speedScale);
+        Diag::infof("[WINDING] %s — %u Hz — tpp=%.3f scale=%.2f",
+            forward ? "CW" : "CCW", hz,
+            _activePlan.turnsPerPass, _activePlan.speedScale);
         _stepper.start(forward);
         _lateral.startWinding(hz, _activePlan.turnsPerPass,
                               _windingStartMm(), _windingEndMm(),
@@ -384,18 +383,17 @@ WinderStatus WinderApp::getStatus() const {
         (_state == WindingState::RODAGE),
         _rodagePassDone,
         _rodagePasses,
-        _rodageDistMm,
+        _rodageDist_mm,
         (bool)_freerun,
         (_direction == Direction::CW),
-        false,   // autoMode — reserved
         _burstEnabled,
         _burstActive,
         _burstConfiguredTurns,
         _burstTargetTurns,
         (_burstActive ? max(0L, _burstTargetTurns - _stepper.getTurns()) : 0L),
-        _geom.turnsPerPass(),
-        _geom.turnsPerPassCalc(),
-        _geom.turnsPerPassOffset,
+        _geom.turnsPerPassFloat(),
+        (float)_geom.turnsPerPassCalc(),
+        (float)_geom.turnsPerPassOffset,
         _geom.scatterFactor,
         (int)_lateral.getPassCount(),
         _activePlan.turnsPerPass,
@@ -408,15 +406,15 @@ WinderStatus WinderApp::getStatus() const {
         _geom.totalWidth_mm, _geom.flangeBottom_mm, _geom.flangeTop_mm,
         _geom.margin_mm, _geom.wireDiameter_mm,
         _lateral.getHomeOffset(),
-        WindingPatternPlanner::styleKey(_recipe.style),
         _recipe.seed,
-        _recipe.layerJitterPct,
-        _recipe.layerSpeedPct,
-        _recipe.humanTraversePct,
-        _recipe.humanSpeedPct,
         _recipe.firstPassTraverseFactor,
         (int)_recipe.endPos,
         _recipe.endPosTurns,
+        (_state == WindingState::CALIBRATING),
+        _calibCurrent,
+        _calibRepeats,
+        _calibMeasuredTPP,
+        _calibSuggestedOffset,
         windingStateName(_state),
     };
 }
@@ -607,8 +605,8 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
 
     // ── Rodage axe lateral ───────────────────────────────────────────────────
     if (cmd == "rodage_dist") {
-        _rodageDistMm = constrain(value.toFloat(), 5.0f, (float)LAT_TRAVERSE_MM);
-        Diag::infof("[RODAGE] Distance: %.1f mm", _rodageDistMm);
+        _rodageDist_mm = constrain(value.toFloat(), 5.0f, (float)LAT_TRAVERSE_MM);
+        Diag::infof("[RODAGE] Distance: %.1f mm", _rodageDist_mm);
         return true;
     }
     if (cmd == "rodage_passes") {
@@ -762,13 +760,7 @@ bool WinderApp::_handleGeometryCommand(const String& cmd, const String& value) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bool WinderApp::_handlePatternCommand(const String& cmd, const String& value) {
-    if (cmd == "winding_style") {
-        _recipe.style = WindingPatternPlanner::styleFromString(value);
-        _planner.setRecipe(_captureRecipe());
-        Diag::infof("Winding style: %s", WindingPatternPlanner::styleName(_recipe.style));
-        _saveRecipe();
-        return true;
-    }
+    // Winding style selection removed; profile is fixed to straight.
 
     if (cmd == "winding_seed") {
         uint32_t seed = (uint32_t)((value.toInt() > 0) ? value.toInt() : 1);
@@ -943,7 +935,7 @@ void WinderApp::_applyRecipe(const WindingRecipe& recipe, bool persist) {
     _direction   = recipe.directionCW ? Direction::CW : Direction::CCW;
     _state       = WindingState::IDLE;
     _pendingDisable = false;
-    _lateral.setHomeOffset(recipe.latOffsetMm);
+    _lateral.setHomeOffset(recipe.latOffset_mm);
     _planner.setRecipe(_recipe);
     _activePlan = _planner.getPlan(_stepper.getTurns(), 0.0f);
     if (persist) _saveRecipe();
@@ -955,7 +947,7 @@ WindingRecipe WinderApp::_captureRecipe() const {
     recipe.freerun = _freerun;
     recipe.directionCW = (_direction == Direction::CW);
     recipe.geometry = _geom;
-    recipe.latOffsetMm = _lateral.getHomeOffset();
+    recipe.latOffset_mm = _lateral.getHomeOffset();
     return recipe;
 }
 

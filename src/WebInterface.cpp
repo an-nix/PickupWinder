@@ -93,15 +93,15 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
     char buf[832];
     snprintf(buf, sizeof(buf),
         "{\"rpm\":%.0f,\"hz\":%u,\"turns\":%ld,\"target\":%ld,\"maxRpm\":%u,"
-        "\"running\":%s,\"enabled\":%s,\"startRequested\":%s,\"carriageReady\":%s,\"freerun\":%s,\"cw\":%s,\"auto\":%s,"
-        "\"tpp\":%ld,\"tppCalc\":%ld,\"tppOfs\":%ld,\"scatter\":%.2f,"
-        "\"pass\":%d,\"activeTpp\":%ld,\"latScale\":%.3f,\"latProgress\":%.3f,\"latPos\":%.3f,\"wStart\":%.3f,\"wEnd\":%.3f,\"wStartTrim\":%.3f,\"wEndTrim\":%.3f,\"eff\":%.2f,"
+        "\"running\":%s,\"enabled\":%s,\"startRequested\":%s,\"carriageReady\":%s,\"freerun\":%s,\"cw\":%s,"
+              "\"tpp\":%.3f,\"tppCalc\":%.3f,\"tppOfs\":%.3f,\"scatter\":%.2f,"
+        "\"pass\":%d,\"activeTpp\":%.3f,\"latScale\":%.3f,\"latProgress\":%.3f,\"latPos\":%.3f,\"wStart\":%.3f,\"wEnd\":%.3f,\"wStartTrim\":%.3f,\"wEndTrim\":%.3f,\"eff\":%.2f,"
         "\"gt\":%.2f,\"gb\":%.2f,\"gtp\":%.2f,\"gm\":%.2f,\"gw\":%.4f,"
-        "\"latOfs\":%.2f,\"wStyle\":\"%s\",\"seed\":%lu,"
-        "\"layerJitter\":%.3f,\"layerSpeed\":%.3f,\"humanTraverse\":%.3f,\"humanSpeed\":%.3f,\"firstPassTraverse\":%.3f,"
+            "\"latOfs\":%.2f,\"seed\":%lu,"
+            "\"firstPassTraverse\":%.3f,"
             "\"rodageMode\":%s,\"rodagePass\":%d,\"rodagePasses\":%d,\"rodageDist\":%.1f,"
         "\"endPos\":%d,\"endPosTurns\":%d,"
-        "\"verifyLow\":%s,\"verifyHigh\":%s,\"state\":\"%s\"}",
+        "\"verifyLow\":%s,\"verifyHigh\":%s,\"calibInProgress\":%s,\"calibCurrent\":%d,\"calibTotal\":%d,\"calibMeasuredTPP\":%.3f,\"calibSuggestedOffset\":%ld,\"state\":\"%s\"}",
         s.rpm, s.speedHz, s.turns, s.targetTurns,
         (unsigned)s.maxRpm,
         s.running      ? "true" : "false",
@@ -110,18 +110,22 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         s.carriageReady  ? "true" : "false",
         s.freerun      ? "true" : "false",
         s.directionCW  ? "true" : "false",
-        s.autoMode     ? "true" : "false",
         s.turnsPerPass, s.turnsPerPassCalc, s.turnsPerPassOffset, s.scatterFactor,
         s.currentPass, s.activeTurnsPerPass, s.activeSpeedScale, s.latProgress,
-        s.latPositionMm, s.windingStartMm, s.windingEndMm, s.windingStartTrimMm, s.windingEndTrimMm, s.effectiveWidth_mm,
+        s.latPosition_mm, s.windingStart_mm, s.windingEnd_mm, s.windingStartTrim_mm, s.windingEndTrim_mm, s.effectiveWidth_mm,
         s.geomTotal, s.geomBottom, s.geomTop, s.geomMargin, s.geomWire,
-        s.latOffset, s.windingStyle, (unsigned long)s.seed,
-        s.layerJitterPct, s.layerSpeedPct, s.humanTraversePct, s.humanSpeedPct, s.firstPassTraverseFactor,
+            s.latOffset, (unsigned long)s.seed,
+            s.firstPassTraverseFactor,
         s.rodageMode ? "true" : "false",
-        s.rodagePassDone, s.rodagePasses, s.rodageDistMm,
+        s.rodagePassDone, s.rodagePasses, s.rodageDist_mm,
         s.endPos, s.endPosTurns,
         s.verifyLow ? "true" : "false",
         s.verifyHigh ? "true" : "false",
+        s.calibInProgress ? "true" : "false",
+        s.calibCurrent,
+        s.calibTotal,
+        s.calibMeasuredTPP,
+        s.calibSuggestedOffset,
         s.stateName);
     // Broadcast to all connected WebSocket clients.
     _ws.textAll(buf);

@@ -33,9 +33,9 @@ public:
     /**
      * @brief Initialize lateral axis and start homing sequence.
      * @param engine Shared FastAccelStepper engine.
-     * @param homeOffsetMm Offset from switch trigger to logical position zero.
-     */
-    void begin(FastAccelStepperEngine& engine, float homeOffsetMm = LAT_HOME_OFFSET_DEFAULT_MM);
+        * @param homeOffset_mm Offset from switch trigger to logical position zero.
+        */
+        void begin(FastAccelStepperEngine& engine, float homeOffset_mm = LAT_HOME_OFFSET_DEFAULT_MM);
 
     /**
      * @brief Non-blocking state-machine update.
@@ -66,10 +66,10 @@ public:
 
     /**
      * @brief Move carriage to requested start position.
-     * @param startMm Target position in mm from bobbin base.
-     * @param speedHz Positioning speed in step-Hz.
-     */
-    void prepareStartPosition(float startMm, uint32_t speedHz = LAT_TRAVERSE_SPEED_HZ);
+        * @param start_mm Target position in mm from bobbin base.
+        * @param speedHz Positioning speed in step-Hz.
+        */
+        void prepareStartPosition(float start_mm, uint32_t speedHz = LAT_TRAVERSE_SPEED_HZ);
     /** @brief True when axis is homed exactly at configured start position. */
     bool isPositionedForStart() const { return _state == LatState::HOMED && _isAtStartPosition(); }
     /** @brief Convenience helper parking carriage at 0 mm. */
@@ -81,9 +81,9 @@ public:
 
     /**
      * @brief Relative jog move from current/target position.
-     * @param deltaMm Relative displacement in mm.
-     */
-    void jog(float deltaMm);
+        * @param delta_mm Relative displacement in mm.
+        */
+        void jog(float delta_mm);
     /** @brief Arm pause on next natural reversal. */
     void armPauseOnNextReversal() { _pauseOnNextReversal = true; _pausedAtReversal = false; }
     /** @brief Arm one-shot stop at next high bound. */
@@ -112,16 +112,16 @@ public:
      * @brief Start synchronized lateral traversal for winding.
      * @param windingHz Spindle step frequency.
      * @param tpp Active turns-per-pass.
-     * @param startMm Low bound in mm.
-     * @param endMm High bound in mm.
+    * @param start_mm Low bound in mm.
+    * @param end_mm High bound in mm.
      * @param speedScale Traverse speed multiplier.
      */
-    void startWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale = 1.0f);
+    void startWinding(uint32_t windingHz, float tpp, float start_mm, float end_mm, float speedScale = 1.0f);
 
     /**
      * @brief Update synchronized traversal parameters while running.
      */
-    void updateWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale = 1.0f);
+    void updateWinding(uint32_t windingHz, float tpp, float start_mm, float end_mm, float speedScale = 1.0f);
 
     /** @brief Stop synchronized traversal and return to HOMED state. */
     void stopWinding();
@@ -143,7 +143,7 @@ public:
      */
     void  setHomeOffset(float mm);
     /** @brief Get configured home offset in mm. */
-    float getHomeOffset() const { return _homeOffsetMm; }
+    float getHomeOffset() const { return _homeOffset_mm; }
     /** @brief Get current carriage position in mm. */
     float getCurrentPositionMm() const;
     /**
@@ -158,7 +158,7 @@ private:
     FastAccelStepper*      _stepper         = nullptr;
     LatState               _state           = LatState::FAULT;
     uint32_t               _lastCheckMs     = 0;
-    float                  _homeOffsetMm    = LAT_HOME_OFFSET_DEFAULT_MM;  // Switch-to-zero offset loaded from NVS
+    float                  _homeOffset_mm    = LAT_HOME_OFFSET_DEFAULT_MM;  // Switch-to-zero offset loaded from NVS
     volatile bool          _homeFlag        = false;
 
     // Active synchronized traversal state during winding.
@@ -175,9 +175,9 @@ private:
 
     // Compute synchronized lateral speed in steps/s from spindle speed and geometry.
     // lat_Hz = effWidth_steps * windingHz / (tpp * STEPS_PER_REV)
-    uint32_t _calcLatHz(uint32_t windingHz, long tpp, float widthMm, float speedScale) const;
+    uint32_t _calcLatHz(uint32_t windingHz, float tpp, float width_mm, float speedScale) const;
     bool     _isAtStartPosition() const;
-    void     _setTraverseBounds(float startMm, float endMm);
+    void     _setTraverseBounds(float start_mm, float end_mm);
 
     // Start the spindle slowdown window that covers a lateral reversal.
     void _onReversal();

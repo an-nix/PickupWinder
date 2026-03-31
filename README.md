@@ -251,7 +251,71 @@ This strongly affects traverse density and packing.
 
 These settings control how the traverse behaves from one pass to another.
 
-### Profile type
+### Constant Tours/mm ratio (nouveau)
+
+PickupWinder implémente désormais une compensation dynamique pour maintenir un ratio constant de tours par millimètre pendant toute la traversée du chariot, y compris les phases d'inversion.
+
+- Ratio : `turns_per_mm = RPM_bobine / vitesse_chariot_mm_s`
+- Quand `vitesse_chariot_mm_s` diminue (décélération et inversion), le firmware adapte la fréquence de la bobine avec :
+
+```c++
+spindleHz = clamp( spindleHz * (vitesse_actuelle / vitesse_nominale) )
+```
+
+- La vitesse nominale du chariot est dérivée de la géométrie (`effectiveWidth`) et du `turnsPerPass` calculé par `WindingPatternPlanner`.
+- Si `turnsPerPass` tombe sur une valeur entière, le système ajoute un petit décalage (≈0.12) pour assurer un motif croisé non-entier, évitant l'empilage exact.
+- L'axe latéral utilise une vraie rampe d'accélération (`FastAccelStepper`); la compensation est mise à jour à chaque appel de `WinderApp::tick()` (~10 ms) ce qui rend le ratio stable.
+
+### Marges et largeur utile
+
+- `largeur_utile = totalWidth_mm - (flangeBottom_mm + flangeTop_mm) - 2×margin_mm`.
+- Les limites de début/fin (`windingStartMm`, `windingEndMm`) sont calculées de manière symétrique (marge identique à gauche et droite) par `WindingGeometry`.
+- Toute modification de `margin_mm` est appliquée uniformément aux deux extrémités.
+
+### Gestion des inversions et arrêts
+
+- Le chariot est armé pour s'arrêter à la butée suivante puis repartir avec _auto-reverse_.
+- Pendant l'inversion, si la vitesse latérale chute en dessous de `compensationMinLatMmPerSec`, le comportement peut être configuré par `comp_mode` :
+  - `stop` : arrête la bobine quand le chariot est quasi-stationnaire.
+  - `min` : garde au minimum `SPEED_HZ_MIN`.
+  - `keep` : ne change pas la consigne bobine.
+- Le mode par défaut est `min`.
+
+### Stop complet du chariot
+
+- Le système évite les arrêts francs grâce à une rampe d'accélération latérale.
+- Si le chariot est temporairement presque arrêté aux bords (inversion), la compensation applique un RPM réduit pour garder `Tours/mm` constant.
+- Optionnellement, l'utilisateur peut activer/ajuster `comp_threshold` avec la commande WebSocket `comp_threshold`.
+
+### Télémétrie et visualisation
+
+- La page Web UI reçoit des mises à jour via WebSocket (`/ws`) tous les 200ms.
+- Champs disponibles : `rpm`, `hz`, `latPos`, `latProgress`, `activeTpp`, `latScale`, `calib*` etc.
+- Une application Python peut se connecter et tracer `latSpeed` et `rpm` pour vérifier la proportionnalité (décalage max ±5%).
+
+### Profil de vitesse global
+
+- Avec le profil `STRAIGHT`, `SCATTER`, `HUMAN`, le plan de traverse est calculé dans `WindingPatternPlanner::getPlan()`.
+- `turnsPerPass` est déduit de la géométrie `turnsPerPassFloat()` via `WindingGeometry`.
+- `WinderApp` assure le suivi du ratio pendant l’exécution.
+
+### Utilisation pratique
+
+- Par défaut, le réglage `wireDiameter_mm` (bobinage micro guitare AWG42) et `margin_mm` sont initiaux.
+- Pour optimiser un nouveau bobinage, lancer `auto_calib` (commande WS `auto_calib`), ajuster `geom_tpp_ofs` si besoin.
+
+### Notes de sécurité
+
+- Le système ne basse pas la marge d'arrêt pour accélérer ; elle reste symétrique et sécurisée.
+
+### Extrait de commandes WebSocket importantes
+
+- `{"cmd":"auto_calib","val":"80,3,1"}` : lance diagnostique auto-calibration.
+- `{"cmd":"comp_mode","val":"min"}` : mode compensation en dessous du seuil.
+- `{"cmd":"comp_threshold","val":"0.05"}` : fixe seuil latéral en mm/s.
+
+
+### Profil type
 
 #### Straight
 Regular winding.

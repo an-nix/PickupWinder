@@ -126,13 +126,7 @@ function update(d) {
   syncInput('g-start-trim', d.wStartTrim);
   syncInput('g-end-trim', d.wEndTrim);
   syncInput('g-wire', d.gw);
-
-  if (d.wStyle) {
-    byId('ws-straight').checked = d.wStyle === 'straight';
-    byId('ws-scatter').checked  = d.wStyle === 'scatter';
-    byId('ws-human').checked    = d.wStyle === 'human';
-    updateSliderVisibility(d.wStyle);
-  }
+  // Profile is fixed to Straight in this UI build.
   const epStr = ['none','high','low'][d.endPos ?? 0] || 'none';
   byId('ep-none').checked = epStr === 'none';
   byId('ep-high').checked = epStr === 'high';
@@ -150,10 +144,6 @@ function update(d) {
   if (byId('g-tpp-ofs') && document.activeElement !== byId('g-tpp-ofs') && d.tppOfs !== undefined)
     byId('g-tpp-ofs').value = d.tppOfs;
   byId('tpp-ofs-lbl').textContent = d.tppOfs ?? 0;
-  syncRange('w-layer-jitter', d.layerJitter, 'lj', 2);
-  syncRange('w-layer-speed', d.layerSpeed, 'ls', 2);
-  syncRange('w-human-traverse', d.humanTraverse, 'ht', 2);
-  syncRange('w-human-speed', d.humanSpeed, 'hs', 2);
   syncRange('w-first-pass-traverse', d.firstPassTraverse, 'fp', 2);
 
   /* ── Break-in UI ── */
@@ -202,12 +192,7 @@ function updateContextPanels(st, d) {
 }
 
 /* ── Style-dependent slider visibility ─────────────────── */
-function updateSliderVisibility(style) {
-  const scatterOn = style === 'scatter' || style === 'human';
-  const humanOn   = style === 'human';
-  document.querySelectorAll('.sl-scatter').forEach(el => el.classList.toggle('sl-dim', !scatterOn));
-  document.querySelectorAll('.sl-human').forEach(el   => el.classList.toggle('sl-dim', !humanOn));
-}
+// Profile is fixed to Straight; no visibility toggles required.
 
 /* ── Lock state: gray out locked fields during session ─── */
 function updateLockState(st, d) {
@@ -259,5 +244,4 @@ function updateStatusLine(st, d, pos) {
 }
 
 /* ── Init ──────────────────────────────────────────────── */
-updateSliderVisibility('straight'); // default until first WS update
 connect();

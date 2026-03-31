@@ -19,6 +19,7 @@ using RecipeJsonProvider = std::function<String(void)>;
 //  Any state ──(stop)──► IDLE
 enum class WindingState {
     IDLE,
+    CALIBRATING,
     WINDING,
     PAUSED,
     TARGET_REACHED,
@@ -52,40 +53,40 @@ struct WinderStatus {
     bool     rodageMode;
     int      rodagePassDone;
     int      rodagePasses;
-    float    rodageDistMm;
+    float    rodageDist_mm;
     bool     freerun;
     bool     directionCW;
-    bool     autoMode;
     bool     burstEnabled;
     bool     burstActive;
     long     burstConfiguredTurns;
     long     burstTargetTurns;
     long     burstRemainingTurns;
-    long     turnsPerPass;
-    long     turnsPerPassCalc;
-    long     turnsPerPassOffset;
+    float    turnsPerPass;
+    float    turnsPerPassCalc;
+    float    turnsPerPassOffset;
     float    scatterFactor;
     int      currentPass;
-    long     activeTurnsPerPass;
+    float    activeTurnsPerPass;
     float    activeSpeedScale;
     float    latProgress;
-    float    latPositionMm;
-    float    windingStartMm;
-    float    windingEndMm;
-    float    windingStartTrimMm;
-    float    windingEndTrimMm;
+    float    latPosition_mm;
+    float    windingStart_mm;
+    float    windingEnd_mm;
+    float    windingStartTrim_mm;
+    float    windingEndTrim_mm;
     float    effectiveWidth_mm;
     float    geomTotal, geomBottom, geomTop, geomMargin, geomWire;
     float    latOffset;
-    const char* windingStyle;
     uint32_t seed;
-    float    layerJitterPct;
-    float    layerSpeedPct;
-    float    humanTraversePct;
-    float    humanSpeedPct;
+    // Style/jitter fields removed from status (planner is straight-only).
     float    firstPassTraverseFactor;
     int      endPos;
     int      endPosTurns;
+    bool     calibInProgress;
+    int      calibCurrent;
+    int      calibTotal;
+    float    calibMeasuredTPP;
+    long     calibSuggestedOffset;
     const char* stateName;
 };
 

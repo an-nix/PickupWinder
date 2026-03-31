@@ -131,7 +131,7 @@ private:
 
     // ── Rodage ──
     int    _rodagePasses   = 10;
-    float  _rodageDistMm   = 80.0f;
+    float  _rodageDist_mm   = 80.0f;
     int    _rodagePassDone = 0;
     bool   _rodageFwd      = true;
 };

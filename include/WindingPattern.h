@@ -3,11 +3,7 @@
 #include "Config.h"
 #include "WindingGeometry.h"
 
-enum class WindingStyle : uint8_t {
-	STRAIGHT = 0,
-	SCATTER  = 1,
-	HUMAN    = 2,
-};
+// Winding styles removed; planner uses straight-only behaviour.
 
 // Desired final carriage position at the end of winding.
 // HIGH/LOW return the carriage to the corresponding bound a few turns before
@@ -47,8 +43,8 @@ struct WindingRecipe {
 	bool            freerun            = false;
 	bool            directionCW        = true;
 	WindingGeometry geometry           = {};
-	float           latOffsetMm        = LAT_HOME_OFFSET_DEFAULT_MM;
-	WindingStyle    style              = WindingStyle::STRAIGHT;
+	float           latOffset_mm        = LAT_HOME_OFFSET_DEFAULT_MM;
+	// Style selection removed; planner uses straight-only behaviour.
 	uint32_t        seed               = WINDING_DEFAULT_SEED;
 	float           layerJitterPct     = WINDING_LAYER_JITTER_DEFAULT;
 	float           layerSpeedPct      = WINDING_LAYER_SPEED_JITTER_DEFAULT;
@@ -68,7 +64,7 @@ struct WindingRecipe {
  */
 struct TraversePlan {
 	/** Turns to execute before lateral reversal. */
-	long     turnsPerPass = 1;
+	float    turnsPerPass = 1.0f;
 	/** Multiplicative traverse speed factor. */
 	float    speedScale   = 1.0f;
 	/** Zero-based pass index currently planned. */
@@ -99,12 +95,7 @@ public:
 	 */
 	TraversePlan getPlan(long turnsDone, float progressInPass) const;
 
-	/** @brief Localized display name for style enum. */
-	static const char* styleName(WindingStyle style);
-	/** @brief Stable lowercase serialization key for style enum. */
-	static const char*  styleKey(WindingStyle style);
-	/** @brief Parse style key into enum value. */
-	static WindingStyle styleFromString(const String& value);
+	// Style helper methods removed; only straight behaviour is supported.
 
 private:
 	WindingRecipe _recipe;

@@ -5,7 +5,7 @@
 /**
  * @brief Initialize lateral axis stepper, sensor IO, and homing sequence.
  */
-void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm) 
+void LateralController::begin(FastAccelStepperEngine& engine, float homeOffset_mm) 
 {
     pinMode(HOME_PIN_NO, INPUT_PULLUP);
     pinMode(HOME_PIN_NC, INPUT_PULLUP);
@@ -23,10 +23,10 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 
     _stepper->setDirectionPin(DIR_PIN_LAT);
     _stepper->setAcceleration(LAT_ACCEL);
-    _homeOffsetMm = max(0.0f, homeOffsetMm);
+        _homeOffset_mm = max(0.0f, homeOffset_mm);
     _passCount = 0;
     Diag::infof("[Lateral] Offset home : %.2f mm",
-            _homeOffsetMm);
+            _homeOffset_mm);
 
                 delay(10);
 
@@ -250,12 +250,12 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 /**
  * @brief Position carriage to requested start bound.
  */
-            void LateralController::prepareStartPosition(float startMm, uint32_t speedHz) {
+            void LateralController::prepareStartPosition(float start_mm, uint32_t speedHz) {
                 if (_state != LatState::HOMED && _state != LatState::POSITIONING) return;
 
                 const bool wasPositioning = (_state == LatState::POSITIONING);
                 const int32_t prevTarget = _latStartSteps;
-                _setTraverseBounds(startMm, startMm);
+                _setTraverseBounds(start_mm, start_mm);
 
                 if (_isAtStartPosition()) {
                     if (_stepper->isRunning()) {
@@ -272,7 +272,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 
                 if (!wasPositioning || prevTarget != _latStartSteps) {
                     Diag::infof("[Lateral] Positionnement départ bobinage : %.2f mm",
-                startMm);
+                start_mm);
                 }
             }
 
@@ -312,22 +312,22 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
  * @brief Set switch-to-zero home offset in mm.
  */
             void LateralController::setHomeOffset(float mm) {
-                _homeOffsetMm = (mm < 0.0f) ? 0.0f : mm;
+                _homeOffset_mm = (mm < 0.0f) ? 0.0f : mm;
                 Diag::infof("[Lateral] Offset home enregistré : %.2f mm",
-            _homeOffsetMm);
+            _homeOffset_mm);
             }
 
 /**
  * @brief Apply configured home offset move or transition directly to HOMED.
  */
             void LateralController::_applyOffsetOrNext() {
-                int32_t offsetSteps = (int32_t)(_homeOffsetMm * (float)LAT_STEPS_PER_MM);
+                int32_t offsetSteps = (int32_t)(_homeOffset_mm * (float)LAT_STEPS_PER_MM);
                 if (offsetSteps > 0) {
                     _stepper->setSpeedInHz(LAT_HOME_SPEED_HZ);
                     _stepper->moveTo(offsetSteps);
                     _state = LatState::HOMING_OFFSET;
                     Diag::infof("[Lateral] Offset : déplacement de %.2f mm (%ld steps)...",
-            _homeOffsetMm, (long)offsetSteps);
+            _homeOffset_mm, (long)offsetSteps);
                 } else {
                     _gotoHomed();
                 }
@@ -347,10 +347,10 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 /**
  * @brief Compute synchronized lateral speed in step-Hz.
  */
-            uint32_t LateralController::_calcLatHz(uint32_t windingHz, long tpp, float effWidthMm, float speedScale) const {
-                if (tpp <= 0 || windingHz == 0 || effWidthMm <= 0.0f) return 0;
-                float effSteps = effWidthMm * (float)LAT_STEPS_PER_MM;
-                float hz = effSteps * (float)windingHz / ((float)tpp * (float)STEPS_PER_REV);
+            uint32_t LateralController::_calcLatHz(uint32_t windingHz, float tpp, float width_mm, float speedScale) const {
+                if (tpp <= 0.0f || windingHz == 0 || width_mm <= 0.0f) return 0;
+                float effSteps = width_mm * (float)LAT_STEPS_PER_MM;
+                float hz = effSteps * (float)windingHz / (tpp * (float)STEPS_PER_REV);
                 hz *= constrain(speedScale, 0.4f, 1.8f);
                 return (uint32_t)max(1.0f, hz);
             }
@@ -366,9 +366,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 /**
  * @brief Start synchronized lateral traversal for winding.
  */
-            void LateralController::startWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale) {
+            void LateralController::startWinding(uint32_t windingHz, float tpp, float start_mm, float end_mm, float speedScale) {
                 if (_state == LatState::WINDING_FWD || _state == LatState::WINDING_BWD) {
-                    updateWinding(windingHz, tpp, startMm, endMm, speedScale);
+                    updateWinding(windingHz, tpp, start_mm, end_mm, speedScale);
                     return;
                 }
                 if (_state != LatState::HOMED) {
@@ -376,15 +376,15 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
             stateStr());
                     return;
                 }
-                if (windingHz == 0 || tpp <= 0 || endMm <= startMm) {
-                    Diag::errorf("[Lateral] startWinding ignoré — paramètres invalides : windHz=%u tpp=%ld start=%.2f end=%.2f",
-             windingHz, (long)tpp, startMm, endMm);
+                if (windingHz == 0 || tpp <= 0 || end_mm <= start_mm) {
+                    Diag::errorf("[Lateral] startWinding ignoré — paramètres invalides : windHz=%u tpp=%.3f start=%.2f end=%.2f",
+             windingHz, tpp, start_mm, end_mm);
                     return;
                 }
 
                 _enableDriver();
-                _setTraverseBounds(startMm, endMm);
-                _latHz = _calcLatHz(windingHz, tpp, endMm - startMm, speedScale);
+                _setTraverseBounds(start_mm, end_mm);
+                _latHz = _calcLatHz(windingHz, tpp, end_mm - start_mm, speedScale);
                 _passCount = 0;
                     _pausedAtReversal = false;
 
@@ -416,7 +416,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
 
                 float mmPerSec = (float)_latHz / (float)LAT_STEPS_PER_MM;
-                float passDuration = (mmPerSec > 0.0f) ? ((endMm - startMm) / mmPerSec) : 0.0f;
+                float passDuration = (mmPerSec > 0.0f) ? ((end_mm - start_mm) / mmPerSec) : 0.0f;
                 Diag::infof("[Lateral] Traversal started: %u Hz (%.2f mm/s) pass=%.1fs dir=%s",
             _latHz, mmPerSec, passDuration,
                               (_state == LatState::WINDING_FWD) ? "FWD" : "BWD");
@@ -425,11 +425,10 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 /**
  * @brief Update running traversal bounds and speed.
  */
-            void LateralController::updateWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale) {
+            void LateralController::updateWinding(uint32_t windingHz, float tpp, float start_mm, float end_mm, float speedScale) {
                 if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
-
-                float s = max(0.0f, startMm);
-                float e = max(s, endMm);
+                float s = max(0.0f, start_mm);
+                float e = max(s, end_mm);
                 int32_t newStart = (int32_t)(s * (float)LAT_STEPS_PER_MM);
                 int32_t newEnd   = (int32_t)(e * (float)LAT_STEPS_PER_MM);
 
@@ -492,7 +491,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                 }
 
                 // ── Speed update ──────────────────────────────────────────────
-                uint32_t newHz = _calcLatHz(windingHz, tpp, endMm - startMm, speedScale);
+                uint32_t newHz = _calcLatHz(windingHz, tpp, end_mm - start_mm, speedScale);
                 if (newHz < 1) newHz = 1;
                 if (newHz != _latHz) {
                     _latHz = newHz;
@@ -504,21 +503,21 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
 /**
  * @brief Perform relative manual jog move.
  */
-            void LateralController::jog(float deltaMm) {
+            void LateralController::jog(float delta_mm) {
                 if (_state != LatState::HOMED && _state != LatState::POSITIONING) return;
                 // Use the active target while already positioning, otherwise use the
                 // current physical position as the jog base.
-                float baseMm = (_state == LatState::POSITIONING)
+                float base_mm = (_state == LatState::POSITIONING)
                     ? (float)_latStartSteps / (float)LAT_STEPS_PER_MM
                     : getCurrentPositionMm();
-                float targetMm = constrain(baseMm + deltaMm, 0.0f, (float)LAT_TRAVERSE_MM);
-                _latStartSteps = (int32_t)(targetMm * (float)LAT_STEPS_PER_MM);
+                float target_mm = constrain(base_mm + delta_mm, 0.0f, (float)LAT_TRAVERSE_MM);
+                _latStartSteps = (int32_t)(target_mm * (float)LAT_STEPS_PER_MM);
                 _latEndSteps   = _latStartSteps;
                 _enableDriver();
                 _stepper->setSpeedInHz(LAT_TRAVERSE_SPEED_HZ);
                 _stepper->moveTo(_latStartSteps);
                 _state = LatState::POSITIONING;
-                Diag::infof("[Lateral] Jog → %.2f mm", targetMm);
+                Diag::infof("[Lateral] Jog → %.2f mm", target_mm);
             }
 
 /** @brief Clear one-shot stop/pause flags. */
@@ -588,9 +587,9 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
             }
 
 /** @brief Convert mm bounds to step-space bounds. */
-            void LateralController::_setTraverseBounds(float startMm, float endMm) {
-                float s = max(0.0f, startMm);
-                float e = max(s, endMm);
+            void LateralController::_setTraverseBounds(float start_mm, float end_mm) {
+                float s = max(0.0f, start_mm);
+                float e = max(s, end_mm);
                 _latStartSteps = (int32_t)(s * (float)LAT_STEPS_PER_MM);
                 _latEndSteps   = (int32_t)(e * (float)LAT_STEPS_PER_MM);
             }

@@ -43,52 +43,7 @@ uint32_t WindingPatternPlanner::_mix(uint32_t x) {
 	x ^= x >> 16;
 	return x;
 }
-
-/**
- * @brief Produce a deterministic pseudo-random value in [-1, 1].
- *
- * Combines a seed with two integer coordinates to generate a repeatable
- * pseudo-random float. Only the lower 24 bits of the hashed value are
- * used to create a uniform value in [0,1], then remapped to [-1,1].
- *
- * @param seed Global seed controlling repeatability.
- * @param a First coordinate / discriminator.
- * @param b Second coordinate / discriminator.
- * @return Deterministic pseudo-random float in the range [-1, 1].
- * @par Usage
- * Called by `_smoothNoise` and by the planner to introduce per-pass
- * variability. This function is internal to the planner and not exported.
- */
-float WindingPatternPlanner::_noiseSigned(uint32_t seed, uint32_t a, uint32_t b) {
-	uint32_t h = _mix(seed ^ _mix(a + 0x9e3779b9U) ^ _mix(b + 0x85ebca6bU));
-	float unit = (float)(h & 0x00ffffffU) / 16777215.0f;
-	return unit * 2.0f - 1.0f;
-}
-
-float WindingPatternPlanner::_smoothNoise(uint32_t seed, uint32_t passIndex, float x) {
-	constexpr uint32_t SEGMENTS = 7;
-	x = clampf(x, 0.0f, 1.0f) * (float)SEGMENTS;
-	uint32_t i0 = (uint32_t)x;
-	if (i0 >= SEGMENTS) i0 = SEGMENTS - 1;
-	uint32_t i1 = i0 + 1;
-	float t = x - (float)i0;
-	float s = t * t * (3.0f - 2.0f * t);
-	/**
-	 * @brief Produce smooth interpolated noise over `SEGMENTS` using cubic
-	 * Hermite interpolation (s = 3t^2 - 2t^3).
-	 *
-	 * The function samples `_noiseSigned` at two adjacent segment points and
-	 * interpolates between them to get a continuous, smooth value for the
-	 * given x in [0,1]. `passIndex` and `seed` ensure repeatability per pass.
-	 * @par Usage
-	 * Used by `getPlan()` to compute smoothly-varying human-style offsets.
-	 * Called indirectly from `WinderApp::_buildTraversePlan()` and other
-	 * WinderApp call sites when the planner is queried for traverse parameters.
-	 */
-	float a = _noiseSigned(seed, passIndex, 100 + i0);
-	float b = _noiseSigned(seed, passIndex, 100 + i1);
-	return a + (b - a) * s;
-}
+// Noise helpers removed - planner uses straight-only behaviour (no scatter/human).
 
 /**
  * @brief Compute a traverse plan for the current winding state.
@@ -112,60 +67,32 @@ float WindingPatternPlanner::_smoothNoise(uint32_t seed, uint32_t passIndex, flo
  */
 TraversePlan WindingPatternPlanner::getPlan(long turnsDone, float progressInPass) const {
 	TraversePlan plan;
-	long baseTpp = _recipe.geometry.turnsPerPass();
-	plan.turnsPerPass = max(1L, baseTpp);
-	if (baseTpp <= 0) return plan;
+	float baseTpp = _recipe.geometry.turnsPerPassFloat();
+	plan.turnsPerPass = max(1.0f, baseTpp);
+	if (baseTpp <= 0.0f) return plan;
 
-	// Ensure progress is in [0,1] and compute which traverse pass we're on
-	// based on `turnsDone` and the base `turnsPerPass` from the geometry.
+	// Normalize progress and compute pass index from completed turns.
 	progressInPass = clampf(progressInPass, 0.0f, 1.0f);
-	uint32_t passIndex = (uint32_t)max(0L, turnsDone / max(1L, baseTpp));
+	uint32_t passIndex = (uint32_t)floorf((float)turnsDone / baseTpp);
 	plan.passIndex = passIndex;
 
-	// Derive per-pass perturbations from pseudo-random noise. These values
-	// are scaled by recipe percentages to control the magnitude.
-	float layerJitter = _noiseSigned(_recipe.seed, passIndex, 1) * _recipe.layerJitterPct;
-	float layerSpeed  = _noiseSigned(_recipe.seed, passIndex, 2) * _recipe.layerSpeedPct;
-	float tppScale    = 1.0f; // multiplier for turns-per-pass
-	float speedScale  = 1.0f; // multiplier for traverse speed
-
-	switch (_recipe.style) {
-	case WindingStyle::STRAIGHT:
-		break;
-
-	case WindingStyle::SCATTER:
-		// Scatter style adds layer-level jitter and speed variation.
-		tppScale   += layerJitter;
-		speedScale += layerSpeed;
-		break;
-
-	case WindingStyle::HUMAN: {
-		// Human style adds smoothly-varying traverse and speed offsets that
-		// change across the pass progress to mimic natural, non-uniform
-		// winding behavior.
-		float humanTraverse = _smoothNoise(_recipe.seed + 17U, passIndex, progressInPass)
-							* _recipe.humanTraversePct;
-		float humanSpeed    = _smoothNoise(_recipe.seed + 31U, passIndex, progressInPass)
-							* _recipe.humanSpeedPct;
-		tppScale   += layerJitter + humanTraverse;
-		speedScale += layerSpeed + humanSpeed;
-		break;
-	}
-	}
+	// Straight-only behaviour: no scatter/human perturbations.
+	float tppScale = 1.0f;
+	float speedScale = 1.0f;
 
 	// Optional dedicated multiplier for the very first traverse pass.
 	if (passIndex == 0) {
 		speedScale *= _recipe.firstPassTraverseFactor;
 	}
 
-	// Constrain scales to reasonable bounds to avoid extreme values.
-	tppScale   = clampf(tppScale, 0.55f, 1.60f);
+	// Constrain scales to reasonable bounds.
+	tppScale = clampf(tppScale, 0.55f, 1.60f);
 	speedScale = clampf(speedScale, 0.55f, 1.60f);
 
-	// Compute final plan values: integer turns-per-pass and floating speed
-	// scale. `lroundf` rounds to nearest long.
-	plan.turnsPerPass = max(1L, lroundf((float)baseTpp * tppScale));
-	plan.speedScale   = speedScale;
+	float tppValue = baseTpp * tppScale;
+	if (fabsf(tppValue - roundf(tppValue)) < 0.01f) tppValue += 0.12f;
+	plan.turnsPerPass = max(0.55f, tppValue);
+	plan.speedScale = speedScale;
 	return plan;
 }
 
@@ -180,17 +107,6 @@ TraversePlan WindingPatternPlanner::getPlan(long turnsDone, float progressInPass
  * Used by the UI/logging code in `WinderApp` (e.g. `WinderApp::begin()` and
  * numerous `Diag::infof` calls) to display the active profile name.
  */
-const char* WindingPatternPlanner::styleName(WindingStyle style) {
-	switch (style) {
-		// Return a human-readable name for the winding style. These are
-		// used for display in the UI; names here are localized (French).
-		case WindingStyle::STRAIGHT: return "Droit";
-		case WindingStyle::SCATTER:  return "Scatter";
-		case WindingStyle::HUMAN:    return "Humain";
-		default:                     return "Droit";
-	}
-}
-
 /**
  * @brief Get a stable serialization key for a `WindingStyle`.
  *
@@ -203,15 +119,6 @@ const char* WindingPatternPlanner::styleName(WindingStyle style) {
  * Used by `WinderApp::getStatus()` to expose the current style to the UI
  * and by `WindingRecipeStore` when serializing recipes to JSON.
  */
-const char* WindingPatternPlanner::styleKey(WindingStyle style) {
-	switch (style) {
-		case WindingStyle::STRAIGHT: return "straight";
-		case WindingStyle::SCATTER:  return "scatter";
-		case WindingStyle::HUMAN:    return "human";
-		default:                     return "straight";
-	}
-}
-
 /**
  * @brief Parse a style key string back to the enum value.
  *
@@ -224,10 +131,4 @@ const char* WindingPatternPlanner::styleKey(WindingStyle style) {
  * Used when importing recipes from JSON (`WindingRecipeStore::fromJson`) and
  * when receiving pattern commands in `WinderApp::_handlePatternCommand()`.
  */
-WindingStyle WindingPatternPlanner::styleFromString(const String& value) {
-	// Parse a style key string back into the enum. Unknown values default
-	// to `STRAIGHT` to ensure safe behavior.
-	if (value == "scatter") return WindingStyle::SCATTER;
-	if (value == "human")   return WindingStyle::HUMAN;
-	return WindingStyle::STRAIGHT;
-}
+// Style helpers removed; planner implements straight-only behaviour.

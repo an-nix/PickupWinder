@@ -51,14 +51,13 @@ String WindingRecipeStore::toJson(const WindingRecipe& recipe) const {
 	doc["targetTurns"] = recipe.targetTurns;
 	doc["freerun"] = recipe.freerun;
 	doc["directionCW"] = recipe.directionCW;
-	doc["style"] = WindingPatternPlanner::styleKey(recipe.style);
 	doc["seed"] = recipe.seed;
 	doc["layerJitterPct"] = recipe.layerJitterPct;
 	doc["layerSpeedPct"] = recipe.layerSpeedPct;
 	doc["humanTraversePct"] = recipe.humanTraversePct;
 	doc["humanSpeedPct"] = recipe.humanSpeedPct;
 	doc["firstPassTraverseFactor"] = recipe.firstPassTraverseFactor;
-	doc["latOffsetMm"] = recipe.latOffsetMm;
+	doc["latOffsetMm"] = recipe.latOffset_mm;
 	doc["endPos"] = windingEndPosKey(recipe.endPos);
 	doc["endPosTurns"] = recipe.endPosTurns;
 
@@ -93,14 +92,13 @@ bool WindingRecipeStore::fromJson(const String& json, WindingRecipe& recipe) con
 	recipe.targetTurns      = doc["targetTurns"] | DEFAULT_TARGET_TURNS;
 	recipe.freerun          = doc["freerun"] | false;
 	recipe.directionCW      = doc["directionCW"] | true;
-	recipe.style            = WindingPatternPlanner::styleFromString(String((const char*)(doc["style"] | "straight")));
 	recipe.seed             = doc["seed"] | WINDING_DEFAULT_SEED;
 	recipe.layerJitterPct   = doc["layerJitterPct"] | WINDING_LAYER_JITTER_DEFAULT;
 	recipe.layerSpeedPct    = doc["layerSpeedPct"] | WINDING_LAYER_SPEED_JITTER_DEFAULT;
 	recipe.humanTraversePct = doc["humanTraversePct"] | WINDING_HUMAN_TRAVERSE_JITTER_DEFAULT;
 	recipe.humanSpeedPct    = doc["humanSpeedPct"] | WINDING_HUMAN_SPEED_JITTER_DEFAULT;
 	recipe.firstPassTraverseFactor = constrain((float)(doc["firstPassTraverseFactor"] | 1.0f), 0.40f, 1.80f);
-	recipe.latOffsetMm      = doc["latOffsetMm"] | LAT_HOME_OFFSET_DEFAULT_MM;
+	recipe.latOffset_mm      = doc["latOffsetMm"] | LAT_HOME_OFFSET_DEFAULT_MM;
 	recipe.endPos           = windingEndPosFromString(String((const char*)(doc["endPos"] | "none")));
 	recipe.endPosTurns      = constrain((int)(doc["endPosTurns"] | 3), 1, 20);
 
@@ -121,6 +119,6 @@ bool WindingRecipeStore::fromJson(const String& json, WindingRecipe& recipe) con
 	recipe.humanTraversePct = constrain(recipe.humanTraversePct, 0.0f, 0.45f);
 	recipe.humanSpeedPct    = constrain(recipe.humanSpeedPct, 0.0f, 0.45f);
 	recipe.geometry.scatterFactor = constrain(recipe.geometry.scatterFactor, 0.5f, 4.0f);
-	recipe.latOffsetMm = max(0.0f, recipe.latOffsetMm);
+	recipe.latOffset_mm = max(0.0f, recipe.latOffset_mm);
 	return true;
 }

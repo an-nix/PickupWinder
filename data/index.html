@@ -152,16 +152,14 @@
       </div>
     </div>
     <div class="card" id="card-profile">
-      <div class="card-title">Winding profile <span class="lock-tag lockable" id="lock-profile" style="display:none">🔒 locked</span></div>
-      <div class="seg seg3 lockable" style="margin-bottom:10px"><label><input type="radio" name="wstyle" id="ws-straight" checked onchange="cmd('winding_style','straight');updateSliderVisibility('straight')"><span class="pill">Straight</span></label><label><input type="radio" name="wstyle" id="ws-scatter" onchange="cmd('winding_style','scatter');updateSliderVisibility('scatter')"><span class="pill">Scatter</span></label><label><input type="radio" name="wstyle" id="ws-human" onchange="cmd('winding_style','human');updateSliderVisibility('human')"><span class="pill">Human</span></label></div>
-      <div class="sliders lockable">
-        <label>Scatter <b id="scatter-lbl">1.0</b></label><input id="g-scatter" type="range" min="0.5" max="4" step="0.1" oninput="byId('scatter-lbl').textContent=parseFloat(this.value).toFixed(1)" onchange="cmd('geom_scatter',this.value)">
-        <label>TPP offset <b id="tpp-ofs-lbl">0</b></label><input id="g-tpp-ofs" type="range" min="-80" max="80" step="1" oninput="byId('tpp-ofs-lbl').textContent=this.value" onchange="cmd('geom_tpp_ofs',this.value)">
-        <label class="sl-scatter">Layer jitter <b id="lj">0.10</b></label><input class="sl-scatter" id="w-layer-jitter" type="range" min="0" max="0.45" step="0.01" oninput="byId('lj').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_layer_jitter',this.value)">
-        <label class="sl-scatter">Layer speed <b id="ls">0.08</b></label><input class="sl-scatter" id="w-layer-speed" type="range" min="0" max="0.45" step="0.01" oninput="byId('ls').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_layer_speed',this.value)">
-        <label class="sl-human">Human traverse <b id="ht">0.16</b></label><input class="sl-human" id="w-human-traverse" type="range" min="0" max="0.45" step="0.01" oninput="byId('ht').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_human_traverse',this.value)">
-        <label class="sl-human">Human speed <b id="hs">0.12</b></label><input class="sl-human" id="w-human-speed" type="range" min="0" max="0.45" step="0.01" oninput="byId('hs').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_human_speed',this.value)">
-        <label>1st pass factor <b id="fp">1.00</b></label><input id="w-first-pass-traverse" type="range" min="0.40" max="1.80" step="0.01" oninput="byId('fp').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_first_pass_traverse',this.value)">
+      <div class="card-title">Winding profile</div>
+      <div class="fg">
+        <label>Scatter <b id="scatter-lbl">1.0</b></label>
+        <input id="g-scatter" type="range" min="0.5" max="4" step="0.1" oninput="byId('scatter-lbl').textContent=parseFloat(this.value).toFixed(1)" onchange="cmd('geom_scatter',this.value)">
+        <label>TPP offset <b id="tpp-ofs-lbl">0</b></label>
+        <input id="g-tpp-ofs" type="range" min="-80" max="80" step="1" oninput="byId('tpp-ofs-lbl').textContent=this.value" onchange="cmd('geom_tpp_ofs',this.value)">
+        <label>1st pass factor <b id="fp">1.00</b></label>
+        <input id="w-first-pass-traverse" type="range" min="0.40" max="1.80" step="0.01" oninput="byId('fp').textContent=parseFloat(this.value).toFixed(2)" onchange="cmd('winding_first_pass_traverse',this.value)">
       </div>
     </div>
   </div>

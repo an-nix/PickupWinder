@@ -75,8 +75,14 @@ struct WindingGeometry {
      * @brief Compute effective turns-per-pass.
      * @return Calculated turns-per-pass plus offset, clamped to at least 1.
      */
+    float turnsPerPassFloat() const {
+        // Effective turns-per-pass as a float value with manual offset.
+        float val = (float)turnsPerPassCalc() + (float)turnsPerPassOffset;
+        return max(1.0f, val);
+    }
+
     long turnsPerPass() const {
-        return max(1L, turnsPerPassCalc() + turnsPerPassOffset);
+        return max(1L, (long)lroundf(turnsPerPassFloat()));
     }
 
     /**
