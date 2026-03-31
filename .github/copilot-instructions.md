@@ -11,6 +11,7 @@ Always prioritize **determinism, low memory footprint, and hardware safety** ove
 - **Framework**: Arduino (via PlatformIO)
 - **RTOS**: FreeRTOS (included with Arduino-ESP32 core)
 - **Build system**: PlatformIO (`platformio.ini`)
+ - **Build script**: Use `./build.sh` to compile the project (wrapper around PlatformIO; writes full output to `build.log`).
 - **Language**: C++17
 - **Constraints**: Limited RAM (~520 KB SRAM), no OS-level memory safety, real-time requirements
 

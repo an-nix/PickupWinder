@@ -127,10 +127,7 @@
           <label>Final pos.</label>
           <div class="seg seg3"><label><input type="radio" name="endpos" id="ep-none" onchange="cmd('end_pos','none')"><span class="pill">Free</span></label><label><input type="radio" name="endpos" id="ep-high" onchange="cmd('end_pos','high')"><span class="pill">High</span></label><label><input type="radio" name="endpos" id="ep-low" onchange="cmd('end_pos','low')"><span class="pill">Low</span></label></div>
           <label>Hold turns</label><input id="ep-turns" type="number" min="1" max="20" step="1" onchange="cmd('end_pos_turns',this.value)">
-          <div class="row4" style="align-items:center; gap:.5rem; margin-top:.5rem;">
-            <label style="margin:0;"><input id="burst-enabled" type="checkbox" onclick="cmd('burst_enable', this.checked ? 'true' : 'false')"> Burst mode</label>
-            <input id="burst-turns" type="number" min="1" max="10000" step="1" style="width:100px;" onchange="cmd('burst_turns',this.value)" placeholder="1">
-          </div>
+          <!-- Burst mode controls removed -->
         </div>
       </div>
       <div class="card">

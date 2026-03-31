@@ -7,10 +7,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void WinderApp::begin() {
-    _burstEnabled = false;
-    _burstActive = false;
-    _burstConfiguredTurns = 1;
-    _burstTargetTurns = 0;
+    // burst mode removed
 
     _recipeStore.begin();
     _recipe = _captureRecipe();
@@ -47,10 +44,7 @@ void WinderApp::_toIdle() {
     const WindingState prev = _state;
     _state              = WindingState::IDLE;
     _pendingDisable     = true;
-    _burstEnabled       = false;
-    _burstActive        = false;
-    _burstCompleted     = false;
-    _burstTargetTurns   = 0;
+    // burst mode removed
     _verifyLowPending   = false;
     _verifyHighPending  = false;
     _positioningToLow   = false;
@@ -197,12 +191,7 @@ void WinderApp::_runWindingAtHz(uint32_t hz) {
 
     // 1. Approach zone slowdown (near target)
     if (!_freerun && _stepper.isRunning()) {
-        // Consider burst target as a temporary nearby stop target so that
-        // approach/deceleration logic can engage early and avoid overshoot
-        // when performing short bursts.
-        long effectiveTarget = (long)_targetTurns;
-        if (_burstActive) effectiveTarget = min(effectiveTarget, _burstTargetTurns);
-        long remaining = effectiveTarget - _stepper.getTurns();
+        long remaining = (long)_targetTurns - _stepper.getTurns();
         if (remaining > 0 && remaining <= APPROACH_TURNS) {
             float ratio = (float)remaining / APPROACH_TURNS;
             uint32_t maxHz = APPROACH_SPEED_HZ_FLOOR
@@ -331,15 +320,7 @@ void WinderApp::_checkAutoStop() {
         }
     }
 
-    // Burst auto-stop (non-persistent scenario)
-    if (_burstActive && _stepper.getTurns() >= _burstTargetTurns) {
-        _burstActive = false;
-        _burstCompleted = true;
-        _burstTargetTurns = 0;
-        _toPaused();
-        Diag::infof("[BURST] Completed %ld turns, auto-paused", _burstConfiguredTurns);
-        return;
-    }
+    // burst mode removed
 
     // Auto-stop at target
     if (_stepper.getTurns() >= (long)_targetTurns) {
@@ -386,11 +367,6 @@ WinderStatus WinderApp::getStatus() const {
         _rodageDist_mm,
         (bool)_freerun,
         (_direction == Direction::CW),
-        _burstEnabled,
-        _burstActive,
-        _burstConfiguredTurns,
-        _burstTargetTurns,
-        (_burstActive ? max(0L, _burstTargetTurns - _stepper.getTurns()) : 0L),
         _geom.turnsPerPassFloat(),
         (float)_geom.turnsPerPassCalc(),
         (float)_geom.turnsPerPassOffset,
@@ -481,12 +457,7 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
                 return true;
             }
 
-            // Burst target is relative to the fresh counter after reset
-            if (_burstEnabled) {
-                _burstActive = true;
-                _burstTargetTurns = _burstConfiguredTurns;
-                Diag::infof("[BURST] Enabled for %ld turns => target %ld", _burstConfiguredTurns, _burstTargetTurns);
-            }
+            // start: Fresh session — reset and begin verify sequence
 
             // Fresh session — reset and begin verify sequence
             _stepper.resetTurns();
@@ -502,12 +473,6 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         }
         if (_state == WindingState::PAUSED) {
             // Resume via explicit Start command (from SessionController) and allow current pot-based speed.
-            if (_burstEnabled && !_burstActive) {
-                _burstActive = true;
-                _burstCompleted = false;
-                _burstTargetTurns = _stepper.getTurns() + _burstConfiguredTurns;
-                Diag::infof("[BURST] Resuming burst to target %ld", _burstTargetTurns);
-            }
             _toWinding();
             return true;
         }
@@ -526,10 +491,6 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
 
     if (cmd == "resume") {
         if (_state == WindingState::PAUSED) {
-            if (_burstCompleted && _burstEnabled) {
-                Diag::info("[Resume] Ignored — burst completed, use Start to begin a new burst");
-                return true;
-            }
             _toWinding();
             Diag::info("[Resume] Armed — transitioning to winding");
         } else {
@@ -572,36 +533,7 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         return true;
     }
 
-    // ── Burst mode (non-persistent) ─────────────────────────────────────────
-    if (cmd == "burst_turns") {
-        long n = constrain(value.toInt(), 1L, 10000L);
-        _burstConfiguredTurns = n;
-        Diag::infof("[BURST] Configured %ld turns", n);
-        return true;
-    }
-
-    if (cmd == "burst") {
-        // Compatibility helper: enables burst mode and starts with a specified count.
-        long n = (_burstConfiguredTurns > 0) ? _burstConfiguredTurns : 1;
-        if (value.length() > 0) n = constrain(value.toInt(), 1, 10000);
-        _burstConfiguredTurns = n;
-        _burstEnabled = true;
-
-        if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
-            _burstActive = true;
-            _burstTargetTurns = n;
-            Diag::infof("[BURST] Starting burst %ld turns from zero", n);
-            _handleImmediateCommand("start", "");
-        } else {
-            _burstActive = true;
-            _burstTargetTurns = _stepper.getTurns() + n;
-            Diag::infof("[BURST] Starting burst %ld turns from %ld", n, _stepper.getTurns());
-            if (_state == WindingState::PAUSED) {
-                _toWinding();
-            }
-        }
-        return true;
-    }
+    // (no burst commands) -- simplified command set
 
     // ── Rodage axe lateral ───────────────────────────────────────────────────
     if (cmd == "rodage_dist") {
@@ -614,21 +546,7 @@ bool WinderApp::_handleImmediateCommand(const String& cmd, const String& value) 
         Diag::infof("[RODAGE] Passes: %d", _rodagePasses);
         return true;
     }
-    if (cmd == "burst_enable") {
-        _burstEnabled = (value == "true");
-        if (!_burstEnabled) {
-            _burstActive = false;
-            _burstTargetTurns = 0;
-        }
-        Diag::infof("[BURST] Enabled=%s", _burstEnabled ? "true" : "false");
-        return true;
-    }
-
-    if (cmd == "burst_turns") {
-        _burstConfiguredTurns = constrain(value.toInt(), 1L, 10000L);
-        Diag::infof("[BURST] Configured %ld turns", _burstConfiguredTurns);
-        return true;
-    }
+    // burst commands removed
 
     if (cmd == "rodage") {
         if (_state == WindingState::IDLE) {
