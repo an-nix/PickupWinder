@@ -35,26 +35,42 @@ void LinkSerial::sendStatus(float    rpm,
  * @brief Poll UART and dispatch full command lines.
  * @param cb Callback receiving parsed command/value pairs.
  */
+static void trimChars(char* s) {
+    if (!s) return;
+    // Trim leading spaces
+    char* p = s;
+    while (*p != '\0' && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+    // Trim trailing spaces
+    size_t len = strlen(s);
+    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\r' || s[len-1] == '\n')) {
+        s[--len] = '\0';
+    }
+}
+
 void LinkSerial::poll(CommandCallback cb) {
     // Consume all available bytes without blocking the control flow.
     while (LINK_UART.available()) {
         char c = (char)LINK_UART.read();
 
         if (c == '\n') {
-            // A full line was received; split it around the ':' separator.
-            int sep = _rxBuf.indexOf(':');
-            if (sep > 0 && cb) {
-                String cmd = _rxBuf.substring(0, sep);
-                String val = _rxBuf.substring(sep + 1);
-                cmd.trim();
-                val.trim();
-                cb(cmd, val);
+            if (_rxLen == 0) continue;
+            _rxBuf[_rxLen] = '\0';
+            char* sep = strchr(_rxBuf, ':');
+            if (sep && cb) {
+                *sep = '\0';
+                char* val = sep + 1;
+                trimChars(_rxBuf);
+                trimChars(val);
+                cb(_rxBuf, val);
             }
-            _rxBuf = "";
+            _rxLen = 0;
         } else if (c != '\r') {
-            // Protect against corrupted or runaway lines.
-            if (_rxBuf.length() < 128) _rxBuf += c;
-            else                        _rxBuf = "";  // Silent reset on overflow.
+            if (_rxLen < RX_BUF_SIZE - 1) {
+                _rxBuf[_rxLen++] = c;
+            } else {
+                _rxLen = 0;  // Silent reset on overflow.
+            }
         }
     }
 }

@@ -23,7 +23,7 @@ bool WindingRecipeStore::load(WindingRecipe& recipe) {
 	String json = prefs.getString(RECIPE_KEY, "");
 	prefs.end();
 	if (json.isEmpty()) return false;
-	return fromJson(json, recipe);
+	return fromJson(json.c_str(), recipe);
 }
 
 /**
@@ -32,12 +32,13 @@ bool WindingRecipeStore::load(WindingRecipe& recipe) {
  * @return true when write length matches serialized length.
  */
 bool WindingRecipeStore::save(const WindingRecipe& recipe) {
-	String json = toJson(recipe);
+	char json[2048];
+	toJson(recipe, json, sizeof(json));
 	Preferences prefs;
 	if (!prefs.begin(RECIPE_NS, false)) return false;
 	size_t written = prefs.putString(RECIPE_KEY, json);
 	prefs.end();
-	return written == json.length();
+	return written == strlen(json);
 }
 
 /**
@@ -45,7 +46,8 @@ bool WindingRecipeStore::save(const WindingRecipe& recipe) {
  * @param recipe Recipe input.
  * @return Pretty-printed JSON string.
  */
-String WindingRecipeStore::toJson(const WindingRecipe& recipe) const {
+void WindingRecipeStore::toJson(const WindingRecipe& recipe, char* outBuf, size_t outBufLen) const {
+	if (!outBuf || outBufLen == 0) return;
 	JsonDocument doc;
 	doc["version"] = recipe.version;
 	doc["targetTurns"] = recipe.targetTurns;
@@ -73,9 +75,7 @@ String WindingRecipeStore::toJson(const WindingRecipe& recipe) const {
 	geom["turnsPerPassOffset"] = recipe.geometry.turnsPerPassOffset;
 	geom["scatterFactor"] = recipe.geometry.scatterFactor;
 
-	String out;
-	serializeJsonPretty(doc, out);
-	return out;
+	serializeJsonPretty(doc, outBuf, outBufLen);
 }
 
 /**
@@ -84,7 +84,8 @@ String WindingRecipeStore::toJson(const WindingRecipe& recipe) const {
  * @param recipe Output recipe.
  * @return true when JSON parsing succeeds.
  */
-bool WindingRecipeStore::fromJson(const String& json, WindingRecipe& recipe) const {
+bool WindingRecipeStore::fromJson(const char* json, WindingRecipe& recipe) const {
+	if (!json) return false;
 	JsonDocument doc;
 	DeserializationError err = deserializeJson(doc, json);
 	if (err) return false;
@@ -93,7 +94,7 @@ bool WindingRecipeStore::fromJson(const String& json, WindingRecipe& recipe) con
 	recipe.targetTurns      = doc["targetTurns"] | DEFAULT_TARGET_TURNS;
 	recipe.freerun          = doc["freerun"] | false;
 	recipe.directionCW      = doc["directionCW"] | true;
-	recipe.style            = WindingPatternPlanner::styleFromString(String((const char*)(doc["style"] | "straight")));
+	recipe.style            = WindingPatternPlanner::styleFromString((const char*)(doc["style"] | "straight"));
 	recipe.seed             = doc["seed"] | WINDING_DEFAULT_SEED;
 	recipe.layerJitterPct   = doc["layerJitterPct"] | WINDING_LAYER_JITTER_DEFAULT;
 	recipe.layerSpeedPct    = doc["layerSpeedPct"] | WINDING_LAYER_SPEED_JITTER_DEFAULT;
@@ -101,7 +102,7 @@ bool WindingRecipeStore::fromJson(const String& json, WindingRecipe& recipe) con
 	recipe.humanSpeedPct    = doc["humanSpeedPct"] | WINDING_HUMAN_SPEED_JITTER_DEFAULT;
 	recipe.firstPassTraverseFactor = constrain((float)(doc["firstPassTraverseFactor"] | 1.0f), 0.40f, 1.80f);
 	recipe.latOffsetMm      = doc["latOffsetMm"] | LAT_HOME_OFFSET_DEFAULT_MM;
-	recipe.endPos           = windingEndPosFromString(String((const char*)(doc["endPos"] | "none")));
+	recipe.endPos           = windingEndPosFromString((const char*)(doc["endPos"] | "none"));
 	recipe.endPosTurns      = constrain((int)(doc["endPosTurns"] | 3), 1, 20);
 
 	JsonObject geom = doc["geometry"].as<JsonObject>();

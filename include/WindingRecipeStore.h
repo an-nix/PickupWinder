@@ -28,15 +28,16 @@ public:
 	/**
 	 * @brief Serialize a recipe to JSON.
 	 * @param recipe Recipe to serialize.
-	 * @return JSON payload as a string.
+	 * @param outBuf Output buffer for JSON text.
+	 * @param outBufLen Output buffer length in bytes (including null terminator).
 	 */
-	String toJson(const WindingRecipe& recipe) const;
+	void toJson(const WindingRecipe& recipe, char* outBuf, size_t outBufLen) const;
 
 	/**
 	 * @brief Parse a recipe from JSON.
-	 * @param json Source JSON payload.
+	 * @param json Source JSON payload (null-terminated).
 	 * @param recipe Output recipe structure.
 	 * @return true if parsing and validation succeeded.
 	 */
-	bool   fromJson(const String& json, WindingRecipe& recipe) const;
+	bool fromJson(const char* json, WindingRecipe& recipe) const;
 };

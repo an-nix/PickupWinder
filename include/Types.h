@@ -1,9 +1,8 @@
 #pragma once
 #include <Arduino.h>
-#include <functional>
 
-using CommandCallback = std::function<void(const String&, const String&)>;
-using RecipeJsonProvider = std::function<String(void)>;
+using CommandCallback = void (*)(const char* cmd, const char* value);
+using RecipeJsonProvider = void (*)(char* outBuf, size_t outBufLen);
 
 // ── WindingState ──────────────────────────────────────────────────────────────
 // Simplified state machine. Verify is NOT a state — it uses flags during the

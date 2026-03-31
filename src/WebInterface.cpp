@@ -74,7 +74,10 @@ void WebInterface::begin() {
             req->send(503, "application/json", "{\"error\":\"recipe unavailable\"}");
             return;
         }
-        AsyncWebServerResponse* res = req->beginResponse(200, "application/json", _recipeProvider());
+        char jsonBuf[2048];
+        jsonBuf[0] = '\0';
+        _recipeProvider(jsonBuf, sizeof(jsonBuf));
+        AsyncWebServerResponse* res = req->beginResponse(200, "application/json", jsonBuf);
         res->addHeader("Content-Disposition", "attachment; filename=pickup-winder-recipe.json");
         req->send(res);
     });
@@ -95,8 +98,8 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
     char buf[832];
     snprintf(buf, sizeof(buf),
         "{\"rpm\":%.0f,\"hz\":%u,\"turns\":%ld,\"target\":%ld,\"maxRpm\":%u,"
-        "\"running\":%s,\"enabled\":%s,\"startRequested\":%s,\"carriageReady\":%s,\"freerun\":%s,\"cw\":%s,\"auto\":%s,"
-        "\"tpp\":%ld,\"tppCalc\":%ld,\"tppOfs\":%ld,\"scatter\":%.2f,"
+        "\"running\":%s,\"enabled\":%s,\"startRequested\":%s,\"carriageReady\":%s,\"freerun\":%s,\"cw\":%s,"
+        "\"tpp\":%.2f,\"tppCalc\":%.2f,\"tppOfs\":%.2f,\"scatter\":%.2f,"
         "\"pass\":%d,\"activeTpp\":%ld,\"latScale\":%.3f,\"latProgress\":%.3f,\"latPos\":%.3f,\"wStart\":%.3f,\"wEnd\":%.3f,\"wStartTrim\":%.3f,\"wEndTrim\":%.3f,\"eff\":%.2f,"
         "\"gt\":%.2f,\"gb\":%.2f,\"gtp\":%.2f,\"gm\":%.2f,\"gw\":%.4f,"
         "\"latOfs\":%.2f,\"wStyle\":\"%s\",\"seed\":%lu,"
@@ -112,7 +115,6 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
         s.carriageReady  ? "true" : "false",
         s.freerun      ? "true" : "false",
         s.directionCW  ? "true" : "false",
-        s.autoMode     ? "true" : "false",
         s.turnsPerPass, s.turnsPerPassCalc, s.turnsPerPassOffset, s.scatterFactor,
         s.currentPass, s.activeTurnsPerPass, s.activeSpeedScale, s.latProgress,
         s.latPositionMm, s.windingStartMm, s.windingEndMm, s.windingStartTrimMm, s.windingEndTrimMm, s.effectiveWidth_mm,
@@ -172,12 +174,11 @@ void WebInterface::_onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* clie
     DeserializationError err = deserializeJson(doc, data, len);
     if (err) return;
 
-    String cmd = String((const char*)(doc["cmd"] | ""));
-    String val = String((const char*)(doc["val"] | ""));
+    const char* cmdIn = doc["cmd"] | "";
+    const char* valIn = doc["val"] | "";
 
-    // Forward to the registered command handler (WinderApp::_handleCommand).
-    if (cmd.length() > 0 && _callback) {
-        Diag::infof("[WS-CMD] cmd='%s' val='%s'", cmd.c_str(), val.c_str());
-        _callback(cmd, val);
+    if (_callback && cmdIn && cmdIn[0] != '\0') {
+        Diag::infof("[WS-CMD] cmd='%s' val='%s'", cmdIn, valIn);
+        _callback(cmdIn, valIn);
     }
 }

@@ -64,6 +64,8 @@ public:
     void poll();
 
 private:
-    String _rxBuf;  // Receive buffer for the current in-flight line.
+    static constexpr size_t RX_BUF_SIZE = 128;
+    char _rxBuf[RX_BUF_SIZE];  // Receive buffer for the current in-flight line.
+    size_t _rxLen = 0;
     CommandCallback _callback = nullptr;
 };

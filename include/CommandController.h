@@ -23,6 +23,11 @@ public:
     */
    CommandController(LinkSerial& serial, WebInterface& web);
 
+   /**
+    * @brief Transport callback adapter used for C-style function pointers.
+    */
+   static void onTransportCommand(const char* cmd, const char* val);
+
    /** @brief Create the queue and register transport callbacks. */
    void begin();
 
@@ -44,4 +49,6 @@ private:
    // FreeRTOS queue for thread-safe command passing between tasks.
    static constexpr int CMD_QUEUE_SIZE = 32;
    QueueHandle_t _cmdQueue = nullptr;
+
+   static CommandController* s_instance;
 };

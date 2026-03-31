@@ -2,9 +2,20 @@
 #include "Diag.h"
 #include "SessionController.h"
 
+CommandController* CommandController::s_instance = nullptr;
+
 CommandController::CommandController(LinkSerial& serial, WebInterface& web)
     : _serial(serial), _web(web)
 {
+    s_instance = this;
+}
+
+void CommandController::onTransportCommand(const char* cmd, const char* val) {
+    if (!s_instance) return;
+    CommandEntry c;
+    strncpy(c.cmd, cmd, sizeof(c.cmd)); c.cmd[sizeof(c.cmd)-1] = '\0';
+    strncpy(c.val, val, sizeof(c.val)); c.val[sizeof(c.val)-1] = '\0';
+    s_instance->pushCommand(c);
 }
 
 void CommandController::begin()
@@ -14,18 +25,9 @@ void CommandController::begin()
 
     // Register both transports against the same push path so all commands are
     // normalized before reaching the control task.
-    _web.setCommandCallback([this](const String& cmd, const String& val) {
-        CommandEntry c;
-        cmd.toCharArray(c.cmd, sizeof(c.cmd));
-        val.toCharArray(c.val, sizeof(c.val));
-        this->pushCommand(c);
-    });
-    _serial.setCommandCallback([this](const String& cmd, const String& val) {
-        CommandEntry c;
-        cmd.toCharArray(c.cmd, sizeof(c.cmd));
-        val.toCharArray(c.val, sizeof(c.val));
-        this->pushCommand(c);
-    });
+    _web.setCommandCallback(CommandController::onTransportCommand);
+    _serial.setCommandCallback(CommandController::onTransportCommand);
+
 }
 
 void CommandController::drain(SessionController::TickInput& out)

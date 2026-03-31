@@ -50,7 +50,7 @@ public:
     void stopWinding() { _toIdle(); }
 
     /** @brief Dispatch a user or transport command into the winding domain. */
-    void handleCommand(const String& cmd, const String& value);
+    void handleCommand(const char* cmd, const char* value);
 
     /** @brief Apply one encoder delta to the interactive trim logic. */
     void handleEncoderDelta(int32_t delta);
@@ -58,8 +58,8 @@ public:
     /** @brief Build a snapshot of all UI-facing status fields. */
     WinderStatus getStatus() const;
 
-    /** @brief Serialize the active recipe to JSON. */
-    String recipeJson() const;
+    /** @brief Serialize the active recipe to JSON into caller buffer. */
+    void recipeJson(char* buf, size_t len) const;
 
 private:
     // ── Hardware subsystems ──
@@ -114,9 +114,9 @@ private:
 
     // ── Command handlers ──
     bool _parametersLocked() const { return _state != WindingState::IDLE; }
-    bool _handleImmediateCommand(const String& cmd, const String& value);
-    bool _handleGeometryCommand(const String& cmd, const String& value);
-    bool _handlePatternCommand(const String& cmd, const String& value);
+    bool _handleImmediateCommand(const char* cmd, const char* value);
+    bool _handleGeometryCommand(const char* cmd, const char* value);
+    bool _handlePatternCommand(const char* cmd, const char* value);
     void _refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged);
 
     // ── Recipe helpers ──
