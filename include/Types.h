@@ -55,15 +55,10 @@ struct WinderStatus {
     float    rodageDistMm;
     bool     freerun;
     bool     directionCW;
-    bool     autoMode;
-    bool     burstEnabled;
-    bool     burstActive;
-    long     burstConfiguredTurns;
-    long     burstTargetTurns;
-    long     burstRemainingTurns;
-    long     turnsPerPass;
-    long     turnsPerPassCalc;
-    long     turnsPerPassOffset;
+    // Burst mode removed — fields eliminated to simplify status
+    float    turnsPerPass;
+    float    turnsPerPassCalc;
+    float    turnsPerPassOffset;
     float    scatterFactor;
     int      currentPass;
     long     activeTurnsPerPass;
