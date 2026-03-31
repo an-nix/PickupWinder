@@ -37,7 +37,9 @@ void WebInterface::begin() {
     }
 
     _wifiOk = true;
-    Diag::infof("[Web] WiFi connected, IP %s", _wifiManager->getIP().c_str());
+    char ipBuf[32];
+    _wifiManager->getIP(ipBuf, sizeof(ipBuf));
+    Diag::infof("[Web] WiFi connected, IP %s", ipBuf);
 
     // Register the WebSocket event handler using a lambda to forward calls
     // to the private _onWsEvent method (captures `this`).
@@ -137,9 +139,16 @@ void WebInterface::setRecipeProvider(RecipeJsonProvider cb) {
     _recipeProvider = cb;
 }
 
-/** @brief Return local IP string when connected, otherwise `N/A`. */
-String WebInterface::getIP() const {
-    return _wifiManager ? _wifiManager->getIP() : String("N/A");
+/** @brief Broadcast-wired accessor for getIP. */
+void WebInterface::getIP(char* buf, size_t len) const {
+    if (!_wifiManager || !buf || len == 0) {
+        if (buf && len > 0) {
+            strncpy(buf, "N/A", len);
+            buf[len-1] = '\0';
+        }
+        return;
+    }
+    _wifiManager->getIP(buf, len);
 }
 
 void WebInterface::setWifiManager(WifiManager* manager) {

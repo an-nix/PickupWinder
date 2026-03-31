@@ -152,7 +152,9 @@ void setup() {
     });
 
     if (web.isConnected()) {
-        Diag::infof("→ Web interface: http://%s", web.getIP().c_str());
+        char ipBuf[32];
+        web.getIP(ipBuf, sizeof(ipBuf));
+        Diag::infof("→ Web interface: http://%s", ipBuf);
     }
 
     // Create inter-task synchronization

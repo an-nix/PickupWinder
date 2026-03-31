@@ -46,10 +46,11 @@ public:
     void   setRecipeProvider(RecipeJsonProvider cb);
 
     /**
-     * @brief Get local WiFi IP string.
-     * @return Local IP, or "N/A" when disconnected.
+     * @brief Fill buffer with local WiFi IP.
+     * @param buf caller buffer for IP text.
+     * @param len buffer length in bytes.
      */
-    String getIP() const;
+    void getIP(char* buf, size_t len) const;
 
     /**
      * @brief Check whether web interface is online.

@@ -1,76 +1,69 @@
 #include "WifiManager.h"
 #include <WiFi.h>
-#include <Preferences.h>
 #include "Diag.h"
 #include "Config.h"
+#include "NvsCompat.h"
 
 WifiManager::WifiManager() : _wifiOk(false) {}
 
-bool WifiManager::ensureNvsCredentials(String& ssid, String& password) {
-    Preferences prefs;
-    prefs.begin("wifi", true);
-    String storedSsid = prefs.getString("ssid", "");
-    String storedPassword = prefs.getString("pwd", "");
-    prefs.end();
+bool WifiManager::ensureNvsCredentials(char* ssidBuf, size_t ssidBufLen, char* pwdBuf, size_t pwdBufLen) {
+    // Use NVS compatibility API to read credentials without Arduino String data.
+    size_t got = 0;
+    bool ok = NvsCompat::readBlob("wifi", "ssid", ssidBuf, ssidBufLen - 1, got);
+    if (ok && got > 0) ssidBuf[got < ssidBufLen ? got : ssidBufLen - 1] = '\0';
+    else if (ssidBuf && ssidBufLen > 0) ssidBuf[0] = '\0';
 
-    if (storedSsid.length() && storedPassword.length()) {
-        ssid = storedSsid;
-        password = storedPassword;
-        return true;
-    }
+    got = 0;
+    ok = NvsCompat::readBlob("wifi", "pwd", pwdBuf, pwdBufLen - 1, got);
+    if (ok && got > 0) pwdBuf[got < pwdBufLen ? got : pwdBufLen - 1] = '\0';
+    else if (pwdBuf && pwdBufLen > 0) pwdBuf[0] = '\0';
 
-    return false;
+    return (ssidBuf && ssidBuf[0] != '\0' && pwdBuf && pwdBuf[0] != '\0');
 }
 
-bool WifiManager::isDefaultCredentials(const String& ssid, const String& password) const {
-    // Prevent using placeholder defaults for actual connection or NVS writes.
-    if (ssid == "your_ssid_here" || password == "your_password_here") return true;
-    if (ssid.length() == 0 || password.length() == 0) return true;
+bool WifiManager::isDefaultCredentials(const char* ssid, const char* password) const {
+    if (!ssid || !password) return true;
+    if (strcmp(ssid, "your_ssid_here") == 0 || strcmp(password, "your_password_here") == 0) return true;
+    if (ssid[0] == '\0' || password[0] == '\0') return true;
     return false;
 }
 
 void WifiManager::begin() {
-    String ssid = String(WIFI_SSID);
-    String password = String(WIFI_PASSWORD);
+    char ssidBuf[64];
+    char pwdBuf[64];
+    strncpy(ssidBuf, WIFI_SSID, sizeof(ssidBuf)); ssidBuf[sizeof(ssidBuf)-1] = '\0';
+    strncpy(pwdBuf, WIFI_PASSWORD, sizeof(pwdBuf)); pwdBuf[sizeof(pwdBuf)-1] = '\0';
 
-    String nvsSsid;
-    String nvsPassword;
-    bool hasNvs = false;
-
-    // Read NVS first, if present use that.
-    {
-        Preferences prefs;
-        prefs.begin("wifi", true);
-        nvsSsid = prefs.getString("ssid", "");
-        nvsPassword = prefs.getString("pwd", "");
-        prefs.end();
-        hasNvs = nvsSsid.length() && nvsPassword.length();
-    }
+    char nvsSsid[64];
+    char nvsPwd[64];
+    bool hasNvs = ensureNvsCredentials(nvsSsid, sizeof(nvsSsid), nvsPwd, sizeof(nvsPwd));
+    Diag::infof("[WiFi] compile-time credentials: SSID='%s' PWD='%s'", ssidBuf, pwdBuf);
+    Diag::infof("[WiFi] NVS load status: hasNvs=%d nvsSsid='%s' nvsPwd='%s'", hasNvs, nvsSsid, nvsPwd);
 
     if (hasNvs) {
-        // If runtime config is non-default and differs from NVS, persist new values.
-        if (!isDefaultCredentials(ssid, password) && (ssid != nvsSsid || password != nvsPassword)) {
-            setCredentials(ssid, password);
-            nvsSsid = ssid;
-            nvsPassword = password;
+        if (!isDefaultCredentials(ssidBuf, pwdBuf) &&
+            (strcmp(ssidBuf, nvsSsid) != 0 || strcmp(pwdBuf, nvsPwd) != 0)) {
+            Diag::info("[WiFi] compile-time credentials are non-default and different from NVS; updating NVS.");
+            setCredentials(ssidBuf, pwdBuf);
+            strncpy(nvsSsid, ssidBuf, sizeof(nvsSsid));
+            strncpy(nvsPwd, pwdBuf, sizeof(nvsPwd));
         }
 
-        ssid = nvsSsid;
-        password = nvsPassword;
-        Diag::infof("[WiFi] Using credentials from NVS '%s'", ssid.c_str());
+        strncpy(ssidBuf, nvsSsid, sizeof(ssidBuf));
+        strncpy(pwdBuf, nvsPwd, sizeof(pwdBuf));
+        Diag::infof("[WiFi] Using credentials from NVS '%s'", ssidBuf);
     } else {
-        // If no NVS data, only connect if non-default config values are supplied.
-        if (isDefaultCredentials(ssid, password)) {
+        if (isDefaultCredentials(ssidBuf, pwdBuf)) {
             Diag::error("[WiFi] No NVS credentials and config default values; WiFi disabled.");
             _wifiOk = false;
             return;
         }
 
-        setCredentials(ssid, password);
-        Diag::infof("[WiFi] Storing compile-time config values to NVS '%s'", ssid.c_str());
+        setCredentials(ssidBuf, pwdBuf);
+        Diag::infof("[WiFi] Storing compile-time config values to NVS '%s'", ssidBuf);
     }
 
-    WiFi.begin(ssid.c_str(), password.c_str());
+    WiFi.begin(ssidBuf, pwdBuf);
     Serial.print("[WiFi] Connecting");
 
     uint8_t tries = 0;
@@ -87,39 +80,49 @@ void WifiManager::begin() {
     }
 
     _wifiOk = true;
-    Diag::infof("\n[WiFi] Connected — IP: %s", WiFi.localIP().toString().c_str());
+    char ipbuf[32];
+    snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u",
+             WiFi.localIP()[0], WiFi.localIP()[1], WiFi.localIP()[2], WiFi.localIP()[3]);
+    Diag::infof("\n[WiFi] Connected — IP: %s", ipbuf);
 }
 
-bool WifiManager::setCredentials(const String& ssid, const String& password) {
+bool WifiManager::setCredentials(const char* ssid, const char* password) {
+    if (!ssid || !password) return false;
     if (isDefaultCredentials(ssid, password)) {
         Diag::error("[WiFi] Refuse default/empty credentials in NVS.");
         return false;
     }
 
-    Preferences prefs;
-    prefs.begin("wifi", false);
+    char existingSsid[128] = {0};
+    char existingPwd[128] = {0};
+    size_t got = 0;
+    NvsCompat::readBlob("wifi", "ssid", existingSsid, sizeof(existingSsid) - 1, got);
+    NvsCompat::readBlob("wifi", "pwd", existingPwd, sizeof(existingPwd) - 1, got);
 
-    String storedSsid = prefs.getString("ssid", "");
-    String storedPassword = prefs.getString("pwd", "");
-
-    if (storedSsid == ssid && storedPassword == password) {
+    if (strcmp(existingSsid, ssid) == 0 && strcmp(existingPwd, password) == 0) {
         Diag::info("[WiFi] Credentials unchanged; skip NVS update.");
-        prefs.end();
         return false;
     }
 
-    prefs.putString("ssid", ssid);
-    prefs.putString("pwd", password);
-    prefs.end();
+    bool ok = NvsCompat::writeBlob("wifi", "ssid", ssid, strlen(ssid) + 1) &&
+              NvsCompat::writeBlob("wifi", "pwd", password, strlen(password) + 1);
 
     Diag::info("[WiFi] Updated credentials in NVS.");
-    return true;
+    return ok;
 }
 
 bool WifiManager::isConnected() const {
     return _wifiOk;
 }
 
-String WifiManager::getIP() const {
-    return _wifiOk ? WiFi.localIP().toString() : String("N/A");
+void WifiManager::getIP(char* buf, size_t len) const {
+    if (!buf || len == 0) return;
+    if (!_wifiOk) {
+        strncpy(buf, "N/A", len);
+        buf[len-1] = '\0';
+        return;
+    }
+    IPAddress ip = WiFi.localIP();
+    snprintf(buf, len, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
+

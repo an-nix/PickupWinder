@@ -9,16 +9,17 @@ public:
     // Initialize WiFi connection, using NVS credentials if present.
     void begin();
 
-    // Save credentials in NVS. Returns true when value is written, false when unchanged.
-    bool setCredentials(const String& ssid, const String& password);
+    // Save credentials in NVS. C-string API to avoid heap allocations.
+    bool setCredentials(const char* ssid, const char* password);
 
     // Current connection status.
     bool isConnected() const;
 
-    String getIP() const;
+    // Fill caller buffer with IP or N/A.
+    void getIP(char* buf, size_t len) const;
 
 private:
-    bool ensureNvsCredentials(String& ssid, String& password);
-    bool isDefaultCredentials(const String& ssid, const String& password) const;
+    bool ensureNvsCredentials(char* ssidBuf, size_t ssidBufLen, char* pwdBuf, size_t pwdBufLen);
+    bool isDefaultCredentials(const char* ssid, const char* password) const;
     bool _wifiOk;
 };
