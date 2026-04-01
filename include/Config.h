@@ -53,6 +53,9 @@
 #define LAT_STEPS_PER_MM    (LAT_MOTOR_STEPS * MICROSTEPPING)  // 3072 steps/mm
 #define LAT_TRAVERSE_MM     100     // 100 mm traversal used for calibration and checks
 #define LAT_TRAVERSE_SPEED_HZ 4800  // Traverse speed ~= 0.75 mm/s with the current mechanics
+// Slowdown factor applied to spindle speed during lateral direction reversal.
+// Value in range (0.0f, 1.0f]; 0.5f means 50% of the target spindle speed while reversing.
+#define LAT_REVERSAL_SLOWDOWN 0.50f
 // Fallback speed for the final end-position hold move if the carriage is idle.
 #define LAT_ENDPOS_FALLBACK_HZ  (LAT_TRAVERSE_SPEED_HZ / 6)
 // Break-in shuttle speed, intentionally faster than normal traversal.
