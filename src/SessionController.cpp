@@ -27,7 +27,9 @@ void SessionController::recordIntent(ControlIntent intent, InputSource src) {
     // validation while idle.
     if (intent == ControlIntent::Start && _sessionState == SessionState::IDLE
         && src != InputSource::IHM) {
+#if DIAG_VERBOSE
         Diag::infof("[Session] recordIntent: rejected non-UI Start while IDLE (src=%d)", (int)src);
+#endif
         return;
     }
 
@@ -51,8 +53,10 @@ void SessionController::recordIntent(ControlIntent intent, InputSource src) {
         default: break;
     }
     // Log all intent observations for debugging the start/arm flow.
+#if DIAG_VERBOSE
     Diag::infof("[Session] recordIntent observed intent=%s src=%s pot=%.3f potNeedsRearm=%d session=%d",
                 intentName, srcName, _potLevel, _potNeedsRearm, (int)_sessionState);
+#endif
 
     // If another source takes control while pot is non-zero, require a pot
     // return-to-zero before pot can start the machine again.
@@ -89,13 +93,17 @@ void SessionController::applyPendingIntent() {
         // intents coming from Pot or Footswitch to avoid accidental validation
         // when the user is only adjusting controls.
         if (_sessionState == SessionState::IDLE && src != InputSource::IHM) {
+#if DIAG_VERBOSE
             Diag::infof("[Session] Ignoring non-UI Start while IDLE (src=%d)", (int)src);
+#endif
             break; // Do not transition out of IDLE
         }
 
         // Diagnostic: log intent application for tracing race conditions.
+    #if DIAG_VERBOSE
         Diag::infof("[Session] applyPendingIntent applying Start src=%d sessionBefore=%d",
-                (int)src, (int)_sessionState);
+            (int)src, (int)_sessionState);
+    #endif
 
         // Forward Start intents to WinderApp so UI/footswitch can resume from
         // PAUSED or re-arm the session when appropriate.
@@ -197,8 +205,8 @@ void SessionController::applyPower()
 
         _winder.setControlHz(commandedSpeedHz);
         // Log only on meaningful changes to avoid spamming the serial console.
-        if (_sessionState != _lastLoggedSessionState || _runMode != _lastLoggedRunMode
-            || _lastEventSource != _lastLoggedSource) {
+        if (DIAG_VERBOSE && (_sessionState != _lastLoggedSessionState || _runMode != _lastLoggedRunMode
+            || _lastEventSource != _lastLoggedSource)) {
             Diag::infof("[Session] ARMED speedHz=%u pot=%.3f source=%d runMode=%d",
                         commandedSpeedHz, _potLevel, (int)_lastEventSource, (int)_runMode);
             _lastLoggedSessionState = _sessionState;
@@ -210,7 +218,7 @@ void SessionController::applyPower()
     {
         // Any non-armed state forces zero speed command.
         _winder.setControlHz(0); // Guarantee no speed command outside ARMED_OR_RUNNING.
-        if (_sessionState != _lastLoggedSessionState || _lastEventSource != _lastLoggedSource) {
+        if (DIAG_VERBOSE && (_sessionState != _lastLoggedSessionState || _lastEventSource != _lastLoggedSource)) {
             Diag::infof("[Session] PAUSED source=%d pot=%.3f", (int)_lastEventSource, _potLevel);
             _lastLoggedSessionState = _sessionState;
             _lastLoggedSource = _lastEventSource;
@@ -245,7 +253,9 @@ void SessionController::tick(const TickInput& in) {
                 // When IDLE, do not emit pot-derived intents — just update baseline
                 // so moving the pot doesn't arm or pause the session unexpectedly.
                 if (_sessionState == SessionState::IDLE) {
+#if DIAG_VERBOSE
                     Diag::infof("[Session] Ignoring pot event while IDLE (aboveZero=%d)", (int)potAboveZero);
+#endif
                 } else {
                     if (!potAboveZero) {
                         _potNeedsRearm = false;
@@ -273,7 +283,9 @@ void SessionController::tick(const TickInput& in) {
         } else if (_footswitch != in.footswitch) {
             _footswitch = in.footswitch; // update latest state
             if (_sessionState == SessionState::IDLE) {
+#if DIAG_VERBOSE
                 Diag::infof("[Session] Ignoring footswitch event while IDLE (pressed=%d)", (int)_footswitch);
+#endif
             } else {
                 recordIntent(_footswitch ? ControlIntent::Start : ControlIntent::Pause,
                              InputSource::Footswitch); // Press->start, release->pause.

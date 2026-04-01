@@ -2,6 +2,22 @@
 #include <Arduino.h>
 #include "Diag.h"
 
+void StepperController::_servicePendingStart() {
+    if (!_stepper || !_startPending) return;
+    const uint32_t now = millis();
+    if ((int32_t)(now - _startReadyAtMs) < 0) return;
+
+    _stepper->setSpeedInHz(_speedHz);
+    _stepper->applySpeedAcceleration();
+    if (_startForward) _stepper->runForward();
+    else               _stepper->runBackward();
+    _startPending = false;
+
+#if DIAG_VERBOSE
+    Diag::infof("[Stepper] start committed: targetHz=%u", _speedHz);
+#endif
+}
+
 /**
  * @brief Initialize spindle stepper channel and safe startup state.
  */
@@ -33,6 +49,8 @@ void StepperController::begin(FastAccelStepperEngine& engine) {
  * @brief Update spindle speed setpoint with runtime-safe behavior.
  */
 void StepperController::setSpeedHz(uint32_t hz) {
+    _servicePendingStart();
+
     // Clamp the requested speed to the configured min/max range.
     uint32_t clamped = constrain(hz, SPEED_HZ_MIN, SPEED_HZ_MAX);
     // Skip update if speed has not changed (avoids unnecessary I2C-like overhead).
@@ -56,12 +74,22 @@ void StepperController::setSpeedHz(uint32_t hz) {
  */
 void StepperController::start(bool forward) {
     if (!_stepper) return;
+    _startForward = forward;
+
+    // If already pending, only update direction and target speed.
+    if (_startPending) return;
+
     // If the driver was disabled, enable it first and let the rotor settle on
     // the nearest electrical step before emitting pulses.
     if (!_driverEnabled) {
         digitalWrite(ENABLE_PIN, LOW);
         _driverEnabled = true;
-        delay(30);  // Allow a short silent rotor settle before motion.
+        _startPending = true;
+        _startReadyAtMs = millis() + 30;
+#if DIAG_VERBOSE
+        Diag::infof("[Stepper] start deferred: targetHz=%u", _speedHz);
+#endif
+        return;
     }
     // Start directly with the requested target speed. FastAccelStepper will ramp
     // from zero using the configured acceleration profile. Earlier revisions used
@@ -69,24 +97,14 @@ void StepperController::start(bool forward) {
     // workaround is no longer needed because setSpeedHz() now avoids applying a
     // live speed change when the motor is stopped.
     _stepper->setSpeedInHz(_speedHz);
-    // Diagnostic logging: sample actuator speed for a short window after
-    // starting so we can observe any transient plateau before reaching the
-    // configured target. These logs are lightweight and intended for
-    // troubleshooting; remove them once the root cause is identified.
-    Diag::infof("[Stepper] start(): targetHz=%u driverEnabled=%d", _speedHz, (int)_driverEnabled);
+#if DIAG_VERBOSE
+    Diag::infof("[Stepper] start immediate: targetHz=%u", _speedHz);
+#endif
     _stepper->applySpeedAcceleration();
     if (forward)
         _stepper->runForward();
     else
         _stepper->runBackward();
-
-    // Sample current speed (milliHz) a few times immediately after start.
-    // This helps reveal transient plateaus produced by the driver/library.
-    for (int i = 0; i < 5; ++i) {
-        int32_t mhz = _stepper->getCurrentSpeedInMilliHz();
-        Diag::infof("[Stepper] post-start sample %d: speed_mHz=%ld (%.3f Hz)", i, (long)mhz, (float)mhz / 1000.0f);
-        delay(10);
-    }
 }
 
 /** @brief Request controlled stop (deceleration ramp). */
@@ -121,6 +139,7 @@ void StepperController::forceStop() {
 
 /** @brief Check if spindle is currently moving. */
 bool StepperController::isRunning() const {
+    const_cast<StepperController*>(this)->_servicePendingStart();
     // Returns true while steps are still being generated (including ramp-down).
     return _stepper && _stepper->isRunning();
 }
@@ -146,4 +165,44 @@ float StepperController::getRPM() const {
     // (0 when stopped, reflects actual ramp state during accel/decel).
     int32_t mhz = _stepper->getCurrentSpeedInMilliHz();
     return abs((float)mhz) / 1000.0f * 60.0f / STEPS_PER_REV;
+}
+
+/**
+ * @brief Calculate spindle speed compensated for carriage velocity to maintain constant turns-per-mm.
+ * 
+ * Ensures uniform wire density by adjusting spindle speed proportionally when carriage
+ * velocity changes (e.g., during reversals where lateral stepper ramping occurs).
+ * 
+ * Compensation formula: spindle_hz_comp = spindle_hz_nom × (lat_hz_actual / lat_hz_nominal)
+ * 
+ * This maintains the critical ratio: Turns_per_mm = Spindle_RPM / Carriage_velocity_mm_s = CONSTANT
+ */
+uint32_t StepperController::calculateCompensatedSpindleHz(
+    uint32_t nominalSpindleHz,
+    uint32_t currentLatHz,
+    uint32_t nominalLatHz
+) {
+    // Protect against division by zero and invalid inputs
+    if (nominalLatHz == 0 || nominalSpindleHz == 0) {
+        return nominalSpindleHz;
+    }
+    
+    // Minimum carriage velocity threshold to avoid division issues when velocity is near-zero
+    const uint32_t MIN_LAT_HZ_THRESHOLD = 100;  // ~0.03 mm/s at LAT_STEPS_PER_MM = 3072
+    
+    if (currentLatHz < MIN_LAT_HZ_THRESHOLD) {
+        // During complete stop, maintain nominal spindle speed rather than stopping spindle.
+        // This creates a brief edge artifact (a few extra turns at reversal point)
+        // which is acceptable if duration is very short (100-600ms).
+        return nominalSpindleHz;
+    }
+    
+    // Compute compensation: (current / nominal) ratio applied to spindle speed
+    float ratio = (float)currentLatHz / (float)nominalLatHz;
+    ratio = constrain(ratio, 0.3f, 1.5f);  // Clamp to reasonable bounds to prevent instability
+    
+    uint32_t compensated = (uint32_t)((float)nominalSpindleHz * ratio);
+    
+    // Ensure the result stays within configured spindle speed limits
+    return constrain(compensated, SPEED_HZ_MIN, SPEED_HZ_MAX);
 }

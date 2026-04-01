@@ -2,6 +2,8 @@
 #include "WifiManager.h"
 #include <ArduinoJson.h>
 #include "Diag.h"
+#include "Protocol.h"
+#include "CommandRegistry.h"
 
 // The HTML file is embedded into the firmware binary at compile time.
 // platformio.ini: board_build.embed_txtfiles = data/index.html
@@ -74,12 +76,30 @@ void WebInterface::begin() {
             req->send(503, "application/json", "{\"error\":\"recipe unavailable\"}");
             return;
         }
-        char jsonBuf[2048];
+        // Keep buffer modest — recipe JSON is ~600 bytes.  The provider also
+        // places a StaticJsonDocument<1024> on stack, so total ≈ 2 KB.
+        char jsonBuf[1024];
         jsonBuf[0] = '\0';
         _recipeProvider(jsonBuf, sizeof(jsonBuf));
         AsyncWebServerResponse* res = req->beginResponse(200, "application/json", jsonBuf);
         res->addHeader("Content-Disposition", "attachment; filename=pickup-winder-recipe.json");
         req->send(res);
+    });
+
+    _server.on("/protocol.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "{\"ws\":\"%s\",\"uart\":\"%s\",\"recipe\":%u}",
+                 PICKUP_WS_PROTOCOL_VERSION,
+                 PICKUP_UART_PROTOCOL_VERSION,
+                 (unsigned)PICKUP_RECIPE_FORMAT_VERSION);
+        req->send(200, "application/json", buf);
+    });
+
+    _server.on("/capabilities.json", HTTP_GET, [](AsyncWebServerRequest* req) {
+        char buf[6144];
+        CommandRegistry::capabilitiesJson(buf, sizeof(buf));
+        req->send(200, "application/json", buf);
     });
 
     _server.begin();
@@ -94,8 +114,8 @@ void WebInterface::sendUpdate(const WinderStatus& s) {
     if (!_wifiOk || _ws.count() == 0) return;
 
     // Serialise the full machine state to a compact JSON string.
-    // The buffer size (400 bytes) is sized to fit all fields with margin.
-    char buf[832];
+    // Worst-case payload measured at ~830 bytes; 896 gives safe margin.
+    char buf[896];
     snprintf(buf, sizeof(buf),
         "{\"rpm\":%.0f,\"hz\":%u,\"turns\":%ld,\"target\":%ld,\"maxRpm\":%u,"
         "\"running\":%s,\"enabled\":%s,\"startRequested\":%s,\"carriageReady\":%s,\"freerun\":%s,\"cw\":%s,"
@@ -170,7 +190,7 @@ void WebInterface::_onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* clie
     // Multi-frame or binary messages are ignored for simplicity.
     if (!info->final || info->index != 0 || info->len != len || info->opcode != WS_TEXT) return;
 
-    JsonDocument doc;
+    StaticJsonDocument<192> doc;
     DeserializationError err = deserializeJson(doc, data, len);
     if (err) return;
 
@@ -178,7 +198,9 @@ void WebInterface::_onWsEvent(AsyncWebSocket* server, AsyncWebSocketClient* clie
     const char* valIn = doc["val"] | "";
 
     if (_callback && cmdIn && cmdIn[0] != '\0') {
+#if DIAG_VERBOSE
         Diag::infof("[WS-CMD] cmd='%s' val='%s'", cmdIn, valIn);
+#endif
         _callback(cmdIn, valIn);
     }
 }

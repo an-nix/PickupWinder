@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "Config.h"
+#include "Protocol.h"
 #include "WindingGeometry.h"
 
 enum class WindingStyle : uint8_t {
@@ -42,7 +43,7 @@ inline WindingEndPos windingEndPosFromString(const char* s) {
  * @brief Complete winding recipe persisted to storage and used at runtime.
  */
 struct WindingRecipe {
-	uint32_t        version            = 1;
+	uint32_t        version            = PICKUP_RECIPE_FORMAT_VERSION;
 	long            targetTurns        = DEFAULT_TARGET_TURNS;
 	bool            freerun            = false;
 	bool            directionCW        = true;

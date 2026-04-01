@@ -1,7 +1,5 @@
 #pragma once
 #include <Arduino.h>
-#include <functional>
-#include <vector>
 
 // ── Diag ──────────────────────────────────────────────────────────────────────
 // Lightweight diagnostic logger. Serial is always an active sink.
@@ -14,7 +12,7 @@
 //   Diag::error("[Stepper] Driver fault");
 //
 // Registering an extra sink in main.cpp:
-//   Diag::addSink([](Diag::Level lvl, const String& msg) {
+//   Diag::addSink([](Diag::Level lvl, const char* msg) {
 //       web.broadcast(msg);   // forward to WebSocket clients
 //   });
 class Diag {
@@ -29,7 +27,7 @@ public:
      *
      * Receives log level and fully-formatted message.
      */
-    using Sink = std::function<void(Level, const String&)>;
+    using Sink = void (*)(Level, const char*);
 
     /**
      * @brief Register an additional output sink.
@@ -55,7 +53,9 @@ public:
     static void errorf(const char* fmt, ...);
 
 private:
-    static std::vector<Sink> _sinks;
+    static constexpr uint8_t MAX_SINKS = 4;
+    static Sink _sinks[MAX_SINKS];
+    static uint8_t _sinkCount;
 
     /**
      * @brief Dispatch one formatted message to Serial + all sinks.

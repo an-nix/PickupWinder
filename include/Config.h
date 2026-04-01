@@ -1,11 +1,10 @@
 #pragma once
 
-// Wi-Fi credential default values (edit here directly).
-// If NVS contains saved values, they are used at runtime.
-#define WIFI_SSID "your_ssid_here"
-#define WIFI_PASSWORD "your_password_here"
-
-
+// Global diagnostic verbosity.
+// 0 = production-friendly logs, 1 = verbose lab diagnostics.
+#ifndef DIAG_VERBOSE
+  #define DIAG_VERBOSE 0
+#endif
 
 // ── Main spindle stepper ──────────────────────────────────
 #define STEP_PIN            26
@@ -58,9 +57,31 @@
 #define LAT_ENDPOS_FALLBACK_HZ  (LAT_TRAVERSE_SPEED_HZ / 6)
 // Break-in shuttle speed, intentionally faster than normal traversal.
 #define LAT_RODAGE_SPEED_HZ  12000
-// Spindle slowdown factor applied during lateral reversals.
-// Effective duration is computed dynamically from lateral speed and acceleration.
-#define LAT_REVERSAL_SLOWDOWN  0.5f  // Spindle speed multiplier while reversing
+
+// ── Winding Uniformity & Carriage-Spindle Synchronization ──────────────────────
+// CRITICAL PRINCIPLE: Maintain a constant ratio between spindle RPM and carriage velocity.
+// This ensures uniform wire density across the entire bobbin width (no bulges or gaps).
+//
+// Formula:  Turns_per_mm = Spindle_RPM / Carriage_velocity_mm_s = CONSTANT
+//
+// At default settings:
+//   - Spindle nominal: 42 kHz (tuned ~630 RPM at default pot max)
+//   - Lateral nominal:  4800 Hz (≈ 1.56 mm/s at LAT_STEPS_PER_MM = 3072)
+//   - Nominal turns per mm: 630 RPM / 1.56 mm/s ≈ 404 turns/mm
+//
+// The compensation algorithm (in StepperController::calculateCompensatedSpindleHz)
+// dynamically adjusts spindle speed when carriage velocity changes (e.g., during reversals):
+//
+//   spindle_hz_compensated = spindle_hz_nominal × (lateral_hz_current / lateral_hz_nominal)
+//
+// This maintains ratio uniformity to ±5% across the winding width, eliminating
+// the characteristic bulge-at-edges and gap-at-center artifacts caused by inadequate
+// reversal slowdown.
+//
+// Traverse ratio (turnsPerPass / effectiveWidth) should be NON-INTEGER (e.g., 3.7, 4.2)
+// to avoid wire stacking and create a uniform cross-hatch (losange) pattern.
+// If ratio is 3, 4, or 5, wires land exactly on top of each other → MUST be corrected
+// by adjusting either turns per pass or effective winding width.
 
 // Select ONE transport option if the project ever needs an alternate external link:
 //
@@ -125,9 +146,6 @@
 // Debounce time for mechanical contact stabilization.
 #define FOOTSWITCH_DEBOUNCE_MS 20
 
-// Wi-Fi credential default values (edit here directly).
-// If NVS contains saved values, they are used at runtime.
-
 #ifndef WIFI_SSID
   #define WIFI_SSID "your_ssid_here"
 #endif
@@ -141,8 +159,6 @@
 
 // ── Winding defaults ─────────────────────────────────────
 #define DEFAULT_TARGET_TURNS  8000
-#define DEFAULT_REWIND_BATCH_TURNS 200
-#define DEFAULT_REWIND_BATCH_RPM   350
 #define WINDING_DEFAULT_SEED   424242UL
 #define WINDING_LAYER_JITTER_DEFAULT          0.10f
 #define WINDING_LAYER_SPEED_JITTER_DEFAULT    0.08f
@@ -156,5 +172,3 @@
 #define APPROACH_TURNS      80    // Number of turns before target where slowdown begins
 // Minimum speed allowed in the target approach zone.
 #define APPROACH_SPEED_HZ_FLOOR  (200UL * STEPS_PER_REV / 60)  // 200 RPM ≈ 21333 Hz
-// Maximum spindle speed during the first verification pass near the reversal.
-#define VERIFY_SPEED_HZ_MAX      (600UL * STEPS_PER_REV / 60)  // ~100 RPM

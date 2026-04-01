@@ -3,6 +3,7 @@
 #include "WebInterface.h"
 #include "SessionController.h"
 #include "Types.h"
+#include "CommandRegistry.h"
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -16,6 +17,13 @@
 class CommandController
 {
 public:
+   struct Stats {
+      uint32_t enqueued = 0;
+      uint32_t droppedQueueFull = 0;
+      uint32_t rejectedOversize = 0;
+      uint32_t rejectedSchema = 0;
+   };
+
    /**
     * @brief Construct the command bridge.
     * @param serial Serial transport used to receive line-based commands.
@@ -43,12 +51,20 @@ public:
     */
    void pushCommand(const CommandEntry& c);
 
+   /** @brief Snapshot current ingress counters (best-effort, non-atomic). */
+   Stats getStats() const;
+
 private:
    LinkSerial& _serial;
    WebInterface& _web;
    // FreeRTOS queue for thread-safe command passing between tasks.
    static constexpr int CMD_QUEUE_SIZE = 32;
    QueueHandle_t _cmdQueue = nullptr;
+
+   volatile uint32_t _enqueued = 0;
+   volatile uint32_t _droppedQueueFull = 0;
+   volatile uint32_t _rejectedOversize = 0;
+   volatile uint32_t _rejectedSchema = 0;
 
    static CommandController* s_instance;
 };

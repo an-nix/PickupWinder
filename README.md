@@ -56,6 +56,74 @@ platformio run -e esp32dev
 platformio run -e esp32dev --target upload
 ```
 
+### Build profiles
+
+- `esp32dev`: production-oriented profile (`DIAG_VERBOSE=0`, `-Os`, `-flto`)
+- `esp32dev-lab`: lab diagnostics profile (`DIAG_VERBOSE=1`, `-O0`)
+
+Example:
+
+```bash
+platformio run -e esp32dev-lab --target upload
+```
+
+## Protocol and capabilities
+
+The firmware now exposes explicit protocol versions and command capabilities:
+
+- `GET /protocol.json`: `{ ws, uart, recipe }`
+- `GET /capabilities.json`: command list with type, mutability and help text
+
+This allows UI clients to discover supported commands dynamically and stay decoupled from hardcoded firmware assumptions.
+
+UART also emits a startup protocol banner:
+
+- `P|<uartProtocolVersion>`
+
+followed by regular status frames.
+
+## Command validation and normalization
+
+Incoming commands are now validated before entering the control queue:
+
+- alias normalization (`max-rpm` -> `max_rpm`, `windows_shift` -> `window_shift`)
+- value schema checking (boolean, integer ranges, float ranges, enum values, JSON payload)
+- explicit rejection metrics for oversize and schema-invalid payloads
+
+Command ingress counters are logged periodically in RTOS metrics.
+
+## Runtime metrics
+
+Periodic metrics now include:
+
+- heap free and minimum heap observed
+- stack high-water mark for control/comms tasks
+- control/comms worst loop execution time
+- command ingress/drop/reject counters
+
+These metrics are intended to validate memory and timing headroom on target hardware.
+
+## CI and test workflow
+
+GitHub Actions now compiles:
+
+- firmware for `esp32dev`
+- firmware for `esp32dev-lab`
+- unit tests for both environments (compile-only, no upload)
+
+Useful local commands:
+
+```bash
+platformio run -e esp32dev
+platformio test -e esp32dev --without-uploading
+platformio test -e esp32dev-lab --without-uploading
+```
+
+Engineering references:
+
+- `doc/review_checklist_realtime_heap.md`
+- `doc/benchmark_control_loop.md`
+
 ## Runtime modes
 
 - `IDLE`
@@ -487,6 +555,145 @@ Goal:
 - avoid abrupt end-of-run repositioning
 - avoid “reach bound, leave, come back” behavior
 - start the hold turns with the carriage already on the requested bound
+
+---
+
+## Winding Uniformity and Wire Distribution Logic
+
+### Core Principle: Constant Turns-Per-Millimeter Ratio
+
+The fundamental requirement for uniform wire density across the entire bobbin width is that the **ratio between spindle RPM and carriage velocity must remain constant at all times**:
+
+$$\text{Turns per mm} = \frac{\text{Spindle RPM}}{\text{Carriage velocity (mm/s)}} = \text{CONSTANT}$$
+
+If this ratio varies during winding, the wire distribution becomes uneven:
+- **Excessive ratio** (spindle fast, carriage slow) → wire bunches up → **bulge**
+- **Reduced ratio** (spindle slow, carriage fast) → wire spreads out → **gap**
+
+### Problem Scenario: Carriage Reversals and Acceleration
+
+Without compensation, the following occurs during each carriage reversal:
+
+1. **Deceleration phase**: Carriage slows down as it approaches the reversal point.
+2. **Spindle uncompensated**: Spindle continues at nominal RPM → the ratio increases.
+3. **Result**: Extra wire deposited at edges during carriage slowdown.
+4. **Acceleration phase**: Carriage speeds back up after reversal.
+5. **Spindle still uncompensated**: Ratio decreases as carriage accelerates.
+6. **Result**: Less wire deposited mid-pass → gap at center.
+
+### Solution: Dynamic Spindle-Carriage Compensation
+
+The firmware implements real-time compensation to maintain constant ratio during all carriage states.
+
+**Compensation formula:**
+
+$$\text{Spindle}_{\text{Hz, compensated}} = \text{Spindle}_{\text{Hz, nominal}} \times \frac{\text{Lateral}_{\text{Hz, current}}}{\text{Lateral}_{\text{Hz, nominal}}}$$
+
+**When carriage velocity drops** (during reversal deceleration):
+- Compensation reduces spindle speed proportionally
+- Maintains constant turns-per-mm ratio
+- Prevents edge bulges
+
+**When carriage velocity rises** (during acceleration):
+- Compensation increases spindle speed proportionally
+- Maintains ratio stability
+- Prevents mid-bobbin gaps
+
+### Traverse Ratio: Integer vs. Non-Integer
+
+The **turns-per-pass ÷ effective-width ratio** must be **non-integer** (e.g., 3.7, 4.2, 5.3) to create a uniform cross-hatch (losange) pattern.
+
+**Why integer ratios are problematic:**
+
+| Ratio Type | Result | Visual Effect |
+|-----------|--------|--------------|
+| Integer (3, 4, 5) | Wires stack vertically | Visible banding, uneven density |
+| Non-integer (3.7, 4.2) | Wires offset per layer | Uniform cross-hatch pattern |
+
+**Example:**
+- Bobbin width: 10 mm
+- Turns per pass: 37
+- Ratio: 37 ÷ 10 = **3.7** turns/mm ✓ (GOOD)
+
+If you adjust the geometry and observe integer ratios (within ±0.15 of any whole number), adjust either:
+- **Turns per pass offset** (in the UI or recipe)
+- **Effective winding width** (by adjusting flange/margin/trim values)
+- **Wire diameter** (though less practical)
+
+### Boundary Margins: Symmetry Requirement
+
+The carriage has intentional margins (safe distance from physical bobbin edges):
+
+**Default margins:**
+- Bottom margin: 15 mm (from `LAT_HOME_OFFSET_DEFAULT_MM`)
+- Top margin: 15 mm (symmetric)
+- Effective winding width: 100 - (2 × 15) = **70 mm**
+
+**Critical requirement: margins MUST be SYMMETRIC on both sides.**
+
+If margins are asymmetric:
+- Winding center shifts relative to the physical bobbin
+- Wire distribution becomes unequal between left and right halves
+- One side gets denser, the other gets looser
+
+The firmware enforces symmetry by using a single offset constant applied to both bounds. Verify your mechanical setup:
+- Measure physical distance from left edge to left sensor trigger
+- Measure physical distance from right edge to right sensor trigger
+- Both distances should be equal
+
+### Expected Results After Compensation
+
+**Nominal regime** (constant speed):
+- Spindle RPM constant
+- Carriage velocity constant
+- Ratio remains perfectly stable
+- Wire deposits uniformly
+
+**Deceleration phase** (carriage approaches reversal):
+- Spindle RPM decreases proportionally with carriage velocity
+- Ratio maintained within ±5%
+- No edge bulging
+
+**Acceleration phase** (carriage speeds up):
+- Spindle RPM increases proportionally with carriage velocity
+- Ratio maintained within ±5%
+- No mid-bobbin gaps
+
+**Reversal artifact**:
+- Brief 100–600 ms deviation as carriage changes direction
+- Creates ~0.5–2 mm bulge at reversal point (acceptable)
+- Spindle begins compensation as carriage re-accelerates
+
+### Validation and Troubleshooting
+
+#### How to validate compensation is working
+
+1. Wind a test pickup with a simple profile (Straight, no jitter).
+2. Inspect the bobbin under good lighting.
+3. Look for the **cross-hatch (losange) pattern** across the entire surface.
+4. Pattern should be uniform left-to-right with no visible banding or gaps.
+
+#### Symptoms of poor compensation
+
+| Symptom | Likely Cause | Fix |
+|---------|------------|-----|
+| Bulge at center edges | Carriage reversal slowdown inadequate | Check `LAT_ACCEL`, verify compensation enabled |
+| Gap at bobbin center | Carriage acceleration too fast for spindle | Increase `ACCELERATION` or adjust traverse ratio |
+| Integer banding pattern | Traverse ratio is whole number | Adjust turns-per-pass offset or width |
+| Asymmetric distribution | Boundary margins mismatched | Verify home sensor position symmetry |
+| All loose / all dense | Wire diameter incorrect | Adjust in Geometry settings |
+
+#### Logging and debugging
+
+The control loop logs worst-case timing every 5 seconds:
+
+```
+[RTOS] control_worst_loop_us=892
+```
+
+Ensure this stays below ~4000 µs (10 ms tick = 10000 µs available, budget ~40% for motion control).
+
+Compensation calculations are lightweight (~0.5 ms) and should not impact timing.
 
 ---
 

@@ -179,7 +179,8 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                         _stepper->forceStopAndNewPosition(_latStartSteps);
                         _passCount++;
                         _onReversal();
-                        if (_stopOnNextLow) {
+                        if (_pauseOnNextReversal || _stopOnNextLow) {
+                            _pauseOnNextReversal = false;
                             _stopOnNextLow = false;
                             _pausedAtReversal = true;
                             _state = LatState::HOMED;
@@ -201,7 +202,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
  * @brief Force restart of homing sequence.
  */
             void LateralController::rehome() {
-                if (!_stepper) return;
+                if (!_stepper) { _state = LatState::FAULT; return; }
                 if (!_sensorPresent()) {
                     Diag::error("[Lateral] Rehoming impossible : capteur absent.");
                     return;
@@ -251,6 +252,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
  * @brief Position carriage to requested start bound.
  */
             void LateralController::prepareStartPosition(float startMm, uint32_t speedHz) {
+                if (!_stepper) return;
                 if (_state != LatState::HOMED && _state != LatState::POSITIONING) return;
 
                 const bool wasPositioning = (_state == LatState::POSITIONING);
@@ -367,6 +369,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
  * @brief Start synchronized lateral traversal for winding.
  */
             void LateralController::startWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale) {
+                if (!_stepper) return;
                 if (_state == LatState::WINDING_FWD || _state == LatState::WINDING_BWD) {
                     updateWinding(windingHz, tpp, startMm, endMm, speedScale);
                     return;
@@ -426,6 +429,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
  * @brief Update running traversal bounds and speed.
  */
             void LateralController::updateWinding(uint32_t windingHz, long tpp, float startMm, float endMm, float speedScale) {
+                if (!_stepper) return;
                 if (_state != LatState::WINDING_FWD && _state != LatState::WINDING_BWD) return;
 
                 float s = max(0.0f, startMm);
@@ -476,7 +480,8 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
                     _stepper->forceStopAndNewPosition(_latStartSteps);
                     _passCount++;
                     _onReversal();
-                    if (_stopOnNextLow) {
+                    if (_pauseOnNextReversal || _stopOnNextLow) {
+                        _pauseOnNextReversal = false;
                         _stopOnNextLow    = false;
                         _pausedAtReversal = true;
                         _state = LatState::HOMED;
@@ -505,6 +510,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
  * @brief Perform relative manual jog move.
  */
             void LateralController::jog(float deltaMm) {
+                if (!_stepper) return;
                 if (_state != LatState::HOMED && _state != LatState::POSITIONING) return;
                 // Use the active target while already positioning, otherwise use the
                 // current physical position as the jog base.
@@ -533,6 +539,7 @@ void LateralController::begin(FastAccelStepperEngine& engine, float homeOffsetMm
  * @brief Stop synchronized traversal and return to HOMED.
  */
             void LateralController::stopWinding() {
+                if (!_stepper) return;
                 // POSITIONING means the carriage is executing a reposition move,
                 // for example during final end-position handling. Force-stop it
                 // and return to HOMED.

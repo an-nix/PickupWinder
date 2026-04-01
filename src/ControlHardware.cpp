@@ -65,6 +65,7 @@ void ControlHardware::tick(uint32_t now, SessionController::TickInput& out)
     } else {
         out.encoderDelta = 0;
     }
+#if DIAG_VERBOSE
     if (now - _lastEncMs >= 50) {
         _lastEncMs = now;
         if (cur != _lastPrinted) {
@@ -72,6 +73,7 @@ void ControlHardware::tick(uint32_t now, SessionController::TickInput& out)
             Serial.printf("[Encoder] count = %ld\n", (long)cur);
         }
     }
+#endif
 
 
     // Sample the potentiometer at a controlled rate to avoid excessive ADC work.
@@ -96,7 +98,9 @@ void ControlHardware::_initPotSmoothing() {
     }
     _potIdx = 0;
     _potLastHz = 0;
+#if DIAG_VERBOSE
     Serial.println("[ControlHardware] Pot smoothing initialized");
+#endif
 }
 
 uint32_t ControlHardware::_readPotHz() {

@@ -37,8 +37,8 @@ void WifiManager::begin() {
     char nvsSsid[64];
     char nvsPwd[64];
     bool hasNvs = ensureNvsCredentials(nvsSsid, sizeof(nvsSsid), nvsPwd, sizeof(nvsPwd));
-    Diag::infof("[WiFi] compile-time credentials: SSID='%s' PWD='%s'", ssidBuf, pwdBuf);
-    Diag::infof("[WiFi] NVS load status: hasNvs=%d nvsSsid='%s' nvsPwd='%s'", hasNvs, nvsSsid, nvsPwd);
+    Diag::infof("[WiFi] credential sources: hasNvs=%d compileTimeDefault=%d",
+                (int)hasNvs, (int)isDefaultCredentials(ssidBuf, pwdBuf));
 
     if (hasNvs) {
         if (!isDefaultCredentials(ssidBuf, pwdBuf) &&
@@ -51,7 +51,7 @@ void WifiManager::begin() {
 
         strncpy(ssidBuf, nvsSsid, sizeof(ssidBuf));
         strncpy(pwdBuf, nvsPwd, sizeof(pwdBuf));
-        Diag::infof("[WiFi] Using credentials from NVS '%s'", ssidBuf);
+        Diag::info("[WiFi] Using credentials from NVS");
     } else {
         if (isDefaultCredentials(ssidBuf, pwdBuf)) {
             Diag::error("[WiFi] No NVS credentials and config default values; WiFi disabled.");
@@ -60,17 +60,19 @@ void WifiManager::begin() {
         }
 
         setCredentials(ssidBuf, pwdBuf);
-        Diag::infof("[WiFi] Storing compile-time config values to NVS '%s'", ssidBuf);
+        Diag::info("[WiFi] Storing compile-time credentials into NVS");
     }
 
     WiFi.begin(ssidBuf, pwdBuf);
     Serial.print("[WiFi] Connecting");
 
-    uint8_t tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 20) {
-        delay(500);
+    // Non-blocking wait with millis() — yields to watchdog via yield().
+    const uint32_t wifiTimeoutMs = 10000;
+    const uint32_t startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < wifiTimeoutMs) {
+        yield();
+        delay(100);
         Serial.print(".");
-        tries++;
     }
 
     if (WiFi.status() != WL_CONNECTED) {

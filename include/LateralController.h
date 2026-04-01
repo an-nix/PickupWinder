@@ -153,7 +153,28 @@ public:
      * physical position.
      */
     float getTargetPositionMm() const;
+    /**
+     * @brief Get the commanded lateral traverse target speed.
+     * @return Target step frequency in Hz last set by startWinding() / updateWinding().
+     * @note This is the SET-POINT, not the instantaneous physical speed.
+     *       FastAccelStepper ramps the motor to this target using LAT_ACCEL.
+     *       Use getActualVelocityHz() for the real-time physical speed.
+     */
+    uint32_t getInstantaneousLatHzNominal() const { return _latHz; }
 
+    /**
+     * @brief Get the real-time lateral carriage velocity.
+     * @return Instantaneous step frequency in Hz as measured by FastAccelStepper,
+     *         reflecting the actual ramp state (decel/accel during reversals).
+     *         Returns 0 when stopped or if stepper not initialized.
+     * @note Use this as the current-velocity input to
+     *       StepperController::calculateCompensatedSpindleHz() for ratio compensation.
+     */
+    uint32_t getActualVelocityHz() const {
+        if (!_stepper) return 0;
+        int32_t mhz = _stepper->getCurrentSpeedInMilliHz();
+        return (uint32_t)(abs(mhz) / 1000);
+    }
 private:
     FastAccelStepper*      _stepper         = nullptr;
     LatState               _state           = LatState::FAULT;

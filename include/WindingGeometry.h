@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <math.h>
 
 // ── Insulated wire diameters (mm) ────────────────────────────────────────────
 namespace WireGauge {
@@ -92,5 +93,43 @@ struct WindingGeometry {
         windingEndTrim_mm = 0.0f;
         wireDiameter_mm = BOBBIN_PRESETS[idx].wire;
         turnsPerPassOffset = 0;  // Reset offset on preset change
+    }
+
+    /**
+     * @brief Compute the turns-per-mm traverse ratio.
+     * @return Effective turns per millimeter (turns per pass / effective width).
+     * 
+     * @details
+     * The traverse ratio is the number of wire turns deposited per millimeter
+     * of carriage travel. For uniform distribution, this should be NON-INTEGER.
+     * 
+     * Example:
+     *   - turnsPerPass = 37
+     *   - effectiveWidth = 10 mm
+     *   - ratio = 3.7 turns/mm (GOOD: creates cross-hatch pattern)
+     * 
+     * If ratio is 3, 4, or 5 (integer), wires stack vertically on repeating layers,
+     * causing visible banding and uneven density. This is a winding quality defect.
+     */
+    float computeTraverseRatio() const {
+        float width = effectiveWidth();
+        if (width <= 0.0f) return 0.0f;
+        return (float)turnsPerPass() / width;
+    }
+
+    /**
+     * @brief Check if traverse ratio is dangerously close to an integer.
+     * @param ratio Traverse ratio from computeTraverseRatio().
+     * @param tolerance Acceptable deviation from integer (default 0.15 = ±15%).
+     * @return true if ratio is within tolerance of any integer value.
+     * 
+     * @details
+     * Ratios like 2.9, 3.0, 3.1, 4.0, 4.1 are flagged as problematic because
+     * they cause wire stacking and banding.
+     */
+    static bool isTraverseRatioProblematic(float ratio, float tolerance = 0.15f) {
+        if (ratio <= 0.0f) return false;
+        float frac = ratio - floorf(ratio);
+        return (frac <= tolerance) || (frac >= (1.0f - tolerance));
     }
 };

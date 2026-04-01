@@ -20,10 +20,12 @@
 #include "CommandController.h"
 #include "Diag.h"
 #include "ControlHardware.h"
+#include "Protocol.h"
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <esp_heap_caps.h>
 
 // ── Subsystem instances ───────────────────────────────────────────────────────
 static WifiManager      wifiManager;
@@ -67,7 +69,10 @@ static const char* resetReasonStr(esp_reset_reason_t r) {
 // ═════════════════════════════════════════════════════════════════════════════
 static void controlTask(void*) {
     TickType_t lastWake = xTaskGetTickCount();
+    uint32_t worstLoopUs = 0;
+    uint32_t lastMetricsMs = 0;
     for (;;) {
+        const uint32_t loopStartUs = micros();
         const uint32_t now = millis();
 
         // 1. Read sensors (pot + encoder) and fill TickInput
@@ -87,7 +92,16 @@ static void controlTask(void*) {
             xSemaphoreGive(statusMutex);
         }
 
+        const uint32_t loopUs = micros() - loopStartUs;
+        if (loopUs > worstLoopUs) worstLoopUs = loopUs;
+
         vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(10));
+
+        if (now - lastMetricsMs >= 5000) {
+            lastMetricsMs = now;
+            Diag::infof("[RTOS] control_worst_loop_us=%u", (unsigned)worstLoopUs);
+            worstLoopUs = 0;
+        }
     }
 }
 
@@ -98,7 +112,11 @@ static void controlTask(void*) {
 static void commsTask(void*) {
     uint32_t lastLinkMs = 0;
     uint32_t lastWsMs   = 0;
+    uint32_t lastWsCleanMs = 0;
+    uint32_t lastMetricsMs = 0;
+    uint32_t worstLoopUs = 0;
     for (;;) {
+        const uint32_t loopStartUs = micros();
         const uint32_t now = millis();
 
         // Poll UART for incoming commands (pushed to queue via callback)
@@ -127,6 +145,36 @@ static void commsTask(void*) {
             web.sendUpdate(s);
         }
 
+        // Periodic WebSocket client cleanup (prevents memory leak).
+        if (now - lastWsCleanMs >= 2000) {
+            lastWsCleanMs = now;
+            web.cleanupClients();
+        }
+
+        // Periodic runtime telemetry to validate memory and task headroom.
+        if (now - lastMetricsMs >= 5000) {
+            lastMetricsMs = now;
+            const uint32_t free8 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+            const uint32_t min8  = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+            const UBaseType_t ctrlHwmWords = uxTaskGetStackHighWaterMark(controlTaskHandle);
+            const UBaseType_t commHwmWords = uxTaskGetStackHighWaterMark(nullptr);
+            const CommandController::Stats cs = cmdController.getStats();
+            Diag::infof("[RTOS] heap_free=%u heap_min=%u ctrl_hwm=%uB comm_hwm=%uB comms_worst_loop_us=%u cmd_enq=%u cmd_drop_q=%u cmd_rej_len=%u cmd_rej_schema=%u",
+                        (unsigned)free8,
+                        (unsigned)min8,
+                        (unsigned)(ctrlHwmWords * sizeof(StackType_t)),
+                        (unsigned)(commHwmWords * sizeof(StackType_t)),
+                        (unsigned)worstLoopUs,
+                        (unsigned)cs.enqueued,
+                        (unsigned)cs.droppedQueueFull,
+                        (unsigned)cs.rejectedOversize,
+                        (unsigned)cs.rejectedSchema);
+            worstLoopUs = 0;
+        }
+
+        const uint32_t loopUs = micros() - loopStartUs;
+        if (loopUs > worstLoopUs) worstLoopUs = loopUs;
+
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
@@ -138,6 +186,10 @@ void setup() {
     const esp_reset_reason_t rr = esp_reset_reason();
     Diag::infof("[BOOT] count=%lu reset=%s(%d)",
         (unsigned long)s_bootCount, resetReasonStr(rr), (int)rr);
+    Diag::infof("[BOOT] protocol ws=%s uart=%s recipe=%u",
+        PICKUP_WS_PROTOCOL_VERSION,
+        PICKUP_UART_PROTOCOL_VERSION,
+        (unsigned)PICKUP_RECIPE_FORMAT_VERSION);
     Diag::info("\n=== Pickup Winder (FreeRTOS) ===");
 
     // Initialize subsystems (all on Arduino core before tasks start)

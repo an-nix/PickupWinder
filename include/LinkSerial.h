@@ -5,6 +5,9 @@
 // UART2 link between the winding controller ESP32 and the display ESP32.
 //
 // Protocol:
+//   TX (winder -> display): one protocol banner at startup.
+//     Format: "P|<uartProtocolVersion>\n"
+//
 //   TX (winder -> display): compact status line every LINK_UPDATE_MS.
 //     Format: "S|<turns>|<targetTurns>|<rpm>|<speedHz>|<running>|<motorEnabled>|<freerun>|<dirCW>\n"
 //

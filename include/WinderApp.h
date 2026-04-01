@@ -73,16 +73,16 @@ private:
     TraversePlan           _activePlan;
 
     // ── State machine ──
-    volatile WindingState _state        = WindingState::IDLE;
-    volatile Direction    _direction    = Direction::CW;
-    volatile long         _targetTurns  = DEFAULT_TARGET_TURNS;
-    volatile uint32_t     _maxSpeedHz   = SPEED_HZ_MAX;
-    volatile uint32_t     _inputHz      = 0;
-    volatile bool         _freerun      = false;
+    WindingState _state        = WindingState::IDLE;
+    Direction    _direction    = Direction::CW;
+    long         _targetTurns  = DEFAULT_TARGET_TURNS;
+    uint32_t     _maxSpeedHz   = SPEED_HZ_MAX;
+    uint32_t     _inputHz      = 0;
+    bool         _freerun      = false;
 
     // ── Control flags ──
     bool _pendingDisable = false;   // Deferred driver disable after stop
-    volatile bool _pauseRequested = false; // Cross-task pause request, consumed in tick()
+    bool _pauseRequested = false; // Consumed in the control task tick.
 
     // Burst mode removed: simpler single-mode winding
 
@@ -129,11 +129,4 @@ private:
     float  _rodageDistMm   = 80.0f;
     int    _rodagePassDone = 0;
     bool   _rodageFwd      = true;
-
-    // ── Calibration status (telemetry fields expected by WinderStatus)
-    bool   _calibInProgress       = false;
-    int    _calibCurrent          = 0;
-    int    _calibRepeats          = 0; // total repeats requested
-    float  _calibMeasuredTPP      = 0.0f;
-    long   _calibSuggestedOffset  = 0;
 };

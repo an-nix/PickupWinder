@@ -1,7 +1,6 @@
 #pragma once
 #include <Arduino.h>
 #include <ESPAsyncWebServer.h>
-#include <functional>
 #include "Config.h"
 #include "Types.h"
 #include "WifiManager.h"
@@ -13,6 +12,9 @@
 // Manages WiFi connection, HTTP server (serves embedded HTML) and WebSocket.
 // The HTML file (data/index.html) is embedded at compile time via
 // board_build.embed_txtfiles in platformio.ini and served as a binary symbol.
+// Additional machine-readable endpoints:
+//   GET /protocol.json      -> transport and recipe format versions
+//   GET /capabilities.json  -> command metadata for decoupled UI clients
 class WebInterface {
 public:
 	/**
@@ -59,6 +61,13 @@ public:
     bool   isConnected()   const { return _wifiOk; }
 
     /**
+     * @brief Reclaim memory from disconnected WebSocket clients.
+     * @par Usage
+     * Call periodically from the comms task (e.g. every 1–2 s).
+     */
+    void   cleanupClients() { _ws.cleanupClients(); }
+
+    /**
      * @brief Configure WiFi manager instance used for connectivity.
      */
     void setWifiManager(WifiManager* manager);
@@ -66,8 +75,8 @@ public:
 private:
     AsyncWebServer  _server;    // ESPAsyncWebServer instance on WEB_PORT
     AsyncWebSocket  _ws;        // WebSocket handler mounted at /ws
-    CommandCallback _callback;  // Registered command handler (set by WinderApp)
-    RecipeJsonProvider _recipeProvider; // Download current recipe as JSON
+    CommandCallback _callback = nullptr;  // Registered command handler (set by WinderApp)
+    RecipeJsonProvider _recipeProvider = nullptr; // Download current recipe as JSON
     bool            _wifiOk = false;  // Set to true once WiFi is connected
     WifiManager*    _wifiManager = nullptr; // WiFi manager instance used for connectivity
 

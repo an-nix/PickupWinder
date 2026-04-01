@@ -1,6 +1,7 @@
 #include "LinkSerial.h"
 #include <Arduino.h>
 #include "Diag.h"
+#include "Protocol.h"
 
 /**
  * @brief Initialize UART bridge to the display ESP.
@@ -9,6 +10,7 @@ void LinkSerial::begin() {
     // SERIAL_8N1 means 8 data bits, no parity and 1 stop bit.
     // TX/RX pins are configured in Config.h.
     LINK_UART.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
+    LINK_UART.printf("P|%s\n", PICKUP_UART_PROTOCOL_VERSION);
     Diag::info("[Link] UART2 OK");
 }
 
@@ -69,7 +71,8 @@ void LinkSerial::poll(CommandCallback cb) {
             if (_rxLen < RX_BUF_SIZE - 1) {
                 _rxBuf[_rxLen++] = c;
             } else {
-                _rxLen = 0;  // Silent reset on overflow.
+                _rxLen = 0;
+                Diag::warn("[UART] RX buffer overflow — line dropped");
             }
         }
     }
