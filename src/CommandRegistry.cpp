@@ -157,6 +157,13 @@ const CommandDefinition* CommandRegistry::findByKey(const char* key) {
     return nullptr;
 }
 
+const CommandDefinition* CommandRegistry::findById(CommandId id) {
+    for (size_t i = 0; i < (sizeof(kCommands) / sizeof(kCommands[0])); ++i) {
+        if (kCommands[i].id == id) return &kCommands[i];
+    }
+    return nullptr;
+}
+
 bool CommandRegistry::normalizeAndValidate(const char* cmdIn,
                                            const char* valueIn,
                                            char* canonicalCmdOut,

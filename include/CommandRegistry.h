@@ -78,5 +78,6 @@ public:
     static void capabilitiesJson(char* outBuf, size_t outBufLen);
 
     static const CommandDefinition* findByKey(const char* key);
+    static const CommandDefinition* findById(CommandId id);
     static const CommandDefinition* all(size_t& count);
 };

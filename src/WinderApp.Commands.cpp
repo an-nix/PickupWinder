@@ -116,6 +116,14 @@ void WinderApp::handleCommand(const char* cmd, const char* value) {
 }
 
 void WinderApp::handleCommand(CommandId id, const char* value) {
+    const CommandDefinition* def = CommandRegistry::findById(id);
+#if DIAG_VERBOSE
+    if (def) {
+        Diag::infof("[APP-CMD] cmd='%s' id=%d val='%s'", def->key, (int)id, value);
+    } else {
+        Diag::infof("[APP-CMD] id=%d val='%s' (unknown)", (int)id, value);
+    }
+#endif
 #if DIAG_VERBOSE
     Diag::infof("[APP-CMD] cmdId=%d val='%s'", (int)id, value);
 #endif
