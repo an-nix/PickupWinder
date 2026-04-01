@@ -36,6 +36,7 @@ void CommandController::onTransportCommand(const char* cmd, const char* val) {
     CommandEntry c;
     strncpy(c.cmd, canonicalCmd, sizeof(c.cmd)); c.cmd[sizeof(c.cmd)-1] = '\0';
     strncpy(c.val, val, sizeof(c.val)); c.val[sizeof(c.val)-1] = '\0';
+    c.id = id;
     s_instance->pushCommand(c);
 }
 

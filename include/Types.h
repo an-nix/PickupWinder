@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "CommandRegistry.h"
 
 using CommandCallback = void (*)(const char* cmd, const char* value);
 using RecipeJsonProvider = void (*)(char* outBuf, size_t outBufLen);
@@ -89,4 +90,5 @@ struct CommandEntry {
     static constexpr size_t VAL_SZ = 48;
     char cmd[CMD_SZ];
     char val[VAL_SZ];
+    CommandId id = CommandId::Unknown;
 };

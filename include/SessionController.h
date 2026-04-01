@@ -106,7 +106,7 @@ public:
      * @return true if consumed by `SessionController`, false if caller should
      *         forward to domain-specific handlers (e.g. `WinderApp`).
      */
-    bool handleCommand(const char* cmd, const char* value);
+    bool handleCommand(CommandId id, const char* value);
 
     /**
      * @brief Run one session update cycle.

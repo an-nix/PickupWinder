@@ -7,6 +7,7 @@
 #include "LateralController.h"
 #include "Types.h"
 #include "Config.h"
+#include "CommandRegistry.h"
 
 enum class Direction { CW, CCW };
 
@@ -51,6 +52,7 @@ public:
 
     /** @brief Dispatch a user or transport command into the winding domain. */
     void handleCommand(const char* cmd, const char* value);
+    void handleCommand(CommandId id, const char* value);
 
     /** @brief Apply one encoder delta to the interactive trim logic. */
     void handleEncoderDelta(int32_t delta);
@@ -114,9 +116,9 @@ private:
 
     // ── Command handlers ──
     bool _parametersLocked() const { return _state != WindingState::IDLE; }
-    bool _handleImmediateCommand(const char* cmd, const char* value);
-    bool _handleGeometryCommand(const char* cmd, const char* value);
-    bool _handlePatternCommand(const char* cmd, const char* value);
+    bool _handleImmediateCommand(CommandId id, const char* value);
+    bool _handleGeometryCommand(CommandId id, const char* value);
+    bool _handlePatternCommand(CommandId id, const char* value);
     void _refreshCarriageForGeometryChange(bool startBoundChanged, bool endBoundChanged);
 
     // ── Recipe helpers ──

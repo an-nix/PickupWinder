@@ -1,28 +1,25 @@
 #include "WinderApp.h"
+#include "CommandRegistry.h"
 
 #include <Arduino.h>
 
 #include "Diag.h"
 
-bool WinderApp::_handleImmediateCommand(const char* cmd, const char* value) {
-    if (strcmp(cmd, "stop") == 0) {
+bool WinderApp::_handleImmediateCommand(CommandId id, const char* value) {
+    switch (id) {
+    case CommandId::Stop:
         _toIdle();
         return true;
-    }
-
-    if (strcmp(cmd, "reset") == 0) {
+    case CommandId::Reset:
         _toIdle();
         Diag::info("[IDLE] Turn counter reset");
         return true;
-    }
-
-    if (strcmp(cmd, "start") == 0) {
+    case CommandId::Start:
         if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
             if (!_lateral.isHomed() || _lateral.isBusy()) {
                 Diag::error("[Start] Lateral axis not ready");
                 return true;
             }
-
             _stepper.resetTurns();
             _planner.reset();
             _verifyLowPending = true;
@@ -43,9 +40,7 @@ bool WinderApp::_handleImmediateCommand(const char* cmd, const char* value) {
             return true;
         }
         return true;
-    }
-
-    if (strcmp(cmd, "pause") == 0) {
+    case CommandId::Pause:
         if (_state == WindingState::IDLE || _state == WindingState::TARGET_REACHED) {
             Diag::info("[Pause] Ignored - no active session");
         } else {
@@ -53,9 +48,7 @@ bool WinderApp::_handleImmediateCommand(const char* cmd, const char* value) {
             Diag::info("[Pause] Pause requested");
         }
         return true;
-    }
-
-    if (strcmp(cmd, "resume") == 0) {
+    case CommandId::Resume:
         if (_state == WindingState::PAUSED) {
             _toWinding();
             Diag::info("[Resume] Transitioning to WINDING");
@@ -63,82 +56,75 @@ bool WinderApp::_handleImmediateCommand(const char* cmd, const char* value) {
             Diag::infof("[Resume] Ignored in state %s", windingStateName(_state));
         }
         return true;
-    }
-
-    if (strcmp(cmd, "max_rpm") == 0 || strcmp(cmd, "max-rpm") == 0) {
-        const int rpm = constrain((int)strtol(value, nullptr, 10), 10, 1500);
-        _maxSpeedHz = (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL;
-        Diag::infof("[MaxRPM] (immediate) Set %d RPM -> %u Hz", rpm, (unsigned)_maxSpeedHz);
-        return true;
-    }
-
-    if (strcmp(cmd, "stop_next_high") == 0) {
+    case CommandId::MaxRpm:
+        {
+            const int rpm = constrain((int)strtol(value, nullptr, 10), 10, 1500);
+            _maxSpeedHz = (uint32_t)rpm * (uint32_t)STEPS_PER_REV / 60UL;
+            Diag::infof("[MaxRPM] (immediate) Set %d RPM -> %u Hz", rpm, (unsigned)_maxSpeedHz);
+            return true;
+        }
+    case CommandId::StopNextHigh:
         _lateral.armStopAtNextHigh();
         Diag::info("[Mode] Stop armed on next high bound");
         return true;
-    }
-
-    if (strcmp(cmd, "stop_next_low") == 0) {
+    case CommandId::StopNextLow:
         _lateral.armStopAtNextLow();
         Diag::info("[Mode] Stop armed on next low bound");
         return true;
-    }
-
-    if (strcmp(cmd, "end_pos") == 0) {
+    case CommandId::EndPos:
         _recipe.endPos = windingEndPosFromString(value);
         _saveRecipe();
         Diag::infof("[END_POS] Position finale: %s", windingEndPosKey(_recipe.endPos));
         return true;
-    }
-
-    if (strcmp(cmd, "end_pos_turns") == 0) {
+    case CommandId::EndPosTurns:
         _recipe.endPosTurns = (int)constrain((int)strtol(value, nullptr, 10), 1, 20);
         _saveRecipe();
         Diag::infof("[END_POS] Tours finaux: %d", _recipe.endPosTurns);
         return true;
-    }
-
-    if (strcmp(cmd, "rodage_dist") == 0) {
+    case CommandId::RodageDist:
         _rodageDistMm = constrain(atof(value), 5.0f, (float)LAT_TRAVERSE_MM);
         Diag::infof("[RODAGE] Distance: %.1f mm", _rodageDistMm);
         return true;
-    }
-
-    if (strcmp(cmd, "rodage_passes") == 0) {
+    case CommandId::RodagePasses:
         _rodagePasses = (int)constrain((int)strtol(value, nullptr, 10), 1, 200);
         Diag::infof("[RODAGE] Passes: %d", _rodagePasses);
         return true;
-    }
-
-    if (strcmp(cmd, "rodage") == 0) {
+    case CommandId::Rodage:
         if (_state == WindingState::IDLE) {
             _toRodage();
         } else {
             Diag::infof("[RODAGE] Ignore - etat actuel: %s", windingStateName(_state));
         }
         return true;
-    }
-
-    if (strcmp(cmd, "rodage_stop") == 0) {
+    case CommandId::RodageStop:
         if (_state == WindingState::RODAGE) {
             _toIdle();
             Diag::info("[RODAGE] Arret demande par l'operateur");
         }
         return true;
+    default:
+        return false;
     }
-
-    return false;
 }
 
 void WinderApp::handleCommand(const char* cmd, const char* value) {
+    const CommandDefinition* def = CommandRegistry::findByKey(cmd);
+    if (!def) {
+        return;
+    }
+    handleCommand(def->id, value);
+}
+
+void WinderApp::handleCommand(CommandId id, const char* value) {
 #if DIAG_VERBOSE
-    Diag::infof("[APP-CMD] cmd='%s' val='%s'", cmd, value);
+    Diag::infof("[APP-CMD] cmdId=%d val='%s'", (int)id, value);
 #endif
 
-    if (_handleImmediateCommand(cmd, value)) return;
-    if (_handleGeometryCommand(cmd, value)) return;
+    if (_handleImmediateCommand(id, value)) return;
+    if (_handleGeometryCommand(id, value)) return;
 
-    if (strcmp(cmd, "target") == 0) {
+    switch (id) {
+    case CommandId::Target: {
         const long t = strtol(value, nullptr, 10);
         if (t > 0) {
             _targetTurns = t;
@@ -151,20 +137,12 @@ void WinderApp::handleCommand(const char* cmd, const char* value) {
         }
         return;
     }
-
-    if (_parametersLocked()) {
-        Diag::infof("[Lock] Ignored during session (%s): %s", windingStateName(_state), cmd);
-        return;
-    }
-
-    if (strcmp(cmd, "freerun") == 0) {
+    case CommandId::Freerun:
         _freerun = (strcmp(value, "true") == 0);
         Diag::infof("Mode: %s", _freerun ? "FreeRun" : "Target");
         _saveRecipe();
         return;
-    }
-
-    if (strcmp(cmd, "direction") == 0) {
+    case CommandId::Direction: {
         const Direction newDir = (strcmp(value, "cw") == 0) ? Direction::CW : Direction::CCW;
         if (newDir != _direction) {
             _direction = newDir;
@@ -173,10 +151,7 @@ void WinderApp::handleCommand(const char* cmd, const char* value) {
         }
         return;
     }
-
-    if (_handlePatternCommand(cmd, value)) return;
-
-    if (strcmp(cmd, "recipe_import") == 0) {
+    case CommandId::RecipeImport: {
         WindingRecipe imported;
         if (_recipeStore.fromJson(value, imported)) {
             _applyRecipe(imported, true);
@@ -186,8 +161,7 @@ void WinderApp::handleCommand(const char* cmd, const char* value) {
         }
         return;
     }
-
-    if (strcmp(cmd, "lat_offset") == 0) {
+    case CommandId::LatOffset: {
         const float mm = constrain((float)atof(value), 0.0f, (float)LAT_TRAVERSE_MM);
         _lateral.setHomeOffset(mm);
         _toIdle();
@@ -196,4 +170,14 @@ void WinderApp::handleCommand(const char* cmd, const char* value) {
         _saveRecipe();
         return;
     }
+    default:
+        break;
+    }
+
+    if (_parametersLocked()) {
+        Diag::infof("[Lock] Ignored during session (%s)", windingStateName(_state));
+        return;
+    }
+
+    if (_handlePatternCommand(id, value)) return;
 }

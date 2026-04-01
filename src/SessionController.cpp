@@ -107,7 +107,7 @@ void SessionController::applyPendingIntent() {
 
         // Forward Start intents to WinderApp so UI/footswitch can resume from
         // PAUSED or re-arm the session when appropriate.
-        _winder.handleCommand("start", "");
+        _winder.handleCommand(CommandId::Start, "");
         _sessionState = SessionState::ARMED_OR_RUNNING;
         _appliedSource = src;
         if (src == InputSource::Pot) {
@@ -147,40 +147,34 @@ void SessionController::requestStop() {
 // -----------------------------------------------------------------------------
 // Command decoding
 // -----------------------------------------------------------------------------
-bool SessionController::handleCommand(const char* cmd, const char* value) {
-    // Session lifecycle commands are converted to intents.
-    if (strcmp(cmd, "start") == 0) {
-        requestStart(); // Convert transport command into start intent.
-        return true;    // Mark as consumed by SessionController.
+bool SessionController::handleCommand(CommandId id, const char* value) {
+    switch (id) {
+    case CommandId::Start:
+        requestStart();
+        return true;
+    case CommandId::Pause:
+        requestPause();
+        return true;
+    case CommandId::Stop:
+        requestStop();
+        return true;
+    case CommandId::Target: {
+        long t = strtol(value, nullptr, 10);
+        if (t > 0) _winder.setTargetTurns(t);
+        return true;
     }
-    if (strcmp(cmd, "pause") == 0) {
-        requestPause(); // Convert transport command into pause intent.
-        return true;    // Mark as consumed by SessionController.
+    case CommandId::Freerun:
+        _winder.setFreerun(strcmp(value, "true") == 0);
+        return true;
+    case CommandId::Direction:
+        _winder.setDirection(strcmp(value, "cw") == 0 ? Direction::CW : Direction::CCW);
+        return true;
+    case CommandId::MaxRpm:
+        _winder.setMaxRpm((uint16_t)constrain((int)strtol(value, nullptr, 10), 10, 1500));
+        return true;
+    default:
+        return false;
     }
-    if (strcmp(cmd, "stop") == 0) {
-        requestStop(); // Convert transport command into stop intent.
-        return true;   // Mark as consumed by SessionController.
-    }
-    if (strcmp(cmd, "target") == 0) {
-        long t = strtol(value, nullptr, 10);         // Parse new target turns.
-        if (t > 0) _winder.setTargetTurns(t); // Apply only valid positive targets.
-        return true;                    // Command handled at session/domain boundary.
-    }
-    if (strcmp(cmd, "freerun") == 0) {
-        _winder.setFreerun(strcmp(value, "true") == 0); // Map text flag to boolean mode.
-        return true;                           // Command consumed.
-    }
-    if (strcmp(cmd, "direction") == 0) {
-        _winder.setDirection(strcmp(value, "cw") == 0 ? Direction::CW : Direction::CCW); // Select spindle direction.
-        return true; // Command consumed.
-    }
-    if (strcmp(cmd, "max_rpm") == 0 || strcmp(cmd, "max-rpm") == 0) {
-        _winder.setMaxRpm((uint16_t)constrain((int)strtol(value, nullptr, 10), 10, 1500)); // Clamp safe operating range.
-        return true; // Command consumed.
-    }
-
-    // Unknown command for SessionController: caller may forward it.
-    return false;
 }
 
 // -----------------------------------------------------------------------------
@@ -295,11 +289,10 @@ void SessionController::tick(const TickInput& in) {
 
     // 3) Decode commands provided in TickInput (bounded, no dynamic alloc).
     for (int i = 0; i < in.cmdCount; ++i) {
-        const char* c = in.commands[i].cmd; // Raw command key from queue.
         const char* v = in.commands[i].val; // Raw command value from queue.
         // Session-level commands handled here; others forwarded to WinderApp.
-        if (!handleCommand(c, v)) {
-            _winder.handleCommand(c, v); // Forward unknown session command.
+        if (!handleCommand(in.commands[i].id, v)) {
+            _winder.handleCommand(in.commands[i].id, v); // Forward unknown session command.
         }
     }
 
