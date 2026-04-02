@@ -1,372 +1,315 @@
-# Copilot Instructions — PickupWinder Firmware
+# Copilot Instructions  PickupWinder (BeagleBone Black)
 
-> ESP32 guitar pickup winding machine controller.
-> Dual-core FreeRTOS, PlatformIO + Arduino framework.
+> Branch `beagle`  migration vers BeagleBone Black (AM335x) + PRU.
+> Sources ESP32 originales dans `archive/original_esp32/` (référence uniquement).
 
 ---
 
 ## 1. Project Identity & Goals
 
-- **Purpose**: Automated/assisted guitar pickup coil winding with precise
-  lateral guide traversal, real-time speed control, and recipe persistence.
-- **Hardware**: ESP32-WROOM-32, two A4988/DRV8825 stepper drivers (spindle +
-  lateral), rotary encoder, analog potentiometer, footswitch, dual-contact
-  home sensor, UART2 display link, WiFi + WebSocket UI.
-- **Core constraint**: The firmware pilots physical motors and wire under
-  tension. Any software fault may damage the pickup being wound. Correctness
-  and determinism always outweigh feature elegance.
+- **Purpose**: Automated/assisted guitar pickup coil winding  precise lateral
+  guide traversal, real-time speed control, recipe persistence.
+- **Hardware**: BeagleBone Black (AM335x), two A4988/DRV8825 stepper drivers
+  (spindle + lateral), rotary encoder, analog potentiometer, footswitch,
+  dual-contact home sensor, WebSocket UI.
+- **Core constraint**: Firmware pilots physical motors under wire tension.
+  Correctness and determinism always outweigh elegance.
+
+---
 
 ## 2. Architecture Overview
 
-### 2.1 FreeRTOS Tasks
+Two layers:
 
-| Task | Core | Priority | Period | Stack | Role |
-|------|------|----------|--------|-------|------|
-| `controlTask` | 1 | 5 | 10 ms | 8 192 B | Sensors → commands → session → motor |
-| `commsTask` | 0 | 2 | 20 ms | 8 192 B | UART poll, WS/UART status broadcast |
+```
++-------------------------------------------------+
+|         Linux userspace  (ARM Cortex-A8)        |
+|  WinderApp . Session . Recipe . WebUI . Diag    |
+|  StepperPRU . LateralPRU  (IPC wrappers)        |
+|              IpcChannel (linux/src/)             |
++----------------------+--------------------------+
+|  PRU0 - Spindle      |  PRU1 - Lateral+Sensors  |
+|  200 MHz determinism |  200 MHz determinism     |
+|  STEP/DIR/EN GPIO    |  STEP/DIR/EN GPIO        |
+|  Accel/decel ramp    |  Accel/decel ramp        |
+|  Compensation RPM    |  Home sensor NO+NC       |
++----------------------+--------------------------+
+```
 
-- **Inter-task comms**:
-  - Commands flow comms→control via a FreeRTOS queue (`CommandController`).
-  - Status flows control→comms via a mutex-protected `WinderStatus` snapshot.
-  - No other shared mutable state exists between tasks.
+Full architecture: see `doc/beaglebone_architecture.md`.
 
-### 2.2 Source File Map
+### 2.1 Linux Modules
 
-| File(s) | Responsibility |
-|---------|----------------|
-| `main.cpp` | Task creation, RTOS metrics, boot diagnostics |
-| `ControlHardware.cpp` | ISR-based encoder, filtered pot, footswitch debounce |
-| `SessionController.cpp` | Last-event-wins intent arbitration (pot/UI/footswitch), speed output |
-| `CommandController.cpp` | Queue-based command bridge, schema validation via `CommandRegistry` |
-| `CommandRegistry.cpp` | Canonical command catalog, alias normalization, value validation, `/capabilities.json` |
-| `WinderApp.Core.cpp` | State machine (IDLE/WINDING/PAUSED/TARGET_REACHED/RODAGE), lateral events, motor control |
-| `WinderApp.Commands.cpp` | Command dispatch & immediate handlers (start/stop/pause/resume/…) |
-| `WinderApp.GeometryPattern.cpp` | Geometry (trims, presets, dimensions), pattern (style/seed/jitter) |
-| `WinderApp.Telemetry.cpp` | `getStatus()` builder, encoder trim during pause |
-| `WinderApp.Recipe.cpp` | Recipe apply/capture/save helpers |
-| `StepperController.cpp` | Non-blocking spindle stepper (deferred enable, soft-start) |
-| `LateralController.cpp` | 10-state lateral axis: homing, positioning, synchronized traversal, overrun correction |
-| `WindingPattern.cpp` | Deterministic pseudo-random traverse variation (STRAIGHT/SCATTER/HUMAN) |
-| `WindingRecipeStore.cpp` | NVS recipe persistence with `StaticJsonDocument<1024>`, version gating |
-| `WebInterface.cpp` | HTTP (embedded assets) + WebSocket server, REST endpoints |
-| `WifiManager.cpp` | WiFi credential management (NVS + compile-time fallback) |
-| `LinkSerial.cpp` | UART2 protocol (banner + pipe-separated status + `cmd:val\n` RX) |
-| `Diag.cpp` | Lightweight logger: Serial + up to 4 registered sinks, fixed 512-byte format buffer |
-| `NvsCompat.cpp` | C-string NVS wrapper (no Arduino String) |
+| Module               | File(s)                              | Responsibility |
+|----------------------|--------------------------------------|----------------|
+| `IpcChannel`         | `port/beaglebone/linux/src/IpcChannel.cpp`    | PRU shared RAM map |
+| `StepperPRU`         | `port/beaglebone/linux/src/StepperPRU.cpp`    | Spindle API -> IPC |
+| `LateralPRU`         | `port/beaglebone/linux/src/LateralPRU.cpp`    | Lateral API -> IPC |
+| `WinderApp.Core`     | `src/WinderApp.Core.cpp`             | State machine |
+| `WinderApp.Commands` | `src/WinderApp.Commands.cpp`         | Command dispatch |
+| `WinderApp.Geometry` | `src/WinderApp.GeometryPattern.cpp`  | Geometry + pattern |
+| `WinderApp.Telemetry`| `src/WinderApp.Telemetry.cpp`        | getStatus() builder |
+| `WinderApp.Recipe`   | `src/WinderApp.Recipe.cpp`           | Recipe helpers |
+| `CommandController`  | `src/CommandController.cpp`          | Queue-based bridge |
+| `CommandRegistry`    | `src/CommandRegistry.cpp`            | Catalog+validation |
+| `SessionController`  | `src/SessionController.cpp`          | Arbitration |
+| `WebInterface`       | `src/WebInterface.cpp`               | HTTP+WebSocket |
+| `WindingPattern`     | `src/WindingPattern.cpp`             | STRAIGHT/SCATTER/HUMAN |
+| `WindingRecipeStore` | `src/WindingRecipeStore.cpp`         | JSON persistence |
+| `Diag`               | `src/Diag.cpp`                       | Lightweight logger |
+
+### 2.2 PRU Firmware
+
+| File                                   | Responsibility |
+|----------------------------------------|----------------|
+| `pru/include/pru_ipc.h`               | IPC shared memory layout (C only) |
+| `pru/include/pru_ramp.h`              | Fixed-point ramp engine (inline) |
+| `pru/pru0_spindle/main.c`             | Spindle STEP generation + compensation |
+| `pru/pru1_lateral/main.c`             | Lateral STEP + home sensor + reversal |
 
 ### 2.3 Key Headers
 
-| Header | Content |
-|--------|---------|
-| `Config.h` | Pin assignments, motor tuning, pot/encoder params, WiFi, winding defaults |
-| `Types.h` | `CommandEntry` (cmd[32]+val[48]), `WinderStatus`, `WindingState` enum |
-| `Protocol.h` | Version constants: WS, UART, Capabilities, Recipe format |
-| `CommandRegistry.h` | `CommandId` enum, `CommandDefinition`, `CommandValueKind`, registry API |
-| `WindingGeometry.h` | Bobbin geometry math, presets, turns-per-pass |
-| `WindingPattern.h` | `WindingRecipe`, `TraversePlan`, `WindingPatternPlanner`, `WindingEndPos` |
-| `SessionController.h` | `TickInput` (MAX_CMDS=16), `SessionState`, `ControlIntent`, `InputSource` |
+| Header                        | Content |
+|-------------------------------|---------|
+| `pru/include/pru_ipc.h`      | pru_cmd_t, pru_axis_telem_t, pru_sync_t, memory offsets |
+| `pru/include/pru_ramp.h`     | axis_state_t, ramp_tick(), hz_to_halfperiod() |
+| `linux/include/IpcChannel.h` | IpcChannel class - shared RAM open/map/read/write |
+| `linux/include/StepperPRU.h` | StepperPRU - spindle API |
+| `linux/include/LateralPRU.h` | LateralPRU - lateral API |
+| `include/Types.h`             | CommandEntry, WinderStatus, WindingState |
+| `include/Protocol.h`          | Version constants |
+| `include/CommandRegistry.h`   | CommandId enum, registry API |
+| `include/WindingGeometry.h`   | Bobbin geometry, presets |
+| `include/WindingPattern.h`    | WindingRecipe, TraversePlan, WindingPatternPlanner |
+| `include/SessionController.h` | TickInput, SessionState, ControlIntent |
+
+---
 
 ## 3. Hard Rules (Must-follow)
 
-### 3.1 Real-Time Safety
+### 3.1 PRU Safety
 
-- **NEVER** call `delay()` inside `controlTask`, `commsTask`, or any function
-  reachable from them at runtime. The only acceptable `delay()` locations are
-  `setup()` / `begin()` one-shots before tasks start.
-- **NEVER** use heap allocation (`new`, `malloc`, `String`, `std::string`,
-  `std::vector`, `DynamicJsonDocument`) in any runtime path. All buffers must be
-  stack-local with bounded sizes or static.
-- **NEVER** call `serializeJsonPretty()` in firmware — compact JSON only.
-- Control tick must complete well under 10 ms worst-case. Log
-  `control_worst_loop_us` every 5 s to catch regressions.
+- **NEVER** use dynamic memory, floats, or OS calls in PRU firmware.
+- **NEVER** use division in the inner PRU step loop (precompute periods).
+- Emergency stop (`CMD_EMERGENCY_STOP`) clears all STEP outputs in <= 2 PRU instructions.
+- All PRU shared memory accesses must use `volatile` pointers.
+- Shared memory structs must be `__attribute__((packed, aligned(4)))`.
 
-### 3.2 Memory / Stack
+### 3.2 Linux Daemon Safety
 
-- `StaticJsonDocument` sizes must be computed from payload, not guessed.
-  Current sizing: recipe = 1024 B, WS command parse = 192 B.
-- Recipe `load()`/`save()` use a 2048-byte stack buffer — these functions run
-  only at startup (`begin()`) or from `controlTask` context. Never call them
-  from the ISR or comms task.
-- WebSocket status `sendUpdate()` uses an 832-byte stack buffer on commsTask
-  (8 KB stack). Keep total commsTask stack pressure below ~3 KB.
-- Diag format buffer is 512 bytes. Keep log format strings short; if truncation
-  risk exists, split into multiple calls.
+- **NEVER** use heap allocation in the hot control loop or telemetry path.
+  All runtime buffers are stack-local with bounded sizes or static.
+- **NEVER** call `serializeJsonPretty()`  compact JSON only.
+- Control loop tick: <= 10 ms. Log `control_worst_loop_us` every 5 s.
+- Ring buffer full: drop + log error. Never block the control loop.
 
-### 3.3 Logging
+### 3.3 IPC Protocol
 
-- Use `Diag::info()` / `warn()` / `error()` and `infof()` / `warnf()` / `errorf()`.
-- High-frequency logs (per-tick, per-sample) **must** be wrapped in
-  `#if DIAG_VERBOSE` (compile-time) or `if (DIAG_VERBOSE)` (runtime check for
-  state-change guards).
-- Production build (`esp32dev`) compiles with `DIAG_VERBOSE=0`.
-- Lab build (`esp32dev-lab`) compiles with `DIAG_VERBOSE=1`, `-O0`.
-- Never log WiFi credentials, NVS blobs, or recipe JSON in production.
+- Commands go through `IpcChannel::sendCommand()` -> ring buffer (32 slots).
+- `pru_ipc.h` is C-compatible: included from both PRU C and Linux C++.
+- Do not poll telemetry at step frequency; read at control loop cadence (<= 10 ms).
 
-### 3.4 Command Protocol
+### 3.4 Command Protocol (unchanged)
 
-- All commands go through `CommandRegistry` before reaching the domain.
-- To add a command: add entry to `kCommands[]` in `CommandRegistry.cpp`, add
-  `CommandId` enum value, handle in the appropriate WinderApp handler.
-- Aliases (`max-rpm` → `max_rpm`, `windows_shift` → `window_shift`) are in
-  `normalizeKeyImpl()`.
-- Value validation (type, range, enum set) happens in `validateValue()`.
-- Never bypass `CommandController::onTransportCommand()` for transport input.
+- All commands validated through `CommandRegistry` before reaching the domain.
+- Aliases normalized in `normalizeKeyImpl()`.
+- Value validation in `validateValue()`.
+- Never bypass `CommandController::onTransportCommand()`.
 
-### 3.5 Recipe & NVS
+### 3.5 Recipe & Persistence
 
-- Recipe format version is `PICKUP_RECIPE_FORMAT_VERSION` in `Protocol.h`.
+- Recipe format version: `PICKUP_RECIPE_FORMAT_VERSION` in `Protocol.h`.
 - `fromJson()` rejects recipes with `version > PICKUP_RECIPE_FORMAT_VERSION`.
-- All float fields are clamped to safe ranges after parsing.
-- Bump the version only for actual schema changes (new fields, removed fields,
-  changed semantics).
+- Float fields clamped after parsing. Bump version only for schema changes.
+- Storage: JSON files on BBB eMMC (replaces ESP32 NVS).
 
-### 3.6 Lateral Controller Safety
+### 3.6 Sensor Safety (PRU1)
 
-- All public methods on `LateralController` must guard `if (!_stepper) return;`
-  to survive a failed `begin()`.
-- The home sensor uses a dual-contact (NO+NC) validation to detect wire faults.
-- Overrun correction in `updateWinding()` snaps the carriage to the moved bound
-  and reverses immediately.
+- Home sensor: NO=LOW + NC=HIGH -> home. NO=HIGH + NC=HIGH -> FAULT.
+- Debounce: 3 consecutive stable reads at 10 us interval.
+- All `LateralPRU` methods guard `if (!_channel) return;`.
 
-### 3.7 Build & CI
+### 3.7 Build
 
-- Two PlatformIO environments: `esp32dev` (production), `esp32dev-lab` (debug).
-- CI builds both environments + compiles unit tests.
-- Unit tests use the Unity framework and live under `test/test_*/test_main.cpp`.
-- The build must compile with zero warnings at `-Os -flto` (production) and
-  `-O0` (lab).
+- PRU: `pru-gcc` or TI `clpru`. Makefile: `port/beaglebone/pru/Makefile`.
+- Linux: CMake >= 3.16. `port/beaglebone/linux/CMakeLists.txt`.
+- Unit tests: native x86-64 host, **gtest** (replaces Unity/PlatformIO).
+  Tests in `test/test_*/` must compile and pass on host without hardware.
+- CI: `.github/workflows/beaglebone-build.yml`.
+
+ - PRU cross-compile: prefer using `crosstool-NG` to build the PRU-capable
+   cross-toolchain used to produce a `pru-gcc` toolchain. Ensure the PRU
+   toolchain is available on the build host or installed/cached by CI.
+
+### 3.8 Logging
+
+- Use `Diag::info()` / `warn()` / `error()` / `infof()` / `warnf()` / `errorf()`.
+- High-frequency logs wrapped in `#if DIAG_VERBOSE`.
+- Never log credentials, recipe blobs, or raw IPC buffers in production.
+
+---
 
 ## 4. Domain Knowledge
 
 ### 4.1 Winding State Machine
 
 ```
-IDLE ──(start)──► PAUSED (positioning to low bound)
-                    │
-                    ├──(positioned + pot/resume)──► WINDING
-                    │                                  │
-                    │                            (pot→0)├──► PAUSED
-                    │                     (turns≥target)├──► TARGET_REACHED
-                    │                                  │
-                    └──────────(stop)──────────────────► IDLE
+IDLE --(start)--> PAUSED (positioning)
+                    |
+                    +--(positioned+pot/resume)--> WINDING
+                    |                               |
+                    |                         (pot=0)--> PAUSED
+                    |                  (turns>=target)--> TARGET_REACHED
+                    |                               |
+                    +----------(stop)---------------> IDLE
 
-IDLE ──(rodage)──► RODAGE ──(rodage_stop / complete)──► IDLE
+IDLE --(rodage)--> RODAGE --(rodage_stop/complete)--> IDLE
 ```
 
 ### 4.2 Session Arbitration (Last-Event-Wins)
 
-- Three input sources: **Pot** (analog), **IHM** (WebSocket/UART UI), **Footswitch**.
-- While IDLE, only IHM can produce a `Start` intent (prevents accidental pot/footswitch starts).
-- When another source takes control while pot is above zero, pot is locked until
-  it returns to zero ("re-arm" mechanism).
-- Pot → `RunMode::Pot` (proportional), UI/Footswitch → `RunMode::Max` (ceiling speed).
+- Sources: Pot (analog), IHM (WebSocket/UART), Footswitch.
+- IDLE: only IHM can produce a Start intent.
+- Pot-lock: when another source takes control while pot > 0, pot locked until it returns to 0.
+- Pot -> RunMode::Pot (proportional). UI/Footswitch -> RunMode::Max.
 
 ### 4.3 Lateral Traverse Synchronization
 
-- Lateral speed is computed from: `effWidthMm × windingHz / (tpp × STEPS_PER_REV)`.
-- Speed is scaled by a pattern-computed `speedScale` (0.55–1.60).
-- Reversal window triggers spindle slow-down via real-time compensation (proportional to actual carriage velocity).
-- One-shot stop flags: `stop_next_high`, `stop_next_low`, `armPauseOnNextReversal`.
+- Lateral speed: `effWidthMm x windingHz / (tpp x STEPS_PER_REV)`.
+- Scaled by pattern `speedScale` (0.55-1.60).
+- Reversal compensation applied in PRU0 by reading `pru_sync.lateral_hz`.
+- One-shot flags: `stop_next_high`, `stop_next_low`, `armPauseOnNextReversal`.
 
 ### 4.4 Winding Patterns
 
-- **STRAIGHT**: constant traverse, no variation.
-- **SCATTER**: per-layer random TPP jitter + speed jitter, stepped.
+- **STRAIGHT**: constant traverse.
+- **SCATTER**: per-layer random TPP + speed jitter.
 - **HUMAN**: smooth Perlin-like noise on traverse and speed.
-- All patterns are deterministic per `seed`.
+- All patterns deterministic per `seed`.
 
-### 4.5 Hardware Constants (from Config.h)
+### 4.5 Hardware Constants
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Spindle steps/rev | 6400 | 200-step motor × 32 µstep |
-| Spindle speed range | 9600/9 – 160000 Hz | ~90 – 1500 RPM |
-| Lateral steps/mm | 3072 | 96-step motor × 32 µstep, M6 1mm pitch |
-| Pot filter | 32 samples × 20 ms = 640 ms | Circular average + exponential curve |
-| Encoder debounce | 1000 µs | ISR-level, IRAM_ATTR |
-| Home sensor | NO (GPIO 23) + NC (GPIO 22) | Dual-contact fault detection |
-
-## 5. Code Style Conventions
-
-- **Language**: C++ (Arduino/ESP-IDF subset). No STL containers, no exceptions,
-  no RTTI.
-- **Naming**: `PascalCase` for classes/enums, `camelCase` for methods/variables,
-  `_prefixed` for private members, `UPPER_SNAKE` for macros/constants.
-- **Fixed buffers**: always use `char buf[N]` with `snprintf(buf, sizeof(buf), …)`.
-  Never use `sprintf()`.
-- **String comparison**: `strcmp()` / `strncmp()` on `const char*`. No `String`.
-- **Numeric parsing**: `strtol()` / `strtof()` / `atof()` with post-parse
-  `constrain()`.
-- **Comments**: French in user-facing log messages is acceptable (existing
-  convention). English for code comments and documentation.
-- **Include order**: matching `.h` first, then `<Arduino.h>`, then library
-  headers, then project headers alphabetically.
-
-## 6. Testing & Validation
-
-- Unit tests live in `test/test_<suite>/test_main.cpp` using Unity.
-- Test coverage priorities:
-  1. Command normalization and validation (`test_command_registry`)
-  2. Geometry math (`test_winding_geometry`)
-  3. Recipe version gating (`test_recipe_format`)
-  4. Session start/pause/stop arbitration (`test_session_rules` — planned)
-- When adding a new command or changing validation rules, add or update the
-  corresponding test.
-
-## 7. Common Pitfalls to Avoid
-
-| Pitfall | Why it matters |
-|---------|----------------|
-| `delay()` in task body | Blocks the entire core, breaks timing guarantees |
-| `String` / `std::string` | Heap fragmentation over hours of continuous winding |
-| `DynamicJsonDocument` | Same heap concern; always use `StaticJsonDocument<N>` |
-| `serializeJsonPretty` | Wastes RAM and flash for no embedded benefit |
-| Shared mutable state without mutex | Race condition between Core 0 and Core 1 |
-| Calling recipe save from commsTask | 2 KB stack buffer on 8 KB stack = overflow risk |
-| Forgetting `if (!_stepper)` guard | Null dereference crash if stepper init failed |
-| Logging passwords/credentials | Security violation; use flags like `hasNvs`/`compileTimeDefault` |
-| `sprintf()` without size limit | Buffer overflow; always `snprintf()` |
-| atof/strtol without constrain | Unbounded user input reaching motor parameters |
-
-## 8. Winding Uniformity & Carriage-Spindle Synchronization (CRITICAL)
-
-### 8.1 Core Concept: Constant Turns-per-Millimeter Ratio
-
-The fundamental principle for uniform winding is that the number of spindle turns 
-deposited per millimeter of lateral carriage travel must remain **CONSTANT at all times**, 
-including during carriage reversal phases.
-
-```
-Ratio = Spindle_RPM / Carriage_velocity_mm_per_s = CONSTANT
-```
-
-If this ratio varies, wire density varies → bulges or gaps emerge.
-
-**Problem scenario during carriage reversal:**
-- Carriage decelerates → velocity decreases
-- If spindle RPM remains constant → ratio increases → too much wire deposited 
-  over short distance → bulge at edges (or gap at center if spindle also slows)
-
-**Compensation formula:**
-```
-RPM_spindle_corrected = RPM_nominal × (Carriage_velocity_actual / Carriage_velocity_nominal)
-```
-
-### 8.2 Code Audit Checklist
-
-#### 1. Base turns-per-mm ratio calculation
-- ✅ Verify nominal carriage velocity is computed as:
-  ```
-  Carriage_velocity_mm_s = (Spindle_RPM × Wire_diameter_mm) / 60
-  ```
-- ✅ Verify that the winding/traverse ratio is a **non-integer** (e.g., 3.7, 4.3...) 
-  to avoid layer-upon-layer wire stacking and create a uniform cross-hatch pattern.
-- ✅ If ratio is integer (3, 4, 5...), wires align exactly on top of each other 
-  at every pass → **MUST CORRECT**.
-
-#### 2. Carriage reversal handling
-- ✅ Identify all code sections that manage carriage turnaround (end-of-travel, 
-  limit sensors, step counting).
-- ✅ Check if deceleration/acceleration ramp is applied to carriage.
-- ✅ If yes: is spindle speed compensated proportionally?
-- ✅ If no: does spindle also slow down during reversal (current problematic behavior)?
-
-#### 3. Dynamic compensation implementation
-Implement real-time compensation function:
-
-```cpp
-float ratio_nominal = RPM_nominal / Carriage_velocity_nominal;
-
-// Called at every carriage velocity update:
-float calculateCompensatedRPM(float carriage_velocity_actual) {
-    if (carriage_velocity_actual < MIN_VELOCITY_THRESHOLD) {
-        // Avoid division by zero during complete stop
-        return RPM_nominal;  // or 0 depending on chosen behavior
-    }
-    return ratio_nominal * carriage_velocity_actual;
-}
-```
-
-Must be invoked:
-- At every step of carriage deceleration ramp
-- At every step of carriage acceleration ramp
-- In nominal state (verify ratio remains constant)
-
-#### 4. Update frequency
-- Compensation must apply as frequently as possible 
-  (ideally at every stepper step or main loop tick).
-- No delay or lag between carriage velocity change and spindle RPM adjustment.
-
-#### 5. End-of-travel boundary margins
-- System has intentional margin between carriage reversal point and physical 
-  bobbin edge. This is **CORRECT by design** — do not modify.
-- **BUT**: verify margin is **SYMMETRIC** on both sides (left/right edges). 
-  Asymmetric margin shifts winding center → unequal distribution.
-- Verify margin is defined in ONE place only (constant or parameter), 
-  not duplicated with differing values.
-- Effective winding width is:
-  ```
-  Effective_width = Total_width - (2 × Border_margin)
-  ```
-  All velocity and ratio calculations must use effective_width, not total_width.
-
-#### 6. Carriage complete stop handling
-During brief instant when carriage is at zero velocity (between deceleration 
-and re-acceleration):
-- **Option A:** Spindle also stops (ratio 0/0 → neutral, but mechanical irregularity)
-- **Option B:** Spindle continues at nominal RPM (a few extra turns at reversal point 
-  → slight edge bulge, acceptable if duration is very short)
-- **Option C:** Carriage ramp so fast no hard stop occurs → **IDEAL**
-
-Verify which option is implemented and consistency with observations.
-
-#### 7. Complete velocity profile logging
-- Log carriage velocity AND spindle RPM over one complete pass (forward + reversal).
-- Verify graphically that both curves are proportional at all times 
-  (same shape, just scaled differently).
-- Any deviation = location of poor wire distribution.
-- Visualization via:
-  - Option A: Lightweight live dashboard on ESP web server (if not too heavy)
-  - Option B: Separate Python app polling WebSocket every 100ms for offline curve analysis
+| Parameter         | Value           | Notes |
+|-------------------|-----------------|-------|
+| Spindle steps/rev | 6400            | 200-step x 32 ustep |
+| Speed range       | ~1067 - 160000 Hz | ~10 - 1500 RPM |
+| Lateral steps/mm  | 3072            | 96-step x 32 ustep, M6 1mm pitch |
+| PRU clock         | 200 MHz         | 5 ns/cycle, 1 cycle/instruction |
 
 ---
 
-### 8.3 Expected Results After Correction
+## 5. Code Style Conventions
 
-- **Nominal regime:** Spindle RPM and carriage velocity constant and proportional
-- **Deceleration phase:** Spindle RPM decreases proportionally with carriage velocity
-- **Acceleration phase:** Spindle RPM increases proportionally with carriage velocity
-- **Ratio stability:** Turns/mm varies ±5% max across entire winding width
-- **Visual pattern:** Regular cross-hatch (losange) pattern across full surface 
-  (evidence of non-integer traverse ratio properly applied)
-- **UI simplification:** Winding style parameters must be minimal to avoid cluttering 
-  interface with low-impact parameters.
+- **Language**: C++ for Linux, pure C for PRU. No STL containers, no exceptions in hot paths.
+- **Naming**: PascalCase classes/enums, camelCase methods/members, _prefix private, UPPER_SNAKE macros.
+- **Fixed buffers**: `char buf[N]` + `snprintf(buf, sizeof(buf), ...)`. Never `sprintf`.
+- **String comparison**: `strcmp()` / `strncmp()` on `const char*`.
+- **Numeric parsing**: `strtol()` / `strtof()` + `constrain()`.
+- **PRU integers only**: speeds in Hz (uint32_t), positions in steps (int32_t). No floats.
+- **Comments**: French acceptable in log messages. English for code comments.
+- **Include order**: matching .h first, then system headers, then project headers.
+
+---
+
+## 6. Testing & Validation
+
+- Unit tests: `test/test_<suite>/test_main.cpp` (gtest, host-compilable).
+- Coverage priorities:
+  1. Command normalization + validation (`test_command_registry`)
+  2. Geometry math (`test_winding_geometry`)
+  3. Recipe version gating (`test_recipe_format`)
+  4. Session arbitration (`test_session_rules`)
+  5. Ramp engine math (`test_pru_ramp` - planned)
+- Add/update test when adding a command or changing validation.
+
+---
+
+## 7. Common Pitfalls
+
+| Pitfall | Why it matters |
+|---------|----------------|
+| Float or division in PRU loop | PRU has no FPU; crashes or extreme slowdown |
+| OS call in PRU firmware | PRU has no OS; link error or crash |
+| Missing `volatile` on shared RAM pointer | Compiler may cache stale value |
+| Full IPC ring buffer -> blocking | Breaks control loop determinism |
+| `sprintf()` without size | Buffer overflow |
+| `atof`/`strtol` without `constrain` | Unbounded value reaches motor parameters |
+| No `if (!_channel)` guard | Null deref if IpcChannel failed to init |
+| Logging credentials / blobs | Security violation |
+| Mismatched `pru_cmd_t` size PRU vs Linux | Silent corrupt IPC messages |
+| Integer ratio for effective winding width | Wires stack on top of each other |
+
+---
+
+## 8. Winding Uniformity & Spindle-Lateral Synchronization (CRITICAL)
+
+### Core Principle
+
+```
+Ratio = Spindle_Hz / Lateral_Hz = CONSTANT at all times
+```
+
+On BBB, compensation runs in PRU0 at every ramp tick (1 ms):
+
+```c
+uint32_t lat = pru_sync->lateral_hz;
+if (lat >= LAT_MIN_HZ && nominal_lat_hz > 0) {
+    spindle_state.target_hz =
+        (uint64_t)nominal_spindle_hz * lat / nominal_lat_hz;
+    spindle_state.target_hz =
+        clamp32(spindle_state.target_hz, SPEED_HZ_MIN, SPEED_HZ_MAX);
+}
+```
+
+### Expected results
+
+- Nominal: both Hz constant, ratio stable +-5%.
+- Decel (reversal): spindle Hz decreases proportionally with lateral.
+- Accel: spindle Hz increases proportionally.
+- Visual: regular cross-hatch (losange) pattern across full bobbin width.
+
+### Winding ratio must be non-integer
+
+`effWidthMm / wire_diameter_mm` must not be a whole number (avoid layer stacking).
+Verify after every geometry change.
+
+---
 
 ## 9. Quick Reference: Adding a New Feature
 
-1. **New command**: Add `CommandId`, `CommandDefinition` in `CommandRegistry.cpp`,
-   handle in the appropriate `_handle*Command()` method, add unit test.
-2. **New geometry parameter**: Add field to `WindingGeometry`, serialize in
-   `WindingRecipeStore::toJson`/`fromJson`, add to `WinderStatus`, update
-   `WebInterface::sendUpdate()` format string, update `script.js` UI.
-3. **New recipe field**: Add to `WindingRecipe`, update toJson/fromJson with
-   safe default, bump `PICKUP_RECIPE_FORMAT_VERSION` if breaking.
-4. **New REST endpoint**: Add `_server.on(...)` in `WebInterface::begin()`,
-   document in `WebInterface.h`.
-5. **New diagnostic**: Use `Diag::infof()`, gate with `#if DIAG_VERBOSE` if
-   high-frequency.
+1. **New command**: add `CommandId` + `CommandDefinition` in `CommandRegistry.cpp`,
+   handle in `WinderApp.Commands.cpp`, add unit test.
+2. **New geometry parameter**: add to `WindingGeometry`, serialize in
+   `WindingRecipeStore`, add to `WinderStatus`, update `WebInterface::sendUpdate()`.
+3. **New recipe field**: add to `WindingRecipe`, update toJson/fromJson,
+   bump `PICKUP_RECIPE_FORMAT_VERSION` if breaking.
+4. **New PRU command**: add `CMD_*` in `pru_ipc.h`, handle in PRU `main.c`,
+   add `IpcChannel` helper, update `StepperPRU`/`LateralPRU`.
+5. **New REST endpoint**: add `_server.on(...)` in `WebInterface::begin()`.
+
+---
 
 ## 10. File Organization
 
 ```
-include/          — All .h headers (no .cpp in include/)
-src/              — All .cpp source files
-data/             — Embedded web assets (HTML/CSS/JS) linked at compile time
-test/test_*/      — Unity unit test suites
-doc/              — Engineering docs, checklists, benchmarks
-.github/workflows — CI configuration
+port/beaglebone/            <- BBB port (active development)
+  pru/include/              <- pru_ipc.h, pru_ramp.h
+  pru/pru0_spindle/         <- PRU0 firmware (spindle)
+  pru/pru1_lateral/         <- PRU1 firmware (lateral + sensors)
+  pru/Makefile
+  linux/include/            <- IpcChannel.h, StepperPRU.h, LateralPRU.h
+  linux/src/                <- IpcChannel.cpp, StepperPRU.cpp, LateralPRU.cpp
+  linux/CMakeLists.txt
+  dts/                      <- Device-tree overlay
+  scripts/                  <- load_pru.sh, deploy.sh
+src/                        <- Linux application logic (WinderApp.*, Session, ...)
+include/                    <- Application headers
+data/                       <- Web assets
+test/test_*/                <- Unit tests (gtest, host-compilable)
+doc/                        <- Architecture docs, checklists
+archive/original_esp32/     <- ESP32 sources (reference only, do NOT modify)
 ```
 
-Do not create new source files without a clear domain justification.
-Keep the WinderApp split as-is; do not re-merge or add more split files
-unless the domain genuinely requires a new responsibility boundary.
+Do not modify `archive/original_esp32/`.
+Do not create new source files without clear domain justification.
+Keep the WinderApp split (Core, Commands, GeometryPattern, Telemetry, Recipe).
