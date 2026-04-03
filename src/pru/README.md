@@ -193,3 +193,48 @@ Troubleshooting
   - `pru1_lateral/main.c`
   - `include/pru_ipc.h`
   - `include/pru_ramp.h`
+
+  Available PRU-capable pins (config-pin grep PRU)
+  ------------------------------------------------
+  The following is the list of header pins on the target system that reported
+  PRU-capable modes when you ran `config-pin | grep PRU` (paste from your board):
+
+      Available modes for P8_11 are: default gpio gpio_pu gpio_pd eqep pruout
+      Available modes for P8_12 are: default gpio gpio_pu gpio_pd eqep pruout
+      Available modes for P8_15 are: default gpio gpio_pu gpio_pd eqep pru_ecap_pwm pruin
+      Available modes for P8_16 are: default gpio gpio_pu gpio_pd eqep pruin
+      Available modes for P8_20 are: default gpio gpio_pu gpio_pd pruout pruin
+      Available modes for P8_21 are: default gpio gpio_pu gpio_pd pruout pruin
+      Available modes for P8_27 are: default gpio gpio_pu gpio_pd pruout pruin
+      Available modes for P8_28 are: default gpio gpio_pu gpio_pd pruout pruin
+      Available modes for P8_29 are: default gpio gpio_pu gpio_pd pruout pruin
+      Available modes for P8_30 are: default gpio gpio_pu gpio_pd pruout pruin
+      Available modes for P8_39 are: default gpio gpio_pu gpio_pd eqep pruout pruin
+      Available modes for P8_40 are: default gpio gpio_pu gpio_pd eqep pruout pruin
+      Available modes for P8_41 are: default gpio gpio_pu gpio_pd eqep pruout pruin
+      Available modes for P8_42 are: default gpio gpio_pu gpio_pd eqep pruout pruin
+      Available modes for P8_43 are: default gpio gpio_pu gpio_pd pwm pruout pruin
+      Available modes for P8_44 are: default gpio gpio_pu gpio_pd pwm pruout pruin
+      Available modes for P8_45 are: default gpio gpio_pu gpio_pd pwm pruout pruin
+      Available modes for P8_46 are: default gpio gpio_pu gpio_pd pwm pruout pruin
+      Available modes for P9_17 are: default gpio gpio_pu gpio_pd spi_cs i2c pwm pru_uart
+      Available modes for P9_18 are: default gpio gpio_pu gpio_pd spi i2c pwm pru_uart
+      Available modes for P9_19 are: default gpio gpio_pu gpio_pd spi_cs can i2c pru_uart timer
+      Available modes for P9_20 are: default gpio gpio_pu gpio_pd spi_cs can i2c pru_uart timer
+      Available modes for P9_21 are: default gpio gpio_pu gpio_pd spi uart i2c pwm pru_uart
+      Available modes for P9_22 are: default gpio gpio_pu gpio_pd spi_sclk uart i2c pwm pru_uart
+      Available modes for P9_24 are: default gpio gpio_pu gpio_pd uart can i2c pru_uart pruin
+      Available modes for P9_25 are: default gpio gpio_pu gpio_pd eqep pruout pruin
+      Available modes for P9_26 are: default gpio gpio_pu gpio_pd uart can i2c pru_uart pruin
+      Available modes for P9_27 are: default gpio gpio_pu gpio_pd eqep pruout pruin
+      Available modes for P9_28 are: default gpio gpio_pu gpio_pd spi_cs pwm pwm2 pruout pruin
+      Available modes for P9_29 are: default gpio gpio_pu gpio_pd spi pwm pruout pruin
+      Available modes for P9_30 are: default gpio gpio_pu gpio_pd spi pwm pruout pruin
+      Available modes for P9_31 are: default gpio gpio_pu gpio_pd spi_sclk pwm pruout pruin
+
+  Notes:
+  - `pruout`/`pruin` indicate the pin can be configured for PRU output/input
+    (pinmux mode 6). Use `config-pin` to test and a device-tree overlay to make
+    the mapping permanent.
+  - Avoid pins required by eMMC/HDMI/USB or other essential functions for your
+    image. Verify before changing active boot pins.

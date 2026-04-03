@@ -268,6 +268,7 @@ if (lat >= LAT_MIN_HZ && nominal_lat_hz > 0) {
 - Accel: spindle Hz increases proportionally.
 - Visual: regular cross-hatch (losange) pattern across full bobbin width.
 
+
 ### Winding ratio must be non-integer
 
 `effWidthMm / wire_diameter_mm` must not be a whole number (avoid layer stacking).
