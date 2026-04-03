@@ -4,3 +4,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# PRU generated firmware binaries
+src/pru/build/
+src/pru/pru0_spindle/.config
