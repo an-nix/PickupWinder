@@ -30,9 +30,9 @@
 #include "../include/pru_ipc.h"
 #include "../include/pru_ramp.h"
 
-/* ── PRU register aliases ────────────────────────────────────────────────────*/
-volatile register uint32_t __R30;
-volatile register uint32_t __R31;
+/* ── PRU register aliases (compatible with pru-gcc) ──────────────────────────*/
+volatile uint32_t __R30 __asm__("r30");
+volatile uint32_t __R31 __asm__("r31");
 
 /* ── GPIO bit masks ──────────────────────────────────────────────────────────*/
 #define LAT_STEP_BIT   (1u << 0)

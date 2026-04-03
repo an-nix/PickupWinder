@@ -23,9 +23,9 @@
 #include "../include/pru_ipc.h"
 #include "../include/pru_ramp.h"
 
-/* ── PRU register aliases ────────────────────────────────────────────────────*/
-volatile register uint32_t __R30;  /* Output register (GPIO) */
-volatile register uint32_t __R31;  /* Input register  (GPIO) */
+/* ── PRU register aliases (compatible with pru-gcc) ──────────────────────────*/
+volatile uint32_t __R30 __asm__("r30");  /* Output register (GPIO) */
+volatile uint32_t __R31 __asm__("r31");  /* Input register  (GPIO) */
 
 /* ── GPIO bit masks (R30) ────────────────────────────────────────────────────*/
 #define SPINDLE_STEP_BIT   (1u << 0)

@@ -25,7 +25,9 @@
 #include <stdint.h>
 
 /* ── Physical base address (used by Linux /dev/mem or prussdrv) ─────────────*/
+#ifndef PRU_SRAM_PHYS_BASE
 #define PRU_SRAM_PHYS_BASE      0x4A310000u
+#endif
 #define PRU_SRAM_SIZE           0x3000u       /* 12 KB */
 
 /* ── Offsets within shared RAM ───────────────────────────────────────────────*/
@@ -95,7 +97,7 @@ typedef struct __attribute__((packed, aligned(4))) {
     int32_t  position_steps;   /* signed position (steps from home, lateral only) */
     uint16_t state;            /* OR of STATE_* flags */
     uint16_t faults;           /* OR of FAULT_* flags */
-    uint32_t _reserved[2];
+    uint32_t _reserved[6];
 } pru_axis_telem_t; /* 48 bytes */
 
 /* ── Inter-PRU synchronisation (both PRUs read+write) ───────────────────────*/
