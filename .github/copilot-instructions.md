@@ -26,13 +26,15 @@ Two layers:
 |         Linux userspace  (ARM Cortex-A8)        |
 |  WinderApp . Session . Recipe . WebUI . Diag    |
 |  StepperPRU . LateralPRU  (IPC wrappers)        |
+|  MoveQueue (pre-computes move triples host-side) |
 |              IpcChannel (linux/src/)             |
 +----------------------+--------------------------+
 |  PRU0 - Spindle      |  PRU1 - Lateral+Sensors  |
-|  200 MHz determinism |  200 MHz determinism     |
+|  200 MHz - IEP owner |  200 MHz - IEP reader    |
+|  Move ring consumer  |  Move ring consumer      |
 |  STEP/DIR/EN GPIO    |  STEP/DIR/EN GPIO        |
-|  Accel/decel ramp    |  Accel/decel ramp        |
-|  Compensation RPM    |  Home sensor NO+NC       |
+|  Edge timing IEP     |  Edge timing IEP         |
+|  No ramp on PRU      |  Home sensor NO+NC       |
 +----------------------+--------------------------+
 ```
 
@@ -42,9 +44,10 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 
 | Module               | File(s)                              | Responsibility |
 |----------------------|--------------------------------------|----------------|
-| `IpcChannel`         | `port/beaglebone/linux/src/IpcChannel.cpp`    | PRU shared RAM map |
-| `StepperPRU`         | `port/beaglebone/linux/src/StepperPRU.cpp`    | Spindle API -> IPC |
-| `LateralPRU`         | `port/beaglebone/linux/src/LateralPRU.cpp`    | Lateral API -> IPC |
+| `IpcChannel`         | `port/beaglebone/linux/src/IpcChannel.cpp`    | PRU shared RAM map; sendMove(), moveQueueFreeSlots() |
+| `MoveQueue`          | `port/beaglebone/linux/src/MoveQueue.cpp`     | Host-side Klipper move planner (ramp math) |
+| `StepperPRU`         | `port/beaglebone/linux/src/StepperPRU.cpp`    | Spindle API + tick() for ring refill |
+| `LateralPRU`         | `port/beaglebone/linux/src/LateralPRU.cpp`    | Lateral API + _pushTraverse() |
 | `WinderApp.Core`     | `src/WinderApp.Core.cpp`             | State machine |
 | `WinderApp.Commands` | `src/WinderApp.Commands.cpp`         | Command dispatch |
 | `WinderApp.Geometry` | `src/WinderApp.GeometryPattern.cpp`  | Geometry + pattern |
@@ -62,20 +65,21 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 
 | File                                   | Responsibility |
 |----------------------------------------|----------------|
-| `pru/include/pru_ipc.h`               | IPC shared memory layout (C only) |
-| `pru/include/pru_ramp.h`              | Fixed-point ramp engine (inline) |
-| `pru/pru0_spindle/main.c`             | Spindle STEP generation + compensation |
-| `pru/pru1_lateral/main.c`             | Lateral STEP + home sensor + reversal |
+| `pru/include/pru_ipc.h`               | IPC shared memory layout; pru_move_t; 6 CMD opcodes; fault flags |
+| `pru/include/pru_stepper.h`           | IEP timer macros; stepper_t (with underrun); move_ring_t; step engine (inline, Klipper add pre-apply) |
+| `pru/pru0_spindle/main.c`             | Spindle IEP step generation (no ramp on PRU) |
+| `pru/pru1_lateral/main.c`             | Lateral IEP step + home sensor + homing_mode |
 
 ### 2.3 Key Headers
 
 | Header                        | Content |
 |-------------------------------|---------|
-| `pru/include/pru_ipc.h`      | pru_cmd_t, pru_axis_telem_t, pru_sync_t, memory offsets |
-| `pru/include/pru_ramp.h`     | axis_state_t, ramp_tick(), hz_to_halfperiod() |
-| `linux/include/IpcChannel.h` | IpcChannel class - shared RAM open/map/read/write |
-| `linux/include/StepperPRU.h` | StepperPRU - spindle API |
-| `linux/include/LateralPRU.h` | LateralPRU - lateral API |
+| `pru/include/pru_ipc.h`      | pru_cmd_t, pru_move_t, pru_axis_telem_t, pru_sync_t, memory offsets |
+| `pru/include/pru_stepper.h`  | stepper_t (with underrun flag), move_ring_t, IEP_NOW(), stepper_edge(), stepper_try_load_next() (with Klipper add pre-apply) |
+| `linux/include/IpcChannel.h` | IpcChannel class - sendMove(), moveQueueFreeSlots(), read/write |
+| `linux/include/MoveQueue.h`  | MoveQueue - pushAccelSegment(), pushConstantMs(), pushDecelToStop() |
+| `linux/include/StepperPRU.h` | StepperPRU - spindle API + tick() |
+| `linux/include/LateralPRU.h` | LateralPRU - lateral API + _pushTraverse() |
 | `include/Types.h`             | CommandEntry, WinderStatus, WindingState |
 | `include/Protocol.h`          | Version constants |
 | `include/CommandRegistry.h`   | CommandId enum, registry API |
@@ -90,8 +94,11 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 ### 3.1 PRU Safety
 
 - **NEVER** use dynamic memory, floats, or OS calls in PRU firmware.
-- **NEVER** use division in the inner PRU step loop (precompute periods).
-- Emergency stop (`CMD_EMERGENCY_STOP`) clears all STEP outputs in <= 2 PRU instructions.
+- **NEVER** use division in the inner PRU step loop (intervals pre-computed host-side).
+- The PRU step loop polls `IEP_NOW()` continuously — no `__delay_cycles` anywhere.
+- Emergency stop (`CMD_EMERGENCY_STOP`) clears all STEP outputs and flushes ring in <= 2 PRU instructions.
+- `CMD_QUEUE_FLUSH` empties the move ring without emergency stop (for speed transitions).
+- PRU0 owns and initializes the IEP timer; PRU1 reads only — never resets it.
 - All PRU shared memory accesses must use `volatile` pointers.
 - Shared memory structs must be `__attribute__((packed, aligned(4)))`.
 
@@ -105,9 +112,12 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 
 ### 3.3 IPC Protocol
 
-- Commands go through `IpcChannel::sendCommand()` -> ring buffer (32 slots).
+- Move triples `(interval, count, add, direction)` pushed via `IpcChannel::sendMove(axis, ...)`.
+- Lifecycle commands (ENABLE, EMERGENCY_STOP, HOME_START, QUEUE_FLUSH, RESET_POSITION) via `sendCommand()`.
 - `pru_ipc.h` is C-compatible: included from both PRU C and Linux C++.
 - Do not poll telemetry at step frequency; read at control loop cadence (<= 10 ms).
+- Move ring: 128 slots per axis; `moveQueueFreeSlots()` to check before pushing.
+- `StepperPRU::tick()` must be called from the control loop to refill the spindle ring.
 
 ### 3.4 Command Protocol (unchanged)
 
@@ -126,7 +136,7 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 ### 3.6 Sensor Safety (PRU1)
 
 - Home sensor: NO=LOW + NC=HIGH -> home. NO=HIGH + NC=HIGH -> FAULT.
-- Debounce: 3 consecutive stable reads at 10 us interval.
+- Debounce: IEP-based 500 µs window (100,000 IEP cycles).
 - All `LateralPRU` methods guard `if (!_channel) return;`.
 
 ### 3.7 Build
@@ -177,7 +187,7 @@ IDLE --(rodage)--> RODAGE --(rodage_stop/complete)--> IDLE
 
 - Lateral speed: `effWidthMm x windingHz / (tpp x STEPS_PER_REV)`.
 - Scaled by pattern `speedScale` (0.55-1.60).
-- Reversal compensation applied in PRU0 by reading `pru_sync.lateral_hz`.
+- Compensation applied **host-side**: WinderApp calls `setSpeedHz(compensatedHz)` each tick; `StepperPRU::tick()` detects change and requeues via MoveQueue.
 - One-shot flags: `stop_next_high`, `stop_next_low`, `armPauseOnNextReversal`.
 
 ### 4.4 Winding Patterns
@@ -219,7 +229,7 @@ IDLE --(rodage)--> RODAGE --(rodage_stop/complete)--> IDLE
   2. Geometry math (`test_winding_geometry`)
   3. Recipe version gating (`test_recipe_format`)
   4. Session arbitration (`test_session_rules`)
-  5. Ramp engine math (`test_pru_ramp` - planned)
+  5. Move underrun detection (`test_pru_underrun` - planned)
 - Add/update test when adding a command or changing validation.
 
 ---
@@ -238,6 +248,9 @@ IDLE --(rodage)--> RODAGE --(rodage_stop/complete)--> IDLE
 | Logging credentials / blobs | Security violation |
 | Mismatched `pru_cmd_t` size PRU vs Linux | Silent corrupt IPC messages |
 | Integer ratio for effective winding width | Wires stack on top of each other |
+| Missing add pre-apply at move boundary | Ramp timing skew vs Klipper (stepper_try_load_next) |
+| pushDecelToStop for speed decrease | Decels to Hz=1 instead of target; use pushAccelSegment |
+| Ignoring FAULT_MOVE_UNDERRUN | Ring drained while running; host didn't push fast enough |
 
 ---
 
@@ -249,16 +262,13 @@ IDLE --(rodage)--> RODAGE --(rodage_stop/complete)--> IDLE
 Ratio = Spindle_Hz / Lateral_Hz = CONSTANT at all times
 ```
 
-On BBB, compensation runs in PRU0 at every ramp tick (1 ms):
+On BBB, compensation runs **host-side** in `StepperPRU::tick()` every control loop tick:
 
-```c
-uint32_t lat = pru_sync->lateral_hz;
-if (lat >= LAT_MIN_HZ && nominal_lat_hz > 0) {
-    spindle_state.target_hz =
-        (uint64_t)nominal_spindle_hz * lat / nominal_lat_hz;
-    spindle_state.target_hz =
-        clamp32(spindle_state.target_hz, SPEED_HZ_MIN, SPEED_HZ_MAX);
-}
+```cpp
+uint32_t compHz = StepperPRU::calculateCompensatedSpindleHz(
+    nominalSpindleHz, currentLatHz, nominalLatHz);
+stepper.setSpeedHz(compHz);   /* sets _speedChanged flag */
+/* tick() detects _speedChanged -> CMD_QUEUE_FLUSH + repush via MoveQueue */
 ```
 
 ### Expected results
@@ -294,7 +304,7 @@ Verify after every geometry change.
 
 ```
 port/beaglebone/            <- BBB port (active development)
-  pru/include/              <- pru_ipc.h, pru_ramp.h
+  pru/include/              <- pru_ipc.h, pru_stepper.h
   pru/pru0_spindle/         <- PRU0 firmware (spindle)
   pru/pru1_lateral/         <- PRU1 firmware (lateral + sensors)
   pru/Makefile

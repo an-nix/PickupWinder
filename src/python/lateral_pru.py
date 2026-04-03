@@ -1,15 +1,14 @@
 """LateralPRU - lateral traverse axis wrapper around IpcChannel.
 
-Mirrors LateralPRU.cpp / LateralPRU.h exactly.
-The state machine runs entirely on the Linux side (Python).
-The PRU handles only STEP generation and reports STATE_RUNNING / STATE_AT_HOME.
+Mirrors LateralPRU.cpp / LateralPRU.h.
+Klipper-style: all steps pushed as (interval, count, add) move triples via sendMove().
+CMD_HOME_START triggers PRU1-side homing.  No CMD_LATERAL_* commands.
 """
 from ipc import (
     IpcChannel,
-    CMD_LATERAL_SET_HZ, CMD_LATERAL_SET_ACCEL,
-    CMD_LATERAL_START, CMD_LATERAL_STOP,
-    CMD_LATERAL_ENABLE, CMD_RESET_POSITION,
-    AXIS_LATERAL,
+    CMD_ENABLE, CMD_EMERGENCY_STOP, CMD_RESET_POSITION,
+    CMD_QUEUE_FLUSH, CMD_HOME_START,
+    AXIS_LATERAL, AXIS_ALL,
     STATE_RUNNING, STATE_AT_HOME,
     FAULT_HOME_SENSOR, FAULT_OVERRUN,
 )
@@ -27,12 +26,46 @@ POSITIONING    = "POSITIONING"
 WINDING_FWD    = "WINDING_FWD"
 WINDING_BWD    = "WINDING_BWD"
 
-_LAT_ACCEL_HZ_MS = 48    # 48 Hz/ms -> 4800 Hz in 100 ms (mirrors LateralPRU.cpp)
-_LAT_MIN_HZ      = 100   # minimum winding lateral Hz
+PRU_CLOCK_HZ = 200_000_000
+MIN_INTERVAL  = 625
+_LAT_MIN_HZ   = 100
+_REFILL_MS    = 20
+
+
+def _hz_to_interval(hz: int) -> int:
+    if hz <= 0:
+        return 0
+    return max(MIN_INTERVAL, PRU_CLOCK_HZ // (2 * hz))
+
+
+def _mm_to_steps(mm: float) -> int:
+    return max(0, int(mm * LAT_STEPS_PER_MM)) if LAT_STEPS_PER_MM else 0
 
 
 def _steps_to_mm(steps: int) -> float:
     return steps / LAT_STEPS_PER_MM if LAT_STEPS_PER_MM else 0.0
+
+
+def _push_move_mm(ch: IpcChannel, hz: int, forward: bool, dist_mm: float) -> bool:
+    """Push a constant-speed block covering dist_mm at hz."""
+    if hz <= 0 or dist_mm < 0.001:
+        return False
+    n_steps = _mm_to_steps(dist_mm)
+    if n_steps <= 0:
+        return False
+    iv = _hz_to_interval(hz)
+    direction = 0 if forward else 1
+    return ch.sendMove(AXIS_LATERAL, iv, 2 * n_steps, 0, direction)
+
+
+def _push_constant_ms(ch: IpcChannel, hz: int, forward: bool, duration_ms: int) -> bool:
+    """Push a constant-speed block for approximately duration_ms."""
+    if hz <= 0 or duration_ms <= 0:
+        return False
+    iv = _hz_to_interval(hz)
+    edges = max(1, (2 * hz * duration_ms) // 1000)
+    direction = 0 if forward else 1
+    return ch.sendMove(AXIS_LATERAL, iv, edges, 0, direction)
 
 
 class LateralPRU:
@@ -45,13 +78,14 @@ class LateralPRU:
         self._telem: dict = {}
 
         # Motion targets
-        self._start_pos_mm: float = 0.0   # carriage start-position target
-        self._start_mm: float = 0.0       # winding start bound
-        self._end_mm:   float = 0.0       # winding end bound
+        self._start_pos_mm: float = 0.0
+        self._start_mm: float = 0.0
+        self._end_mm:   float = 0.0
 
         # Pass tracking
         self._pass_count: int = 0
         self._last_lat_hz: int = 0
+        self._winding_fwd: bool = True
 
         # One-shot flags
         self._stop_on_next_high:     bool = False
@@ -65,16 +99,14 @@ class LateralPRU:
             self._home_offset_mm = home_offset_mm
         if not self._ch.isOpen():
             return
-        self._ch.sendCommand(CMD_LATERAL_SET_ACCEL, AXIS_LATERAL, _LAT_ACCEL_HZ_MS)
-        self._ch.sendCommand(CMD_LATERAL_ENABLE, AXIS_LATERAL, 1)
+        self._ch.sendCommand(CMD_ENABLE, AXIS_LATERAL, 1)
         self.rehome()
 
     def rehome(self):
         if not self._ch.isOpen():
             return
         self._state = HOMING
-        self._ch.sendCommand(CMD_LATERAL_SET_HZ, AXIS_LATERAL, LAT_HOME_SPEED_HZ)
-        self._ch.sendCommand(CMD_LATERAL_START, AXIS_LATERAL, 0)  # 0 = backward toward home
+        self._ch.sendCommand(CMD_HOME_START, AXIS_LATERAL)
 
     # -- State machine tick (call every control loop) -------------------
     def update(self):
@@ -96,49 +128,55 @@ class LateralPRU:
         at_home = bool(st & STATE_AT_HOME)
 
         if self._state == HOMING:
+            # PRU1 drives backward and stops at sensor; host waits for idle
             if at_home and not running:
                 self._state = HOMING_OFFSET
-                self._ch.sendCommand(CMD_LATERAL_SET_HZ, AXIS_LATERAL, LAT_HOME_SPEED_HZ // 2)
-                self._ch.sendCommand(CMD_LATERAL_START, AXIS_LATERAL, 1)   # 1 = forward
-
-        elif self._state == HOMING_OFFSET:
-            if pos_mm >= self._home_offset_mm:
-                self._ch.sendCommand(CMD_LATERAL_STOP, AXIS_LATERAL)
-                if not running:
+                if self._home_offset_mm > 0.001:
+                    _push_move_mm(self._ch, LAT_HOME_SPEED_HZ // 2, True,
+                                  self._home_offset_mm)
+                else:
                     self._ch.sendCommand(CMD_RESET_POSITION, AXIS_LATERAL)
                     self._state = HOMED
 
+        elif self._state == HOMING_OFFSET:
+            if not running:
+                self._ch.sendCommand(CMD_RESET_POSITION, AXIS_LATERAL)
+                self._state = HOMED
+
         elif self._state == POSITIONING:
-            if abs(pos_mm - self._start_pos_mm) <= 0.05:
-                self._ch.sendCommand(CMD_LATERAL_STOP, AXIS_LATERAL)
-                if not running:
-                    self._state = HOMED
+            if not running:
+                self._state = HOMED
 
         elif self._state == WINDING_FWD:
             if pos_mm >= self._end_mm:
+                self._ch.sendCommand(CMD_QUEUE_FLUSH, AXIS_LATERAL)
                 if self._stop_on_next_high:
                     self._stop_on_next_high = False
-                    self._ch.sendCommand(CMD_LATERAL_STOP, AXIS_LATERAL)
                     self._state = HOMED
                 elif self._pause_on_next_reversal:
                     self._pause_on_next_reversal = False
                     self._paused_at_reversal = True
-                    self._ch.sendCommand(CMD_LATERAL_STOP, AXIS_LATERAL)
                     self._state = HOMED
                 else:
                     self._pass_count += 1
-                    self._ch.sendCommand(CMD_LATERAL_START, AXIS_LATERAL, 0)   # backward
+                    width = self._end_mm - self._start_mm
+                    _push_move_mm(self._ch, self._last_lat_hz, False, width)
+                    _push_constant_ms(self._ch, self._last_lat_hz, False, _REFILL_MS)
+                    self._winding_fwd = False
                     self._state = WINDING_BWD
 
         elif self._state == WINDING_BWD:
             if pos_mm <= self._start_mm or at_home:
+                self._ch.sendCommand(CMD_QUEUE_FLUSH, AXIS_LATERAL)
                 if self._stop_on_next_low:
                     self._stop_on_next_low = False
-                    self._ch.sendCommand(CMD_LATERAL_STOP, AXIS_LATERAL)
                     self._state = HOMED
                 else:
                     self._pass_count += 1
-                    self._ch.sendCommand(CMD_LATERAL_START, AXIS_LATERAL, 1)   # forward
+                    width = self._end_mm - self._start_mm
+                    _push_move_mm(self._ch, self._last_lat_hz, True, width)
+                    _push_constant_ms(self._ch, self._last_lat_hz, True, _REFILL_MS)
+                    self._winding_fwd = True
                     self._state = WINDING_FWD
 
     # -- Getters --------------------------------------------------------
@@ -175,7 +213,13 @@ class LateralPRU:
         return max(0.0, min(1.0, (pos - self._start_mm) / (self._end_mm - self._start_mm)))
 
     def get_pass_count(self) -> int: return self._pass_count
-    def get_actual_velocity_hz(self) -> int: return self._telem.get('current_hz', 0)
+
+    def get_actual_velocity_hz(self) -> int:
+        iv = self._telem.get('current_interval', 0)
+        if not iv:
+            return 0
+        return PRU_CLOCK_HZ // (2 * iv)
+
     def get_instantaneous_lat_hz_nominal(self) -> int: return self._last_lat_hz
     def get_home_offset(self) -> float: return self._home_offset_mm
     def set_home_offset(self, mm: float): self._home_offset_mm = float(mm)
@@ -206,7 +250,7 @@ class LateralPRU:
     def stop(self):
         if not self._ch.isOpen():
             return
-        self._ch.sendCommand(CMD_LATERAL_STOP, AXIS_LATERAL)
+        self._ch.sendCommand(CMD_QUEUE_FLUSH, AXIS_LATERAL)
         if self._state in (WINDING_FWD, WINDING_BWD):
             self._state = HOMED
 
@@ -219,16 +263,14 @@ class LateralPRU:
         if abs(dist) < 0.01:
             return
         self._state = POSITIONING
-        fwd = 1 if dist > 0 else 0
-        self._ch.sendCommand(CMD_LATERAL_SET_HZ, AXIS_LATERAL, speed_hz)
-        self._ch.sendCommand(CMD_LATERAL_START, AXIS_LATERAL, fwd)
+        fwd = dist > 0
+        _push_move_mm(self._ch, speed_hz, fwd, abs(dist))
 
     def jog(self, delta_mm: float):
         if not self._ch.isOpen() or delta_mm == 0:
             return
-        fwd = 1 if delta_mm > 0 else 0
-        self._ch.sendCommand(CMD_LATERAL_SET_HZ, AXIS_LATERAL, LAT_HOME_SPEED_HZ // 4)
-        self._ch.sendCommand(CMD_LATERAL_START, AXIS_LATERAL, fwd)
+        fwd = delta_mm > 0
+        _push_move_mm(self._ch, LAT_HOME_SPEED_HZ // 4, fwd, abs(delta_mm))
 
     def start_winding(self, hz_nominal: int, tpp: float,
                       start_mm: float, end_mm: float, speed_scale: float = 1.0):
@@ -238,9 +280,10 @@ class LateralPRU:
         self._end_mm   = float(end_mm)
         lat_hz = self._calc_lat_hz(hz_nominal, tpp, end_mm - start_mm, speed_scale)
         self._last_lat_hz = lat_hz
-        self._ch.setNominalLateralHz(lat_hz)
-        self._ch.sendCommand(CMD_LATERAL_SET_HZ, AXIS_LATERAL, lat_hz)
-        self._ch.sendCommand(CMD_LATERAL_START, AXIS_LATERAL, 1)   # forward
+        width = end_mm - start_mm
+        _push_move_mm(self._ch, lat_hz, True, width)
+        _push_constant_ms(self._ch, lat_hz, True, _REFILL_MS)
+        self._winding_fwd = True
         self._state = WINDING_FWD
 
     def update_winding(self, hz_nominal: int, tpp: float,
@@ -253,8 +296,11 @@ class LateralPRU:
         if lat_hz == self._last_lat_hz:
             return
         self._last_lat_hz = lat_hz
-        self._ch.setNominalLateralHz(lat_hz)
-        self._ch.sendCommand(CMD_LATERAL_SET_HZ, AXIS_LATERAL, lat_hz)
+        # Flush existing moves and repush at new speed
+        self._ch.sendCommand(CMD_QUEUE_FLUSH, AXIS_LATERAL)
+        width = self._end_mm - self._start_mm
+        _push_move_mm(self._ch, lat_hz, self._winding_fwd, width)
+        _push_constant_ms(self._ch, lat_hz, self._winding_fwd, _REFILL_MS)
 
     # -- Private helpers ------------------------------------------------
     @staticmethod

@@ -105,11 +105,11 @@ toolchain:
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
-$(OUT_DIR)/$(FW_NAME_0): pru0_spindle/main.c include/pru_ipc.h include/pru_ramp.h | $(OUT_DIR)
+$(OUT_DIR)/$(FW_NAME_0): pru0_spindle/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
 	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
 	@echo "[PRU0 spindle] built → $@"
 
-$(OUT_DIR)/$(FW_NAME_1): pru1_lateral/main.c include/pru_ipc.h include/pru_ramp.h | $(OUT_DIR)
+$(OUT_DIR)/$(FW_NAME_1): pru1_lateral/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
 	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
 	@echo "[PRU1 lateral] built → $@"
 

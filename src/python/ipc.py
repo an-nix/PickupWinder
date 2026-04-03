@@ -19,44 +19,41 @@ IPC_CMD_RHEAD_OFFSET     = 0x0204
 IPC_SPINDLE_TELEM_OFFSET = 0x0210
 IPC_LATERAL_TELEM_OFFSET = 0x0240
 IPC_SYNC_OFFSET          = 0x0270
+IPC_SP_MOVE_WHEAD_OFFSET = 0x0280
+IPC_SP_MOVE_RHEAD_OFFSET = 0x0284
+IPC_SP_MOVE_RING_OFFSET  = 0x0288
+IPC_SP_MOVE_SLOTS        = 128
+IPC_LAT_MOVE_WHEAD_OFFSET = 0x0A88
+IPC_LAT_MOVE_RHEAD_OFFSET = 0x0A8C
+IPC_LAT_MOVE_RING_OFFSET  = 0x0A90
+IPC_LAT_MOVE_SLOTS        = 128
 
 # Axis identifiers (pru_ipc.h: AXIS_*)
 AXIS_SPINDLE = 0
 AXIS_LATERAL = 1
 AXIS_ALL     = 0xFF
 
-# Command opcodes (pru_ipc.h: CMD_*)
+# Command opcodes (pru_ipc.h: CMD_*) — 6 opcodes only
 CMD_NOP               = 0
-CMD_SPINDLE_SET_HZ    = 1   # value_a = target Hz
-CMD_SPINDLE_SET_ACCEL = 2   # value_a = accel Hz/ms
-CMD_SPINDLE_START     = 3   # value_a = 1:forward  0:backward
-CMD_SPINDLE_STOP      = 4   # controlled decel to 0
-CMD_SPINDLE_FORCE     = 5   # immediate stop, keep enabled
-CMD_SPINDLE_ENABLE    = 6   # value_a = 1:enable  0:disable driver
-CMD_LATERAL_SET_HZ    = 7   # value_a = target Hz
-CMD_LATERAL_SET_ACCEL = 8   # value_a = accel Hz/ms
-CMD_LATERAL_START     = 9   # value_a = 1:forward  0:backward
-CMD_LATERAL_STOP      = 10
-CMD_LATERAL_FORCE     = 11
-CMD_LATERAL_ENABLE    = 12  # value_a = 1:enable  0:disable
-CMD_EMERGENCY_STOP    = 13  # both axes: immediate, disable drivers
-CMD_RESET_POSITION    = 14  # value_a = axis: reset step counter
-CMD_SET_NOMINAL_LAT   = 15  # value_a = nominal lateral Hz for compensation
+CMD_ENABLE            = 1   # value_a = 1:enable  0:disable driver
+CMD_EMERGENCY_STOP    = 2   # both axes: immediate stop, flush ring
+CMD_RESET_POSITION    = 3   # reset step_count and position_steps to 0
+CMD_HOME_START        = 4   # PRU1: enter homing_mode
+CMD_QUEUE_FLUSH       = 5   # flush move ring without emergency stop
 
-# State flag bits (state field of pru_axis_telem_t)
+# State flag bits (state field of pru_axis_telem_t) — must match pru_ipc.h
 STATE_IDLE    = (1 << 0)
 STATE_RUNNING = (1 << 1)
-STATE_ACCEL   = (1 << 2)
-STATE_DECEL   = (1 << 3)
 STATE_AT_HOME = (1 << 4)
 STATE_FAULT   = (1 << 5)
 STATE_ENABLED = (1 << 6)
+STATE_HOMING  = (1 << 7)
 
 # Fault flag bits (faults field of pru_axis_telem_t)
-FAULT_HOME_SENSOR  = (1 << 0)
-FAULT_OVERRUN      = (1 << 1)
-FAULT_WATCHDOG     = (1 << 2)
-FAULT_CMD_OVERFLOW = (1 << 3)
+FAULT_HOME_SENSOR    = (1 << 0)
+FAULT_OVERRUN        = (1 << 1)
+FAULT_WATCHDOG       = (1 << 2)
+FAULT_MOVE_UNDERRUN  = (1 << 3)  # ring drained while stepper was running
 
 
 class IpcChannel:
@@ -117,12 +114,62 @@ class IpcChannel:
             pass
         return True
 
-    # snake_case alias
+    def sendMove(self, axis: int, interval: int, count: int, add: int, direction: int) -> bool:
+        """Push one Klipper-style move triple into the per-axis move ring."""
+        if not self.mm:
+            return False
+        if axis == AXIS_SPINDLE:
+            whead_off = IPC_SP_MOVE_WHEAD_OFFSET
+            rhead_off = IPC_SP_MOVE_RHEAD_OFFSET
+            ring_off  = IPC_SP_MOVE_RING_OFFSET
+            slots     = IPC_SP_MOVE_SLOTS
+        elif axis == AXIS_LATERAL:
+            whead_off = IPC_LAT_MOVE_WHEAD_OFFSET
+            rhead_off = IPC_LAT_MOVE_RHEAD_OFFSET
+            ring_off  = IPC_LAT_MOVE_RING_OFFSET
+            slots     = IPC_LAT_MOVE_SLOTS
+        else:
+            return False
+        whead = struct.unpack_from('<I', self.mm, whead_off)[0]
+        rhead = struct.unpack_from('<I', self.mm, rhead_off)[0]
+        if ((whead + 1) % slots) == rhead:
+            return False   # ring full
+        entry_off = ring_off + whead * 16
+        # pru_move_t: u32 interval, u32 count, i32 add, u8 direction, u8 _pad[3]
+        packed = struct.pack('<IIiB3x',
+                             int(interval) & 0xFFFFFFFF,
+                             int(count) & 0xFFFFFFFF,
+                             int(add),
+                             int(direction) & 0xFF)
+        self.mm[entry_off:entry_off + 16] = packed
+        struct.pack_into('<I', self.mm, whead_off, (whead + 1) % slots)
+        try:
+            self.mm.flush(whead_off, 4)
+        except Exception:
+            pass
+        return True
+
+    def moveQueueFreeSlots(self, axis: int) -> int:
+        """Return number of free slots in an axis move ring."""
+        if not self.mm:
+            return 0
+        if axis == AXIS_SPINDLE:
+            wh = struct.unpack_from('<I', self.mm, IPC_SP_MOVE_WHEAD_OFFSET)[0]
+            rh = struct.unpack_from('<I', self.mm, IPC_SP_MOVE_RHEAD_OFFSET)[0]
+            slots = IPC_SP_MOVE_SLOTS
+        else:
+            wh = struct.unpack_from('<I', self.mm, IPC_LAT_MOVE_WHEAD_OFFSET)[0]
+            rh = struct.unpack_from('<I', self.mm, IPC_LAT_MOVE_RHEAD_OFFSET)[0]
+            slots = IPC_LAT_MOVE_SLOTS
+        used = (wh - rh) % slots
+        return slots - 1 - used
+
+    # snake_case aliases
     def send_command(self, cmd, axis, value_a=0, value_b=0):
         return self.sendCommand(cmd, axis, value_a, value_b)
 
-    def setNominalLateralHz(self, lat_hz: int):
-        self.sendCommand(CMD_SET_NOMINAL_LAT, AXIS_LATERAL, lat_hz)
+    def send_move(self, axis, interval, count, add, direction):
+        return self.sendMove(axis, interval, count, add, direction)
 
     # ── Telemetry ─────────────────────────────────────────────────────────────
     def _readAxisTelem(self, offset: int) -> dict:
@@ -131,20 +178,25 @@ class IpcChannel:
             return {}
         data = self.mm[offset:offset + 48]
         try:
-            # seq(u32), step_count(u32), current_hz(u32), target_hz(u32),
+            # seq(u32), step_count(u32), current_interval(u32), moves_pending(u32),
             # position_steps(i32), state(u16), faults(u16), _reserved[2](u32 x2)
-            seq, step_count, current_hz, target_hz, position_steps, state, faults, _, _ = \
+            seq, step_count, current_interval, moves_pending, \
+                position_steps, state, faults, _, _ = \
                 struct.unpack_from('<IIIIiHHII', data, 0)
         except struct.error:
             return {}
+        # Compute Hz from interval for convenience
+        PRU_CLOCK_HZ = 200_000_000
+        current_hz = PRU_CLOCK_HZ // (2 * current_interval) if current_interval else 0
         return {
-            'seq':            seq,
-            'step_count':     step_count,
-            'current_hz':     current_hz,
-            'target_hz':      target_hz,
-            'position_steps': position_steps,
-            'state':          state,
-            'faults':         faults,
+            'seq':              seq,
+            'step_count':       step_count,
+            'current_interval': current_interval,
+            'current_hz':       current_hz,     # derived
+            'moves_pending':    moves_pending,
+            'position_steps':   position_steps,
+            'state':            state,
+            'faults':           faults,
         }
 
     def readSpindleTelem(self) -> dict:
@@ -163,15 +215,19 @@ class IpcChannel:
             return {}
         data = self.mm[IPC_SYNC_OFFSET:IPC_SYNC_OFFSET + 16]
         try:
-            spindle_hz, lateral_hz, nominal_lat_hz, control_flags = \
+            spindle_interval, lateral_interval, control_flags, _ = \
                 struct.unpack_from('<4I', data, 0)
         except struct.error:
             return {}
+        PRU_CLOCK_HZ = 200_000_000
+        spindle_hz = PRU_CLOCK_HZ // (2 * spindle_interval) if spindle_interval else 0
+        lateral_hz = PRU_CLOCK_HZ // (2 * lateral_interval) if lateral_interval else 0
         return {
-            'spindle_hz':     spindle_hz,
-            'lateral_hz':     lateral_hz,
-            'nominal_lat_hz': nominal_lat_hz,
-            'control_flags':  control_flags,
+            'spindle_interval': spindle_interval,
+            'lateral_interval': lateral_interval,
+            'spindle_hz':       spindle_hz,    # derived
+            'lateral_hz':       lateral_hz,    # derived
+            'control_flags':    control_flags,
         }
 
     def read_sync(self): return self.readSync()

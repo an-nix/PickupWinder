@@ -1,200 +1,194 @@
-PRU Firmware Overview
+# PRU Firmware — PickupWinder (BeagleBone Black)
 
-This folder contains the PRU firmware sources and build helpers for the
-AM335x PRUs used by PickupWinder. Two PRU images are built:
+This folder contains PRU firmware sources and build helpers for the AM335x
+PRUs used by PickupWinder. Two PRU images are built:
 
-- PRU0 — Spindle (spindle step generator)
-- PRU1 — Lateral (lateral carriage step generator + sensors)
+- `build/am335x-pru0-fw` — PRU0 (spindle step generator)
+- `build/am335x-pru1-fw` — PRU1 (lateral step generator + home sensor)
 
-PRU0 — Spindle (pru0_spindle)
-- Responsibilities:
-  - Generate STEP/DIR pulses for the spindle stepper motor.
-  - Run the acceleration/deceleration ramp engine (fixed-point, deterministic).
-  - Read lateral speed (from shared `pru_sync`) and apply spindle/lateral
-    compensation so turns-per-mm remains constant during reversals.
-  - Consume command ring buffer entries addressed to the spindle and publish
-    spindle telemetry (speed, position, state) to shared PRU RAM.
-- GPIOs used (configured by device-tree overlay, PRU R30):
-  - `R30[0]` SPINDLE_STEP
-  - `R30[1]` SPINDLE_DIR
-  - `R30[2]` SPINDLE_ENABLE (active low)
+---
 
-PRU1 — Lateral (pru1_lateral)
-- Responsibilities:
-  - Generate STEP/DIR pulses for the lateral carriage.
-  - Sample the dual-contact home sensor (NO+NC) with hardware debounce.
-  - Detect reversals, enforce software position limits, and publish telemetry.
-  - Write `lateral_hz` into shared `pru_sync` so PRU0 can apply compensation.
-  - Consume command ring buffer entries addressed to the lateral axis.
-- GPIOs used (R30 outputs, R31 inputs):
-  - `R30[0]` LATERAL_STEP
-  - `R30[1]` LATERAL_DIR
-  - `R30[2]` LATERAL_ENABLE (active low)
-  - `R31[3]` HOME_NO (LOW when at home)
-  - `R31[4]` HOME_NC (HIGH when at home)
+## Architecture: Klipper-inspired move rings
 
-Shared RAM / IPC
-- The PRUs and Linux userspace exchange a small IPC region in PRU shared RAM.
-- Key offsets are defined in `include/pru_ipc.h` (command ring, telemetry for
-  each axis, and a `pru_sync` area used for spindle/lateral synchronization).
-- When compiling for the PRU target the makefile defines `PRU_SRAM_PHYS_BASE` to
-  `0x00010000u` so firmware uses the local PRU RAM addresses.
+Step generation follows the Klipper model: the **Linux host** pre-computes
+all step moves as `(interval, count, add)` triples and pushes them into
+per-axis ring buffers in PRU Shared RAM. The PRUs are pure consumers — they
+never compute speeds, ramps, or do divisions. All timing is driven by the
+200 MHz IEP hardware counter.
 
-Build & Toolchain
-- The Makefile supports pointing to a crosstool-ng toolchain. Common variables:
-  - `PRU_CC` — full path to the PRU GCC binary (e.g. `/home/user/x-tools/pru-elf/bin/pru-gcc`).
-  - `TOOLCHAIN_DIR` — default search dir (`$(HOME)/x-tools`) used to locate a toolchain.
-  - `PRU_SWPKG` — path to TI PRU software support package headers (optional).
+```
+Linux host                        PRU Shared RAM           PRU
+─────────────────────────────     ─────────────────        ────────────────
+MoveQueue::pushAccelSegment()  →  spindle move ring   →  PRU0 IEP edge loop
+MoveQueue::pushConstantMs()    →  spindle move ring   →    (no __delay_cycles)
+MoveQueue::pushDecelToStop()   →  lateral move ring   →  PRU1 IEP edge loop
+```
 
-- Example: build using an installed toolchain
+**Move triple format** (`pru_move_t`, 16 bytes):
+```c
+uint32_t interval;   /* IEP cycles between two edges (min 625 = 3.125 µs) */
+uint32_t count;      /* total edges to generate (= 2 × step_count)       */
+int32_t  add;        /* per-edge interval delta (linear ramp, 0 = const)  */
+uint8_t  direction;  /* 0 = forward, 1 = backward                         */
+```
+
+The edge algorithm (`pru_stepper.h`) at each edge:
+```c
+toggle STEP pin
+stepper.count--
+if (count == 0):
+  pop next move from ring or stop (set underrun fault if ring drained)
+  on success: next_edge_time += new.interval; interval += add  (Klipper pre-apply)
+else:
+  stepper.next_edge_time += stepper.interval
+  stepper.interval        += stepper.add     /* Klipper exact order */
+```
+
+On move boundary, `interval += add` is pre-applied (matching Klipper's
+`stepper_load_next`) so the first inter-edge gap of the new move uses the
+ramped interval instead of the raw base interval.
+
+---
+
+## PRU0 — Spindle
+
+**IEP timer owner**: PRU0 initialises the IEP counter at boot. PRU1 reads it.
+
+Responsibilities:
+- Own and initialise the IEP timer (`IEP_INIT()`)
+- Consume move triples from the spindle move ring via `stepper_try_load_next()`
+- Toggle `R30[0]` (STEP) with IEP-absolute timing
+- Count absolute steps; publish `spindle_telem` and `pru_sync.spindle_interval`
+
+GPIOs:
+```
+R30[0] → P9_31  SPINDLE_STEP
+R30[1] → P9_29  SPINDLE_DIR
+R30[2] → P9_30  SPINDLE_ENABLE (active low)
+```
+
+---
+
+## PRU1 — Lateral + Sensors
+
+**IEP timer reader**: PRU1 reads PRU0's IEP counter. Never resets it.
+
+Responsibilities:
+- Consume move triples from the lateral move ring
+- Toggle `R30[0]` (STEP) with IEP-absolute timing
+- Read dual-contact home sensor with IEP-based debounce (500 µs)
+- In `homing_mode` (set by `CMD_HOME_START`): flush ring + stop when HOME_HIT
+- Count signed position; detect overrun; publish `lateral_telem` and `pru_sync.lateral_interval`
+
+GPIOs:
+```
+R30[0] → P8_45  LATERAL_STEP
+R30[1] → P8_46  LATERAL_DIR
+R30[2] → P8_43  LATERAL_ENABLE (active low)
+R31[3] → P8_xx  HOME_NO  (LOW when at home)
+R31[4] → P8_xx  HOME_NC  (HIGH when at home)
+```
+
+Home sensor logic:
+```
+NO=LOW + NC=HIGH  → home detected (homing latch)
+NO=HIGH + NC=HIGH → FAULT (wiring fault)
+Debounce: IEP_NOW()-based 500 µs window
+```
+
+---
+
+## IPC Shared RAM Layout
+
+Offsets defined in `include/pru_ipc.h`:
+```
+0x0000   512 B  Command ring (32 × 16 B)
+0x0200     4 B  cmd_whead
+0x0204     4 B  cmd_rhead
+0x0210    48 B  spindle_telem  (pru_axis_telem_t)
+0x0240    48 B  lateral_telem  (pru_axis_telem_t)
+0x0270    16 B  pru_sync       (spindle_interval, lateral_interval)
+0x0280     4 B  sp_move_whead
+0x0284     4 B  sp_move_rhead
+0x0288  2048 B  spindle move ring (128 × pru_move_t)
+0x0A88     4 B  lat_move_whead
+0x0A8C     4 B  lat_move_rhead
+0x0A90  2048 B  lateral move ring (128 × pru_move_t)
+```
+
+## Command set (6 opcodes)
+
+| Opcode               | Value | Description |
+|----------------------|-------|-------------|
+| `CMD_NOP`            | 0     | No operation |
+| `CMD_ENABLE`         | 1     | Enable/disable driver (value_a=1/0) |
+| `CMD_EMERGENCY_STOP` | 2     | Immediate stop; flush ring; clear STEP |
+| `CMD_RESET_POSITION` | 3     | Reset step_count and position_steps to 0 |
+| `CMD_HOME_START`     | 4     | PRU1: enter homing_mode |
+| `CMD_QUEUE_FLUSH`    | 5     | Flush move ring (no emergency stop) |
+
+---
+
+## Key Headers
+
+| Header              | Content |
+|---------------------|---------|
+| `include/pru_ipc.h` | Shared RAM layout, `pru_move_t`, `pru_axis_telem_t`, 6 CMD opcodes, fault flags |
+| `include/pru_stepper.h` | IEP macros (`IEP_NOW`, `IEP_INIT`), `stepper_t` (with `underrun`), `move_ring_t`, inline step engine |
+
+---
+
+## Build & Toolchain
 
 ```bash
 cd src/pru
-make PRU_CC=/home/nicolas/x-tools/pru-elf/bin/pru-gcc
+make PRU_CC=/home/user/x-tools/pru-elf/bin/pru-gcc
 ```
 
-- The Makefile will produce:
-  - `build/am335x-pru0-fw`
-  - `build/am335x-pru1-fw`
+Variables accepted by the Makefile:
+- `PRU_CC` — full path to PRU GCC binary
+- `TOOLCHAIN_DIR` — search dir for toolchains (default `$(HOME)/x-tools`)
+- `PRU_SWPKG` — path to TI PRU software support headers (optional)
 
-Deploying to a BeagleBone
-- `make install` (run on the BeagleBone itself) copies the firmwares to
-  `/lib/firmware` and restarts the PRUs via the `remoteproc` sysfs interface.
-- `make deploy` (run from host) copies firmwares via `scp` and reloads PRUs via
-  `ssh`. Use the variables `BBB_IP`, `BBB_USER`, and `SSH_KEY` to control
-  connection details. The deploy target backs up existing remote firmwares
-  to `.bak.<timestamp>` before installing.
+Artifacts:
+- `build/am335x-pru0-fw`
+- `build/am335x-pru1-fw`
 
-Notes & Portability
-- PRU firmware must avoid dynamic memory and floating point; it uses fixed
-  point and integer math for determinism.
-- All shared RAM structs are packed and aligned to 4 bytes for compatibility
-  between Linux and PRU code (see `include/pru_ipc.h`).
-- If you modify telemetry sizes or the shared layout, update both PRU and
-  Linux headers simultaneously to avoid silent IPC corruption.
+Deploy to BeagleBone:
+- `make install` — copies firmwares to `/lib/firmware` and restarts remoteproc
+- `make deploy BBB_IP=... BBB_USER=... SSH_KEY=...` — copies via scp + ssh
 
-Troubleshooting
-- If compilation fails with missing device-specs, try removing `-mmcu` or
-  point `PRU_CC` to the crosstool-ng-built compiler found under
-  PRU Firmware Overview
+---
 
-  This folder contains the PRU firmware sources and build helpers for the
-  AM335x PRUs used by PickupWinder. Two PRU images are built and loaded as
-  separate remoteproc instances:
+## Safety & Real-time Rules
 
-  - `build/am335x-pru0-fw` — PRU0 (spindle)
-  - `build/am335x-pru1-fw` — PRU1 (lateral)
+- PRU code never uses dynamic memory, floating point, OS calls, or division
+- `__delay_cycles` is **forbidden** in the step loop — use IEP-absolute timing
+- PRU0 initialises the IEP; PRU1 reads it only — never call `IEP_INIT()` in PRU1
+- All shared structs use `__attribute__((packed, aligned(4)))` and `volatile`
+- `CMD_EMERGENCY_STOP` must clear STEP within ≤2 PRU instructions
+- Any layout change in `pru_ipc.h` must be reflected in Linux headers simultaneously
 
-  High-level responsibilities
-  - PRU0 (spindle): generate STEP/DIR pulses for the spindle, run the ramp
-    engine, apply spindle/lateral compensation, publish spindle telemetry.
-  - PRU1 (lateral): generate STEP/DIR pulses for the lateral carriage, sample
-    home sensors with debounce, detect reversals/limits, publish lateral
-    telemetry and update `pru_sync.lateral_hz`.
+---
 
-  Source layout & entry points
-  - `pru0_spindle/main.c` — entry `main()` for PRU0. Key functions and symbols:
-    - `main()` — initialization then an infinite timed loop.
-    - `process_command(const volatile pru_cmd_t*, uint32_t *nominal_spindle_hz)`
-      — handle one command from the ring.
-    - `apply_compensation(uint32_t nominal_spindle_hz)` — compute spindle target
-      from `pru_sync->lateral_hz` and `pru_sync->nominal_lat_hz`.
-    - `ramp_*` helpers from `include/pru_ramp.h` — ramp_tick / ramp_start etc.
+## Fault Detection
 
-  - `pru1_lateral/main.c` — entry `main()` for PRU1. Key functions and symbols:
-    - `main()` — initialization then sensor+step loop.
-    - sensor debounce and `home` detection code (DEBOUNCE_COUNT / read windows).
-    - lateral position limit checks and reversal handling.
+Both PRUs report fault flags in `pru_axis_telem_t.faults`:
 
-  PRU loop & timing
-  - Both PRUs run a tight deterministic loop with a fixed `LOOP_CYCLES` value.
-    Use `__delay_cycles()` (pru builtin) to pad cycles so the loop duration is
-    constant. Timing constants live in each `main.c` (e.g. `LOOP_CYCLES`,
-    `LOOP_OVERHEAD`, `TELEM_INTERVAL`).
+| Flag                 | Bit | Description |
+|----------------------|-----|-------------|
+| `FAULT_HOME_SENSOR`  | 0   | NO+NC sensor consistency error (PRU1 only) |
+| `FAULT_OVERRUN`      | 1   | Position exceeded software limit (PRU1 only) |
+| `FAULT_WATCHDOG`     | 2   | Reserved |
+| `FAULT_MOVE_UNDERRUN`| 3   | Move ring drained while stepper was running (both PRUs) |
 
-  GPIO / PRU registers
-  - PRU outputs are accessed through `r30` (compiler alias `__R30`) and inputs
-    through `r31` (alias `__R31`). Mapping (tied to device-tree pinmux):
-    - PRU0 (spindle): `R30[0]` STEP, `R30[1]` DIR, `R30[2]` ENABLE (active low)
-    - PRU1 (lateral): `R30[0]` STEP, `R30[1]` DIR, `R30[2]` ENABLE (active low)
-    - PRU1 sensors: `R31[3]` HOME_NO (LOW at home), `R31[4]` HOME_NC (HIGH at home)
+`FAULT_MOVE_UNDERRUN` mirrors Klipper's "missed scheduling of next step"
+shutdown. It indicates the host-side did not push moves fast enough to keep
+the ring fed. The host should treat this as a winding error.
 
-  IPC / Shared RAM layout
-  - Offsets and sizes are defined in `include/pru_ipc.h`. Important regions:
-    - `IPC_CMD_RING_OFFSET` (ring of 32 × 16 B entries) — Linux writes commands
-      here; PRUs read them.
-    - `IPC_SPINDLE_TELEM_OFFSET` — `pru_axis_telem_t` for spindle (48 B)
-    - `IPC_LATERAL_TELEM_OFFSET` — `pru_axis_telem_t` for lateral (48 B)
-    - `IPC_SYNC_OFFSET` — `pru_sync_t` (16 B) for inter-PRU sync (lateral↔spindle)
+---
 
-  Data structures (important fields)
-  - `pru_cmd_t` (16 bytes): `cmd` (opcode), `axis`, `flags`, `value_a`, `value_b`.
-    Linux enqueues commands; PRU reads and executes.
-  - `pru_axis_telem_t` (48 bytes): `seq`, `step_count`, `current_hz`, `target_hz`,
-    `position_steps`, `state`, `faults`, reserved fields.
-  - `pru_sync_t` (16 bytes): `spindle_hz`, `lateral_hz`, `nominal_lat_hz`,
-    `control_flags` (bit 0 = compensation enabled).
-
-  Command set (summary)
-  - Commands are defined as `CMD_*` in `include/pru_ipc.h` and include:
-    - Spindle commands: `CMD_SPINDLE_SET_HZ`, `CMD_SPINDLE_SET_ACCEL`,
-      `CMD_SPINDLE_START`, `CMD_SPINDLE_STOP`, `CMD_SPINDLE_ENABLE`, ...
-    - Lateral commands: `CMD_LATERAL_SET_HZ`, `CMD_LATERAL_SET_ACCEL`,
-      `CMD_LATERAL_START`, `CMD_LATERAL_STOP`, `CMD_LATERAL_ENABLE`, ...
-    - Global: `CMD_EMERGENCY_STOP`, `CMD_RESET_POSITION`, `CMD_SET_NOMINAL_LAT`
-
-  Safety & real-time rules
-  - PRU code never uses dynamic memory or floating point; all arithmetic is
-    integer/fixed-point.
-  - Emergency stop (`CMD_EMERGENCY_STOP`) must clear STEP outputs within a few
-    PRU instructions and disable drivers.
-  - Shared structs are `packed` + `aligned(4)` and accesses are via `volatile`.
-
-  Building
-  - Variables accepted by the Makefile:
-    - `PRU_CC` — full path to PRU gcc (recommended). Example:
-      `PRU_CC=/home/nicolas/x-tools/pru-elf/bin/pru-gcc`
-    - `TOOLCHAIN_DIR` — search dir for toolchains (default `$(HOME)/x-tools`).
-    - `PRU_SWPKG` — path to TI PRU support headers if needed.
-    - `PRU_SRAM_PHYS_BASE` is defined by the Makefile to `0x00010000u` during
-      PRU compilation so firmware uses local PRU RAM addresses.
-
-  Example build:
-  ```bash
-  cd src/pru
-  make PRU_CC=/home/nicolas/x-tools/pru-elf/bin/pru-gcc
-  ```
-
-  Artifacts
-  - `build/am335x-pru0-fw`
-  - `build/am335x-pru1-fw`
-
-  Deploy
-  - `make install` (run on the BeagleBone) copies the firmwares to `/lib/firmware`
-    and restarts remoteproc instances.
-  - `make deploy BBB_IP=... BBB_USER=... SSH_KEY=...` — copies firmwares via
-    `scp` and reloads PRUs remotely; deploy backs up existing firmwares
-    to `.bak.<timestamp>` before installing.
-
-  Debug & diagnostics
-  - On the BeagleBone: check `dmesg`, `/sys/class/remoteproc/remoteproc*/state`,
-    and `/lib/firmware` filenames after deploy.
-  - Use `objdump -D --target=binary -m pru build/am335x-pru0-fw` to inspect
-    generated code (toolchain must support pru target).
-
-  Notes
-  - Any change to the shared memory layout requires simultaneous update to the
-    Linux-side headers and PRU headers (`include/pru_ipc.h`).
-  - See `include/pru_ramp.h` for the ramp engine implementation details and
-    constraints (no division in inner loops, fixed-point ticks).
-
-  Files to review for behavior details:
-  - `pru0_spindle/main.c`
-  - `pru1_lateral/main.c`
-  - `include/pru_ipc.h`
-  - `include/pru_ramp.h`
-
-  Available PRU-capable pins (config-pin grep PRU)
+## Available PRU-capable pins (config-pin grep PRU)
   ------------------------------------------------
   The following is the list of header pins on the target system that reported
   PRU-capable modes when you ran `config-pin | grep PRU` (paste from your board):

@@ -34,6 +34,7 @@ set(APP_SRC            ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 # ---------------------------------------------------------------------------
 add_library(bbb_hal STATIC
     src/IpcChannel.cpp
+    src/MoveQueue.cpp
     src/StepperPRU.cpp
     src/LateralPRU.cpp
 )

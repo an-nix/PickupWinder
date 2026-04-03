@@ -16,14 +16,18 @@ Cette dualité map parfaitement sur la séparation de responsabilités du projet
 │  WinderApp · Session · Recipe · WebUI · CommandRegistry │
 │              Patterns · Telemetry · WiFi                │
 │                                                         │
+│  StepperPRU           LateralPRU                        │
+│  MoveQueue (spindle)  MoveQueue (lateral)               │
+│      Pre-compute (interval, count, add) move triples    │
+│                                                         │
 │         IPC (PRU Shared RAM 0x4A310000, 12 KB)          │
 ├───────────────────┬─────────────────────────────────────┤
 │   PRU0 — Spindle  │     PRU1 — Lateral + Sensors        │
-│  Step generation  │   Step generation                   │
-│  Accel ramp       │   Accel ramp                        │
-│  Compensation RPM │   Home sensor (NO+NC)               │
-│  Position count   │   Position count + direction        │
-│  Emergency stop   │   Reversal detection                │
+│  IEP timer owner  │   IEP timer reader                  │
+│  Move ring pop    │   Move ring pop                     │
+│  Edge generation  │   Edge generation                   │
+│  Position count   │   Home sensor (NO+NC) + debounce    │
+│  Emergency stop   │   Position count + direction        │
 └───────────────────┴─────────────────────────────────────┘
 ```
 
@@ -33,12 +37,13 @@ Cette dualité map parfaitement sur la séparation de responsabilités du projet
 
 | Critère                                          | PRU | Linux |
 |--------------------------------------------------|:---:|:-----:|
-| Latence exigée < 10 µs                           | ✓   |       |
+| Latence exigée < 1 µs (edge timing IEP)          | ✓   |       |
 | Génération de signaux STEP/DIR/ENABLE            | ✓   |       |
-| Lecture capteur avec débounce matériel           | ✓   |       |
-| Arrêt d'urgence immédiat                         | ✓   |       |
+| Lecture capteur avec débounce (IEP-based 500 µs) | ✓   |       |
+| Arrêt d'urgence immédiat (CMD_EMERGENCY_STOP)    | ✓   |       |
 | Comptage pas / position                          | ✓   |       |
-| Compensation spindle ↔ lateral en real-time      | ✓   |       |
+| Calcul move triples (interval, count, add)       |     | ✓     |
+| Compensation spindle ↔ lateral                   |     | ✓     |
 | Calcul de profil (ramps, patterns, géométrie)    |     | ✓     |
 | Machine d'état (IDLE/WINDING/PAUSED/…)           |     | ✓     |
 | UI WebSocket / REST / UART                       |     | ✓     |
@@ -67,99 +72,139 @@ Offset  Taille  Nom                     Propriétaire
 0x0204     4 B  cmd_rhead               PRU met à jour (index de lecture)
 0x0210    48 B  spindle_telem           PRU0 écrit, Linux lit
 0x0240    48 B  lateral_telem           PRU1 écrit, Linux lit
-0x0270    16 B  pru_sync                PRU0↔PRU1 (vitesses actuelles)
+0x0270    16 B  pru_sync                PRU0↔PRU1 (intervals actifs)
+0x0280     4 B  sp_move_whead           Linux écrit
+0x0284     4 B  sp_move_rhead           PRU0 écrit
+0x0288  2048 B  spindle move ring       128 × pru_move_t (16 B chacun)
+0x0A88     4 B  lat_move_whead          Linux écrit
+0x0A8C     4 B  lat_move_rhead          PRU1 écrit
+0x0A90  2048 B  lateral move ring       128 × pru_move_t
 ```
 
 ### 3.2 Structures clés (`pru_ipc.h`)
 
 ```c
+/* Commande lifecycle (ring buffer) */
 typedef struct __attribute__((packed, aligned(4))) {
-    uint8_t  cmd;       /* CMD_* opcode */
+    uint8_t  cmd;       /* CMD_NOP | CMD_ENABLE | CMD_EMERGENCY_STOP |  */
+                        /* CMD_RESET_POSITION | CMD_HOME_START | CMD_QUEUE_FLUSH */
     uint8_t  axis;      /* AXIS_SPINDLE | AXIS_LATERAL | AXIS_ALL */
     uint8_t  flags;
     uint8_t  _pad;
-    uint32_t value_a;   /* vitesse cible en Hz */
-    uint32_t value_b;   /* accélération en Hz/ms */
+    uint32_t value_a;
+    uint32_t value_b;
     uint32_t _reserved;
 } pru_cmd_t; /* 16 bytes */
 
+/* Move triple — unité atomique de génération de pas */
+typedef struct __attribute__((packed, aligned(4))) {
+    uint32_t interval;   /* IEP cycles entre deux fronts (STEP edges) */
+    uint32_t count;      /* nombre de fronts à générer (2 × nb pas) */
+    int32_t  add;        /* delta interval par front (rampe linéaire) */
+    uint8_t  direction;  /* 0 = forward, 1 = backward */
+    uint8_t  _pad[3];
+} pru_move_t; /* 16 bytes */
+
+/* Télémétrie par axe (PRU → Linux) */
 typedef struct __attribute__((packed, aligned(4))) {
     uint32_t seq;               /* compteur monotone */
     uint32_t step_count;        /* pas absolus depuis reset */
-    uint32_t current_hz;        /* vitesse réelle (Hz) */
-    uint32_t target_hz;         /* consigne (Hz) */
+    uint32_t current_interval;  /* demi-période courante (IEP cycles) */
+    uint32_t moves_pending;     /* slots non encore consommés */
     int32_t  position_steps;    /* position signée (lateral) */
     uint16_t state;             /* flags d'état */
     uint16_t faults;            /* bits de faute */
     uint32_t _reserved[2];
 } pru_axis_telem_t; /* 48 bytes */
+
+/* Sync PRU0 ↔ PRU1 */
+typedef struct __attribute__((packed, aligned(4))) {
+    uint32_t spindle_interval;  /* intervalle courant PRU0 (IEP cycles) */
+    uint32_t lateral_interval;  /* intervalle courant PRU1 (IEP cycles) */
+    uint32_t control_flags;
+    uint32_t _reserved;
+} pru_sync_t; /* 16 bytes */
 ```
 
-### 3.3 Ring Buffer de commandes
+### 3.3 Jeu de commandes (6 opcodes)
 
-```
-Capacité : 32 slots × 16 bytes = 512 bytes
-cmd_whead : Linux incrémente après écriture
-cmd_rhead : PRU incrémente après traitement
-Condition vide : whead == rhead
-Condition pleine : (whead+1) % 32 == rhead
-```
+| Commande             | Valeur | Description |
+|----------------------|--------|-------------|
+| `CMD_NOP`            | 0      | Pas d'opération |
+| `CMD_ENABLE`         | 1      | Active/désactive le driver (value_a=1/0) |
+| `CMD_EMERGENCY_STOP` | 2      | Coupe STEP immédiatement, vide le ring |
+| `CMD_RESET_POSITION` | 3      | Remet step_count et position_steps à 0 |
+| `CMD_HOME_START`     | 4      | PRU1 : active homing_mode |
+| `CMD_QUEUE_FLUSH`    | 5      | Vide le move ring sans arrêt d'urgence |
 
 ---
 
 ## 4. PRU0 — Spindle Step Generator
 
 ### Responsabilités
-- Générer les impulsions STEP/DIR sur les GPIO R30 dédiés
-- Exécuter la rampe d'accélération/décélération (fixed-point, ±1 Hz/ms)
-- Appliquer la compensation de vitesse spindle en lisant `pru_sync.lateral_hz`
-- Écrire `pru_sync.spindle_hz` pour que PRU1 puisse en prendre connaissance
-- Compter les pas absolus et publier `spindle_telem` toutes les 256 impulsions
+- Initialiser et posséder le **IEP timer** (200 MHz free-running counter)
+- Consommer les move triples `(interval, count, add)` depuis le spindle move ring
+- Générer les fronts STEP/DIR avec précision < 5 ns (IEP edge timing absolu)
+- Compter les pas absolus et publier `spindle_telem`
+- Publier `pru_sync.spindle_interval` pour la couche Linux
 
-### GPIO (à confirmer via device-tree overlay)
+### GPIO
 ```
 R30[0] → P9_31  SPINDLE_STEP
 R30[1] → P9_29  SPINDLE_DIR
 R30[2] → P9_30  SPINDLE_ENABLE  (actif bas)
 ```
 
-### Algorithme de génération
+### Algorithme IEP (pru_stepper.h)
 
-```
+```c
+/* Boucle chaude — aucun __delay_cycles */
 loop:
-  read commands from ring buffer (every STEP_POLL_STRIDE = 128 steps)
-  update ramp: current_hz → target_hz (±accel_hz_per_ms per 1ms)
-  period_cycles = 200_000_000 / current_hz
-  half_period = period_cycles / 2
-  SET STEP=1
-  __delay_cycles(half_period - OVERHEAD)
-  SET STEP=0
-  __delay_cycles(half_period - OVERHEAD)
-  step_count++
-  write current_hz to pru_sync
-  apply compensation: spindle_hz = nominal × (lateral_actual / lateral_nominal)
+  poll command ring (every CMD_CHECK_STRIDE = 1000 iters)
+  if (IEP_NOW() >= stepper.next_edge_time):
+    toggle STEP pin
+    stepper.count--
+    if stepper.count == 0:
+      pop next move from ring (chain seamlessly, pre-apply add)
+      or mark running=false + set underrun fault
+    else:
+      stepper.next_edge_time += stepper.interval
+      stepper.interval += stepper.add   /* linear ramp */
+  publish telem (every TELEM_STRIDE = 500000 iters)
 ```
+
+On move boundary, `interval += add` is pre-applied after loading the new move
+(matches Klipper `stepper_load_next`). `FAULT_MOVE_UNDERRUN` is set if the ring
+drains while the stepper was running (host didn't push moves fast enough).
+
+### Paramètres move triple
+| Champ      | Type     | Description |
+|------------|----------|-------------|
+| `interval` | uint32_t | IEP cycles entre deux fronts (min 625 = 3,125 µs) |
+| `count`    | uint32_t | Nombre de fronts = 2 × pas |
+| `add`      | int32_t  | Delta interval/front (rampe linéaire, peut être 0) |
+| `direction`| uint8_t  | 0=forward, 1=backward |
 
 ### Fréquences supportées
-| Paramètre    | Valeur        |
-|--------------|---------------|
-| F_PRU        | 200 MHz       |
-| Step max     | 160 kHz       |
-| Half-period min | 625 cycles |
-| Step min (mesure) | ~10 Hz  |
-| Résolution ramp | 1 Hz / ms |
+| Paramètre         | Valeur        |
+|-------------------|---------------|
+| F_PRU             | 200 MHz       |
+| Step max          | 160 kHz       |
+| Interval min      | 625 cycles    |
+| Résolution timing | 5 ns (1 cycle) |
 
 ---
 
 ## 5. PRU1 — Lateral Step Generator + Sensors
 
 ### Responsabilités
-- Générer les impulsions STEP/DIR pour l'axe lateral
-- Exécuter la rampe (même moteur que PRU0)
-- Lire le capteur home dual-contact (NO+NC) avec débounce 10 µs
-- Détecter début/fin de traversée et signaler via `state` dans `lateral_telem`
-- Écrire `pru_sync.lateral_hz` pour la compensation spindle
-- Détecter dépassement de course et lever une faute (`faults`)
+- Lire le **IEP timer** initialisé par PRU0 (ne jamais le réinitialiser)
+- Consommer les move triples depuis le lateral move ring
+- Générer les fronts STEP/DIR pour l'axe lateral
+- Lire le capteur home dual-contact (NO+NC) avec débounce IEP (500 µs)
+- En mode `homing_mode` : vider le ring et stopper quand home est détecté
+- Compter la position signée et détecter les dépassements de course
+- Publier `pru_sync.lateral_interval` et `lateral_telem`
 
 ### GPIO
 ```
@@ -170,12 +215,12 @@ R31[0] → P8_45  HOME_NO         (entrée)
 R31[1] → P8_46  HOME_NC         (entrée)
 ```
 
-### Débounce capteur home
+### Débounce capteur home (IEP-based)
 ```
-Lecture R31 toutes les 10 µs (2000 cycles)
-État validé si stable 3 lectures consécutives
+Débounce via IEP_NOW() — 100 000 cycles = 500 µs
 NO=LOW + NC=HIGH → home détecté
 NO=HIGH + NC=HIGH → FAUTE (câble débranché)
+En homing_mode : home_hit_latch → flush ring + stop + reset position
 ```
 
 ---
@@ -188,9 +233,10 @@ Unique processus userspace : `pickupwinderd`
 
 | Module              | Fichier                        | Rôle |
 |---------------------|-------------------------------|------|
-| `IpcChannel`        | `linux/src/IpcChannel.cpp`    | Mappe PRU shared RAM via `/dev/mem` ou prussdrv |
-| `StepperPRU`        | `linux/src/StepperPRU.cpp`    | API compatible `StepperController` → commandes IPC |
-| `LateralPRU`        | `linux/src/LateralPRU.cpp`    | API compatible `LateralController` → commandes IPC |
+| `IpcChannel`        | `linux/src/IpcChannel.cpp`    | Mappe PRU shared RAM; `sendMove()`, `moveQueueFreeSlots()` |
+| `MoveQueue`         | `linux/src/MoveQueue.cpp`     | Calcule les move triples (ramp math flottant) |
+| `StepperPRU`        | `linux/src/StepperPRU.cpp`    | API spindle; `tick()` pour refill du ring |
+| `LateralPRU`        | `linux/src/LateralPRU.cpp`    | API lateral; poussée de traversées par `_pushTraverse()` |
 | `WinderApp.Core`    | `src/WinderApp.Core.cpp`      | Machine d'état (inchangée) |
 | `WinderApp.*`       | `src/WinderApp.*.cpp`         | Commands, patterns, recipe (inchangés) |
 | `WebInterface`      | `src/WebInterface.cpp`        | HTTP + WebSocket (inchangé) |
@@ -233,22 +279,22 @@ Voir `linux/src/IpcChannel.cpp` pour l'implémentation.
 port/beaglebone/
 ├── pru/
 │   ├── include/
-│   │   ├── pru_ipc.h           ← layout mémoire partagée (C pur)
-│   │   └── pru_ramp.h          ← moteur rampe fixed-point (inline)
+│   │   ├── pru_ipc.h           ← layout mémoire partagée; pru_move_t; fault flags
+│   │   └── pru_stepper.h       ← IEP timer + Klipper step engine (inline, underrun)
 │   ├── pru0_spindle/
-│   │   ├── main.c
-│   │   └── Makefile
+│   │   └── main.c
 │   ├── pru1_lateral/
-│   │   ├── main.c
-│   │   └── Makefile
+│   │   └── main.c
 │   └── Makefile
 ├── linux/
 │   ├── include/
 │   │   ├── IpcChannel.h
+│   │   ├── MoveQueue.h         ← planificateur host (pushAccelSegment, etc.)
 │   │   ├── StepperPRU.h
 │   │   └── LateralPRU.h
 │   ├── src/
 │   │   ├── IpcChannel.cpp
+│   │   ├── MoveQueue.cpp
 │   │   ├── StepperPRU.cpp
 │   │   └── LateralPRU.cpp
 │   └── CMakeLists.txt
@@ -269,21 +315,31 @@ La densité de fil doit rester constante à tout instant :
 Ratio = Spindle_Hz / Lateral_Hz = CONSTANT
 ```
 
-Sur BBB, la compensation est appliquée **dans PRU0** à chaque impulsion spindle,
-en lisant `pru_sync.lateral_hz` écrit par PRU1 :
+Avec l'architecture Klipper, la compensation est appliquée **côté Linux** avant
+de pousser les move triples dans le ring :
 
-```c
-/* PRU0 — appliqué à chaque ramp-tick (1ms) */
-uint32_t lat_hz = pru_sync->lateral_hz;
-if (lat_hz > LAT_MIN_HZ_THRESHOLD && nominal_lat_hz > 0) {
-    current_spindle_hz = (uint64_t)nominal_spindle_hz
-                         * lat_hz / nominal_lat_hz;
-    /* clamp SPEED_HZ_MIN..SPEED_HZ_MAX */
-}
+```cpp
+/* Dans StepperPRU::tick() / WinderApp */
+uint32_t compHz = StepperPRU::calculateCompensatedSpindleHz(
+    nominalSpindleHz, currentLatHz, nominalLatHz);
+stepper.setSpeedHz(compHz);  /* met à jour _speedHz + _speedChanged */
+/* tick() détecte _speedChanged → flush + repush via MoveQueue */
 ```
 
-Cette implémentation remplace `StepperController::calculateCompensatedSpindleHz()`
-de l'ESP32, maintenant exécutée dans le PRU au lieu du `controlTask`.
+Le calcul de ramp (triples) suit la cinématique Klipper :
+```
+N_edges = 2 × (v1² - v0²) / (2 × accel_hz_per_s)
+iv0     = PRU_CLOCK / (2 × v0)
+add     = round((iv1 - iv0) / N_edges)
+```
+
+La zone de sync `pru_sync` contient maintenant les **intervals IEP** (cycles)
+au lieu des fréquences Hz, permettant une reconstitution Hz exacte :
+```
+hz = PRU_CLOCK_HZ / (2 × current_interval)
+```
+
+Cette implémentation remplace l'ancienne compensation en PRU0.
 
 ---
 
