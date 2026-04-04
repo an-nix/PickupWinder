@@ -91,6 +91,59 @@ done
 - Si vous avez des problèmes de démarrage, arrêtez PRU (`echo stop`) et relisez
   les logs : `dmesg`.
 
+### Si `config-pin` / paquet `bb-cape-overlays` n'est pas disponible
+
+Sur certaines images Debian/BBB le paquet `bb-cape-overlays` peut ne pas être
+présent dans les dépôts; dans ce cas `config-pin` renvoie une erreur
+"failed to set pruout". Trois solutions possibles :
+
+1) Installer `config-pin` depuis le dépôt `bb.org-overlays`
+
+```bash
+sudo apt update
+sudo apt install git
+git clone https://github.com/beagleboard/bb.org-overlays.git /tmp/bb.org-overlays
+sudo cp /tmp/bb.org-overlays/tools/config-pin /usr/local/bin/
+sudo chmod +x /usr/local/bin/config-pin
+# vérifier
+which config-pin && config-pin -q P8_46 || echo "config-pin non opérationnel"
+```
+
+2) Charger le `.dtbo` au boot (recommandé pour production)
+
+Copiez le fichier `.dtbo` dans `/lib/firmware/` et activez l'overlay au démarrage
+via `/boot/uEnv.txt` (méthode u-boot) ou via votre mécanisme d'overlays :
+
+```text
+enable_uboot_overlays=1
+uboot_overlay_addr4=/lib/firmware/pickup-winder-p8-steppers.dtbo
+```
+
+Puis reboot. Cette méthode applique le pinmux très tôt pendant l'init kernel
+et réduit fortement la fenêtre de risque. Pour tester sans reboot, si votre
+kernel expose encore `capemgr` :
+
+```bash
+echo pickup-winder-p8-steppers | sudo tee /sys/devices/platform/bone_capemgr/slots
+dmesg | tail -n 40
+```
+
+3) Mitigation matérielle (sécurité maximale)
+
+Ajouter des résistances pull-up externes (par ex. 10 kΩ) sur les lignes
+`SPINDLE_EN` et `LATERAL_EN` vers le +V afin de forcer `EN = HIGH` (drivers
+désactivés) tant que le pinmux PRU n'est pas appliqué. C'est la protection la
+plus sûre quel que soit le mécanisme de boot.
+
+Diagnostics rapides :
+
+```bash
+which config-pin || echo "config-pin absent"
+ls /sys/devices/platform | grep -i cape || true
+dmesg | tail -n 40
+```
+
+
 Notes additionnelles
 - Pour un usage persistant, installez le `.dtbo` et ajoutez la surcharge
   via la méthode d'activation DT appropriée à votre distribution (ex: `uEnv.txt`
