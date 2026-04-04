@@ -14,12 +14,17 @@
 #   export PRU_SWPKG=~/pru-software-support-package
 #
 # Usage:
-#   make                             → build pru0_spindle.fw + pru1_lateral.fw
+#   make                             → build pru0_spindle.fw + pru1_dual_stepper.fw (default)
+#   make pru1_lateral                → build legacy pru1_lateral firmware instead
+#   make dtbo                        → compile DTS overlays to .dtbo
 #   make clean                       → remove build artefacts
 #   make install                     → copy .fw to /lib/firmware/ and reload PRUs (on BBB)
 #   make deploy BBB_IP=192.168.7.2   → cross-deploy via SSH + reload PRUs (from host)
 #   make toolchain                   → build crosstool-ng toolchain from scratch
 #   make toolchain-info              → display current toolchain config
+#
+# DTS overlay prerequisites (for dtbo target):
+#   sudo apt install device-tree-compiler
 
 # ── Crosstool-ng ────────────────────────────────────────────────────────────
 CT_NG     ?= ct-ng
@@ -79,10 +84,25 @@ SSH_KEY  ?=
 SSH_OPTS ?=
 REMOTE_FW_DIR ?= /lib/firmware
 
+# SCP/SSH command selection (evaluated once at parse time, before any target).
+# Moving these here avoids the GNU Make "recipe commences before first target"
+# error that occurs when ifeq blocks with variable assignments appear inside a
+# recipe body.
+ifeq ($(strip $(SSH_KEY)),)
+SCP_CMD = scp $(SSH_OPTS)
+SSH_CMD = ssh $(SSH_OPTS)
+else
+SCP_CMD = scp -i $(SSH_KEY) $(SSH_OPTS)
+SSH_CMD = ssh -i $(SSH_KEY) $(SSH_OPTS)
+endif
+
 # ── Targets ─────────────────────────────────────────────────────────────────
-.PHONY: all clean install deploy toolchain toolchain-info
+.PHONY: all clean install deploy toolchain toolchain-info dtbo pru1_lateral
 
 all: $(OUT_DIR)/$(FW_NAME_0) $(OUT_DIR)/$(FW_NAME_1)
+
+# Legacy lateral firmware (kept for reference, not loaded by default)
+pru1_lateral: $(OUT_DIR)/am335x-pru1-lateral-fw
 
 # ── Toolchain info ───────────────────────────────────────────────────────────
 toolchain-info:
@@ -109,9 +129,31 @@ $(OUT_DIR)/$(FW_NAME_0): pru0_spindle/main.c include/pru_ipc.h include/pru_stepp
 	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
 	@echo "[PRU0 spindle] built → $@"
 
-$(OUT_DIR)/$(FW_NAME_1): pru1_lateral/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
+$(OUT_DIR)/$(FW_NAME_1): pru1_dual_stepper/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
 	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
-	@echo "[PRU1 lateral] built → $@"
+	@echo "[PRU1 dual-stepper] built → $@"
+
+# Legacy lateral-only firmware (explicit target)
+$(OUT_DIR)/am335x-pru1-lateral-fw: pru1_lateral/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
+	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
+	@echo "[PRU1 lateral (legacy)] built → $@"
+
+# ── Device-tree overlays ─────────────────────────────────────────────────────
+DTC       ?= dtc
+DTS_DIR    = dts
+DTBO_DIR   = $(OUT_DIR)/dtbo
+
+DTS_SOURCES := $(wildcard $(DTS_DIR)/*.dts)
+DTBO_TARGETS := $(patsubst $(DTS_DIR)/%.dts,$(DTBO_DIR)/%.dtbo,$(DTS_SOURCES))
+
+dtbo: $(DTBO_TARGETS)
+
+$(DTBO_DIR):
+	mkdir -p $(DTBO_DIR)
+
+$(DTBO_DIR)/%.dtbo: $(DTS_DIR)/%.dts | $(DTBO_DIR)
+	$(DTC) -O dtb -b 0 -@ $< -o $@
+	@echo "[DTS overlay] built → $@"
 
 # ── Install (sur le BBB lui-même) ────────────────────────────────────────────
 install: all
@@ -132,15 +174,6 @@ install: all
 deploy: all
 ifeq ($(strip $(BBB_IP)),)
 	$(error BBB_IP must be set. Example: make deploy BBB_IP=192.168.7.2)
-endif
-
-# SCP/SSH command selection (use -i $(SSH_KEY) when provided)
-ifeq ($(strip $(SSH_KEY)),)
-SCP_CMD = scp $(SSH_OPTS)
-SSH_CMD = ssh $(SSH_OPTS)
-else
-SCP_CMD = scp -i $(SSH_KEY) $(SSH_OPTS)
-SSH_CMD = ssh -i $(SSH_KEY) $(SSH_OPTS)
 endif
 
 	@echo "Copying firmwares to $(BBB_IP):$(REMOTE_FW_DIR)"

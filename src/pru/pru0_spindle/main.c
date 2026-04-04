@@ -1,5 +1,19 @@
 /* pru0_spindle/main.c — PRU0 spindle step generator (Klipper-inspired).
  *
+ * ── Topology note ────────────────────────────────────────────────────────────
+ * ORIGINAL topology (one axis per PRU):
+ *   PRU0 = spindle step gen  — owns IEP timer — calls IEP_INIT()
+ *   PRU1 = lateral step gen  — reads IEP_NOW() only
+ *
+ * DUAL-STEPPER topology (both axes on PRU1, default for P8_41-P8_46):
+ *   PRU1 = pru1_dual_stepper/main.c — owns IEP — calls IEP_INIT()
+ *   PRU0 = aux tasks (sensors, UART, …) — must NOT call IEP_INIT()
+ *
+ * This file is the ORIGINAL single-axis spindle firmware kept for reference.
+ * It is NOT loaded by default when using pru1_dual_stepper.
+ * Build with:  make pru0_spindle   (or: make all if FW_NAME_0 still points here)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
  * Responsibilities:
  *  - Own the IEP hardware counter (call IEP_INIT()).
  *  - Consume move triples from the spindle move ring and emit STEP edges

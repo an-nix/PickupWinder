@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * pickup-winder-p8-steppers.dts — BeagleBone Black pin overlay
+ *
+ * Configures P8_41..P8_46 as PRU1 outputs (LCD_DATA0-5, mode 6).
+ * Required before loading the pru1_dual_stepper firmware.
+ *
+ * Signal mapping (PRU1 R30 register):
+ *   P8_45  LCD_DATA0  → pr1_pru1_pru_r30_0   LATERAL_STEP   (pinctrl 0xA0)
+ *   P8_46  LCD_DATA1  → pr1_pru1_pru_r30_1   SPINDLE_STEP   (pinctrl 0xA4)
+ *   P8_43  LCD_DATA2  → pr1_pru1_pru_r30_2   LATERAL_DIR    (pinctrl 0xA8)
+ *   P8_44  LCD_DATA3  → pr1_pru1_pru_r30_3   SPINDLE_DIR    (pinctrl 0xAC)
+ *   P8_41  LCD_DATA4  → pr1_pru1_pru_r30_4   LATERAL_EN     (pinctrl 0xB0)
+ *   P8_42  LCD_DATA5  → pr1_pru1_pru_r30_5   SPINDLE_EN     (pinctrl 0xB4)
+ *
+ * Build:
+ *   dtc -O dtb -b 0 -@ pickup-winder-p8-steppers.dts \
+ *       -o pickup-winder-p8-steppers.dtbo
+ *
+ * Install (on BBB):
+ *   sudo cp pickup-winder-p8-steppers.dtbo /lib/firmware/
+ *   sudo sh -c 'echo pickup-winder-p8-steppers > \
+ *       /sys/devices/platform/bone_capemgr/slots'
+ *
+ * Alternatively, use config-pin at runtime (see test_spindle_p8.sh).
+ *
+ * Pinmux value: 0x06 = mode 6 (pruout), pull-down enabled, output-only.
+ * For active-low ENABLE signals you may prefer 0x16 (pull-up) to prevent
+ * accidental motor enable if the PRU is not running, but 0x06 is safe once
+ * the firmware immediately drives EN high on startup.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&am33xx_pinmux {
+	pickup_winder_stepper_pins: pickup-winder-stepper-pins {
+		pinctrl-single,pins = <
+			/* P8_45  LCD_DATA0  pr1_pru1_pru_r30_0  LATERAL_STEP */
+			0x0A0 0x06
+			/* P8_46  LCD_DATA1  pr1_pru1_pru_r30_1  SPINDLE_STEP */
+			0x0A4 0x06
+			/* P8_43  LCD_DATA2  pr1_pru1_pru_r30_2  LATERAL_DIR  */
+			0x0A8 0x06
+			/* P8_44  LCD_DATA3  pr1_pru1_pru_r30_3  SPINDLE_DIR  */
+			0x0AC 0x06
+			/* P8_41  LCD_DATA4  pr1_pru1_pru_r30_4  LATERAL_EN   (active-low, pull-up) */
+			0x0B0 0x16
+			/* P8_42  LCD_DATA5  pr1_pru1_pru_r30_5  SPINDLE_EN   (active-low, pull-up) */
+			0x0B4 0x16
+		>;
+	};
+};
