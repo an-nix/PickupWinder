@@ -201,6 +201,33 @@ This project uses the following pins on an ESP32:
    +-------------------+
 ```
 
+## PRU / BeagleBone (broches P8)
+
+Pour la cible BeagleBone Black (PRU1 dual-stepper), les broches utilisées sur
+le connecteur P8 sont :
+
+```
+  P8_46  -> SPINDLE_STEP  (PRU1 R30[1])
+  P8_44  -> SPINDLE_DIR   (PRU1 R30[3])
+  P8_42  -> SPINDLE_EN    (PRU1 R30[5])  (ACTIVE-LOW : 0 = driver ON)
+
+  P8_45  -> LATERAL_STEP  (PRU1 R30[0])
+  P8_43  -> LATERAL_DIR   (PRU1 R30[2])
+  P8_41  -> LATERAL_EN    (PRU1 R30[4])  (ACTIVE-LOW : 0 = driver ON)
+```
+
+Remarques importantes :
+- Le firmware `pru1_dual_stepper` (PRU1) possède le compteur IEP et appelle
+  `IEP_INIT()` ; ne lancez pas en parallèle l'ancien firmware `pru0_spindle` qui
+  ferait également usage de la même zone de commandes/telemetrie.
+- Les signaux `ENABLE` sont actifs bas (0 = driver activé). Veillez au pull-up
+ /pull-down hardware ou au paramétrage pinmux pour éviter d'activer le driver
+  accidentellement au démarrage.
+
+Voir `src/pru/PRU_DEPLOY.md` pour la procédure complète de déploiement et de
+configuration des pins (`config-pin` ou `.dtbo`).
+
+
 ## Variable machine parameters
 
 The following constants can be tuned in `include/Config.h` and related headers:
