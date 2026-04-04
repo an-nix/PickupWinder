@@ -4,12 +4,14 @@
 # Run on the BeagleBone Black AFTER copying am335x-pru1-fw to /lib/firmware/.
 #
 # What this script does:
-#   1. Set P8_41..P8_46 to 'pruout' via config-pin  (no reboot needed)
+#   1. Optionally set P8_41..P8_46 to 'pruout' via config-pin
+#      (skipped when DTBO is already loaded at boot or if --skip-pinmux is used)
 #   2. Stop + reload PRU1 with the dual-stepper firmware
 #   3. Print PRU1 remoteproc state
 #
 # Usage:
 #   sudo ./test_spindle_p8.sh
+#   sudo ./test_spindle_p8.sh --skip-pinmux
 #
 # To restore default (gpio) after testing:
 #   sudo ./test_spindle_p8.sh --restore
@@ -22,8 +24,9 @@
 #   P8_43  LATERAL_DIR   R30[2]
 #   P8_41  LATERAL_EN    R30[4]  (active-low)
 #
-# Dependencies: config-pin (bb-cape-overlays / bone-scripts package)
-#   sudo apt install bb-cape-overlays
+# Dependencies:
+#   - config-pin is optional (needed only when changing pinmux at runtime)
+#   - if DTBO is loaded at boot, script can run without config-pin
 
 set -euo pipefail
 
@@ -36,7 +39,23 @@ FW_PRU1="am335x-pru1-fw"
 RPROC1="/sys/class/remoteproc/remoteproc2"
 
 RESTORE=0
-[[ "${1:-}" == "--restore" ]] && RESTORE=1
+SKIP_PINMUX=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --restore)
+            RESTORE=1
+            shift
+            ;;
+        --skip-pinmux)
+            SKIP_PINMUX=1
+            shift
+            ;;
+        *)
+            error "Unknown option: $1 (use --restore or --skip-pinmux)"
+            ;;
+    esac
+done
 
 # ── Helper ───────────────────────────────────────────────────────────────────
 info()  { echo -e "[\e[32m OK \e[0m] $*"; }
@@ -50,15 +69,19 @@ require_root
 
 if [[ $RESTORE -eq 1 ]]; then
     echo "Restoring P8_41..P8_46 to default mode..."
+    if ! command -v config-pin >/dev/null 2>&1; then
+        warn "config-pin not found; cannot restore pinmux. Skipping."
+        exit 0
+    fi
     for pin in P8_41 P8_42 P8_43 P8_44 P8_45 P8_46; do
         config-pin "$pin" default && info "$pin → default" || warn "$pin restore failed"
     done
     exit 0
 fi
 
-# ── 1. Set pins to pruout ─────────────────────────────────────────────────────
+# ── 1. Set pins to pruout (optional) ──────────────────────────────────────────
 echo ""
-echo "=== Step 1: Configure P8_41..P8_46 as pruout ==="
+echo "=== Step 1: Configure P8_41..P8_46 pinmux (optional) ==="
 declare -A PIN_ROLE=(
     [P8_46]="SPINDLE_STEP (R30[1])"
     [P8_44]="SPINDLE_DIR  (R30[3])"
@@ -67,21 +90,30 @@ declare -A PIN_ROLE=(
     [P8_43]="LATERAL_DIR  (R30[2])"
     [P8_41]="LATERAL_EN   (R30[4])"
 )
-for pin in P8_41 P8_42 P8_43 P8_44 P8_45 P8_46; do
-    if config-pin "$pin" pruout 2>/dev/null; then
-        info "$pin → pruout  [${PIN_ROLE[$pin]}]"
-    else
-        error "$pin: failed to set pruout. Is config-pin installed? (apt install bb-cape-overlays)"
-    fi
-done
 
-# Verify
-echo ""
-echo "=== Pin state after config-pin ==="
-for pin in P8_41 P8_42 P8_43 P8_44 P8_45 P8_46; do
-    state=$(config-pin -q "$pin" 2>/dev/null || echo "unknown")
-    echo "  $pin : $state"
-done
+if [[ $SKIP_PINMUX -eq 1 ]]; then
+    warn "Skipping runtime pinmux as requested (--skip-pinmux)."
+    warn "Assuming DTBO already configures P8_41..P8_46 at boot."
+elif command -v config-pin >/dev/null 2>&1; then
+    for pin in P8_41 P8_42 P8_43 P8_44 P8_45 P8_46; do
+        if config-pin "$pin" pruout 2>/dev/null; then
+            info "$pin → pruout  [${PIN_ROLE[$pin]}]"
+        else
+            error "$pin: failed to set pruout via config-pin."
+        fi
+    done
+
+    # Verify
+    echo ""
+    echo "=== Pin state after config-pin ==="
+    for pin in P8_41 P8_42 P8_43 P8_44 P8_45 P8_46; do
+        state=$(config-pin -q "$pin" 2>/dev/null || echo "unknown")
+        echo "  $pin : $state"
+    done
+else
+    warn "config-pin not found; skipping runtime pinmux."
+    warn "If DTBO is not loaded at boot, PRU outputs may not be routed to P8 pins."
+fi
 
 # ── 2. Check firmware file ────────────────────────────────────────────────────
 echo ""
