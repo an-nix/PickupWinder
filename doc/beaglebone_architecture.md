@@ -150,8 +150,9 @@ typedef struct __attribute__((packed, aligned(4))) {
 
 ### GPIO
 ```
-R30[0] → P9_31  SPINDLE_STEP
-R30[1] → P9_29  SPINDLE_DIR
+R30[1] → P9_29  STEP_A
+R30[5] → P9_27  DIR_A
+R30[7] → P9_25  EN_A
 R30[2] → P9_30  SPINDLE_ENABLE  (actif bas)
 ```
 
@@ -208,11 +209,11 @@ drains while the stepper was running (host didn't push moves fast enough).
 
 ### GPIO
 ```
-R30[0] → P8_45  LATERAL_STEP
-R30[1] → P8_46  LATERAL_DIR
-R30[2] → P8_43  LATERAL_ENABLE  (actif bas)
-R31[0] → P8_45  HOME_NO         (entrée)
-R31[1] → P8_46  HOME_NC         (entrée)
+R30[4]  → P9_42  STEP_B
+R30[0]  → P9_31  DIR_B
+R30[3]  → P9_28  EN_B           (actif bas)
+R31[15] → P8_15  ENDSTOP_1      (entrée)
+R31[14] → P8_16  ENDSTOP_2      (entrée)
 ```
 
 ### Débounce capteur home (IEP-based)
@@ -281,9 +282,9 @@ port/beaglebone/
 │   ├── include/
 │   │   ├── pru_ipc.h           ← layout mémoire partagée; pru_move_t; fault flags
 │   │   └── pru_stepper.h       ← IEP timer + Klipper step engine (inline, underrun)
-│   ├── pru0_spindle/
+│   ├── pru0_motor_control/
 │   │   └── main.c
-│   ├── pru1_lateral/
+│   ├── pru1_orchestration/
 │   │   └── main.c
 │   └── Makefile
 ├── linux/
@@ -302,7 +303,9 @@ port/beaglebone/
 │   └── pickupwinder-pru-00A0.dts   ← overlay pinmux + PRU enable
 └── scripts/
     ├── load_pru.sh
-    └── deploy.sh
+    ├── deploy.sh
+    ├── pickupwinder-pru.service
+    └── pru_spin_test.py
 ```
 
 ---

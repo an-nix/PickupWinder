@@ -201,28 +201,36 @@ This project uses the following pins on an ESP32:
    +-------------------+
 ```
 
-## PRU / BeagleBone (broches P8)
+## PRU / BeagleBone (mapping canonique)
 
-Pour la cible BeagleBone Black (PRU1 dual-stepper), les broches utilisées sur
-le connecteur P8 sont :
+Architecture de référence :
+- **PRU0 = motor control + real-time IO**
+- **PRU1 = orchestration/supervision + host communication**
+
+Pinout moteurs (PRU0 uniquement) :
 
 ```
-  P8_46  -> SPINDLE_STEP  (PRU1 R30[1])
-  P8_44  -> SPINDLE_DIR   (PRU1 R30[3])
-  P8_42  -> SPINDLE_EN    (PRU1 R30[5])  (ACTIVE-LOW : 0 = driver ON)
+  Motor A (Group 1)
+  P9_25  -> EN_A    (PRU0 R30[7])  (ACTIVE-LOW : 0 = driver ON)
+  P9_27  -> DIR_A   (PRU0 R30[5])
+  P9_29  -> STEP_A  (PRU0 R30[1])  [réservé futur pru_uart TX_1]
 
-  P8_45  -> LATERAL_STEP  (PRU1 R30[0])
-  P8_43  -> LATERAL_DIR   (PRU1 R30[2])
-  P8_41  -> LATERAL_EN    (PRU1 R30[4])  (ACTIVE-LOW : 0 = driver ON)
+  Motor B (Group 2)
+  P9_28  -> EN_B    (PRU0 R30[3])  (ACTIVE-LOW : 0 = driver ON)
+  P9_31  -> DIR_B   (PRU0 R30[0])  [réservé futur pru_uart TX_2]
+  P9_42  -> STEP_B  (PRU0 R30[4])
+
+  Endstops (PRU0 inputs)
+  P8_15  -> ENDSTOP_1 (PRU0 R31[15])
+  P8_16  -> ENDSTOP_2 (PRU0 R31[14])
 ```
 
 Remarques importantes :
-- Le firmware `pru1_dual_stepper` (PRU1) possède le compteur IEP et appelle
-  `IEP_INIT()` ; ne lancez pas en parallèle l'ancien firmware `pru0_spindle` qui
-  ferait également usage de la même zone de commandes/telemetrie.
-- Les signaux `ENABLE` sont actifs bas (0 = driver activé). Veillez au pull-up
- /pull-down hardware ou au paramétrage pinmux pour éviter d'activer le driver
-  accidentellement au démarrage.
+- PRU0 possède le compteur IEP et appelle `IEP_INIT()`.
+- PRU1 ne doit pas piloter de STEP/DIR/EN.
+- Les signaux `ENABLE` sont actifs bas (0 = driver activé).
+- `P9_29` et `P9_31` sont volontairement conservées pour migration future en
+  `pru_uart` (TMC2209 UART mode).
 
 Voir `src/pru/PRU_DEPLOY.md` pour la procédure complète de déploiement et de
 configuration des pins (`config-pin` ou `.dtbo`).

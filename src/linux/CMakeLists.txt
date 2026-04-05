@@ -81,6 +81,23 @@ target_link_libraries(pickupwinderd
 )
 
 # ---------------------------------------------------------------------------
+# Real firmware test utility (spindle): sends real IPC moves to PRU firmware
+# ---------------------------------------------------------------------------
+add_executable(pru_fw_test
+    src/pru_fw_test.cpp
+)
+target_include_directories(pru_fw_test PRIVATE
+    ${BBB_LINUX_INCLUDE}
+    ${BBB_PRU_INCLUDE}
+    ${APP_INCLUDE}
+)
+target_link_libraries(pru_fw_test
+    PRIVATE
+        bbb_hal
+        pthread
+)
+
+# ---------------------------------------------------------------------------
 # Optional: ArduinoJson (header-only, expected in /usr/local/include or vcpkg)
 # ---------------------------------------------------------------------------
 find_path(ARDUINOJSON_INCLUDE ArduinoJson.h

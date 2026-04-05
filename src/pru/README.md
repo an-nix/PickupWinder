@@ -3,8 +3,8 @@
 This folder contains PRU firmware sources and build helpers for the AM335x
 PRUs used by PickupWinder. Two PRU images are built:
 
-- `build/am335x-pru0-fw` — PRU0 (spindle step generator)
-- `build/am335x-pru1-fw` — PRU1 (lateral step generator + home sensor)
+- `build/am335x-pru0-fw` — PRU0 (dual-motor real-time control + endstops)
+- `build/am335x-pru1-fw` — PRU1 (orchestration/supervision + host-link side tasks)
 
 ---
 
@@ -18,10 +18,10 @@ never compute speeds, ramps, or do divisions. All timing is driven by the
 
 ```
 Linux host                        PRU Shared RAM           PRU
-─────────────────────────────     ─────────────────        ────────────────
-MoveQueue::pushAccelSegment()  →  spindle move ring   →  PRU0 IEP edge loop
-MoveQueue::pushConstantMs()    →  spindle move ring   →    (no __delay_cycles)
-MoveQueue::pushDecelToStop()   →  lateral move ring   →  PRU1 IEP edge loop
+─────────────────────────────     ─────────────────        ───────────────────
+MoveQueue::pushAccelSegment()  →  spindle move ring   →  PRU0 motor A edge loop
+MoveQueue::pushConstantMs()    →  lateral move ring   →  PRU0 motor B edge loop
+sendCommand()/status sync      ↔  cmd/telem/sync      ↔  PRU1 supervision loop
 ```
 
 **Move triple format** (`pru_move_t`, 16 bytes):
@@ -50,51 +50,56 @@ ramped interval instead of the raw base interval.
 
 ---
 
-## PRU0 — Spindle
+## PRU0 — Motor control + real-time IO (authoritative)
 
 **IEP timer owner**: PRU0 initialises the IEP counter at boot. PRU1 reads it.
 
 Responsibilities:
 - Own and initialise the IEP timer (`IEP_INIT()`)
-- Consume move triples from the spindle move ring via `stepper_try_load_next()`
-- Toggle `R30[0]` (STEP) with IEP-absolute timing
-- Count absolute steps; publish `spindle_telem` and `pru_sync.spindle_interval`
+- Consume both move rings (spindle + lateral)
+- Toggle STEP/DIR/EN GPIO for both motors with IEP-absolute timing
+- Sample endstops on `R31[15]`/`R31[14]`
+- Publish both telemetry blocks + sync intervals
 
-GPIOs:
-```
-R30[0] → P9_31  SPINDLE_STEP
-R30[1] → P9_29  SPINDLE_DIR
-R30[2] → P9_30  SPINDLE_ENABLE (active low)
-```
+### Canonical PRU0 pin table
+
+| Header pin | PRU bit | Function | Notes |
+|------------|---------|----------|-------|
+| P9_25 | R30[7] | EN_A | active-low |
+| P9_27 | R30[5] | DIR_A | motor A direction |
+| P9_29 | R30[1] | STEP_A | reserved for future `pru_uart` TX_1 |
+| P9_28 | R30[3] | EN_B | active-low |
+| P9_31 | R30[0] | DIR_B | reserved for future `pru_uart` TX_2 |
+| P9_42 | R30[4] | STEP_B | motor B step |
+| P8_15 | R31[15] | ENDSTOP_1 | PRU input |
+| P8_16 | R31[14] | ENDSTOP_2 | PRU input |
+| P8_11 | eQEP | ENCODER_1_A | Linux/eQEP peripheral |
+| P8_12 | eQEP | ENCODER_1_B | Linux/eQEP peripheral |
+| P8_33 | eQEP | ENCODER_2_A | Linux/eQEP peripheral |
+| P8_35 | eQEP | ENCODER_2_B | Linux/eQEP peripheral |
+| P9_12 | GPIO | HX711_SCK | host-side GPIO |
+| P9_14 | GPIO | HX711_DOUT | host-side GPIO |
+| P9_23 | GPIO | FOOTSWITCH | host-side GPIO |
 
 ---
 
-## PRU1 — Lateral + Sensors
+## PRU1 — Low-level orchestration + supervision
 
-**IEP timer reader**: PRU1 reads PRU0's IEP counter. Never resets it.
+**IEP timer reader**: PRU1 reads PRU0's IEP state. Never resets it.
 
 Responsibilities:
-- Consume move triples from the lateral move ring
-- Toggle `R30[0]` (STEP) with IEP-absolute timing
-- Read dual-contact home sensor with IEP-based debounce (500 µs)
-- In `homing_mode` (set by `CMD_HOME_START`): flush ring + stop when HOME_HIT
-- Count signed position; detect overrun; publish `lateral_telem` and `pru_sync.lateral_interval`
+- Keep orchestration/supervision runtime alive
+- Keep host-link side tasks on PRU1 side
+- Avoid any STEP/DIR/EN ownership (motor control is PRU0-only)
 
-GPIOs:
-```
-R30[0] → P8_45  LATERAL_STEP
-R30[1] → P8_46  LATERAL_DIR
-R30[2] → P8_43  LATERAL_ENABLE (active low)
-R31[3] → P8_xx  HOME_NO  (LOW when at home)
-R31[4] → P8_xx  HOME_NC  (HIGH when at home)
-```
+PRU1 must not consume move rings and must not advance command ownership used
+by PRU0 motor control.
 
-Home sensor logic:
-```
-NO=LOW + NC=HIGH  → home detected (homing latch)
-NO=HIGH + NC=HIGH → FAULT (wiring fault)
-Debounce: IEP_NOW()-based 500 µs window
-```
+## Future TMC2209 UART reservation
+
+`P9_29` and `P9_31` are intentionally selected because they can be switched to
+`pru_uart` TX later (TMC2209 UART mode). Keep this reservation unchanged unless
+explicitly requested.
 
 ---
 
@@ -124,7 +129,7 @@ Offsets defined in `include/pru_ipc.h`:
 | `CMD_ENABLE`         | 1     | Enable/disable driver (value_a=1/0) |
 | `CMD_EMERGENCY_STOP` | 2     | Immediate stop; flush ring; clear STEP |
 | `CMD_RESET_POSITION` | 3     | Reset step_count and position_steps to 0 |
-| `CMD_HOME_START`     | 4     | PRU1: enter homing_mode |
+| `CMD_HOME_START`     | 4     | PRU0: lateral axis homing mode |
 | `CMD_QUEUE_FLUSH`    | 5     | Flush move ring (no emergency stop) |
 
 ---
@@ -153,10 +158,18 @@ Variables accepted by the Makefile:
 Artifacts:
 - `build/am335x-pru0-fw`
 - `build/am335x-pru1-fw`
+- `build/dtbo/pickup-winder-p8-steppers.dtbo`
 
 Deploy to BeagleBone:
 - `make install` — copies firmwares to `/lib/firmware` and restarts remoteproc
 - `make deploy BBB_IP=... BBB_USER=... SSH_KEY=...` — copies via scp + ssh
+
+Automation scripts:
+- `scripts/deploy.sh` — host-side build/copy/install helper for firmware + DT overlay
+- `scripts/load_pru.sh` — target-side installer/loader used directly or via systemd
+- `scripts/pickupwinder-pru.service` — boot-time PRU startup service
+- `scripts/pru_spin_test.py` — root-only direct IPC spindle spin test
+- `test_pru0_motor.sh` — quick runtime pinmux + remoteproc smoke test
 
 ---
 

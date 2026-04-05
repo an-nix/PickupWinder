@@ -29,12 +29,12 @@ Two layers:
 |  MoveQueue (pre-computes move triples host-side) |
 |              IpcChannel (linux/src/)             |
 +----------------------+--------------------------+
-|  PRU0 - Spindle      |  PRU1 - Lateral+Sensors  |
-|  200 MHz - IEP owner |  200 MHz - IEP reader    |
-|  Move ring consumer  |  Move ring consumer      |
-|  STEP/DIR/EN GPIO    |  STEP/DIR/EN GPIO        |
-|  Edge timing IEP     |  Edge timing IEP         |
-|  No ramp on PRU      |  Home sensor NO+NC       |
+|  PRU0 - Motor RT IO          |  PRU1 - Orchestration/Supervision |
+|  200 MHz - IEP owner         |  200 MHz - IEP reader             |
+|  Spindle + Lateral consumers |  Host-link + low-level supervisor |
+|  STEP/DIR/EN + Endstops      |  No motor GPIO ownership          |
+|  Edge timing IEP             |  Shared-memory sync only          |
+|  No ramp on PRU              |  No move-ring consumption         |
 +----------------------+--------------------------+
 ```
 
@@ -67,8 +67,8 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 |----------------------------------------|----------------|
 | `pru/include/pru_ipc.h`               | IPC shared memory layout; pru_move_t; 6 CMD opcodes; fault flags |
 | `pru/include/pru_stepper.h`           | IEP timer macros; stepper_t (with underrun); move_ring_t; step engine (inline, Klipper add pre-apply) |
-| `pru/pru0_spindle/main.c`             | Spindle IEP step generation (no ramp on PRU) |
-| `pru/pru1_lateral/main.c`             | Lateral IEP step + home sensor + homing_mode |
+| `pru/pru0_motor_control/main.c`       | Dual-motor IEP step generation + endstops (authoritative) |
+| `pru/pru1_orchestration/main.c`       | PRU1 orchestration/supervision (no motor control) |
 
 ### 2.3 Key Headers
 
@@ -99,8 +99,37 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 - Emergency stop (`CMD_EMERGENCY_STOP`) clears all STEP outputs and flushes ring in <= 2 PRU instructions.
 - `CMD_QUEUE_FLUSH` empties the move ring without emergency stop (for speed transitions).
 - PRU0 owns and initializes the IEP timer; PRU1 reads only — never resets it.
+- All motor-related real-time code must target **PRU0**.
+- PRU1 is reserved for orchestration, supervision, and host communication.
 - All PRU shared memory accesses must use `volatile` pointers.
 - Shared memory structs must be `__attribute__((packed, aligned(4)))`.
+
+### 3.1.1 Canonical pin layout (MUST NOT change implicitly)
+
+Motor A (Group 1):
+- `P9_25` → `EN_A` (`PRU0 R30[7]`, active-low)
+- `P9_27` → `DIR_A` (`PRU0 R30[5]`)
+- `P9_29` → `STEP_A` (`PRU0 R30[1]`) — reserved for future `pru_uart` TX_1
+
+Motor B (Group 2):
+- `P9_28` → `EN_B` (`PRU0 R30[3]`, active-low)
+- `P9_31` → `DIR_B` (`PRU0 R30[0]`) — reserved for future `pru_uart` TX_2
+- `P9_42` → `STEP_B` (`PRU0 R30[4]`)
+
+Endstops (PRU0 inputs):
+- `P8_15` → `ENDSTOP_1` (`PRU0 R31[15]`)
+- `P8_16` → `ENDSTOP_2` (`PRU0 R31[14]`)
+
+Additional board IO:
+- Encoder1: `P8_11` (A), `P8_12` (B)
+- Encoder2: `P8_33` (A), `P8_35` (B)
+- HX711: `P9_12` (SCK), `P9_14` (DOUT)
+- Footswitch: `P9_23`
+
+Rules:
+- Do not remap these pins unless the user explicitly requests it.
+- Keep `P9_29` and `P9_31` reserved for future TMC2209 UART migration.
+- Any PRU pin change must update firmware + DTS + documentation in one commit.
 
 ### 3.2 Linux Daemon Safety
 
@@ -133,7 +162,7 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 - Float fields clamped after parsing. Bump version only for schema changes.
 - Storage: JSON files on BBB eMMC (replaces ESP32 NVS).
 
-### 3.6 Sensor Safety (PRU1)
+### 3.6 Sensor Safety
 
 - Home sensor: NO=LOW + NC=HIGH -> home. NO=HIGH + NC=HIGH -> FAULT.
 - Debounce: IEP-based 500 µs window (100,000 IEP cycles).
@@ -305,8 +334,8 @@ Verify after every geometry change.
 ```
 port/beaglebone/            <- BBB port (active development)
   pru/include/              <- pru_ipc.h, pru_stepper.h
-  pru/pru0_spindle/         <- PRU0 firmware (spindle)
-  pru/pru1_lateral/         <- PRU1 firmware (lateral + sensors)
+  pru/pru0_motor_control/   <- PRU0 firmware (motor control + endstops)
+  pru/pru1_orchestration/   <- PRU1 firmware (orchestration + supervision)
   pru/Makefile
   linux/include/            <- IpcChannel.h, StepperPRU.h, LateralPRU.h
   linux/src/                <- IpcChannel.cpp, StepperPRU.cpp, LateralPRU.cpp

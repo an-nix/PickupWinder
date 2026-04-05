@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * eQEP1 overlay — BeagleBone Black, kernel 6.12
+ *
+ * P8_35 (conf_mcasp0_ahclkr, offset 0x0D0) → EQEP1A_in, MODE4, pull-up
+ * P8_33 (conf_mcasp0_fsr,    offset 0x0D4) → EQEP1B_in, MODE4, pull-up
+ *
+ * IMPORTANT: this kernel uses #pinctrl-cells = <2>, so pinctrl-single,pins
+ * requires 3 cells per pin: <offset config_flags mux_mode>
+ * The driver ORs config_flags | mux_mode to produce the final register value.
+ *
+ * Cell breakdown:
+ *   offset     : pad register offset from pinmux base
+ *   config_flags: 0x30 = RXACTIVE(bit5=1) | PUTYPESEL(bit4=1) — pull-up, input
+ *   mux_mode   : 0x04 = MUXMODE 4 → eQEP1A / eQEP1B function
+ *   final write : 0x30 | 0x04 = 0x34
+ *
+ * Evidence from running DTB:
+ *   i2c2-pins: <0x178 0x30 0x03  0x17c 0x30 0x03>  ← 3 cells/pin
+ *   user-leds: <0x54 0x00 0x07  0x58 0x10 0x07  ...> ← 3 cells/pin
+ */
+/dts-v1/;
+/plugin/;
+
+&am33xx_pinmux {
+    pinctrl_eqep1_pins: pinctrl_eqep1_pins {
+        pinctrl-single,pins = <
+            0x0D0 0x30 0x04  /* P8_35 = EQEP1A_in: rx+pull-up, MODE4 */
+            0x0D4 0x30 0x04  /* P8_33 = EQEP1B_in: rx+pull-up, MODE4 */
+        >;
+    };
+};
+
+&epwmss1 {
+    status = "okay";
+};
+
+&eqep1 {
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_eqep1_pins>;
+    status = "okay";
+};

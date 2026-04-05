@@ -14,8 +14,7 @@
 #   export PRU_SWPKG=~/pru-software-support-package
 #
 # Usage:
-#   make                             → build pru0_spindle.fw + pru1_dual_stepper.fw (default)
-#   make pru1_lateral                → build legacy pru1_lateral firmware instead
+#   make                             → build PRU0 motor fw + PRU1 orchestration fw (default)
 #   make dtbo                        → compile DTS overlays to .dtbo
 #   make clean                       → remove build artefacts
 #   make install                     → copy .fw to /lib/firmware/ and reload PRUs (on BBB)
@@ -97,12 +96,9 @@ SSH_CMD = ssh -i $(SSH_KEY) $(SSH_OPTS)
 endif
 
 # ── Targets ─────────────────────────────────────────────────────────────────
-.PHONY: all clean install deploy toolchain toolchain-info dtbo pru1_lateral
+.PHONY: all clean install deploy toolchain toolchain-info dtbo
 
 all: $(OUT_DIR)/$(FW_NAME_0) $(OUT_DIR)/$(FW_NAME_1)
-
-# Legacy lateral firmware (kept for reference, not loaded by default)
-pru1_lateral: $(OUT_DIR)/am335x-pru1-lateral-fw
 
 # ── Toolchain info ───────────────────────────────────────────────────────────
 toolchain-info:
@@ -125,18 +121,13 @@ toolchain:
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
-$(OUT_DIR)/$(FW_NAME_0): pru0_spindle/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
+$(OUT_DIR)/$(FW_NAME_0): pru0_motor_control/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
 	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
-	@echo "[PRU0 spindle] built → $@"
+	@echo "[PRU0 motor-control] built → $@"
 
-$(OUT_DIR)/$(FW_NAME_1): pru1_dual_stepper/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
+$(OUT_DIR)/$(FW_NAME_1): pru1_orchestration/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
 	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
-	@echo "[PRU1 dual-stepper] built → $@"
-
-# Legacy lateral-only firmware (explicit target)
-$(OUT_DIR)/am335x-pru1-lateral-fw: pru1_lateral/main.c include/pru_ipc.h include/pru_stepper.h | $(OUT_DIR)
-	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
-	@echo "[PRU1 lateral (legacy)] built → $@"
+	@echo "[PRU1 orchestration] built → $@"
 
 # ── Device-tree overlays ─────────────────────────────────────────────────────
 DTC       ?= dtc

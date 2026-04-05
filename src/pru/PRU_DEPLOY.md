@@ -1,75 +1,118 @@
-# Déploiement manuel PRU (PRU1 dual-stepper)
+# Déploiement manuel PRU (PRU0 motor-control)
 
-Ce fichier décrit la procédure manuelle pour déployer le firmware PRU1 `am335x-pru1-fw`
-qui pilote les deux moteurs (spindle + lateral) sur les broches P8_41..P8_46.
+Ce fichier décrit la procédure manuelle pour déployer le firmware PRU0 `am335x-pru0-fw`
+qui pilote les deux moteurs (A + B) selon le mapping P9/P8 canonique.
 
 Important
-- Le firmware `pru1_dual_stepper` fait que PRU1 **possède** le compteur IEP
-  (il appelle `IEP_INIT()`). Ne démarrez PAS l'ancien firmware `pru0_spindle`
-  en même temps que `pru1_dual_stepper`.
+- Le firmware PRU0 **possède** le compteur IEP (il appelle `IEP_INIT()`).
+- PRU1 reste réservé à l'orchestration/supervision et ne pilote aucun moteur.
 - Les signaux ENABLE sont actifs LOW (0 = driver ON).
 
-Rappel GPIO (PRU1 R30)
-- P8_46  → SPINDLE_STEP (R30[1])
-- P8_44  → SPINDLE_DIR  (R30[3])
-- P8_42  → SPINDLE_EN   (R30[5]) (active-low)
-- P8_45  → LATERAL_STEP (R30[0])
-- P8_43  → LATERAL_DIR  (R30[2])
-- P8_41  → LATERAL_EN   (R30[4]) (active-low)
+Rappel GPIO (PRU0)
+- P9_29  → STEP_A (R30[1])
+- P9_27  → DIR_A  (R30[5])
+- P9_25  → EN_A   (R30[7]) (active-low)
+- P9_42  → STEP_B (R30[4])
+- P9_31  → DIR_B  (R30[0])
+- P9_28  → EN_B   (R30[3]) (active-low)
+- P8_15  → ENDSTOP_1 (R31[15])
+- P8_16  → ENDSTOP_2 (R31[14])
+
+## Déploiement automatisé recommandé
+
+Depuis la machine de développement :
+
+```bash
+cd /home/nicolas/Documents/PlatformIO/Projects/PickupWinder/src/pru
+./scripts/deploy.sh --host BBB_IP --spin-test
+```
+
+Ce script :
+- compile les firmwares + l'overlay,
+- copie le payload sur la BBB,
+- installe `/lib/firmware/am335x-pru0-fw`, `/lib/firmware/am335x-pru1-fw` et le `.dtbo`,
+- installe `/usr/local/bin/load_pru.sh`, `/usr/local/bin/test_pru0_motor.sh` et `/usr/local/bin/pru_spin_test.py`,
+- installe/active le service `pickupwinder-pru.service`,
+- démarre PRU0 + PRU1,
+- peut lancer un test de rotation du moteur broche.
+
+## Déploiement manuel
 
 1) Construire localement (sur le PC)
 
 ```bash
 cd /home/nicolas/Documents/PlatformIO/Projects/PickupWinder/src/pru
-make         # compile les firmwares (PRU0 + PRU1 dual-stepper)
+make         # compile les firmwares (PRU0 motor + PRU1 orchestration)
 make dtbo    # compile les .dtbo depuis dts/ (optionnel pour pinmux persistant)
 ```
 
 2) Copier les fichiers sur la BBB (ex. vers /tmp)
 
 ```bash
-scp build/am335x-pru1-fw debian@BBB_IP:/tmp/
+scp build/am335x-pru0-fw debian@BBB_IP:/tmp/
 scp build/dtbo/pickup-winder-p8-steppers.dtbo debian@BBB_IP:/tmp/   # si utilisé
-scp test_spindle_p8.sh debian@BBB_IP:/tmp/
+scp test_pru0_motor.sh debian@BBB_IP:/tmp/
+scp scripts/load_pru.sh debian@BBB_IP:/tmp/
+scp scripts/pru_spin_test.py debian@BBB_IP:/tmp/
+scp scripts/pickupwinder-pru.service debian@BBB_IP:/tmp/
 ```
 
 3) Installer sur la BBB (actions root)
 
 ```bash
-# copier firmware + overlay + script
+# copier firmware + overlay + scripts
+sudo cp /tmp/am335x-pru0-fw /lib/firmware/
 sudo cp /tmp/am335x-pru1-fw /lib/firmware/
 sudo cp /tmp/pickup-winder-p8-steppers.dtbo /lib/firmware/   # optionnel
-sudo cp /tmp/test_spindle_p8.sh /usr/local/bin/
-sudo chmod +x /usr/local/bin/test_spindle_p8.sh
+sudo cp /tmp/test_pru0_motor.sh /usr/local/bin/
+sudo cp /tmp/load_pru.sh /usr/local/bin/
+sudo cp /tmp/pru_spin_test.py /usr/local/bin/
+sudo chmod +x /usr/local/bin/test_pru0_motor.sh
+sudo chmod +x /usr/local/bin/load_pru.sh
+sudo chmod +x /usr/local/bin/pru_spin_test.py
+
+# optionnel : service de démarrage
+sudo cp /tmp/pickupwinder-pru.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable pickupwinder-pru.service
 ```
 
 4a) Méthode simple (recommandée pour tests rapides) — utiliser le script
 
 ```bash
-sudo /usr/local/bin/test_spindle_p8.sh
+sudo /usr/local/bin/test_pru0_motor.sh
 ```
 
 Le script :
-- met P8_41..P8_46 en `pruout` via `config-pin`
-- arrête PRU1, assigne `am335x-pru1-fw` et démarre PRU1
+- met les pins moteur/endstops sur le mapping PRU0 (`pruout`/`pruin`) via `config-pin`
+- arrête PRU0/PRU1, assigne `am335x-pru0-fw` + `am335x-pru1-fw` et démarre les deux PRUs
 - affiche l'état final
+
+Test de rotation spindle :
+
+```bash
+sudo /usr/local/bin/pru_spin_test.py --rpm 20 --seconds 6 --forward 1
+```
 
 4b) Méthode manuelle (remoteproc + config-pin)
 
 ```bash
 # config des pins (en local sur la BBB)
-for pin in P8_41 P8_42 P8_43 P8_44 P8_45 P8_46; do
+for pin in P9_25 P9_27 P9_28 P9_29 P9_31 P9_42; do
   sudo config-pin "$pin" pruout
+done
+for pin in P8_15 P8_16; do
+  sudo config-pin "$pin" pruin
 done
 
 # remoteproc (vérifier le numéro remoteproc sur votre kernel)
-# remoteproc2 est habituel pour PRU1; adaptez si nécessaire
-echo stop  | sudo tee /sys/class/remoteproc/remoteproc2/state
-echo am335x-pru1-fw | sudo tee /sys/class/remoteproc/remoteproc2/firmware
-echo start | sudo tee /sys/class/remoteproc/remoteproc2/state
+# remoteproc1 est habituel pour PRU0; adaptez si nécessaire
+echo stop  | sudo tee /sys/class/remoteproc/remoteproc1/state
+echo am335x-pru0-fw | sudo tee /sys/class/remoteproc/remoteproc1/firmware
+echo start | sudo tee /sys/class/remoteproc/remoteproc1/state
 
 # vérifier
-cat /sys/class/remoteproc/remoteproc2/state
+cat /sys/class/remoteproc/remoteproc1/state
 sudo dmesg | tail -20
 ```
 
@@ -77,16 +120,16 @@ sudo dmesg | tail -20
 
 ```bash
 # via le script
-sudo /usr/local/bin/test_spindle_p8.sh --restore
+sudo /usr/local/bin/test_pru0_motor.sh --restore
 
 # ou manuellement
-for pin in P8_41 P8_42 P8_43 P8_44 P8_45 P8_46; do
+for pin in P9_25 P9_27 P9_28 P9_29 P9_31 P9_42 P8_15 P8_16; do
   sudo config-pin "$pin" default
 done
 ```
 
 6) Vérifications utiles
-- `cat /sys/class/remoteproc/remoteproc2/state` → doit afficher `running`.
+- `cat /sys/class/remoteproc/remoteproc1/state` → doit afficher `running`.
 - `dmesg | tail -20` → messages kernel relatifs au chargement du firmware.
 - Si vous avez des problèmes de démarrage, arrêtez PRU (`echo stop`) et relisez
   les logs : `dmesg`.
@@ -106,7 +149,7 @@ git clone https://github.com/beagleboard/bb.org-overlays.git /tmp/bb.org-overlay
 sudo cp /tmp/bb.org-overlays/tools/config-pin /usr/local/bin/
 sudo chmod +x /usr/local/bin/config-pin
 # vérifier
-which config-pin && config-pin -q P8_46 || echo "config-pin non opérationnel"
+which config-pin && config-pin -q P9_29 || echo "config-pin non opérationnel"
 ```
 
 2) Charger le `.dtbo` au boot (recommandé pour production)
@@ -131,7 +174,7 @@ dmesg | tail -n 40
 3) Mitigation matérielle (sécurité maximale)
 
 Ajouter des résistances pull-up externes (par ex. 10 kΩ) sur les lignes
-`SPINDLE_EN` et `LATERAL_EN` vers le +V afin de forcer `EN = HIGH` (drivers
+`EN_A` et `EN_B` vers le +V afin de forcer `EN = HIGH` (drivers
 désactivés) tant que le pinmux PRU n'est pas appliqué. C'est la protection la
 plus sûre quel que soit le mécanisme de boot.
 
@@ -153,5 +196,5 @@ Notes additionnelles
   `cmd_rhead`/anneau de commandes simultanément — cela corromprait le protocole.
 
 Si vous voulez, je peux :
-- ajouter un `make install`/`make deploy` plus sélectif (déployer seulement PRU1),
+- ajouter un `make install`/`make deploy` plus sélectif,
 - automatiser le commit + push de `PRU_DEPLOY.md` (je peux le faire maintenant).

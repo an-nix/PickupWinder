@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * pickup-winder-p8-steppers.dts — BeagleBone Black pin overlay
+ * pickup-winder-p8-steppers.dts — BeagleBone Black pin overlay (PRU0 motor map)
  *
- * Configures P8_41..P8_46 as PRU1 outputs (LCD_DATA0-5, mode 6).
- * Required before loading the pru1_dual_stepper firmware.
+ * New canonical routing:
+ *   Motor A:
+ *     P9_29 -> PRU0 R30[1] STEP_A  (reserved for future pru_uart TX #1)
+ *     P9_27 -> PRU0 R30[5] DIR_A
+ *     P9_25 -> PRU0 R30[7] EN_A (active-low, pull-up)
  *
- * Signal mapping (PRU1 R30 register):
- *   P8_45  LCD_DATA0  → pr1_pru1_pru_r30_0   LATERAL_STEP   (pinctrl 0xA0)
- *   P8_46  LCD_DATA1  → pr1_pru1_pru_r30_1   SPINDLE_STEP   (pinctrl 0xA4)
- *   P8_43  LCD_DATA2  → pr1_pru1_pru_r30_2   LATERAL_DIR    (pinctrl 0xA8)
- *   P8_44  LCD_DATA3  → pr1_pru1_pru_r30_3   SPINDLE_DIR    (pinctrl 0xAC)
- *   P8_41  LCD_DATA4  → pr1_pru1_pru_r30_4   LATERAL_EN     (pinctrl 0xB0)
- *   P8_42  LCD_DATA5  → pr1_pru1_pru_r30_5   SPINDLE_EN     (pinctrl 0xB4)
+ *   Motor B:
+ *     P9_42 -> PRU0 R30[4] STEP_B
+ *     P9_31 -> PRU0 R30[0] DIR_B  (reserved for future pru_uart TX #2)
+ *     P9_28 -> PRU0 R30[3] EN_B (active-low, pull-up)
+ *
+ *   Endstops (inputs):
+ *     P8_15 -> PRU0 R31[15] ENDSTOP_1
+ *     P8_16 -> PRU0 R31[14] ENDSTOP_2
  *
  * Build:
  *   dtc -O dtb -b 0 -@ pickup-winder-p8-steppers.dts \
@@ -22,7 +26,7 @@
  *   sudo sh -c 'echo pickup-winder-p8-steppers > \
  *       /sys/devices/platform/bone_capemgr/slots'
  *
- * Alternatively, use config-pin at runtime (see test_spindle_p8.sh).
+ * Alternatively, use config-pin at runtime.
  *
  * Pinmux value: 0x06 = mode 6 (pruout), pull-down enabled, output-only.
  * For active-low ENABLE signals you may prefer 0x16 (pull-up) to prevent
@@ -33,21 +37,28 @@
 /dts-v1/;
 /plugin/;
 
+
 &am33xx_pinmux {
 	pickup_winder_stepper_pins: pickup-winder-stepper-pins {
 		pinctrl-single,pins = <
-			/* P8_45  LCD_DATA0  pr1_pru1_pru_r30_0  LATERAL_STEP */
-			0x0A0 0x06
-			/* P8_46  LCD_DATA1  pr1_pru1_pru_r30_1  SPINDLE_STEP */
-			0x0A4 0x06
-			/* P8_43  LCD_DATA2  pr1_pru1_pru_r30_2  LATERAL_DIR  */
-			0x0A8 0x06
-			/* P8_44  LCD_DATA3  pr1_pru1_pru_r30_3  SPINDLE_DIR  */
-			0x0AC 0x06
-			/* P8_41  LCD_DATA4  pr1_pru1_pru_r30_4  LATERAL_EN   (active-low, pull-up) */
-			0x0B0 0x16
-			/* P8_42  LCD_DATA5  pr1_pru1_pru_r30_5  SPINDLE_EN   (active-low, pull-up) */
-			0x0B4 0x16
+			/* P9_29 mcasp0_fsx    pr1_pru0_pru_r30_1  STEP_A */
+			0x194 0x06
+			/* P9_27 mcasp0_fsr    pr1_pru0_pru_r30_5  DIR_A  */
+			0x1A4 0x06
+			/* P9_25 mcasp0_ahclkx pr1_pru0_pru_r30_7  EN_A (active-low, pull-up) */
+			0x1AC 0x16
+
+			/* P9_42 ecap0_in_pwm0_out pr1_pru0_pru_r30_4 STEP_B */
+			0x164 0x06
+			/* P9_31 mcasp0_aclkx      pr1_pru0_pru_r30_0 DIR_B  */
+			0x190 0x06
+			/* P9_28 mcasp0_ahclkr     pr1_pru0_pru_r30_3 EN_B (active-low, pull-up) */
+			0x19C 0x16
+
+			/* P8_15 gpmc_ad15 pr1_pru0_pru_r31_15 ENDSTOP_1 input (pull-up) */
+			0x03C 0x2E
+			/* P8_16 gpmc_ad14 pr1_pru0_pru_r31_14 ENDSTOP_2 input (pull-up) */
+			0x038 0x2E
 		>;
 	};
 };
