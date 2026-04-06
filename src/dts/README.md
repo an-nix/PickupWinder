@@ -7,7 +7,7 @@ can enable the set you need (the repo provides 4 canonical overlays).
 
 Overlays in this directory:
 - 00-pru-steppers-endstops.dts : Combined PRU overlay (steppers on PRU0 + endstops on PRU1)
-- 02-host_IO.dts               : Host I/O overlay (encoders eqep0+eqep1 + UART1 pins)
+- 02-host_IO.dts               : Host I/O overlay (encoders eqep0+eqep1 + UART1 pins + P9_23 stop/start button input)
 
 Build instructions (on dev host):
 
