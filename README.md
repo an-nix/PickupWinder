@@ -44,14 +44,14 @@ At startup, the firmware checks NVS namespace `wifi` for stored credentials:
 - If new values are identical to existing NVS values, write is skipped (idempotent).
 Runtime update command:
 
-`cmd('wifi_set', 'ssid|password')`
-
-- Saves to NVS keys `ssid` and `pwd` in namespace `wifi`.
+   P9_25  -> EN_A    (PRU0 R30[7])  (ACTIVE-LOW : 0 = driver ON)
+   P9_29  -> DIR_A   (PRU0 R30[1])
+   P9_31  -> STEP_A  (PRU0 R30[0])
 - Effective on next reboot.
 
-## Build and flash (local)
-
-```bash
+   P9_41  -> EN_B    (PRU0 R30[6])  (ACTIVE-LOW : 0 = driver ON)
+   P9_28  -> DIR_B   (PRU0 R30[3])
+   P9_30  -> STEP_B  (PRU0 R30[2])
 platformio run -e esp32dev
 platformio run -e esp32dev --target upload
 ```
@@ -65,10 +65,6 @@ Example:
 
 ```bash
 platformio run -e esp32dev-lab --target upload
-```
-
-## Protocol and capabilities
-
 The firmware now exposes explicit protocol versions and command capabilities:
 
 - `GET /protocol.json`: `{ ws, uart, recipe }`
@@ -212,17 +208,17 @@ Pinout moteurs (PRU0 uniquement) :
 ```
   Motor A (Group 1)
   P9_25  -> EN_A    (PRU0 R30[7])  (ACTIVE-LOW : 0 = driver ON)
-  P9_27  -> DIR_A   (PRU0 R30[5])
-  P9_29  -> STEP_A  (PRU0 R30[1])  [réservé futur pru_uart TX_1]
+  P9_29  -> DIR_A   (PRU0 R30[1])
+  P9_31  -> STEP_A  (PRU0 R30[0])
 
   Motor B (Group 2)
-  P9_28  -> EN_B    (PRU0 R30[3])  (ACTIVE-LOW : 0 = driver ON)
-  P9_31  -> DIR_B   (PRU0 R30[0])  [réservé futur pru_uart TX_2]
-  P9_42  -> STEP_B  (PRU0 R30[4])
+  P9_41  -> EN_B    (PRU0 R30[6])  (ACTIVE-LOW : 0 = driver ON)
+  P9_28  -> DIR_B   (PRU0 R30[3])
+  P9_30  -> STEP_B  (PRU0 R30[2])
 
-  Endstops (PRU0 inputs)
-  P8_15  -> ENDSTOP_1 (PRU0 R31[15])
-  P8_16  -> ENDSTOP_2 (PRU0 R31[14])
+  Endstops (PRU1 inputs — sampled by PRU1 and published to PRU0)
+  P8_15  -> ENDSTOP_1 (PRU1 R31[15])
+  P8_16  -> ENDSTOP_2 (PRU1 R31[14])
 ```
 
 Remarques importantes :
@@ -231,6 +227,14 @@ Remarques importantes :
 - Les signaux `ENABLE` sont actifs bas (0 = driver activé).
 - `P9_29` et `P9_31` sont volontairement conservées pour migration future en
   `pru_uart` (TMC2209 UART mode).
+ 
+- Final chosen pins (retained mapping)
+- -----------------------------------
+- Motor A (spindle): P9_31=STEP_A, P9_29=DIR_A, P9_25=EN_A (active-low)
+- Motor B (lateral): P9_30=STEP_B, P9_28=DIR_B, P9_41=EN_B (active-low)
+ - Endstops: P8_15=ENDSTOP_1, P8_16=ENDSTOP_2 (sampled by PRU1 and published to PRU0)
+ - Encoders (eQEP): P9_42/P9_27 (encoder A), P8_33/P8_35 (encoder B)
+ - UART (TMC config): P9_24=UART1_TXD, P9_26=UART1_RXD
 
 Voir `src/pru/PRU_DEPLOY.md` pour la procédure complète de déploiement et de
 configuration des pins (`config-pin` ou `.dtbo`).

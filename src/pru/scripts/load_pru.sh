@@ -126,7 +126,7 @@ set_runtime_pinmux() {
     fi
 
     info "Applying runtime pinmux for canonical PRU0 motor map"
-    local out_pins=(P9_25 P9_27 P9_28 P9_29 P9_31 P9_42)
+    local out_pins=(P9_25 P9_29 P9_31 P9_41 P9_28 P9_30)
     local in_pins=(P8_15 P8_16)
     local pin
 

@@ -55,24 +55,24 @@ ramped interval instead of the raw base interval.
 **IEP timer owner**: PRU0 initialises the IEP counter at boot. PRU1 reads it.
 
 Responsibilities:
-- Own and initialise the IEP timer (`IEP_INIT()`)
-- Consume both move rings (spindle + lateral)
-- Toggle STEP/DIR/EN GPIO for both motors with IEP-absolute timing
-- Sample endstops on `R31[15]`/`R31[14]`
-- Publish both telemetry blocks + sync intervals
+  - Own and initialise the IEP timer (`IEP_INIT()`)
+  - Consume both move rings (spindle + lateral)
+  - Toggle STEP/DIR/EN GPIO for both motors with IEP-absolute timing
+  - Consume endstop state published by PRU1 (via `pru_sync->endstop_mask`)
+  - Publish both telemetry blocks + sync intervals
 
 ### Canonical PRU0 pin table
 
 | Header pin | PRU bit | Function | Notes |
 |------------|---------|----------|-------|
 | P9_25 | R30[7] | EN_A | active-low |
-| P9_27 | R30[5] | DIR_A | motor A direction |
-| P9_29 | R30[1] | STEP_A | reserved for future `pru_uart` TX_1 |
-| P9_28 | R30[3] | EN_B | active-low |
-| P9_31 | R30[0] | DIR_B | reserved for future `pru_uart` TX_2 |
-| P9_42 | R30[4] | STEP_B | motor B step |
-| P8_15 | R31[15] | ENDSTOP_1 | PRU input |
-| P8_16 | R31[14] | ENDSTOP_2 | PRU input |
+| P9_29 | R30[1] | DIR_A | motor A direction |
+| P9_31 | R30[0] | STEP_A | motor A step |
+| P9_41 | R30[6] | EN_B | active-low |
+| P9_28 | R30[3] | DIR_B | motor B direction |
+| P9_30 | R30[2] | STEP_B | motor B step |
+| P8_15 | R31[15] | ENDSTOP_1 | PRU1 input (published to PRU0) |
+| P8_16 | R31[14] | ENDSTOP_2 | PRU1 input (published to PRU0) |
 | P8_11 | eQEP | ENCODER_1_A | Linux/eQEP peripheral |
 | P8_12 | eQEP | ENCODER_1_B | Linux/eQEP peripheral |
 | P8_33 | eQEP | ENCODER_2_A | Linux/eQEP peripheral |

@@ -108,17 +108,17 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 
 Motor A (Group 1):
 - `P9_25` → `EN_A` (`PRU0 R30[7]`, active-low)
-- `P9_27` → `DIR_A` (`PRU0 R30[5]`)
-- `P9_29` → `STEP_A` (`PRU0 R30[1]`) — reserved for future `pru_uart` TX_1
+- `P9_29` → `DIR_A` (`PRU0 R30[1]`)
+- `P9_31` → `STEP_A` (`PRU0 R30[0]`)
 
 Motor B (Group 2):
-- `P9_28` → `EN_B` (`PRU0 R30[3]`, active-low)
-- `P9_31` → `DIR_B` (`PRU0 R30[0]`) — reserved for future `pru_uart` TX_2
-- `P9_42` → `STEP_B` (`PRU0 R30[4]`)
+- `P9_41` → `EN_B` (`PRU0 R30[6]`, active-low)
+- `P9_28` → `DIR_B` (`PRU0 R30[3]`)
+- `P9_30` → `STEP_B` (`PRU0 R30[2]`)
 
-Endstops (PRU0 inputs):
-- `P8_15` → `ENDSTOP_1` (`PRU0 R31[15]`)
-- `P8_16` → `ENDSTOP_2` (`PRU0 R31[14]`)
+Endstops (PRU1 inputs — sampled by PRU1 and published to PRU0):
+- `P8_15` → `ENDSTOP_1` (`PRU1 R31[15]`)
+- `P8_16` → `ENDSTOP_2` (`PRU1 R31[14]`)
 
 Additional board IO:
 - Encoder1: `P8_11` (A), `P8_12` (B)
@@ -130,6 +130,13 @@ Rules:
 - Do not remap these pins unless the user explicitly requests it.
 - Keep `P9_29` and `P9_31` reserved for future TMC2209 UART migration.
 - Any PRU pin change must update firmware + DTS + documentation in one commit.
+
+Selected / Retained pins (final):
+- Motor A: `P9_31` (STEP_A), `P9_29` (DIR_A), `P9_25` (EN_A, active-low)
+- Motor B: `P9_30` (STEP_B), `P9_28` (DIR_B), `P9_41` (EN_B, active-low)
+- Endstops: `P8_15`, `P8_16` (sampled by PRU1 and published to PRU0)
+- Encoders (eQEP): `P9_42`/`P9_27` and `P8_33`/`P8_35`
+- UART TMC config: `P9_24` (UART1_TXD), `P9_26` (UART1_RXD)
 
 ### 3.2 Linux Daemon Safety
 

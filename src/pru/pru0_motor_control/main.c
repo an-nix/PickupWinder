@@ -9,14 +9,14 @@
  *
  * Canonical PRU0 mapping:
  *   Motor A (spindle semantics in IPC):
- *     R30[1] -> P9_29 STEP_A   (future TMC UART TX #1 pin)
- *     R30[5] -> P9_27 DIR_A
+ *     R30[0] -> P9_31 STEP_A
+ *     R30[1] -> P9_29 DIR_A
  *     R30[7] -> P9_25 EN_A     (active-low)
  *
  *   Motor B (lateral semantics in IPC):
- *     R30[4] -> P9_42 STEP_B
- *     R30[0] -> P9_31 DIR_B    (future TMC UART TX #2 pin)
- *     R30[3] -> P9_28 EN_B     (active-low)
+ *     R30[2] -> P9_30 STEP_B
+ *     R30[3] -> P9_28 DIR_B
+ *     R30[6] -> P9_41 EN_B     (active-low)
  *
  *   Endstops:
  *     R31[15] -> P8_15 ENDSTOP_1
@@ -30,18 +30,18 @@
 #include "../include/pru_regs.h"
 
 /* Motor A (spindle IPC axis) */
-#define SP_STEP_BIT        (1u << 1)
-#define SP_DIR_BIT         (1u << 5)
+#define SP_STEP_BIT        (1u << 0)
+#define SP_DIR_BIT         (1u << 1)
 #define SP_EN_BIT          (1u << 7)   /* active-low */
 
 /* Motor B (lateral IPC axis) */
-#define LAT_STEP_BIT       (1u << 4)
-#define LAT_DIR_BIT        (1u << 0)
-#define LAT_EN_BIT         (1u << 3)   /* active-low */
+#define LAT_STEP_BIT       (1u << 2)
+#define LAT_DIR_BIT        (1u << 3)
+#define LAT_EN_BIT         (1u << 6)   /* active-low */
 
-/* Endstops (inputs on R31) */
-#define ENDSTOP1_BIT       (1u << 15)
-#define ENDSTOP2_BIT       (1u << 14)
+/* Endstops (PRU1 provides mask via pru_sync->endstop_mask). */
+#define ENDSTOP1_MASK       (1u << 0)  /* pru_sync->endstop_mask bit0 => ES1 */
+#define ENDSTOP2_MASK       (1u << 1)  /* pru_sync->endstop_mask bit1 => ES2 */
 
 /* Throttle constants (shared) */
 #include "../include/pru_throttle.h"
@@ -104,11 +104,11 @@ static inline void apply_dir_lat(const stepper_t *s) {
 }
 
 static inline uint8_t endstop1_hit(void) {
-    return (__R31 & ENDSTOP1_BIT) ? 0u : 1u;
+    return (pru_sync->endstop_mask & ENDSTOP1_MASK) ? 1u : 0u;
 }
 
 static inline uint8_t endstop2_hit(void) {
-    return (__R31 & ENDSTOP2_BIT) ? 0u : 1u;
+    return (pru_sync->endstop_mask & ENDSTOP2_MASK) ? 1u : 0u;
 }
 
 static void spindle_stop(void) {

@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * pickup-winder host IO overlay
+ * - encoders: eqep0 (P9_42/P9_27) and eqep1 (P8_33/P8_35)
+ * - UART1 pins for TMC2209 host-side configuration (P9_24/P9_26)
+ *
+ * This merged overlay enables host-side IO used by the application.
+ */
+
+/dts-v1/;
+/plugin/;
+/
+{
+    compatible = "ti,beaglebone", "ti,beaglebone-black";
+    part-number = "bone_host_io";
+    version = "00A0";
+
+    fragment@0 {
+        target = <&am33xx_pinmux>;
+        __overlay__ {
+            pinctrl_eqep1: pinctrl_eqep1_pins {
+                pinctrl-single,pins = <
+                    0x0D4 0x30 0x02  /* P8_33 = EQEP1B_in, MODE2 */
+                    0x0D0 0x30 0x02  /* P8_35 = EQEP1A_in, MODE2 */
+                >;
+            };
+
+            /* eQEP0 on P9 header (encoder A) */
+            pinctrl_eqep0: pinctrl_eqep0_pins {
+                pinctrl-single,pins = <
+                    0x1A0 0x30 0x01  /* P9_42 = EQEP0A_in, MODE1 */
+                    0x1A4 0x30 0x01  /* P9_27 = EQEP0B_in, MODE1 */
+                >;
+            };
+
+            pinctrl_tmc: pinctrl_tmc_pins {
+                pinctrl-single,pins = <
+                    0x118 0x10  /* P9_24 UART1_TXD */
+                    0x11C 0x10  /* P9_26 UART1_RXD */
+                >;
+            };
+        };
+    };
+
+    fragment@2 {
+        target = <&epwmss1>;
+        __overlay__ {
+            status = "okay";
+        };
+    };
+
+    fragment@3 {
+        target = <&eqep1>;
+        __overlay__ {
+            compatible = "ti,am3352-eqep";
+            pinctrl-names = "default";
+            pinctrl-0 = <&pinctrl_eqep1>;
+            count_mode = <0>;
+            swap_inputs = <0>;
+            invert_qa = <1>;
+            invert_qb = <1>;
+            status = "okay";
+        };
+    };
+
+    fragment@4 {
+        target = <&eqep0>;
+        __overlay__ {
+            compatible = "ti,am3352-eqep";
+            pinctrl-names = "default";
+            pinctrl-0 = <&pinctrl_eqep0>;
+            count_mode = <0>;
+            swap_inputs = <0>;
+            invert_qa = <1>;
+            invert_qb = <1>;
+            status = "okay";
+        };
+    };
+
+    fragment@5 {
+        target = <&ocp>;
+        __overlay__ {
+            pickup_winder_tmc: pickup_winder_tmc {
+                compatible = "pickup-winder,tmc-uart";
+                pinctrl-names = "default";
+                pinctrl-0 = <&pinctrl_tmc>;
+                status = "okay";
+            };
+        };
+    };
+};

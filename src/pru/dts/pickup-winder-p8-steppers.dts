@@ -4,18 +4,18 @@
  *
  * New canonical routing:
  *   Motor A:
- *     P9_29 -> PRU0 R30[1] STEP_A  (reserved for future pru_uart TX #1)
- *     P9_27 -> PRU0 R30[5] DIR_A
- *     P9_25 -> PRU0 R30[7] EN_A (active-low, pull-up)
- *
+ *     P9_25 -> PRU0 R30[7] EN_A   (active-low, pull-up)
+ *     P9_29 -> PRU0 R30[1] DIR_A
+ *     P9_31 -> PRU0 R30[0] STEP_A
+
  *   Motor B:
- *     P9_42 -> PRU0 R30[4] STEP_B
- *     P9_31 -> PRU0 R30[0] DIR_B  (reserved for future pru_uart TX #2)
- *     P9_28 -> PRU0 R30[3] EN_B (active-low, pull-up)
+ *     P9_41 -> PRU0 R30[6] EN_B   (active-low, pull-up)
+ *     P9_28 -> PRU0 R30[3] DIR_B
+ *     P9_30 -> PRU0 R30[2] STEP_B
  *
  *   Endstops (inputs):
- *     P8_15 -> PRU0 R31[15] ENDSTOP_1
- *     P8_16 -> PRU0 R31[14] ENDSTOP_2
+ *     P8_15 -> PRU1 R31[15] ENDSTOP_1 (PRU1 will sample and publish to PRU0)
+ *     P8_16 -> PRU1 R31[14] ENDSTOP_2 (PRU1 will sample and publish to PRU0)
  *
  * Build:
  *   dtc -O dtb -b 0 -@ pickup-winder-p8-steppers.dts \
@@ -41,19 +41,19 @@
 &am33xx_pinmux {
 	pickup_winder_stepper_pins: pickup-winder-stepper-pins {
 		pinctrl-single,pins = <
-			/* P9_29 mcasp0_fsx    pr1_pru0_pru_r30_1  STEP_A */
-			0x194 0x06
-			/* P9_27 mcasp0_fsr    pr1_pru0_pru_r30_5  DIR_A  */
-			0x1A4 0x06
 			/* P9_25 mcasp0_ahclkx pr1_pru0_pru_r30_7  EN_A (active-low, pull-up) */
 			0x1AC 0x16
-
-			/* P9_42 ecap0_in_pwm0_out pr1_pru0_pru_r30_4 STEP_B */
-			0x164 0x06
-			/* P9_31 mcasp0_aclkx      pr1_pru0_pru_r30_0 DIR_B  */
+			/* P9_29 mcasp0_fsx    pr1_pru0_pru_r30_1  DIR_A */
+			0x194 0x06
+			/* P9_31 mcasp0_aclkx      pr1_pru0_pru_r30_0 STEP_A */
 			0x190 0x06
-			/* P9_28 mcasp0_ahclkr     pr1_pru0_pru_r30_3 EN_B (active-low, pull-up) */
-			0x19C 0x16
+
+			/* P9_41 conf_gpmc_a1    pr1_pru0_pru_r30_6  EN_B (active-low, pull-up) */
+			0x1A8 0x16
+			/* P9_28 mcasp0_ahclkr     pr1_pru0_pru_r30_3 DIR_B */
+			0x19C 0x06
+			/* P9_30 ???              pr1_pru0_pru_r30_2 STEP_B */
+			0x198 0x06
 
 			/* P8_15 gpmc_ad15 pr1_pru0_pru_r31_15 ENDSTOP_1 input (pull-up) */
 			0x03C 0x2E

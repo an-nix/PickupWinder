@@ -20,6 +20,14 @@
 static volatile pru_sync_t *pru_sync =
     (volatile pru_sync_t *)(PRU_SRAM_PHYS_BASE + IPC_SYNC_OFFSET);
 
+/* R31 bits expected for the physical pins when configured for PRU1.
+ * Use the same bit indexes as documented for the board pins (15,14).
+ * PRU1 will sample its __R31 pins and publish a compact mask into
+ * pru_sync->endstop_mask where bit0 = ENDSTOP_1, bit1 = ENDSTOP_2.
+ */
+#define PRU1_R31_ES1_BIT  (1u << 15)
+#define PRU1_R31_ES2_BIT  (1u << 14)
+
 /* Lightweight supervisor heartbeat (private to PRU1 runtime). */
 static volatile uint32_t supervisor_heartbeat = 0u;
 
@@ -30,6 +38,15 @@ int main(void) {
         supervisor_heartbeat++;
         (void)pru_sync->spindle_interval;
         (void)pru_sync->lateral_interval;
+        /* Sample endstops and publish mask for PRU0 to consume. */
+        {
+            uint32_t mask = 0u;
+            uint8_t es1 = (__R31 & PRU1_R31_ES1_BIT) ? 0u : 1u;
+            uint8_t es2 = (__R31 & PRU1_R31_ES2_BIT) ? 0u : 1u;
+            if (es1) mask |= (1u << 0);
+            if (es2) mask |= (1u << 1);
+            pru_sync->endstop_mask = mask;
+        }
         __asm volatile ("NOP");
     }
     return 0;

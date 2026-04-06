@@ -150,8 +150,8 @@ typedef struct __attribute__((packed, aligned(4))) {
 
 ### GPIO
 ```
-R30[1] → P9_29  STEP_A
-R30[5] → P9_27  DIR_A
+R30[0] → P9_31  STEP_A
+R30[1] → P9_29  DIR_A
 R30[7] → P9_25  EN_A
 R30[2] → P9_30  SPINDLE_ENABLE  (actif bas)
 ```
@@ -209,11 +209,11 @@ drains while the stepper was running (host didn't push moves fast enough).
 
 ### GPIO
 ```
-R30[4]  → P9_42  STEP_B
-R30[0]  → P9_31  DIR_B
-R30[3]  → P9_28  EN_B           (actif bas)
-R31[15] → P8_15  ENDSTOP_1      (entrée)
-R31[14] → P8_16  ENDSTOP_2      (entrée)
+R30[2]  → P9_30  STEP_B
+R30[3]  → P9_28  DIR_B
+R30[6]  → P9_41  EN_B           (actif bas)
+R31[15] → P8_15  ENDSTOP_1      (entrée, PRU1 sampled)
+R31[14] → P8_16  ENDSTOP_2      (entrée, PRU1 sampled)
 ```
 
 ### Débounce capteur home (IEP-based)

@@ -1,0 +1,36 @@
+/* pickup-winder-00-pru-steppers-endstops.dts
+ * Combined PRU overlay: steppers (PRU0 outputs) + endstops (PRU1 inputs)
+ * This overlay groups the motor pins and the home sensors into a single
+ * overlay intended to be loaded for PRU operation.
+ */
+
+/dts-v1/;
+/plugin/;
+
+&am33xx_pinmux {
+    pru_step_end_pins: pru-step-end-pins {
+        pinctrl-single,pins = <
+            /* Steppers (PRU0 outputs) - mapped per project spec */
+            0x1AC 0x16 /* P9_25 EN_A   (R30[7]) pull-up recommended (active-low) */
+            0x194 0x06 /* P9_29 DIR_A  (R30[1]) */
+            0x190 0x06 /* P9_31 STEP_A (R30[0]) */
+
+            0x1A8 0x16 /* P9_41 EN_B   (R30[6]) pull-up recommended (active-low) */
+            0x19C 0x06 /* P9_28 DIR_B  (R30[3]) */
+            0x198 0x06 /* P9_30 STEP_B (R30[2]) */
+
+            /* Endstops (PRU1 inputs) */
+            0x03C 0x2E /* P8_15 ENDSTOP_1 (R31[15]) */
+            0x038 0x2E /* P8_16 ENDSTOP_2 (R31[14]) */
+        >;
+    };
+};
+
+&ocp {
+    pickup_winder_pru: pickup_winder_pru {
+        compatible = "pickup-winder,pru-step-end";
+        pinctrl-names = "default";
+        pinctrl-0 = <&pru_step_end_pins>;
+        status = "okay";
+    };
+};

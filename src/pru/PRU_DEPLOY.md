@@ -9,14 +9,16 @@ Important
 - Les signaux ENABLE sont actifs LOW (0 = driver ON).
 
 Rappel GPIO (PRU0)
-- P9_29  → STEP_A (R30[1])
-- P9_27  → DIR_A  (R30[5])
 - P9_25  → EN_A   (R30[7]) (active-low)
-- P9_42  → STEP_B (R30[4])
-- P9_31  → DIR_B  (R30[0])
-- P9_28  → EN_B   (R30[3]) (active-low)
+- P9_29  → DIR_A  (R30[1])
+- P9_31  → STEP_A (R30[0])
+- P9_41  → EN_B   (R30[6]) (active-low)
+- P9_28  → DIR_B  (R30[3])
+- P9_30  → STEP_B (R30[2])
 - P8_15  → ENDSTOP_1 (R31[15])
 - P8_16  → ENDSTOP_2 (R31[14])
+- P8_15  → ENDSTOP_1 (R31[15])  (PRU1 sampled, published to PRU0)
+- P8_16  → ENDSTOP_2 (R31[14])  (PRU1 sampled, published to PRU0)
 
 ## Déploiement automatisé recommandé
 

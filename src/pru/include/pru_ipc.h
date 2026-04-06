@@ -183,8 +183,8 @@ typedef struct __attribute__((packed, aligned(4))) {
 typedef struct __attribute__((packed, aligned(4))) {
     volatile uint32_t spindle_interval;  /* PRU0: current IEP interval       */
     volatile uint32_t lateral_interval;  /* PRU1: current IEP interval       */
+    volatile uint32_t endstop_mask;     /* PRU1 -> PRU0: endstop bits (bit0=ES1, bit1=ES2) */
     volatile uint32_t control_flags;     /* reserved                         */
-    volatile uint32_t _reserved;
 } pru_sync_t;
 
 /* ── Compile-time size checks ────────────────────────────────────────────────*/
