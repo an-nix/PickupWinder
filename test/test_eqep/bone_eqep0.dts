@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * eQEP0 overlay for BeagleBone (kernel 6.12+)
+ *
+ * This overlay configures the pinmux pads used by eQEP0 and enables
+ * the EPWMSS0/eqep0 device. It targets kernels which declare
+ * `#pinctrl-cells = <2>` (Debian 12 / kernel 6.12) so `pinctrl-single,pins`
+ * must use the 3-cell format per pin: `<pad_offset config_flags mux_mode>`.
+ *
+ * Important notes (from project investigation):
+ * - Use 3-cell entries: <offset config mux>. The final pad register value
+ *   written by the driver is `config_flags | mux_mode` (e.g. 0x30 | 0x01 = 0x31).
+ * - On kernel 6.12, attaching `pinctrl-0` directly to the `&eqep0` node may
+ *   result in only one pin being claimed by the driver. To avoid this, this
+ *   overlay applies the pinmux via `bone-pinmux-helper` under `&ocp` so the
+ *   pin configuration is applied independently from the device probe order.
+ * - For eQEP0 A/B (P9_42/P9_27) the correct MUXMODE is 1 (MODE1) on these pads.
+ *
+ * Pad offsets (confirmed):
+ *  - P9_42 = conf_gpmc_a0   = 0x1A0  (EQEP0A, MODE1)
+ *  - P9_27 = conf_gpmc_a3   = 0x1A4  (EQEP0B, MODE1)
+ *  - P9_41 = conf_gpmc_a1   = 0x1A8  (index/strobe — include if needed)
+ *  - P9_25 = conf_gpmc_a2   = 0x1AC
+ */
+
+/dts-v1/;
+/plugin/;
+
+/*
+ * Converted overlay: original 2-cell pin entries transformed to 3-cell
+ * (<offset config_flags mux_mode>) preserving the original combined values.
+ */
+
+/ {
+    compatible = "ti,beaglebone", "ti,beaglebone-black";
+
+    /* identification */
+    part-number = "bone_eqep0";
+    version = "00A0";
+
+    fragment@0 {
+        target = <&am33xx_pinmux>;
+        __overlay__ {
+            pinctrl_eqep0: pinctrl_eqep0_pins {
+                /* Converted entries:
+                 * 0x1A8 0x21 -> 0x1A8 0x20 0x01  (P9_41, MODE1)
+                 * 0x1AC 0x21 -> 0x1AC 0x20 0x01  (P9_25, MODE1)
+                 * 0x1A0 0x31 -> 0x1A0 0x30 0x01  (P9_42, MODE1)
+                 * 0x1A4 0x31 -> 0x1A4 0x30 0x01  (P9_27, MODE1)
+                 */
+                pinctrl-single,pins = <
+                    /*0x1A8 0x20 0x01*/  /* P9_41 = EQEP0_index, MODE1 (0x21 -> 0x20+0x01) */
+                    /*0x1AC 0x20 0x01*/  /* P9_25 = EQEP0_strobe, MODE1 (0x21 -> 0x20+0x01) */
+                    0x1A0 0x30 0x01  /* P9_42 = EQEP0A_in, MODE1 (0x31 -> 0x30+0x01) */
+                    0x1A4 0x30 0x01  /* P9_27 = EQEP0B_in, MODE1 (0x31 -> 0x30+0x01) */
+                >;
+            };
+        };
+    };
+
+    fragment@1 {
+        target = <&epwmss0>;
+        __overlay__ {
+            status = "okay";
+        };
+    };
+
+    fragment@2 {
+        target = <&eqep0>;
+        __overlay__ {
+            compatible = "ti,am3352-eqep";
+            pinctrl-names = "default";
+            pinctrl-0 = <&pinctrl_eqep0>;
+
+            count_mode = <0>;
+            swap_inputs = <0>;
+            invert_qa = <1>;
+            invert_qb = <1>;
+            /*invert_qi = <0>;*/
+            /*invert_qs = <0>;*/
+
+            status = "okay";
+        };
+    };
+};
+

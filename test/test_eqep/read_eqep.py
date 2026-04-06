@@ -103,19 +103,64 @@ def main():
     for count_path, enable_path in all_entries:
         print(f'  {count_path}')
 
-    # Enable all counter framework devices (kernel 6.x requires explicit enable)
+    # Configure runtime parameters for counter framework devices:
+    # - ensure ceiling is non-zero (set to 32-bit max)
+    # - ensure function is 'quadrature x4'
+    # - enable the counter
     print()
     enabled_any = False
+    TARGET_CEILING = '4294967295'
+    TARGET_FUNCTION = 'quadrature x4'
+
+    def write_sysfs(path, value):
+        try:
+            with open(path, 'w') as f:
+                f.write(value + '\n')
+            return True
+        except PermissionError:
+            print(f'  [!] Permission refusée pour écrire {path}')
+            return False
+        except Exception as e:
+            print(f'  [!] Erreur écriture {path}: {e}')
+            return False
+
     for count_path, enable_path in counter_entries:
-        current = read_value(os.path.join(os.path.dirname(count_path), 'enable'))
-        if current == '0':
-            print(f'Activation du compteur: {enable_path}')
-            if enable_counter(enable_path):
+        base = os.path.dirname(count_path)
+        ceiling_path = os.path.join(base, 'ceiling')
+        function_path = os.path.join(base, 'function')
+        enable_path = os.path.join(base, 'enable')
+
+        # Ensure ceiling
+        current_ceiling = read_value(ceiling_path)
+        if current_ceiling is None:
+            print(f'  [!] Impossible de lire {ceiling_path}')
+        elif current_ceiling.strip() == '0':
+            print(f'  [info] Réglage de ceiling -> {TARGET_CEILING}')
+            if not write_sysfs(ceiling_path, TARGET_CEILING):
+                print('  [!] Impossible de régler ceiling (permissions).')
+
+        # Ensure function
+        current_function = read_value(function_path)
+        if current_function is None:
+            print(f'  [!] Impossible de lire {function_path}')
+        elif current_function.strip() != TARGET_FUNCTION:
+            print(f'  [info] Réglage de function -> "{TARGET_FUNCTION}"')
+            if not write_sysfs(function_path, TARGET_FUNCTION):
+                print('  [!] Impossible de régler function (permissions).')
+
+        # Enable counter
+        current_enable = read_value(enable_path)
+        if current_enable == '0':
+            print(f'  Activation du compteur: {enable_path}')
+            if write_sysfs(enable_path, '1'):
                 enabled_any = True
-        else:
-            enabled_any = True  # already enabled
+            else:
+                print('  [!] Impossible d\'activer le compteur (permissions).')
+        elif current_enable == '1':
+            enabled_any = True
 
     if counter_entries and not enabled_any:
+        print('  [!] Aucun compteur activé — vérifier les permissions ou exécuter avec sudo')
         return 1
 
     print()

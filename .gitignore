@@ -8,3 +8,11 @@
 # PRU generated firmware binaries
 src/pru/build/
 build/
+
+# Python caches
+__pycache__/
+**/__pycache__/
+
+# Device Tree blobs (compiled overlays)
+*.dtbo
+test/test_eqep/*.dtbo
