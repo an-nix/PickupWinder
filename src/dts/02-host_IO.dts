@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Combined eQEP0, eQEP2 (alternate pins) & P9.24 (Input Pull-up)
+ * Combined eQEP0, eQEP2 (alternate pins) & P9.23 (Input Pull-up)
  * Targets BeagleBone Black - Kernel 6.12+ (Debian 12)
  * 3-cell format: <offset flags mode>
  */
@@ -18,6 +18,14 @@
     fragment@0 {
         target = <&am33xx_pinmux>;
         __overlay__ {
+
+            /* Groupe GPIO : P9.23 (gpmc_ad4) */
+            pinctrl_gpio_input: pinctrl_gpio_input_pins {
+                pinctrl-single,pins = <
+                    0x044 0x30 0x07  /* P9_23: Input + pull-up, Mode 7 */
+                >;
+            };
+
             /* Groupe eQEP0 : P9.42 & P9.27 */
             pinctrl_eqep0: pinctrl_eqep0_pins {
                 pinctrl-single,pins = <
@@ -34,20 +42,15 @@
                 >;
             };
 
-            /* Groupe GPIO : P9.24 (gpmc_ad8) */
-            pinctrl_gpio_input: pinctrl_gpio_input_pins {
-                pinctrl-single,pins = <
-                    0x020 0x30 0x07  /* P9_24: Input + pull-up, Mode 7 */
-                >;
-            };
+            
         };
     };
 
-    /* Application du pinmux pour P9_24 via le helper OCP */
+    /* Application du pinmux pour P9_23 via le helper OCP */
     fragment@1 {
         target = <&ocp>;
         __overlay__ {
-            P9_24_pinmux {
+            P9_23_pinmux {
                 compatible = "bone-pinmux-helper";
                 pinctrl-names = "default";
                 pinctrl-0 = <&pinctrl_gpio_input>;
