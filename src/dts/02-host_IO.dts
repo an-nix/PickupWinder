@@ -19,7 +19,7 @@
         target = <&am33xx_pinmux>;
         __overlay__ {
 
-            /* Groupe GPIO : P9.23 (gpmc_ad4) */
+            /* Groupe GPIO : P9.23 (conf_gpmc_a1 = GPIO1[17]) */
             pinctrl_gpio_input: pinctrl_gpio_input_pins {
                 pinctrl-single,pins = <
                     0x044 0x30 0x07  /* P9_23: Input + pull-up, Mode 7 */
@@ -46,16 +46,12 @@
         };
     };
 
-    /* Application du pinmux pour P9_23 via le helper OCP */
+    /* Attache pinmux P9_23 directement sur gpio1 (bone-pinmux-helper absent sur kernel 6.12) */
     fragment@1 {
-        target = <&ocp>;
+        target = <&gpio1>;
         __overlay__ {
-            P9_23_pinmux {
-                compatible = "bone-pinmux-helper";
-                pinctrl-names = "default";
-                pinctrl-0 = <&pinctrl_gpio_input>;
-                status = "okay";
-            };
+            pinctrl-names = "default";
+            pinctrl-0 = <&pinctrl_gpio_input>;
         };
     };
 
