@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Combined eQEP0 & eQEP1 overlay for BeagleBone Black (kernel 6.12+)
- * Targets Debian 12 with 3-cell pinmux format.
+ * Combined eQEP0, eQEP2 (alternate pins) & P9.24 (Input Pull-up)
+ * Targets BeagleBone Black - Kernel 6.12+ (Debian 12)
+ * 3-cell format: <offset flags mode>
  */
 
 /dts-v1/;
@@ -10,46 +11,64 @@
 / {
     compatible = "ti,beaglebone", "ti,beaglebone-black";
 
-    /* identification */
+    /* Identification */
     part-number = "bone_eqep_combined";
-    version = "00A0";
+    version = "00A6";
 
     fragment@0 {
         target = <&am33xx_pinmux>;
         __overlay__ {
+            /* Groupe eQEP0 : P9.42 & P9.27 */
             pinctrl_eqep0: pinctrl_eqep0_pins {
                 pinctrl-single,pins = <
-                    0x1A0 0x30 0x01  /* P9_42 = EQEP0A_in, MODE1 */
-                    0x1A4 0x30 0x01  /* P9_27 = EQEP0B_in, MODE1 */
+                    0x1A0 0x30 0x01  /* P9_42 = EQEP0A, MODE1 */
+                    0x1A4 0x30 0x01  /* P9_27 = EQEP0B, MODE1 */
                 >;
             };
 
-            pinctrl_eqep1: pinctrl_eqep1_pins {
+            /* Groupe eQEP2 (Alternate) : P8.12 & P8.11 */
+            pinctrl_eqep2: pinctrl_eqep2_pins {
                 pinctrl-single,pins = <
-                    0x0D4 0x30 0x02  /* P8_33 = EQEP1B_in, MODE2 */
-                    0x0D0 0x30 0x02  /* P8_35 = EQEP1A_in, MODE2 */
+                    0x030 0x30 0x04  /* P8_12 = EQEP2A_in, MODE4 */
+                    0x034 0x30 0x04  /* P8_11 = EQEP2B_in, MODE4 */
+                >;
+            };
+
+            /* Groupe GPIO : P9.24 (gpmc_ad8) */
+            pinctrl_gpio_input: pinctrl_gpio_input_pins {
+                pinctrl-single,pins = <
+                    0x020 0x30 0x07  /* P9_24: Input + pull-up, Mode 7 */
                 >;
             };
         };
     };
 
-    /* Enable EPWMSS units */
+    /* Application du pinmux pour P9_24 via le helper OCP */
     fragment@1 {
-        target = <&epwmss0>;
+        target = <&ocp>;
         __overlay__ {
-            status = "okay";
+            P9_24_pinmux {
+                compatible = "bone-pinmux-helper";
+                pinctrl-names = "default";
+                pinctrl-0 = <&pinctrl_gpio_input>;
+                status = "okay";
+            };
         };
     };
 
+    /* Activation ePWMSS 0 & 2 */
     fragment@2 {
-        target = <&epwmss1>;
-        __overlay__ {
-            status = "okay";
-        };
+        target = <&epwmss0>;
+        __overlay__ { status = "okay"; };
     };
 
-    /* Enable eQEP0 hardware */
     fragment@3 {
+        target = <&epwmss2>;
+        __overlay__ { status = "okay"; };
+    };
+
+    /* Activation Hardware eQEP 0 */
+    fragment@4 {
         target = <&eqep0>;
         __overlay__ {
             compatible = "ti,am3352-eqep";
@@ -63,13 +82,13 @@
         };
     };
 
-    /* Enable eQEP1 hardware */
-    fragment@4 {
-        target = <&eqep1>;
+    /* Activation Hardware eQEP 2 */
+    fragment@5 {
+        target = <&eqep2>;
         __overlay__ {
             compatible = "ti,am3352-eqep";
             pinctrl-names = "default";
-            pinctrl-0 = <&pinctrl_eqep1>;
+            pinctrl-0 = <&pinctrl_eqep2>;
             count_mode = <0>;
             swap_inputs = <0>;
             invert_qa = <1>;
