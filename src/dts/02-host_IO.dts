@@ -19,7 +19,7 @@
         target = <&am33xx_pinmux>;
         __overlay__ {
 
-            /* Groupe GPIO : P9.23 (conf_gpmc_a1 = GPIO1[17]) */
+            /* Groupe GPIO : P9.23 (GPIO0[17], offset 0x044) */
             pinctrl_gpio_input: pinctrl_gpio_input_pins {
                 pinctrl-single,pins = <
                     0x044 0x30 0x07  /* P9_23: Input + pull-up, Mode 7 */

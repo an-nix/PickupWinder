@@ -290,6 +290,8 @@ IDLE --(rodage)--> RODAGE --(rodage_stop/complete)--> IDLE
 | 2-cell `pinctrl-single,pins` on kernel 6.12 | `#pinctrl-cells=<2>` expects 3-cell format; only first pin applied, rest silently skipped |
 | `fragment@ {}` syntax in `/plugin/` DTS | Works on older kernels, unreliable on 6.12; use direct `&node {}` syntax |
 | `pinctrl-0` on counter/eQEP driver node only | `ti-eqep-cnt` may claim only one pin during probe; prefer `bone-pinmux-helper` if needed |
+| `bone-pinmux-helper` on kernel 6.12 | Driver not compiled in kernel 6.12; node appears in sysfs with `waiting_for_supplier` but no `driver/` symlink → pinmux never applied. Use `&gpio1` / `&gpio0` target instead |
+| Wrong pad offset for GPIO input pin | P9_23 is NOT `gpmc_ad4` (0x010). Derive offset from the pinctrl debugfs dump: `cat /sys/kernel/debug/pinctrl/44e10800.pinmux-pinctrl-single/pins` — identify the pin by its `gpio-XX-YY` label, then offset = `register_address - 0x44e10800` |
 
 ---
 
@@ -479,9 +481,67 @@ uboot_overlay_addr4=/lib/firmware/MY-OVERLAY-00A0.dtbo
 | Attaching `pinctrl-0` to a counter/eQEP driver node | `ti-eqep-cnt` may claim only one pin at probe; `bone-pinmux-helper` under `&ocp` avoids this |
 | `0x32` / `0x34` used as combined value in 2-cell | Worked on old kernels; misleading on 6.12 where cells are split |
 | Missing `-@` flag in `dtc` command | Overlay symbols not emitted; `dtbo` loads but references unresolved |
+| `bone-pinmux-helper` on kernel 6.12 | Not compiled; node appears in sysfs (`waiting_for_supplier`) but pinmux is never applied. Use `&gpio0` / `&gpio1` as target instead |
+| Wrong pad offset derived from pin name | Do NOT guess offsets from pad names (e.g. `gpmc_ad4` ≠ P9_23). Always derive from the pinctrl debugfs dump (see §11.7) |
 
 
 ### 11.6 Debugging tips
+
+### 11.7 Comment trouver le bon pad offset — méthode fiable
+
+Ne jamais deviner l'offset depuis le nom du pad ou la documentation générique AM335x :
+les noms (`gpmc_ad4`, `gpmc_a1`, etc.) ne correspondent pas directement au numéro
+de broche BBB (P8/P9).
+
+**Procédure à suivre :**
+
+1. Lire le dump pinctrl réel sur la cible :
+   ```bash
+   cat /sys/kernel/debug/pinctrl/44e10800.pinmux-pinctrl-single/pins
+   ```
+
+2. Chaque ligne a la forme :
+   ```
+   pin NN (PINNN)  GPIO_BANK:GPIO_NUM  REGISTER_ADDR  VALUE  pinctrl-single
+   ```
+
+3. Identifier la pin par son GPIO connu :
+   - P9_23 = GPIO1[17] → cherche `17:gpio-32-63` (GPIO1 = bank 32–63)
+   - P9_24 = GPIO0[15] → cherche `15:gpio-0-31`
+
+4. Calculer l'offset :
+   ```
+   offset = REGISTER_ADDR - 0x44e10800
+   ```
+   Exemple : `44e10844 - 44e10800 = 0x044`
+
+5. Vérifier après application de l'overlay que la valeur passe bien à `0x37`
+   (pull-up + input + MODE7) :
+   ```bash
+   grep '44e10844' /sys/kernel/debug/pinctrl/44e10800.pinmux-pinctrl-single/pins
+   ```
+
+**Valeurs de référence confirmées sur ce projet :**
+
+| BBB Pin | GPIO | Registre | Offset DTS | Valeur repos |
+|---------|------|----------|------------|--------------|
+| P9_23 | GPIO1[17] = gpio-32-63 #17 | `44e10844` | `0x044` | `0x2f` (pull-down) |
+| P8_33 | GPIO0[11] = gpio-0-31 #11  | `44e108d4` | `0x0D4` | — |
+| P8_35 | GPIO0[8]  = gpio-0-31 #8   | `44e108d0` | `0x0D0` | — |
+
+**Pour les GPIO input sur kernel 6.12 :** utiliser `&gpio0` ou `&gpio1` comme
+target du fragment au lieu de `bone-pinmux-helper` (non compilé dans kernel 6.12) :
+
+```dts
+fragment@1 {
+    target = <&gpio1>;   /* GPIO1 pour P9_23 */
+    __overlay__ {
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_gpio_input>;
+    };
+};
+```
+
 # BeagleBone eQEP (Kernel 6.6+)
 
 Purpose: Concise checklist for using the modern Linux `counter` framework
