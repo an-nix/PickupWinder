@@ -280,6 +280,9 @@ IDLE --(rodage)--> RODAGE --(rodage_stop/complete)--> IDLE
 | Missing add pre-apply at move boundary | Ramp timing skew vs Klipper (stepper_try_load_next) |
 | pushDecelToStop for speed decrease | Decels to Hz=1 instead of target; use pushAccelSegment |
 | Ignoring FAULT_MOVE_UNDERRUN | Ring drained while running; host didn't push fast enough |
+| 2-cell `pinctrl-single,pins` on kernel 6.12 | `#pinctrl-cells=<2>` expects 3-cell format; only first pin applied, rest silently skipped |
+| `fragment@ {}` syntax in `/plugin/` DTS | Works on older kernels, unreliable on 6.12; use direct `&node {}` syntax |
+| `pinctrl-0` on counter/eQEP driver node only | `ti-eqep-cnt` may claim only one pin during probe; prefer `bone-pinmux-helper` if needed |
 
 ---
 
@@ -353,3 +356,171 @@ archive/original_esp32/     <- ESP32 sources (reference only, do NOT modify)
 Do not modify `archive/original_esp32/`.
 Do not create new source files without clear domain justification.
 Keep the WinderApp split (Core, Commands, GeometryPattern, Telemetry, Recipe).
+
+---
+
+## 11. Device Tree Overlay Authoring (BBB / kernel 6.12)
+
+### 11.1 pinctrl-single,pins format — CRITICAL
+
+The AM335x pinmux node on Debian 12 / kernel 6.12 declares **`#pinctrl-cells = <2>`**.
+This switches `pinctrl-single,pins` to **3-cell format per pin**:
+
+```
+<pad_offset   config_flags   mux_mode>
+```
+
+The driver writes `config_flags | mux_mode` to the pad register at
+`pinmux_base + pad_offset`.
+
+> ⚠️ **Using the old 2-cell format `<offset value>` silently applies only the
+> first pin.** The second pin's offset is misinterpreted as a config value and
+> skipped. This is the root cause of "one pin claimed, the other stays GPIO".
+
+#### Evidence from the running DTB (kernel 6.12.76-bone50)
+
+| Group | Raw cells | Format | Interpretation |
+|---|---|---|---|
+| `i2c0-pins` | `<0x188 0x30 0x00  0x18c 0x30 0x00>` | 3-cell | 2 pins: conf_i2c0_sda + conf_i2c0_scl |
+| `i2c2-pins` | `<0x178 0x30 0x03  0x17c 0x30 0x03>` | 3-cell | 2 pins: I2C2 SDA/SCL at MODE3 |
+| `user-leds-s0` | `<0x54 0x00 0x07  0x58 0x10 0x07  0x5c 0x00 0x07  0x60 0x10 0x07>` | 3-cell | 4 LED GPIO pins at MODE7 |
+| `pinmux_comms_can` | `<0x184 0x32  0x180 0x12>` | **2-cell** | Old BBORG cape overlay, pre-6.12 format |
+| `pinmux_comms_rs485` | `<0x74 0x0e  0x70 0x2e>` | **2-cell** | Old BBORG cape overlay, pre-6.12 format |
+
+The 2-cell entries come from older BeagleBone cape overlays compiled against the
+legacy binding; they still load but must not be used as templates.
+**All new overlays targeting kernel 6.12 must use 3-cell format.**
+
+Note: `&am33xx_pinmux` and `&bone_pinmux` are aliases for the same node
+(`/ocp/interconnect@44c00000/segment@200000/target-module@10000/scm@0/pinmux@800`);
+both labels work in overlays.
+
+### 11.2 Pad register config_flags bits (AM335x)
+
+| Bit | Name | 0 | 1 |
+|-----|------|---|---|
+| 6 | SLEWCTRL | fast | slow |
+| 5 | RXACTIVE | input disabled | input enabled |
+| 4 | PUTYPESEL | pull-down | pull-up |
+| 3 | PUDEN | pull **enabled** | pull disabled |
+| 2:0 | MUXMODE | — | 0–7 function select |
+
+Common `config_flags` values:
+
+| Value | Binary | Meaning | Typical use |
+|-------|--------|---------|-------------|
+| `0x30` | `00110000` | fast, rx-EN, pull-UP, pull-EN | digital input with pull-up (encoder, eQEP) |
+| `0x10` | `00010000` | fast, rx-OFF, pull-UP, pull-EN | GPIO output with pull-up |
+| `0x00` | `00000000` | fast, rx-OFF, pull-DOWN, pull-EN | GPIO output, pull-down |
+| `0x08` | `00001000` | fast, rx-OFF, pull-DISABLED | PRU output (STEP/DIR/EN — no pull load) |
+| `0x20` | `00100000` | fast, rx-EN, pull-DOWN, pull-EN | input with pull-down |
+
+Final register value = `config_flags | mux_mode`.
+Example: pull-up input at MODE4 → `0x30 | 0x04 = 0x34`.
+
+### 11.3 Known pad offsets (confirmed in this project)
+
+| BBB Pin | Pad name | Offset | Function at MODE | Config | Final reg |
+|---------|----------|--------|------------------|--------|-----------|
+| P8_35 | conf_mcasp0_ahclkr | `0x0D0` | MODE4 = EQEP1A_in | `0x30 0x04` | `0x34` |
+| P8_33 | conf_mcasp0_fsr    | `0x0D4` | MODE4 = EQEP1B_in | `0x30 0x04` | `0x34` |
+| — | conf_i2c0_sda | `0x188` | MODE0 = I2C0_SDA  | `0x30 0x00` | `0x30` |
+| — | conf_i2c0_scl | `0x18C` | MODE0 = I2C0_SCL  | `0x30 0x00` | `0x30` |
+
+For PRU stepper and endstop pins (P9 header, P8_15/16), see
+`src/pru/dts/pickup-winder-p8-steppers.dts` — confirmed working with the same
+3-cell syntax.
+
+### 11.4 Minimal working overlay template
+
+```dts
+/dts-v1/;
+/plugin/;
+
+&am33xx_pinmux {
+    my_pins: my_pins {
+        pinctrl-single,pins = <
+            /* offset  config  mux  -- final = config | mux */
+            0x0D0  0x30  0x04   /* P8_35: input, pull-up, MODE4 */
+            0x0D4  0x30  0x04   /* P8_33: input, pull-up, MODE4 */
+        >;
+    };
+};
+
+&my_device {
+    pinctrl-names = "default";
+    pinctrl-0 = <&my_pins>;
+    status = "okay";
+};
+```
+
+Build:  `dtc -O dtb -o MY-OVERLAY-00A0.dtbo -b 0 -@ overlay.dts`
+
+Deploy:
+```bash
+sudo cp MY-OVERLAY-00A0.dtbo /lib/firmware/
+# In /boot/uEnv.txt:
+uboot_overlay_addr4=/lib/firmware/MY-OVERLAY-00A0.dtbo
+```
+
+### 11.5 Overlay-specific pitfalls
+
+| Pitfall | Effect |
+|---------|--------|
+| 2-cell format on kernel 6.12 (`<offset value>`) | Only first pin applied; rest silently skipped |
+| `fragment@ {}` syntax inside `/plugin/` | Unreliable on kernel 6.12; use direct `&node {}` |
+| Attaching `pinctrl-0` to a counter/eQEP driver node | `ti-eqep-cnt` may claim only one pin at probe; `bone-pinmux-helper` under `&ocp` avoids this |
+| `0x32` / `0x34` used as combined value in 2-cell | Worked on old kernels; misleading on 6.12 where cells are split |
+| Missing `-@` flag in `dtc` command | Overlay symbols not emitted; `dtbo` loads but references unresolved |
+
+
+### 11.6 Debugging tips
+# BeagleBone eQEP (Kernel 6.6+)
+
+Purpose: Concise checklist for using the modern Linux `counter` framework
+with the AM335x eQEP peripheral and avoiding common "busy" or zero-count
+failures.
+
+- Hardware & overlay:
+  - eQEP1 is part of EPWMSS1 (physical base `0x48302000`).
+  - eQEP1 device address (counter child): `0x48302180` (appears as `48302180.counter`).
+  - Pins to configure for eQEP1: **P8.33** and **P8.35** must be set to the QEP
+    function (MODE2 on some images) — use the pad offsets and muxmode required by your image.
+  - Always use 3-cell pin entries in overlays for kernel 6.x: `<offset config_flags mux_mode>`
+    (example: `0x0D4 0x30 0x02`).
+
+- Driver & sysfs location:
+  - Modern driver: `ti-eqep-cnt` (counter framework). Do not rely on legacy
+    `/sys/devices/.../eqep*` paths.
+  - The device shows up on the counter bus: `/sys/bus/counter/devices/counterX/`.
+  - The driver node binds to the device at the physical address: `48302180.counter` — verify with
+    `readlink -f /sys/bus/counter/devices/counter0/of_node`.
+
+- Runtime configuration (critical):
+  - `count0/ceiling`: set to `4294967295` (32-bit max). If `ceiling` is left at `0`,
+    the counter will remain at zero.
+    - `echo 4294967295 | sudo tee /sys/bus/counter/devices/counter0/count0/ceiling`
+  - `count0/function`: set to `quadrature x4` for full quadrature counting.
+    - `echo 'quadrature x4' | sudo tee /sys/bus/counter/devices/counter0/count0/function`
+  - `count0/enable`: set to `1` to start counting.
+    - `echo 1 | sudo tee /sys/bus/counter/devices/counter0/count0/enable`
+
+- Diagnostics & sanity checks:
+  - Confirm pinmux: `show-pins | grep -E 'P8\.(33|35|31|32)'` (or inspect DT overlay produced values / devmem2 pad registers).
+  - Confirm counter device: `ls /sys/bus/counter/devices/` should list `counter0` (or similar).
+  - Confirm driver binding: `ls -l /sys/bus/platform/devices/48302180.counter/driver` (should point to `ti-eqep-cnt`).
+  - Confirm runtime config:
+    - `cat /sys/bus/counter/devices/counter0/count0/ceiling`
+    - `cat /sys/bus/counter/devices/counter0/count0/function`
+    - `cat /sys/bus/counter/devices/counter0/count0/enable`
+  - Check `signal0_action` / `signal1_action` — for quadrature both signals should be active
+    (e.g. `both edges`). If one signal is `none` the counter will not increment.
+
+- Common failure modes:
+  - `ceiling=0` → counter stays at zero even with signals present.
+  - `function` not set to `quadrature x4` → wrong counting mode.
+  - `enable=0` → counter disabled.
+  - Pinmux still in old 2-cell format → only first pin applied; second pin remains GPIO.
+  - `pinctrl-0` attached to `&eqep1` may cause only one pin to be claimed on some kernels; prefer `bone-pinmux-helper` under `&ocp` to apply pinctrl.
+
+Add this document as a companion to `.github/copilot-instructions.md` or paste the section into that file when updating the central instructions.
