@@ -212,8 +212,8 @@ drains while the stepper was running (host didn't push moves fast enough).
 R30[2]  → P9_30  STEP_B
 R30[3]  → P9_28  DIR_B
 R30[6]  → P9_41  EN_B           (actif bas)
-R31[15] → P8_15  ENDSTOP_1      (entrée, PRU1 sampled)
-R31[14] → P8_16  ENDSTOP_2      (entrée, PRU1 sampled)
+R31[15] → P8_15  ENDSTOP_1      (entrée, currently PRU0 sampled; PRU1 pins used by eQEP2)
+R31[14] → P8_16  ENDSTOP_2      (entrée, currently PRU0 sampled; PRU1 pins used by eQEP2)
 ```
 
 ### Débounce capteur home (IEP-based)

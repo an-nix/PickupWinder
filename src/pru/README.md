@@ -71,8 +71,8 @@ Responsibilities:
 | P9_41 | R30[6] | EN_B | active-low |
 | P9_28 | R30[3] | DIR_B | motor B direction |
 | P9_30 | R30[2] | STEP_B | motor B step |
-| P8_15 | R31[15] | ENDSTOP_1 | PRU1 input (published to PRU0) |
-| P8_16 | R31[14] | ENDSTOP_2 | PRU1 input (published to PRU0) |
+| P8_15 | R31[15] | ENDSTOP_1 | currently PRU0 input (temporary; PRU1 pins used by eQEP2) |
+| P8_16 | R31[14] | ENDSTOP_2 | currently PRU0 input (temporary; PRU1 pins used by eQEP2) |
 | P8_11 | eQEP | ENCODER_1_A | Linux/eQEP peripheral |
 | P8_12 | eQEP | ENCODER_1_B | Linux/eQEP peripheral |
 | P8_33 | eQEP | ENCODER_2_A | Linux/eQEP peripheral |
