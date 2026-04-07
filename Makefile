@@ -40,16 +40,9 @@ pru:
 	$(MAKE) -C src/pru OUT_DIR=$(CURDIR)/build/pru
 
 # ── C daemon ─────────────────────────────────────────────────────────────
-DAEMON_SRC := src/linux/daemon/pickup_daemon.c
-DAEMON_BIN := build/daemon/pickup_daemon
-DAEMON_CC  ?= gcc
-DAEMON_CFLAGS ?= -O2 -Wall -Wextra -I src/pru/include
-
 daemon:
-	@mkdir -p build/daemon
 	@echo "=== Building daemon ==="
-	$(DAEMON_CC) $(DAEMON_CFLAGS) $(DAEMON_SRC) -o $(DAEMON_BIN)
-	@echo "  -> $(DAEMON_BIN)"
+	$(MAKE) -C src/linux/daemon OUT_DIR=$(CURDIR)/build/daemon
 
 # ── Clean ─────────────────────────────────────────────────────────────────
 clean:

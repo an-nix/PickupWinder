@@ -96,8 +96,23 @@ Makefile                        Root build orchestrator
 ### Prerequisites
 
 - `pru-unknown-elf-gcc` (crosstool-NG) for PRU firmware
-- `gcc` (ARM native or cross) for daemon
+- ARM cross-compiler for daemon on x86 hosts (e.g. `arm-linux-gnueabihf-gcc`)
 - `dtc` for device-tree overlays
+
+### Compiler usage
+
+- PRU firmware: built with `pru-unknown-elf-gcc` from crosstool-NG, typically found in `~/x-tools/*/bin/pru-elf-gcc` or `~/x-tools/*/bin/pru-gcc`.
+- Host daemon: on x86 hosts, `make daemon` automatically searches for an ARM cross-compiler in `PATH` or in `$(HOME)/x-tools/*/bin`.
+  - supported toolchain names include `arm-linux-gnueabihf-gcc`, `armv7l-linux-gnueabihf-gcc`, or equivalent ARM GNU toolchains.
+  - if none is found, the build fails and prompts you to install an ARM cross-toolchain.
+- On an ARM host, the normal native `gcc` is used for `pickup_daemon`.
+
+### Cross compilation
+
+When building on an x86 host, `make daemon` will automatically search for an ARM cross-compiler in your `PATH` and in `$(HOME)/x-tools/*/bin`.
+If none is found, the build prints a clear error and you must either install an ARM cross-toolchain or build the daemon directly on the BeagleBone.
+
+If you already have a cross-toolchain in `~/x-tools`, no extra flags are required.
 
 ### Build everything
 
