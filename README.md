@@ -103,7 +103,7 @@ Makefile                        Root build orchestrator
 
 - PRU firmware: built with `pru-unknown-elf-gcc` from crosstool-NG, typically found in `~/x-tools/*/bin/pru-elf-gcc` or `~/x-tools/*/bin/pru-gcc`.
 - Host daemon: on x86 hosts, `make daemon` automatically searches for an ARM cross-compiler in `PATH` or in `$(HOME)/x-tools/*/bin`.
-  - supported toolchain names include `arm-linux-gnueabihf-gcc`, `armv7l-linux-gnueabihf-gcc`, or equivalent ARM GNU toolchains.
+  - supported toolchain names include `arm-linux-gnueabihf-gcc`, `arm-cortex_a8-linux-gnueabihf-gcc`, `armv7l-linux-gnueabihf-gcc`, or equivalent ARM GNU toolchains.
   - if none is found, the build fails and prompts you to install an ARM cross-toolchain.
 - On an ARM host, the normal native `gcc` is used for `pickup_daemon`.
 

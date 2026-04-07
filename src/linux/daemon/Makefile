@@ -14,6 +14,9 @@ ifneq ($(strip $(DAEMON_CC)),)
 else
   DAEMON_CC := $(shell ls $(TOOLCHAIN_DIR)/*/bin/arm-linux-gnueabihf-gcc 2>/dev/null | head -n1)
   ifeq ($(strip $(DAEMON_CC)),)
+    DAEMON_CC := $(shell ls $(TOOLCHAIN_DIR)/*/bin/arm-cortex_a8-linux-gnueabihf-gcc 2>/dev/null | head -n1)
+  endif
+  ifeq ($(strip $(DAEMON_CC)),)
     DAEMON_CC := $(shell ls $(TOOLCHAIN_DIR)/*/bin/*arm*-linux-gnueabihf-gcc 2>/dev/null | head -n1)
   endif
   ifeq ($(strip $(DAEMON_CC)),)
