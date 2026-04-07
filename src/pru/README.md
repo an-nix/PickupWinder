@@ -1,145 +1,151 @@
 # PRU Firmware — PickupWinder (BeagleBone Black)
 
-This folder contains PRU firmware sources and build helpers for the AM335x
-PRUs used by PickupWinder. Two PRU images are built:
+Two PRU firmware images for the AM335x PRUs:
 
-- `build/am335x-pru0-fw` — PRU0 (dual-motor real-time control + endstops)
-- `build/am335x-pru1-fw` — PRU1 (orchestration/supervision + host-link side tasks)
-
----
-
-## Architecture: Klipper-inspired move rings
-
-Step generation follows the Klipper model: the **Linux host** pre-computes
-all step moves as `(interval, count, add)` triples and pushes them into
-per-axis ring buffers in PRU Shared RAM. The PRUs are pure consumers — they
-never compute speeds, ramps, or do divisions. All timing is driven by the
-200 MHz IEP hardware counter.
-
-```
-Linux host                        PRU Shared RAM           PRU
-─────────────────────────────     ─────────────────        ───────────────────
-MoveQueue::pushAccelSegment()  →  spindle move ring   →  PRU0 motor A edge loop
-MoveQueue::pushConstantMs()    →  lateral move ring   →  PRU0 motor B edge loop
-sendCommand()/status sync      ↔  cmd/telem/sync      ↔  PRU1 supervision loop
-```
-
-**Move triple format** (`pru_move_t`, 16 bytes):
-```c
-uint32_t interval;   /* IEP cycles between two edges (min 625 = 3.125 µs) */
-uint32_t count;      /* total edges to generate (= 2 × step_count)       */
-int32_t  add;        /* per-edge interval delta (linear ramp, 0 = const)  */
-uint8_t  direction;  /* 0 = forward, 1 = backward                         */
-```
-
-The edge algorithm (`pru_stepper.h`) at each edge:
-```c
-toggle STEP pin
-stepper.count--
-if (count == 0):
-  pop next move from ring or stop (set underrun fault if ring drained)
-  on success: next_edge_time += new.interval; interval += add  (Klipper pre-apply)
-else:
-  stepper.next_edge_time += stepper.interval
-  stepper.interval        += stepper.add     /* Klipper exact order */
-```
-
-On move boundary, `interval += add` is pre-applied (matching Klipper's
-`stepper_load_next`) so the first inter-edge gap of the new move uses the
-ramped interval instead of the raw base interval.
+- `am335x-pru0-fw` — PRU0: dual-motor real-time pulse generator + endstop safety
+- `am335x-pru1-fw` — PRU1: orchestrator / brain + host communication
 
 ---
 
-## PRU0 — Motor control + real-time IO (authoritative)
+## Architecture: Option A — Continuous Shared Parameters
 
-**IEP timer owner**: PRU0 initialises the IEP counter at boot. PRU1 reads it.
+PRU0 is a **dumb motor driver**. It reads motor parameters from PRU1 and
+generates STEP/DIR/EN pulses via the IEP hardware counter. It knows nothing
+about commands, homing, or the host.
+
+PRU1 is the **orchestrator**. It reads commands from the host (via shared RAM),
+manages the homing state machine, writes motor parameters for PRU0, and
+publishes aggregated status for the daemon.
+
+```
+Host ──host_cmd_t──→ PRU1 ──motor_params_t──→ PRU0
+                     PRU1 ←──motor_telem_t── PRU0
+Host ←─pru_status_t─ PRU1
+```
+
+**No move rings.** Speed changes are instantaneous. The host sets target
+frequencies (Hz); PRU1 converts to IEP intervals and writes `motor_params_t`.
+PRU0 reads and generates continuous pulses.
+
+---
+
+## PRU0 — Motor Control (Layer 1)
+
+**IEP timer owner**: PRU0 initializes the IEP counter at boot. PRU1 reads only.
 
 Responsibilities:
-  - Own and initialise the IEP timer (`IEP_INIT()`)
-  - Consume both move rings (spindle + lateral)
-  - Toggle STEP/DIR/EN GPIO for both motors with IEP-absolute timing
-  - Consume endstop state published by PRU1 (via `pru_sync->endstop_mask`)
-  - Publish both telemetry blocks + sync intervals
+- Initialize and own the IEP timer (`IEP_INIT()`)
+- Read `motor_params_t` from PRU1 continuously
+- Apply STEP/DIR/EN GPIO for both axes
+- IEP-based pulse generation via `pulse_gen_t` engine (`pulse_update()`)
+- Read R31 endstops — unconditional lateral safety stop
+- Publish `motor_telem_t` (step counts, positions, faults, endstop mask)
 
-### Canonical PRU0 pin table
+**PRU0 does NOT**: process commands, perform homing, communicate with the host,
+make decisions. It is a pure real-time motor driver.
 
-| Header pin | PRU bit | Function | Notes |
-|------------|---------|----------|-------|
-| P9_25 | R30[7] | EN_A | active-low |
-| P9_29 | R30[1] | DIR_A | motor A direction |
-| P9_31 | R30[0] | STEP_A | motor A step |
-| P9_41 | R30[6] | EN_B | active-low |
-| P9_28 | R30[3] | DIR_B | motor B direction |
-| P9_30 | R30[2] | STEP_B | motor B step |
-| P8_15 | R31[15] | ENDSTOP_1 | currently PRU0 input (temporary; PRU1 pins used by eQEP2) |
-| P8_16 | R31[14] | ENDSTOP_2 | currently PRU0 input (temporary; PRU1 pins used by eQEP2) |
-| P8_11 | eQEP | ENCODER_1_A | Linux/eQEP peripheral |
-| P8_12 | eQEP | ENCODER_1_B | Linux/eQEP peripheral |
-| P8_33 | eQEP | ENCODER_2_A | Linux/eQEP peripheral |
-| P8_35 | eQEP | ENCODER_2_B | Linux/eQEP peripheral |
-| P9_12 | GPIO | HX711_SCK | host-side GPIO |
-| P9_14 | GPIO | HX711_DOUT | host-side GPIO |
-| P9_23 | GPIO | FOOTSWITCH | host-side GPIO |
+### PRU0 Pin Table
+
+| Header pin | PRU bit  | Function   | Notes |
+|------------|----------|------------|-------|
+| P9_25      | R30\[7\] | EN_A       | Spindle enable (active-low) |
+| P9_29      | R30\[1\] | DIR_A      | Spindle direction |
+| P9_31      | R30\[0\] | STEP_A     | Spindle step |
+| P9_41      | R30\[6\] | EN_B       | Lateral enable (active-low) |
+| P9_28      | R30\[3\] | DIR_B      | Lateral direction |
+| P9_30      | R30\[2\] | STEP_B     | Lateral step |
+| P8_15      | R31\[15\] | ENDSTOP_1 | Lateral endstop input |
+| P8_16      | R31\[14\] | ENDSTOP_2 | Lateral endstop input |
+
+### Pulse Generation Engine
+
+The `pulse_gen_t` struct (in `pru_stepper.h`) implements continuous IEP-based
+pulse generation. Each axis has its own `pulse_gen_t`:
+
+```c
+typedef struct {
+    uint32_t next_edge;    /* IEP timestamp for next STEP toggle     */
+    uint32_t interval;     /* IEP cycles between edges               */
+    uint32_t step_count;   /* total steps since last reset           */
+    int32_t  position;     /* signed position (steps)                */
+    uint8_t  phase;        /* 0=rising, 1=falling                    */
+    uint8_t  direction;    /* cached direction for position tracking */
+    uint8_t  running;      /* actively generating pulses             */
+    uint8_t  _pad;
+} pulse_gen_t;
+```
+
+`pulse_update(&gen, step_bit, IEP_NOW())`:
+- If not running or interval==0: skip.
+- If IEP has passed `next_edge`: toggle STEP pin, count, advance next_edge.
+- Handles both rising and falling edges (50% duty cycle).
 
 ---
 
-## PRU1 — Low-level orchestration + supervision
+## PRU1 — Orchestration (Layer 2)
 
 **IEP timer reader**: PRU1 reads PRU0's IEP state. Never resets it.
 
 Responsibilities:
-- Keep orchestration/supervision runtime alive
-- Keep host-link side tasks on PRU1 side
-- Avoid any STEP/DIR/EN ownership (motor control is PRU0-only)
+- Read `host_cmd_t` from the daemon (via shared RAM)
+- Process commands: SET_SPEED, ENABLE, ESTOP, HOME_START, ACK_EVENT, RESET_POS
+- Own the homing state machine (IDLE → APPROACH → HIT)
+- Write `motor_params_t` for PRU0 (intervals, directions, enable/run flags)
+- Read `motor_telem_t` from PRU0
+- Publish `pru_status_t` for the daemon (aggregated status + event flags)
+- Detect events (endstop hit, home complete, fault) and signal the host
 
-PRU1 must not consume move rings and must not advance command ownership used
-by PRU0 motor control.
+**PRU1 does NOT**: generate pulses, toggle STEP/DIR/EN pins, own the IEP timer,
+read R31 endstops directly.
 
-## Future TMC2209 UART reservation
+### Homing State Machine
 
-`P9_29` and `P9_31` are intentionally selected because they can be switched to
-`pru_uart` TX later (TMC2209 UART mode). Keep this reservation unchanged unless
-explicitly requested.
+```
+IDLE ──(HOST_CMD_HOME_START)──→ APPROACH
+  (lat_dir=HOMING_DIR, lat_interval=HOMING_INTERVAL, lat_run=1)
+
+APPROACH ──(endstop_mask != 0)──→ HIT
+  (lat_run=0, set EVENT_HOME_COMPLETE, PRU1_STATE_AT_HOME)
+
+HIT ──(host acknowledges)──→ IDLE
+```
 
 ---
 
 ## IPC Shared RAM Layout
 
-Offsets defined in `include/pru_ipc.h`:
+Offsets from PRU Shared RAM base (PRU: `0x00010000`, Host: `0x4A310000`):
+
 ```
-0x0000   512 B  Command ring (32 × 16 B)
-0x0200     4 B  cmd_whead
-0x0204     4 B  cmd_rhead
-0x0210    48 B  spindle_telem  (pru_axis_telem_t)
-0x0240    48 B  lateral_telem  (pru_axis_telem_t)
-0x0270    16 B  pru_sync       (spindle_interval, lateral_interval)
-0x0280     4 B  sp_move_whead
-0x0284     4 B  sp_move_rhead
-0x0288  2048 B  spindle move ring (128 × pru_move_t)
-0x0A88     4 B  lat_move_whead
-0x0A8C     4 B  lat_move_rhead
-0x0A90  2048 B  lateral move ring (128 × pru_move_t)
+Offset   Size    Struct              Direction       Description
+0x0000   64 B    host_cmd_t          Host → PRU1     Commands from daemon
+0x0040   32 B    motor_params_t      PRU1 → PRU0     Motor intervals/dirs/flags
+0x0060   64 B    motor_telem_t       PRU0 → PRU1     Step counts/positions/faults
+0x00A0   64 B    pru_status_t        PRU1 → Host     Aggregated status for daemon
+Total: 224 bytes (out of 12 KB available)
 ```
 
-## Command set (6 opcodes)
+### Command Opcodes (host_cmd_t.cmd)
 
-| Opcode               | Value | Description |
-|----------------------|-------|-------------|
-| `CMD_NOP`            | 0     | No operation |
-| `CMD_ENABLE`         | 1     | Enable/disable driver (value_a=1/0) |
-| `CMD_EMERGENCY_STOP` | 2     | Immediate stop; flush ring; clear STEP |
-| `CMD_RESET_POSITION` | 3     | Reset step_count and position_steps to 0 |
-| `CMD_HOME_START`     | 4     | PRU0: lateral axis homing mode |
-| `CMD_QUEUE_FLUSH`    | 5     | Flush move ring (no emergency stop) |
+| Opcode                | Value | Description |
+|-----------------------|-------|-------------|
+| `HOST_CMD_NOP`        | 0     | Idle / acknowledged |
+| `HOST_CMD_SET_SPEED`  | 1     | Set target IEP intervals + directions |
+| `HOST_CMD_ENABLE`     | 2     | Enable/disable stepper drivers |
+| `HOST_CMD_ESTOP`      | 3     | Emergency stop: immediate all-halt |
+| `HOST_CMD_HOME_START` | 4     | Start lateral homing sequence |
+| `HOST_CMD_ACK_EVENT`  | 5     | Acknowledge last PRU event |
+| `HOST_CMD_RESET_POS`  | 6     | Reset step counters + position |
 
 ---
 
 ## Key Headers
 
-| Header              | Content |
-|---------------------|---------|
-| `include/pru_ipc.h` | Shared RAM layout, `pru_move_t`, `pru_axis_telem_t`, 6 CMD opcodes, fault flags |
-| `include/pru_stepper.h` | IEP macros (`IEP_NOW`, `IEP_INIT`), `stepper_t` (with `underrun`), `move_ring_t`, inline step engine |
+| Header                  | Content |
+|-------------------------|---------|
+| `include/pru_ipc.h`    | Shared RAM layout, 4 IPC structs, HOST_CMD_* opcodes, state/fault/event flags |
+| `include/pru_stepper.h` | IEP macros (`IEP_NOW`, `IEP_INIT`), `pulse_gen_t`, `pulse_update()`, `pulse_stop()` |
+| `include/pru_regs.h`   | R30/R31 register aliases for STEP/DIR/EN/ENDSTOP pins |
 
 ---
 
@@ -147,29 +153,24 @@ Offsets defined in `include/pru_ipc.h`:
 
 ```bash
 cd src/pru
-make PRU_CC=/home/user/x-tools/pru-elf/bin/pru-gcc
+make                    # Build PRU0 + PRU1 firmware
+make toolchain-info     # Show detected toolchain
+make clean              # Remove artifacts
 ```
 
-Variables accepted by the Makefile:
-- `PRU_CC` — full path to PRU GCC binary
-- `TOOLCHAIN_DIR` — search dir for toolchains (default `$(HOME)/x-tools`)
+Variables:
+- `PRU_CC` — full path to PRU GCC binary (auto-detected from `~/x-tools`)
+- `TOOLCHAIN_DIR` — search dir for crosstool-NG toolchains (default: `$(HOME)/x-tools`)
 - `PRU_SWPKG` — path to TI PRU software support headers (optional)
+- `OUT_DIR` — output directory (default: `build`, overridden by root Makefile)
 
 Artifacts:
-- `build/am335x-pru0-fw`
-- `build/am335x-pru1-fw`
-- `build/dtbo/pickup-winder-p8-steppers.dtbo`
+- `$(OUT_DIR)/am335x-pru0-fw`
+- `$(OUT_DIR)/am335x-pru1-fw`
 
 Deploy to BeagleBone:
-- `make install` — copies firmwares to `/lib/firmware` and restarts remoteproc
-- `make deploy BBB_IP=... BBB_USER=... SSH_KEY=...` — copies via scp + ssh
-
-Automation scripts:
-- `scripts/deploy.sh` — host-side build/copy/install helper for firmware + DT overlay
-- `scripts/load_pru.sh` — target-side installer/loader used directly or via systemd
-- `scripts/pickupwinder-pru.service` — boot-time PRU startup service
-- `scripts/pru_spin_test.py` — root-only direct IPC spindle spin test
-- `test_pru0_motor.sh` — quick runtime pinmux + remoteproc smoke test
+- `make install` — copy firmwares to `/lib/firmware`, restart remoteproc
+- `make deploy BBB_IP=<ip>` — deploy via SSH/SCP
 
 ---
 
@@ -177,71 +178,34 @@ Automation scripts:
 
 - PRU code never uses dynamic memory, floating point, OS calls, or division
 - `__delay_cycles` is **forbidden** in the step loop — use IEP-absolute timing
-- PRU0 initialises the IEP; PRU1 reads it only — never call `IEP_INIT()` in PRU1
-- All shared structs use `__attribute__((packed, aligned(4)))` and `volatile`
-- `CMD_EMERGENCY_STOP` must clear STEP within ≤2 PRU instructions
-- Any layout change in `pru_ipc.h` must be reflected in Linux headers simultaneously
+- PRU0 initializes the IEP; PRU1 reads it only — never call `IEP_INIT()` in PRU1
+- All shared structs: `__attribute__((packed, aligned(4)))` and `volatile` pointers
+- `HOST_CMD_ESTOP` must clear all STEP outputs and stop all axes immediately
+- PRU0 endstop safety stop is unconditional — no override possible
+- Any layout change in `pru_ipc.h` must update daemon + documentation simultaneously
 
 ---
 
-## Fault Detection
+## Fault Flags
 
-Both PRUs report fault flags in `pru_axis_telem_t.faults`:
+| Flag                  | Bit | Description |
+|-----------------------|-----|-------------|
+| `FAULT_ENDSTOP_HIT`  | 0   | Endstop triggered lateral safety stop |
+| `FAULT_OVERRUN`       | 1   | Position software limit exceeded |
 
-| Flag                 | Bit | Description |
-|----------------------|-----|-------------|
-| `FAULT_HOME_SENSOR`  | 0   | NO+NC sensor consistency error (PRU1 only) |
-| `FAULT_OVERRUN`      | 1   | Position exceeded software limit (PRU1 only) |
-| `FAULT_WATCHDOG`     | 2   | Reserved |
-| `FAULT_MOVE_UNDERRUN`| 3   | Move ring drained while stepper was running (both PRUs) |
+## Event Types
 
-`FAULT_MOVE_UNDERRUN` mirrors Klipper's "missed scheduling of next step"
-shutdown. It indicates the host-side did not push moves fast enough to keep
-the ring fed. The host should treat this as a winding error.
+| Event                 | Code | Description |
+|-----------------------|------|-------------|
+| `EVENT_NONE`          | 0    | No pending event |
+| `EVENT_ENDSTOP_HIT`   | 1    | Lateral endstop triggered |
+| `EVENT_HOME_COMPLETE` | 2    | Homing sequence finished |
+| `EVENT_FAULT`         | 3    | Motor fault detected |
 
 ---
 
-## Available PRU-capable pins (config-pin grep PRU)
-  ------------------------------------------------
-  The following is the list of header pins on the target system that reported
-  PRU-capable modes when you ran `config-pin | grep PRU` (paste from your board):
+## Future TMC2209 UART Reservation
 
-      Available modes for P8_11 are: default gpio gpio_pu gpio_pd eqep pruout
-      Available modes for P8_12 are: default gpio gpio_pu gpio_pd eqep pruout
-      Available modes for P8_15 are: default gpio gpio_pu gpio_pd eqep pru_ecap_pwm pruin
-      Available modes for P8_16 are: default gpio gpio_pu gpio_pd eqep pruin
-      Available modes for P8_20 are: default gpio gpio_pu gpio_pd pruout pruin
-      Available modes for P8_21 are: default gpio gpio_pu gpio_pd pruout pruin
-      Available modes for P8_27 are: default gpio gpio_pu gpio_pd pruout pruin
-      Available modes for P8_28 are: default gpio gpio_pu gpio_pd pruout pruin
-      Available modes for P8_29 are: default gpio gpio_pu gpio_pd pruout pruin
-      Available modes for P8_30 are: default gpio gpio_pu gpio_pd pruout pruin
-      Available modes for P8_39 are: default gpio gpio_pu gpio_pd eqep pruout pruin
-      Available modes for P8_40 are: default gpio gpio_pu gpio_pd eqep pruout pruin
-      Available modes for P8_41 are: default gpio gpio_pu gpio_pd eqep pruout pruin
-      Available modes for P8_42 are: default gpio gpio_pu gpio_pd eqep pruout pruin
-      Available modes for P8_43 are: default gpio gpio_pu gpio_pd pwm pruout pruin
-      Available modes for P8_44 are: default gpio gpio_pu gpio_pd pwm pruout pruin
-      Available modes for P8_45 are: default gpio gpio_pu gpio_pd pwm pruout pruin
-      Available modes for P8_46 are: default gpio gpio_pu gpio_pd pwm pruout pruin
-      Available modes for P9_17 are: default gpio gpio_pu gpio_pd spi_cs i2c pwm pru_uart
-      Available modes for P9_18 are: default gpio gpio_pu gpio_pd spi i2c pwm pru_uart
-      Available modes for P9_19 are: default gpio gpio_pu gpio_pd spi_cs can i2c pru_uart timer
-      Available modes for P9_20 are: default gpio gpio_pu gpio_pd spi_cs can i2c pru_uart timer
-      Available modes for P9_21 are: default gpio gpio_pu gpio_pd spi uart i2c pwm pru_uart
-      Available modes for P9_22 are: default gpio gpio_pu gpio_pd spi_sclk uart i2c pwm pru_uart
-      Available modes for P9_24 are: default gpio gpio_pu gpio_pd uart can i2c pru_uart pruin
-      Available modes for P9_25 are: default gpio gpio_pu gpio_pd eqep pruout pruin
-      Available modes for P9_26 are: default gpio gpio_pu gpio_pd uart can i2c pru_uart pruin
-      Available modes for P9_27 are: default gpio gpio_pu gpio_pd eqep pruout pruin
-      Available modes for P9_28 are: default gpio gpio_pu gpio_pd spi_cs pwm pwm2 pruout pruin
-      Available modes for P9_29 are: default gpio gpio_pu gpio_pd spi pwm pruout pruin
-      Available modes for P9_30 are: default gpio gpio_pu gpio_pd spi pwm pruout pruin
-      Available modes for P9_31 are: default gpio gpio_pu gpio_pd spi_sclk pwm pruout pruin
-
-  Notes:
-  - `pruout`/`pruin` indicate the pin can be configured for PRU output/input
-    (pinmux mode 6). Use `config-pin` to test and a device-tree overlay to make
-    the mapping permanent.
-  - Avoid pins required by eMMC/HDMI/USB or other essential functions for your
-    image. Verify before changing active boot pins.
+`P9_29` and `P9_31` are intentionally selected because they can be switched to
+`pru_uart` TX later (TMC2209 UART mode). Keep this reservation unchanged unless
+explicitly requested.
