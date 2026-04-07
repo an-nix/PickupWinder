@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 STAGE_DIR="$SCRIPT_DIR"
 INSTALL_MODE=0
 START_NOW=0
@@ -10,8 +10,6 @@ STOP_ONLY=0
 ENABLE_SERVICE=0
 ENABLE_BOOT_OVERLAY=0
 SKIP_PINMUX=0
-RPROC0=""
-RPROC1=""
 WAIT_FOR_RPROC_SECS=20
 FW0="am335x-pru0-fw"
 FW1="am335x-pru1-fw"
@@ -19,12 +17,29 @@ DTBO="pickup-winder-p8-steppers.dtbo"
 SERVICE_NAME="pickupwinder-pru.service"
 INSTALL_BIN_DIR="/usr/local/bin"
 INSTALL_FW_DIR="/lib/firmware"
-TEST_HELPER_NAME="test_pru0_motor.sh"
-SPIN_TEST_NAME="pru_spin_test.py"
+INSTALL_SERVICE_DIR="/etc/systemd/system"
 
 info()  { echo "[INFO] $*"; }
 warn()  { echo "[WARN] $*"; }
 error() { echo "[FAIL] $*" >&2; exit 1; }
+
+require_root() {
+    [[ ${EUID:-$(id -u)} -eq 0 ]] || error "This script must run as root."
+}
+
+require_file() {
+    local path="$1"
+    [[ -f "$path" ]] || error "Required file not found: $path"
+}
+
+copy_if_present() {
+    local src="$1" dst="$2" mode="$3"
+    if [[ -f "$src" ]]; then
+        install -m "$mode" "$src" "$dst"
+    else
+        return 1
+    fi
+}
 
 discover_remoteprocs() {
     local deadline=$((SECONDS + WAIT_FOR_RPROC_SECS))
@@ -41,24 +56,20 @@ discover_remoteprocs() {
             name=$(cat "$node/name" 2>/dev/null || true)
 
             case "$name" in
-                *pru0*|*4a334000.pru*)
-                    RPROC0="$node"
-                    ;;
-                *pru1*|*4a338000.pru*)
-                    RPROC1="$node"
-                    ;;
+                *pru0*|*4a334000.pru*) RPROC0="$node" ;;
+            esac
+            case "$name" in
+                *pru1*|*4a338000.pru*) RPROC1="$node" ;;
             esac
 
             case "$name" in
-                *pru*|*4a334000.pru*|*4a338000.pru*)
-                    pru_nodes+=("$node")
-                    ;;
+                *pru*|*4a334000.pru*|*4a338000.pru*) pru_nodes+=("$node") ;;
             esac
         done
 
         if [[ -z "$RPROC0" || -z "$RPROC1" ]]; then
-            if [[ ${#pru_nodes[@]} -ge 2 ]]; then
-                IFS=$'\n' pru_nodes=($(printf '%s\n' "${pru_nodes[@]}" | sort -V))
+            if (( ${#pru_nodes[@]} >= 2 )); then
+                IFS=$'\n' pru_nodes=( $(printf '%s\n' "${pru_nodes[@]}" | sort -V) )
                 unset IFS
                 [[ -n "$RPROC0" ]] || RPROC0="${pru_nodes[0]}"
                 [[ -n "$RPROC1" ]] || RPROC1="${pru_nodes[1]}"
@@ -66,7 +77,7 @@ discover_remoteprocs() {
         fi
 
         if [[ -n "$RPROC0" && -n "$RPROC1" ]]; then
-            info "Detected PRU remoteprocs: PRU0=$RPROC0 PRU1=$RPROC1"
+            info "Detected PRU remoteproc nodes: PRU0=$RPROC0 PRU1=$RPROC1"
             return 0
         fi
 
@@ -76,71 +87,32 @@ discover_remoteprocs() {
     error "PRU remoteproc nodes not found after ${WAIT_FOR_RPROC_SECS}s"
 }
 
-usage() {
-    cat <<'EOF'
-Usage:
-  sudo ./load_pru.sh --from-dir DIR --install --enable-service --enable-boot-overlay --start-now
-  sudo ./load_pru.sh --start-only
-  sudo ./load_pru.sh --stop-only
-
-Options:
-  --from-dir DIR             Directory containing am335x-pru*.fw, .dtbo and helper scripts
-  --install                  Install firmware, overlay and helper scripts on target
-  --start-now                Start PRU firmware immediately after install
-  --start-only               Only configure pins and (re)start PRUs
-  --stop-only                Stop PRUs only
-  --enable-service           Install and enable systemd service
-  --enable-boot-overlay      Add DT overlay entry to /boot/uEnv.txt when possible
-  --skip-pinmux              Skip runtime config-pin setup during start
-  --help                     Show this message
-EOF
-}
-
-require_root() {
-    [[ ${EUID:-$(id -u)} -eq 0 ]] || error "This script must run as root."
-}
-
-require_file() {
-    local path="$1"
-    [[ -f "$path" ]] || error "Required file not found: $path"
-}
-
-copy_if_present() {
-    local src="$1"
-    local dst="$2"
-    if [[ -f "$src" ]]; then
-        install -m 0755 "$src" "$dst"
-    else
-        return 1
-    fi
-}
-
 set_runtime_pinmux() {
     if [[ $SKIP_PINMUX -eq 1 ]]; then
         warn "Skipping runtime pinmux as requested."
         return 0
     fi
     if ! command -v config-pin >/dev/null 2>&1; then
-        warn "config-pin not available; assuming overlay or boot pinmux already configured."
+        warn "config-pin not available; assuming pinmux is already configured."
         return 0
     fi
 
-    info "Applying runtime pinmux for canonical PRU0 motor map"
+    info "Applying runtime PRU pinmux for motor outputs"
     local out_pins=(P9_25 P9_29 P9_31 P9_41 P9_28 P9_30)
     local in_pins=(P8_15 P8_16)
     local pin
 
     for pin in "${out_pins[@]}"; do
-        config-pin "$pin" pruout >/dev/null
+        config-pin "$pin" pruout >/dev/null 2>&1 || warn "Failed to set $pin to pruout"
     done
     for pin in "${in_pins[@]}"; do
-        config-pin "$pin" pruin >/dev/null
+        config-pin "$pin" pruin >/dev/null 2>&1 || warn "Failed to set $pin to pruin"
     done
 }
 
 stop_prus() {
     discover_remoteprocs
-    local node
+
     for node in "$RPROC0" "$RPROC1"; do
         if [[ -d "$node" ]]; then
             local state
@@ -155,17 +127,16 @@ stop_prus() {
 
 start_prus() {
     discover_remoteprocs
-
     set_runtime_pinmux
     stop_prus
 
-    info "Assigning firmware to PRU0 and PRU1"
+    info "Assigning PRU firmware"
     echo "$FW0" > "$RPROC0/firmware"
     echo "$FW1" > "$RPROC1/firmware"
 
-    info "Starting PRU0"
+    info "Starting PRU0 ($(basename "$RPROC0"))"
     echo start > "$RPROC0/state"
-    info "Starting PRU1"
+    info "Starting PRU1 ($(basename "$RPROC1"))"
     echo start > "$RPROC1/state"
 
     sleep 1
@@ -186,7 +157,6 @@ ensure_uenv_overlay() {
         echo "enable_uboot_overlays=1" >> "$uenv"
     fi
 
-    local slot
     for slot in 4 5 6 7; do
         if ! grep -Eq "^uboot_overlay_addr${slot}=" "$uenv"; then
             echo "uboot_overlay_addr${slot}=/lib/firmware/${DTBO}" >> "$uenv"
@@ -202,34 +172,47 @@ install_payload() {
     require_file "$STAGE_DIR/$FW0"
     require_file "$STAGE_DIR/$FW1"
     require_file "$STAGE_DIR/$DTBO"
-    require_file "$STAGE_DIR/$TEST_HELPER_NAME"
+    require_file "$STAGE_DIR/$SERVICE_NAME"
     require_file "$STAGE_DIR/load_pru.sh"
-    require_file "$STAGE_DIR/$SPIN_TEST_NAME"
 
-    info "Installing firmware and overlay"
+    info "Installing PRU firmware and overlay"
     install -m 0644 "$STAGE_DIR/$FW0" "$INSTALL_FW_DIR/$FW0"
     install -m 0644 "$STAGE_DIR/$FW1" "$INSTALL_FW_DIR/$FW1"
     install -m 0644 "$STAGE_DIR/$DTBO" "$INSTALL_FW_DIR/$DTBO"
 
-    info "Installing helper scripts"
-    install -m 0755 "$STAGE_DIR/$TEST_HELPER_NAME" "$INSTALL_BIN_DIR/$TEST_HELPER_NAME"
+    info "Installing PRU helper and service"
     install -m 0755 "$STAGE_DIR/load_pru.sh" "$INSTALL_BIN_DIR/load_pru.sh"
-    install -m 0755 "$STAGE_DIR/$SPIN_TEST_NAME" "$INSTALL_BIN_DIR/$SPIN_TEST_NAME"
+    install -m 0644 "$STAGE_DIR/$SERVICE_NAME" "$INSTALL_SERVICE_DIR/$SERVICE_NAME"
 
-    if [[ -f "$STAGE_DIR/$SERVICE_NAME" ]]; then
-        install -m 0644 "$STAGE_DIR/$SERVICE_NAME" "/etc/systemd/system/$SERVICE_NAME"
+    if [[ $ENABLE_SERVICE -eq 1 ]]; then
+        systemctl daemon-reload
+        systemctl enable "$SERVICE_NAME"
+        info "Enabled systemd service: $SERVICE_NAME"
     fi
 
     if [[ $ENABLE_BOOT_OVERLAY -eq 1 ]]; then
         ensure_uenv_overlay
     fi
+}
 
-    if [[ $ENABLE_SERVICE -eq 1 ]]; then
-        [[ -f "/etc/systemd/system/$SERVICE_NAME" ]] || error "Service file not installed: /etc/systemd/system/$SERVICE_NAME"
-        systemctl daemon-reload
-        systemctl enable "$SERVICE_NAME"
-        info "Enabled systemd service: $SERVICE_NAME"
-    fi
+usage() {
+    cat <<'EOF'
+Usage:
+  sudo ./load_pru.sh --from-dir DIR --install --enable-service --enable-boot-overlay --start-now
+  sudo ./load_pru.sh --start-only
+  sudo ./load_pru.sh --stop-only
+
+Options:
+  --from-dir DIR             Directory containing am335x-pru*.fw, .dtbo and helper scripts
+  --install                  Install firmware, overlay and helper scripts on target
+  --start-now                Start PRU firmware immediately after install
+  --start-only               Configure and start PRUs only
+  --stop-only                Stop PRUs only
+  --enable-service           Enable pickupwinder-pru.service after install
+  --enable-boot-overlay      Register the .dtbo in /boot/uEnv.txt
+  --skip-pinmux              Skip runtime config-pin setup during PRU startup
+  --help                     Show this message
+EOF
 }
 
 while [[ $# -gt 0 ]]; do
@@ -275,7 +258,7 @@ while [[ $# -gt 0 ]]; do
             error "Unknown option: $1"
             ;;
     esac
-done
+ done
 
 require_root
 

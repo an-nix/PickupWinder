@@ -1,0 +1,16 @@
+[Unit]
+Description=PickupWinder hardware daemon
+After=network.target remote-fs.target
+Wants=pickupwinder-pru.service
+Requires=pickupwinder-pru.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pickup_daemon
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

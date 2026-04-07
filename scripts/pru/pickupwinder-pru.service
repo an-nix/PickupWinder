@@ -1,5 +1,5 @@
 [Unit]
-Description=PickupWinder PRU loader
+Description=PickupWinder PRU firmware loader
 Wants=systemd-udev-settle.service
 After=local-fs.target systemd-modules-load.service systemd-udev-settle.service
 ConditionPathExists=/lib/firmware/am335x-pru0-fw
@@ -8,11 +8,10 @@ ConditionPathExists=/lib/firmware/am335x-pru1-fw
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 20); do ls /sys/class/remoteproc/remoteproc*/name >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
 ExecStart=/usr/local/bin/load_pru.sh --start-only
 ExecStop=/usr/local/bin/load_pru.sh --stop-only
-TimeoutStartSec=20
-TimeoutStopSec=10
+TimeoutStartSec=30
+TimeoutStopSec=15
 Restart=on-failure
 RestartSec=3
 
