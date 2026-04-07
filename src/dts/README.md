@@ -6,19 +6,20 @@ target typically allows up to 4 overlay slots at boot; group overlays so you
 can enable the set you need (the repo provides 4 canonical overlays).
 
 Overlays in this directory:
-- 00-pru-steppers-endstops.dts : Combined PRU overlay (steppers on PRU0 + endstops on PRU1)
-- 02-host_IO.dts               : Host I/O overlay (encoders eqep0+eqep1 + UART1 pins + P9_23 stop/start button input)
+- 00-gpio.dts    : All GPIO pinmux (steppers PRU0 + endstops PRU1 + footswitch P9_23).
+                   Attaches pru_endstop_pins + host_gpio_input_pins → &gpio1
+                   Attaches pru_step_pins → &gpio3
+                   **Remplace l'ancien 00-pru-steppers-endstops.dts.**
+- 02-eqep.dts    : eQEP overlays (eQEP0 on P9_42/P9_27, eQEP2 on P8_12/P8_11).
 
 Build instructions (on dev host):
 
 ```bash
 cd src/dts
 # compile a single overlay
-dtc -O dtb -b 0 -@ 00-pru-steppers-endstops.dts -o 00-pru-steppers-endstops-00A0.dtbo
-# or compile selected overlays (keep to ≤4 overlays for u-boot)
-for f in 00-pru-steppers-endstops.dts 02-host_IO.dts; do
-  dtc -O dtb -b 0 -@ "$f" -o "${f%.dts}-00A0.dtbo"
-done
+dtc -O dtb -b 0 -@ 00-gpio.dts -o 00-gpio-00A0.dtbo
+# or compile all overlays at once (from project root)
+make
 ```
 
 Deploy to BeagleBone (example):
