@@ -22,12 +22,6 @@
 name: Toolchain image
 
 on:
-  push:
-    branches: [beagle, main]
-    paths:
-      - 'tools/bbb-crosscompile/Dockerfile'
-      - 'tools/bbb-crosscompile/config/**'
-  # Allow manual trigger for first-time setup or forced rebuild.
   workflow_dispatch:
     inputs:
       no_cache:
