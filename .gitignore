@@ -18,3 +18,38 @@ __pycache__/
 test/test_eqep/*.dtbo
 
 docker/config/.config
+
+# Docker / Compose
+.env
+.env.*
+docker-compose.override.yml
+docker-compose.*.override.yml
+docker-compose.local.yml
+docker-build.log
+docker-make.log
+.docker/
+.docker-cache/
+
+# Common virtualenv / Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+
+# caches
+.cache/
+
+# Local toolchains and build artefacts created by containerized builds
+/root/x-tools/
+/home/builder/x-tools/
