@@ -16,3 +16,5 @@ __pycache__/
 # Device Tree blobs (compiled overlays)
 *.dtbo
 test/test_eqep/*.dtbo
+
+docker/config/.config
