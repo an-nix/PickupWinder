@@ -78,7 +78,7 @@ docker-build:
 docker-image:
 	@echo "=== Building Docker image: $(DOCKER_IMG) ==="
 	@mkdir -p build
-	DOCKER_BUILDKIT=1 docker build --progress=plain \
+	DOCKER_BUILDKIT=1 BUILDKIT_STEP_LOG_MAX_SIZE=-1 docker build --progress=plain \
 		--build-arg BUILDER_UID=$(shell id -u) \
 		--build-arg BUILDER_GID=$(shell id -g) \
 		-t "$(DOCKER_IMG)" \
