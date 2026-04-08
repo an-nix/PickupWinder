@@ -2,11 +2,11 @@
 # build.yml — PickupWinder cross-compilation CI
 #
 # Compiles PRU firmware, ARM daemon, and DT overlays inside the pre-built
-# cross-compile Docker image (GHCR).  Artefacts are uploaded for 30 days.
+# cross-compile Docker image (Docker Hub).  Artefacts are uploaded for 30 days.
 #
-# Prerequisite: the toolchain image must exist on GHCR.
-#   → run the toolchain-image workflow once (manually or push a Dockerfile
-#     change) before the first build run.
+# Prerequisite: the toolchain image must exist on Docker Hub.
+#   → run the toolchain-image workflow once (manually) before the first build run.
+#   Credentials: set DOCKERHUB_USERNAME + DOCKERHUB_TOKEN in repo secrets.
 # =============================================================================
 name: Build
 
@@ -30,8 +30,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Image used for compilation; kept in GHCR under the repo owner's namespace.
-  IMAGE: ghcr.io/${{ github.repository_owner }}/bbb-crosscompile:debian12
+  # Image used for compilation — stored on Docker Hub.
+  IMAGE: antnic/bbb-crosscompile:debian12
 
 jobs:
   build:
@@ -40,7 +40,6 @@ jobs:
 
     permissions:
       contents: read
-      packages: read        # pull image from GHCR
 
     steps:
       # ── 1. Checkout ────────────────────────────────────────────────────────
@@ -50,23 +49,23 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # ── 2. Authenticate with GHCR ─────────────────────────────────────────
-      - name: Log in to GitHub Container Registry
+      # ── 2. Authenticate with Docker Hub ───────────────────────────────────
+      # Avoids rate-limiting on pull (anonymous pulls are limited to 10/hour).
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # ── 3. Pull the toolchain image ────────────────────────────────────────
-      # If the image is not yet on GHCR (first-time setup), fall back to
+      # If the image is not yet on Docker Hub (first-time setup), fall back to
       # building it locally so CI doesn't fail hard.
       - name: Pull cross-compile image (with local fallback)
         run: |
           docker pull "$IMAGE" && echo "IMAGE_SOURCE=registry" >> "$GITHUB_ENV" \
           || {
-            echo "::warning::Image not found on GHCR — building locally."
-            echo "Run the 'Toolchain image' workflow to cache the image."
+            echo "::warning::Image not found on Docker Hub — building locally."
+            echo "Run the 'Toolchain image' workflow to push the image first."
             DOCKER_BUILDKIT=1 docker build \
               --build-arg BUILDER_UID=1001 \
               --build-arg BUILDER_GID=1001 \

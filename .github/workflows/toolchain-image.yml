@@ -1,23 +1,24 @@
 # =============================================================================
-# toolchain-image.yml — Build & push the cross-compile Docker image to GHCR.
+# toolchain-image.yml — Build & push the cross-compile Docker image to Docker Hub.
 #
 # This workflow builds the heavy toolchain image (PRU pru-unknown-elf-gcc via
-# crosstool-ng + ARM gnueabihf via Debian packages) and caches it on GHCR so
-# the main "build" workflow can pull it in seconds.
+# crosstool-ng + ARM gnueabihf via Debian packages) and pushes it to Docker Hub
+# so the main "build" workflow can pull it in seconds.
 #
-# Triggers:
-#   • Automatically on push to beagle/main when the Dockerfile or ct-ng
-#     config changes.
-#   • Manually via "Run workflow" button (first-time setup, forced refresh).
+# Trigger: manual only ("Run workflow" button in the Actions tab).
 #
 # Published image:
-#   ghcr.io/<owner>/bbb-crosscompile:debian12
-#   ghcr.io/<owner>/bbb-crosscompile:latest
+#   antnic/bbb-crosscompile:debian12
+#   antnic/bbb-crosscompile:latest
 #
 # BuildKit cache:
-#   The build cache is stored as a separate GHCR tag (:buildcache) so that
-#   subsequent builds skip layers that haven't changed (crosstool-ng compile
-#   takes ~30 min on first run, ~2 min on cache hit).
+#   The build cache is stored as a separate tag (:buildcache) on Docker Hub so
+#   that subsequent builds skip unchanged layers (crosstool-ng compile takes
+#   ~30 min on first run, ~2 min on cache hit).
+#
+# Required secrets:
+#   DOCKERHUB_USERNAME  — Docker Hub username
+#   DOCKERHUB_TOKEN     — Docker Hub access token (read/write)
 # =============================================================================
 name: Toolchain image
 
@@ -35,8 +36,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REGISTRY:   ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/bbb-crosscompile
+  IMAGE_NAME: antnic/bbb-crosscompile
 
 jobs:
   build-and-push:
@@ -45,7 +45,6 @@ jobs:
 
     permissions:
       contents: read
-      packages: write    # push to GHCR
 
     steps:
       # ── 1. Checkout ────────────────────────────────────────────────────────
@@ -58,20 +57,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ── 3. Log in to GHCR ─────────────────────────────────────────────────
-      - name: Log in to GitHub Container Registry
+      # ── 3. Log in to Docker Hub ────────────────────────────────────────────
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # ── 4. Compute image metadata (tags + labels) ─────────────────────────
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=debian12
             type=raw,value=latest,enable={{is_default_branch}}
@@ -91,8 +89,8 @@ jobs:
             BUILDER_UID=1001
             BUILDER_GID=1001
           # Registry-backed layer cache — survives between workflow runs.
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to:   ${{ inputs.no_cache != 'true' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || '' }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to:   ${{ inputs.no_cache != 'true' && format('type=registry,ref={0}:buildcache,mode=max', env.IMAGE_NAME) || '' }}
           # Provenance attestation (SBOM / signed image).
           provenance: true
           sbom:       true
@@ -104,5 +102,5 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Tag | Digest |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:debian12\` | \`${{ steps.meta.outputs.version }}\` |" \
+          echo "| \`${{ env.IMAGE_NAME }}:debian12\` | \`${{ steps.meta.outputs.version }}\` |" \
             >> "$GITHUB_STEP_SUMMARY"
