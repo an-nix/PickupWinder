@@ -16,7 +16,11 @@ echo "Ensuring build directory exists: $ROOT_DIR/build"
 mkdir -p build
 
 echo "Running docker build (image=${IMG})"
-tools/docker-build.sh "$IMG" "$OUTLOG"
+docker run --rm \
+	--user "$(id -u):$(id -g)" \
+	-v "$ROOT_DIR":/workspace -w /workspace \
+	"$IMG" \
+	bash -lc "make -j\"$(nproc)\"" | tee "$OUTLOG"
 
 echo "Fixing ownership on build/"
 chown -R "$(id -u):$(id -g)" build || true

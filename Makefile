@@ -14,7 +14,7 @@
 #   build/pru/     — PRU firmware binaries (am335x-pru{0,1}-fw)
 #   build/daemon/  — pickup_daemon binary
 
-.PHONY: all dtbo pru daemon clean install deploy
+.PHONY: all dtbo pru daemon clean install deploy docker-build
 
 all: dtbo pru daemon
 
@@ -48,6 +48,11 @@ daemon:
 clean:
 	rm -rf build/dtbo build/pru build/daemon
 	@echo "Cleaned build/"
+
+# Run the Docker-based build (one-click, produces build/ artifacts)
+docker-build:
+	@echo "=== Building inside Docker image ==="
+	@./docker-build.sh
 
 # ── Install (on BBB target) ──────────────────────────────────────────────
 install: all
