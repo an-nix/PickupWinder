@@ -50,9 +50,12 @@ clean:
 	@echo "Cleaned build/"
 
 # Run the Docker-based build (one-click, produces build/ artifacts)
+DOCKER_IMG ?= antnic/bbb-crosscompile:debian12
+DOCKER_LOG ?= docker-make.log
+
 docker-build:
 	@echo "=== Building inside Docker image ==="
-	@./docker-build.sh
+	@./docker-build.sh "$(DOCKER_IMG)" "$(DOCKER_LOG)" $(TARGET)
 
 # ── Install (on BBB target) ──────────────────────────────────────────────
 install: all

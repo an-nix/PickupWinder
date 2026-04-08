@@ -8,6 +8,8 @@ set -euo pipefail
 
 IMG=${1:-antnic/bbb-crosscompile:debian12}
 OUTLOG=${2:-docker-make.log}
+shift 2 || true
+MAKE_ARGS=("$@")
 
 ROOT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 cd "$ROOT_DIR"
@@ -16,9 +18,16 @@ echo "Ensuring build directory exists: $ROOT_DIR/build"
 mkdir -p build
 
 echo "Running docker build (image=${IMG})"
-docker run --rm \
-	-v "$ROOT_DIR":/workspace -w /workspace \
-	"$IMG" \
-	bash -lc "make -j\"$(nproc)\" && if [ -d build ]; then chown -R $(id -u):$(id -g) build; fi" | tee "$OUTLOG"
+if [[ ${#MAKE_ARGS[@]} -gt 0 ]]; then
+	docker run --rm \
+		-v "$ROOT_DIR":/workspace -w /workspace \
+		"$IMG" \
+		make -j"$(nproc)" "${MAKE_ARGS[@]}" | tee "$OUTLOG"
+else
+	docker run --rm \
+		-v "$ROOT_DIR":/workspace -w /workspace \
+		"$IMG" \
+		make -j"$(nproc)" | tee "$OUTLOG"
+fi
 
 echo "Build complete. Log: $OUTLOG"
