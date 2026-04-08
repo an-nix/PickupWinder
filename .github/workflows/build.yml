@@ -57,8 +57,8 @@ jobs:
           docker pull "$IMAGE" && echo "IMAGE_SOURCE=registry" >> "$GITHUB_ENV" \
           || {
             echo "::warning::Image not found on Docker Hub — building locally."
-            echo "Run the 'Toolchain image' workflow to push the image first."
-            DOCKER_BUILDKIT=1 docker build \
+            echo "Push it manually with: make docker-image-push"
+            DOCKER_BUILDKIT=0 docker build \
               --build-arg BUILDER_UID=1001 \
               --build-arg BUILDER_GID=1001 \
               -t "$IMAGE" \

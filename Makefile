@@ -73,12 +73,14 @@ docker-build:
 		$(if $(T),-- $(T))
 
 # ── Docker: build the cross-compile image itself ─────────────────────────────
-# --progress=plain : stream all BuildKit output (including ct-ng) to terminal.
-# tee              : save the full build log to build/docker-image-build.log.
+# NOTE: we intentionally disable BuildKit here because BuildKit clips very
+# verbose RUN output around 2 MiB per step (ct-ng is far above that).
+# Classic builder streams full logs.
+# tee: save the full build log to build/docker-image-build.log.
 docker-image:
 	@echo "=== Building Docker image: $(DOCKER_IMG) ==="
 	@mkdir -p build
-	DOCKER_BUILDKIT=1 BUILDKIT_STEP_LOG_MAX_SIZE=-1 docker build --progress=plain \
+	DOCKER_BUILDKIT=0 docker build \
 		--build-arg BUILDER_UID=$(shell id -u) \
 		--build-arg BUILDER_GID=$(shell id -g) \
 		-t "$(DOCKER_IMG)" \
