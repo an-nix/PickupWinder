@@ -20,11 +20,13 @@ mkdir -p build
 echo "Running docker build (image=${IMG})"
 if [[ ${#MAKE_ARGS[@]} -gt 0 ]]; then
 	docker run --rm \
+		--user "$(id -u):$(id -g)" \
 		-v "$ROOT_DIR":/workspace -w /workspace \
 		"$IMG" \
 		make -j"$(nproc)" "${MAKE_ARGS[@]}" | tee "$OUTLOG"
 else
 	docker run --rm \
+		--user "$(id -u):$(id -g)" \
 		-v "$ROOT_DIR":/workspace -w /workspace \
 		"$IMG" \
 		make -j"$(nproc)" | tee "$OUTLOG"
