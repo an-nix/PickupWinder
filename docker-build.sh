@@ -17,15 +17,8 @@ mkdir -p build
 
 echo "Running docker build (image=${IMG})"
 docker run --rm \
-	--user "$(id -u):$(id -g)" \
 	-v "$ROOT_DIR":/workspace -w /workspace \
 	"$IMG" \
-	bash -lc "make -j\"$(nproc)\"" | tee "$OUTLOG"
-
-echo "Fixing ownership on build/ via container"
-docker run --rm \
-	-v "$ROOT_DIR":/workspace -w /workspace \
-	"$IMG" \
-	bash -lc "if [ -d build ]; then chown -R $(id -u):$(id -g) build; fi" || true
+	bash -lc "make -j\"$(nproc)\" && if [ -d build ]; then chown -R $(id -u):$(id -g) build; fi" | tee "$OUTLOG"
 
 echo "Build complete. Log: $OUTLOG"
