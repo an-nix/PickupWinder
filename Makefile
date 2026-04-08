@@ -73,14 +73,18 @@ docker-build:
 		$(if $(T),-- $(T))
 
 # ── Docker: build the cross-compile image itself ─────────────────────────────
+# --progress=plain : stream all BuildKit output (including ct-ng) to terminal.
+# tee              : save the full build log to build/docker-image-build.log.
 docker-image:
 	@echo "=== Building Docker image: $(DOCKER_IMG) ==="
+	@mkdir -p build
 	DOCKER_BUILDKIT=1 docker build --progress=plain \
 		--build-arg BUILDER_UID=$(shell id -u) \
 		--build-arg BUILDER_GID=$(shell id -g) \
 		-t "$(DOCKER_IMG)" \
 		-f "$(DOCKER_FILE)" \
-		"$(DOCKER_CONTEXT)"
+		"$(DOCKER_CONTEXT)" \
+		2>&1 | tee build/docker-image-build.log
 
 docker-image-push: docker-image
 	@echo "=== Pushing Docker image: $(DOCKER_IMG) ==="
