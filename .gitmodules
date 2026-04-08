@@ -1,0 +1,3 @@
+[submodule "tools/bbb-crosscompile"]
+path = tools/bbb-crosscompile
+url = https://github.com/an-nix/bbb-crosscompile.git
