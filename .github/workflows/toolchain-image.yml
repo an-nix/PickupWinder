@@ -1,0 +1,114 @@
+# =============================================================================
+# toolchain-image.yml — Build & push the cross-compile Docker image to GHCR.
+#
+# This workflow builds the heavy toolchain image (PRU pru-unknown-elf-gcc via
+# crosstool-ng + ARM gnueabihf via Debian packages) and caches it on GHCR so
+# the main "build" workflow can pull it in seconds.
+#
+# Triggers:
+#   • Automatically on push to beagle/main when the Dockerfile or ct-ng
+#     config changes.
+#   • Manually via "Run workflow" button (first-time setup, forced refresh).
+#
+# Published image:
+#   ghcr.io/<owner>/bbb-crosscompile:debian12
+#   ghcr.io/<owner>/bbb-crosscompile:latest
+#
+# BuildKit cache:
+#   The build cache is stored as a separate GHCR tag (:buildcache) so that
+#   subsequent builds skip layers that haven't changed (crosstool-ng compile
+#   takes ~30 min on first run, ~2 min on cache hit).
+# =============================================================================
+name: Toolchain image
+
+on:
+  push:
+    branches: [beagle, main]
+    paths:
+      - 'tools/bbb-crosscompile/Dockerfile'
+      - 'tools/bbb-crosscompile/config/**'
+  # Allow manual trigger for first-time setup or forced rebuild.
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: 'Ignore build cache (full rebuild)'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: toolchain-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY:   ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/bbb-crosscompile
+
+jobs:
+  build-and-push:
+    name: Build & push cross-compile image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write    # push to GHCR
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── 2. Set up Docker Buildx ────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 3. Log in to GHCR ─────────────────────────────────────────────────
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 4. Compute image metadata (tags + labels) ─────────────────────────
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=debian12
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+
+      # ── 5. Build and push ─────────────────────────────────────────────────
+      # BuildKit registry cache: first run ~30 min, subsequent cache-hits ~2 min.
+      - name: Build and push toolchain image
+        uses: docker/build-push-action@v6
+        with:
+          context: tools/bbb-crosscompile
+          file:    tools/bbb-crosscompile/Dockerfile
+          push:    true
+          tags:    ${{ steps.meta.outputs.tags }}
+          labels:  ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILDER_UID=1001
+            BUILDER_GID=1001
+          # Registry-backed layer cache — survives between workflow runs.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to:   ${{ inputs.no_cache != 'true' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || '' }}
+          # Provenance attestation (SBOM / signed image).
+          provenance: true
+          sbom:       true
+
+      # ── 6. Summary ────────────────────────────────────────────────────────
+      - name: Print pushed image digest
+        run: |
+          echo "### Toolchain image published :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tag | Digest |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:debian12\` | \`${{ steps.meta.outputs.version }}\` |" \
+            >> "$GITHUB_STEP_SUMMARY"

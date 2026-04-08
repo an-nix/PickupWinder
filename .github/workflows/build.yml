@@ -1,0 +1,110 @@
+# =============================================================================
+# build.yml — PickupWinder cross-compilation CI
+#
+# Compiles PRU firmware, ARM daemon, and DT overlays inside the pre-built
+# cross-compile Docker image (GHCR).  Artefacts are uploaded for 30 days.
+#
+# Prerequisite: the toolchain image must exist on GHCR.
+#   → run the toolchain-image workflow once (manually or push a Dockerfile
+#     change) before the first build run.
+# =============================================================================
+name: Build
+
+on:
+  push:
+    branches: [beagle, main]
+    paths-ignore:
+      - '**.md'
+      - 'doc/**'
+      - 'resources/**'
+  pull_request:
+    branches: [beagle, main]
+    paths-ignore:
+      - '**.md'
+      - 'doc/**'
+      - 'resources/**'
+
+# Cancel in-progress runs for the same branch on new pushes.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Image used for compilation; kept in GHCR under the repo owner's namespace.
+  IMAGE: ghcr.io/${{ github.repository_owner }}/bbb-crosscompile:debian12
+
+jobs:
+  build:
+    name: Cross-compile (PRU + daemon + dtbo)
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: read        # pull image from GHCR
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # ── 2. Authenticate with GHCR ─────────────────────────────────────────
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 3. Pull the toolchain image ────────────────────────────────────────
+      # If the image is not yet on GHCR (first-time setup), fall back to
+      # building it locally so CI doesn't fail hard.
+      - name: Pull cross-compile image (with local fallback)
+        run: |
+          docker pull "$IMAGE" && echo "IMAGE_SOURCE=registry" >> "$GITHUB_ENV" \
+          || {
+            echo "::warning::Image not found on GHCR — building locally."
+            echo "Run the 'Toolchain image' workflow to cache the image."
+            DOCKER_BUILDKIT=1 docker build \
+              --build-arg BUILDER_UID=1001 \
+              --build-arg BUILDER_GID=1001 \
+              -t "$IMAGE" \
+              -f tools/bbb-crosscompile/Dockerfile \
+              tools/bbb-crosscompile/
+            echo "IMAGE_SOURCE=local-build" >> "$GITHUB_ENV"
+          }
+
+      # ── 4. Compile ─────────────────────────────────────────────────────────
+      - name: Build firmware
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "$IMAGE" \
+            make -j$(nproc)
+
+      # ── 5. Sanity-check artefacts ─────────────────────────────────────────
+      - name: Check artefacts
+        run: |
+          echo "=== build/ artefacts ==="
+          find build/ -type f | sort
+          echo
+          for f in build/pru/am335x-pru0-fw build/pru/am335x-pru1-fw \
+                   build/daemon/pickup_daemon; do
+            [ -f "$f" ] && echo "OK  $f" || echo "MISSING  $f"
+          done
+
+      # ── 6. Upload artefacts ───────────────────────────────────────────────
+      - name: Upload firmware artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.ref_name }}-${{ github.sha }}
+          path: |
+            build/pru/
+            build/daemon/
+            build/dtbo/
+          retention-days: 30
+          if-no-files-found: warn
