@@ -22,7 +22,10 @@ docker run --rm \
 	"$IMG" \
 	bash -lc "make -j\"$(nproc)\"" | tee "$OUTLOG"
 
-echo "Fixing ownership on build/"
-chown -R "$(id -u):$(id -g)" build || true
+echo "Fixing ownership on build/ via container"
+docker run --rm \
+	-v "$ROOT_DIR":/workspace -w /workspace \
+	"$IMG" \
+	bash -lc "if [ -d build ]; then chown -R $(id -u):$(id -g) build; fi" || true
 
 echo "Build complete. Log: $OUTLOG"
