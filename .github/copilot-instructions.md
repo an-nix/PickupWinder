@@ -117,7 +117,7 @@ Events to Python: `endstop_hit`, `home_complete`, `fault`, `telem`
 |-------------------------------|---------|
 | `pru/include/pru_ipc.h`      | `host_cmd_t` (64B), `motor_params_t` (32B), `motor_telem_t` (64B), `pru_status_t` (64B); HOST_CMD_* opcodes; MOTOR_STATE_*, FAULT_*, EVENT_* flags |
 | `pru/include/pru_stepper.h`  | `pulse_gen_t` (continuous IEP engine), `pulse_update()`, `IEP_NOW()`, `IEP_INIT()` |
-| `pru/include/pru_regs.h`     | R30/R31 pin aliases |
+| `pru/include/pru_regs.h`     | R30/R31 hardware register aliases — **`register volatile` is mandatory**; without `register` writes go to RAM, not pins |
 
 ### 2.5 IPC Shared RAM Layout
 
@@ -385,6 +385,9 @@ IDLE --(start)--> PAUSED (positioning)
 | `fragment@ {}` syntax in `/plugin/` DTS | Unreliable on 6.12; use direct `&node {}` syntax |
 | `bone-pinmux-helper` on kernel 6.12 | Not compiled; node stuck at `waiting_for_supplier` |
 | Wrong pad offset for GPIO input pin | Derive from pinctrl debugfs dump, not from pad name |
+| `__R30`/`__R31` declared without `register` keyword | `volatile uint32_t __R30 __asm__("r30")` without `register` creates a RAM variable named `r30` — writes never reach the physical pins. PRU appears to run (step counts increment in RAM) but no GPIO changes. **Always use `register volatile uint32_t __R30 __asm__("r30")`** — see `pru/include/pru_regs.h`. |
+| MODE6 on PRU0 output pins instead of MODE5 | On AM335x MCASP0 pins used by PRU0: MODE5 = `pr1_pru0_pru_r30_N` (output), MODE6 = `pr1_pru0_pru_r31_N` (input). Using MODE6 on STEP/DIR/EN pins in the DTS silently configures them as inputs — `__R30` writes are correct but the pads never drive. Verify with `cat /sys/kernel/debug/pinctrl/.../pins`: must show `pru 0 out`, not `pru 0 in`. |
+| Blocking `write()` in daemon `broadcast()` | Single-threaded daemon with blocking `write()` on client fds: one slow/stuck `socat` client freezes the entire event loop (no commands, no telem, SIGINT ignored). Fix: `fcntl(cfd, F_SETFL, O_NONBLOCK)` on accept + tolerate `EAGAIN` in `broadcast()`. |
 
 ---
 

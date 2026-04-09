@@ -44,17 +44,19 @@
     };
 
     /* ── GPIO3 : sorties stepper PRU0 ──────────────────────────────────
-     * MODE6 = PRU0 R30 direct output
-     * EN_A/EN_B : pull-up (active-low, assure état safe hors enable)
+     * MODE5 = PRU0 R30 direct OUTPUT  (MODE6 = R31 INPUT — ne pas confondre)
+     * AM335x MCASP0 pins: MODE5 → pr1_pru0_pru_r30_N (output)
+     *                     MODE6 → pr1_pru0_pru_r31_N (input)  ← MAUVAIS pour sorties
+     * EN_A/EN_B : pull-up (active-low, état safe = driver désactivé si PRU OFF)
      * STEP/DIR   : pull désactivé (piloté directement par PRU0)           */
     pru_step_pins: pru-step-pins {
         pinctrl-single,pins = <
-            0x1AC 0x10 0x06  /* P9_25 EN_A   (PRU0 R30[7]) pull-up, active-low */
-            0x1A4 0x08 0x06  /* P9_27 DIR_A  (PRU0 R30[5]) no pull */
-            0x194 0x08 0x06  /* P9_29 STEP_A (PRU0 R30[1]) no pull */
-            0x19C 0x10 0x06  /* P9_28 EN_B   (PRU0 R30[3]) pull-up, active-low */
-            0x190 0x08 0x06  /* P9_31 DIR_B  (PRU0 R30[0]) no pull */
-            0x198 0x08 0x06  /* P9_30 STEP_B (PRU0 R30[2]) no pull */
+            0x1AC 0x10 0x05  /* P9_25 EN_A   (PRU0 R30[7]) pull-up, active-low, MODE5=R30 out */
+            0x1A4 0x08 0x05  /* P9_27 DIR_A  (PRU0 R30[5]) no pull,             MODE5=R30 out */
+            0x194 0x08 0x05  /* P9_29 STEP_A (PRU0 R30[1]) no pull,             MODE5=R30 out */
+            0x19C 0x10 0x05  /* P9_28 EN_B   (PRU0 R30[3]) pull-up, active-low, MODE5=R30 out */
+            0x190 0x08 0x05  /* P9_31 DIR_B  (PRU0 R30[0]) no pull,             MODE5=R30 out */
+            0x198 0x08 0x05  /* P9_30 STEP_B (PRU0 R30[2]) no pull,             MODE5=R30 out */
         >;
     };
 };

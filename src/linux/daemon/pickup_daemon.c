@@ -179,7 +179,11 @@ static void broadcast(const char *msg) {
     int i = 0;
     while (i < g_nclients) {
         ssize_t n = write(g_clients[i], msg, len);
-        if (n <= 0) {
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* Client not reading fast enough — drop this message, keep connected.
+             * This prevents a slow/stuck socat from blocking the entire daemon. */
+            i++;
+        } else if (n <= 0) {
             close(g_clients[i]);
             for (int j = i; j < g_nclients - 1; j++)
                 g_clients[j] = g_clients[j + 1];
@@ -300,6 +304,8 @@ int main(int argc, char **argv) {
         if (fds[0].revents & POLLIN) {
             int cfd = accept(srv, NULL, NULL);
             if (cfd >= 0) {
+                /* Non-blocking: a slow client can never block broadcast(). */
+                fcntl(cfd, F_SETFL, O_NONBLOCK);
                 if (g_nclients < MAX_CLIENTS) {
                     g_clients[g_nclients++] = cfd;
                 } else {

@@ -37,21 +37,25 @@ endif
 
 # ── Compiler flags ──────────────────────────────────────────────────────────
 PRU_CFLAGS = -O2 -Wall -Wextra \
+             -Wno-volatile-register-var \
              $(PRU_INCLUDES) \
              -DPRU_FIRMWARE \
              -DPRU_SRAM_PHYS_BASE=0x00010000u
 
 # ── Outputs ─────────────────────────────────────────────────────────────────
 OUT_DIR   ?= build
-FW_NAME_0 = am335x-pru0-fw
-FW_NAME_1 = am335x-pru1-fw
+FW_NAME_0        = am335x-pru0-fw
+FW_NAME_1        = am335x-pru1-fw
+FW_NAME_TEST_SP   = am335x-pru0-fw-test-spindle
+FW_NAME_TEST_GPIO = am335x-pru0-fw-test-gpio
+FW_NAME_TEST_STATIC = am335x-pru0-fw-test-static
 
 # ── Remote deploy ───────────────────────────────────────────────────────────
 BBB_USER ?= debian
 BBB_IP   ?=
 
 # ── Targets ─────────────────────────────────────────────────────────────────
-.PHONY: all clean install deploy toolchain toolchain-info
+.PHONY: all clean install deploy toolchain toolchain-info test-spindle test-gpio test-static
 
 all: $(OUT_DIR)/$(FW_NAME_0) $(OUT_DIR)/$(FW_NAME_1)
 
@@ -65,6 +69,32 @@ $(OUT_DIR)/$(FW_NAME_0): pru0_motor_control/main.c include/pru_ipc.h include/pru
 $(OUT_DIR)/$(FW_NAME_1): pru1_orchestration/main.c include/pru_ipc.h | $(OUT_DIR)
 	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
 	@echo "[PRU1] built -> $@"
+
+# ── Standalone spindle test (no IPC, no daemon) ──────────────────────────────
+# Drives spindle at 25 RPM directly from PRU0 to validate hardware wiring.
+# Usage: make test-spindle   → builds am335x-pru0-fw-test-spindle
+test-spindle: $(OUT_DIR)/$(FW_NAME_TEST_SP)
+
+$(OUT_DIR)/$(FW_NAME_TEST_SP): test_spindle/main.c include/pru_stepper.h include/pru_regs.h | $(OUT_DIR)
+	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
+	@echo "[TEST] built -> $@"
+
+# ── GPIO blink test (all stepper pins, 1 s toggle) ──────────────────────────
+# Lets you probe each PRU output with a 330Ω + LED to verify pad driving.
+# Usage: make test-gpio
+test-gpio: $(OUT_DIR)/$(FW_NAME_TEST_GPIO)
+
+$(OUT_DIR)/$(FW_NAME_TEST_GPIO): test_gpio/main.c include/pru_stepper.h include/pru_regs.h | $(OUT_DIR)
+	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
+	@echo "[TEST] built -> $@"
+
+# ── Static HIGH test (no timer — diagnose R30 vs IEP) ────────────────────────
+# All stepper pins go HIGH immediately. No blink, no IEP.
+test-static: $(OUT_DIR)/$(FW_NAME_TEST_STATIC)
+
+$(OUT_DIR)/$(FW_NAME_TEST_STATIC): test_static/main.c include/pru_regs.h | $(OUT_DIR)
+	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
+	@echo "[TEST] built -> $@"
 
 # ── Toolchain ────────────────────────────────────────────────────────────────
 toolchain:

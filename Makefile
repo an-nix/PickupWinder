@@ -20,7 +20,7 @@
 #   build/pru/     — PRU firmware binaries (am335x-pru{0,1}-fw)
 #   build/daemon/  — pickup_daemon binary
 
-.PHONY: all dtbo pru daemon clean install deploy \
+.PHONY: all dtbo pru daemon clean install deploy test-spindle test-gpio test-static \
         docker-build docker-image docker-image-push
 
 all: dtbo pru daemon
@@ -46,6 +46,19 @@ pru:
 	@echo "=== Building PRU firmware ==="
 	$(MAKE) -C src/pru OUT_DIR=$(CURDIR)/build/pru
 
+# ── PRU hardware test: spindle at 25 RPM, no daemon, no IPC ──────────────
+test-spindle:
+	@echo "=== Building PRU spindle test firmware ==="
+	$(MAKE) -C src/pru OUT_DIR=$(CURDIR)/build/pru test-spindle
+
+# ── PRU hardware test: blink all stepper GPIO pins every 1 s ─────────────
+test-gpio:
+	@echo "=== Building PRU GPIO blink test firmware ==="
+	$(MAKE) -C src/pru OUT_DIR=$(CURDIR)/build/pru test-gpio
+# ── PRU hardware test: set all stepper pins HIGH statically (no timer) ────────
+test-static:
+	@echo "=== Building PRU static HIGH test firmware ==="
+	$(MAKE) -C src/pru OUT_DIR=$(CURDIR)/build/pru test-static
 # ── C daemon ─────────────────────────────────────────────────────────────
 daemon:
 	@echo "=== Building daemon ==="
