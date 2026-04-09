@@ -44,10 +44,10 @@ for the full architecture rationale.
 | Header pin | PRU bit   | Function | Notes |
 |------------|-----------|----------|-------|
 | P9_25      | R30\[7\]  | EN_A     | Spindle enable (active-low) |
-| P9_29      | R30\[1\]  | DIR_A    | Spindle direction |
-| P9_31      | R30\[0\]  | STEP_A   | Spindle step |
-| P9_41      | R30\[6\]  | EN_B     | Lateral enable (active-low) |
-| P9_28      | R30\[3\]  | DIR_B    | Lateral direction |
+| P9_27      | R30\[5\]  | DIR_A    | Spindle direction |
+| P9_29      | R30\[1\]  | STEP_A   | Spindle step |
+| P9_28      | R30\[3\]  | EN_B     | Lateral enable (active-low) |
+| P9_31      | R30\[0\]  | DIR_B    | Lateral direction |
 | P9_30      | R30\[2\]  | STEP_B   | Lateral step |
 
 ### PRU0 endstop inputs

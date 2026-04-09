@@ -15,9 +15,9 @@
  * resets it.
  *
  * Pin mapping (active-low enable):
- *   Motor A (spindle): STEP=R30[0], DIR=R30[1], EN=R30[7]
- *   Motor B (lateral): STEP=R30[2], DIR=R30[3], EN=R30[6]
- *   Endstops (R31):    ES1=R31[15], ES2=R31[14]   (active-HIGH)
+ *   Motor A (spindle): STEP=R30[1] (P9_29), DIR=R30[5] (P9_27), EN=R30[7] (P9_25)
+ *   Motor B (lateral): STEP=R30[2] (P9_30), DIR=R30[0] (P9_31), EN=R30[3] (P9_28)
+ *   Endstops (R31):    ES1=R31[15] (P8_15), ES2=R31[14] (P8_16)   (active-HIGH)
  */
 
 #include <stdint.h>
@@ -26,13 +26,13 @@
 #include "../include/pru_regs.h"
 
 /* ── Pin bitmasks ────────────────────────────────────────────────────────── */
-#define SP_STEP_BIT    (1u << 0)
-#define SP_DIR_BIT     (1u << 1)
-#define SP_EN_BIT      (1u << 7)   /* active-low */
+#define SP_STEP_BIT    (1u << 1)   /* P9_29 R30[1] */
+#define SP_DIR_BIT     (1u << 5)   /* P9_27 R30[5] */
+#define SP_EN_BIT      (1u << 7)   /* P9_25 R30[7] active-low */
 
-#define LAT_STEP_BIT   (1u << 2)
-#define LAT_DIR_BIT    (1u << 3)
-#define LAT_EN_BIT     (1u << 6)   /* active-low */
+#define LAT_STEP_BIT   (1u << 2)   /* P9_30 R30[2] */
+#define LAT_DIR_BIT    (1u << 0)   /* P9_31 R30[0] */
+#define LAT_EN_BIT     (1u << 3)   /* P9_28 R30[3] active-low */
 
 #define ES1_BIT        (1u << 15)  /* R31 endstop 1 */
 #define ES2_BIT        (1u << 14)  /* R31 endstop 2 */

@@ -233,10 +233,10 @@ typedef struct {
 | Pin header | Bit PRU   | Fonction   | Notes |
 |------------|-----------|------------|-------|
 | P9_25      | R30\[7\]  | EN_A       | Enable spindle (actif-bas) |
-| P9_29      | R30\[1\]  | DIR_A      | Direction spindle |
-| P9_31      | R30\[0\]  | STEP_A     | Step spindle |
-| P9_41      | R30\[6\]  | EN_B       | Enable latéral (actif-bas) |
-| P9_28      | R30\[3\]  | DIR_B      | Direction latéral |
+| P9_27      | R30\[5\]  | DIR_A      | Direction spindle |
+| P9_29      | R30\[1\]  | STEP_A     | Step spindle |
+| P9_28      | R30\[3\]  | EN_B       | Enable latéral (actif-bas) |
+| P9_31      | R30\[0\]  | DIR_B      | Direction latéral |
 | P9_30      | R30\[2\]  | STEP_B     | Step latéral |
 | P8_15      | R31\[15\] | ENDSTOP_1  | Fin de course |
 | P8_16      | R31\[14\] | ENDSTOP_2  | Fin de course |

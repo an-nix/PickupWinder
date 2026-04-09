@@ -224,12 +224,12 @@ sending progressive `set_speed` commands at the control loop cadence (~10 ms).
 
 Motor A — Spindle (Group 1):
 - `P9_25` → `EN_A` (`PRU0 R30[7]`, active-low)
-- `P9_29` → `DIR_A` (`PRU0 R30[1]`)
-- `P9_31` → `STEP_A` (`PRU0 R30[0]`)
+- `P9_27` → `DIR_A` (`PRU0 R30[5]`)
+- `P9_29` → `STEP_A` (`PRU0 R30[1]`)
 
 Motor B — Lateral (Group 2):
-- `P9_41` → `EN_B` (`PRU0 R30[6]`, active-low)
-- `P9_28` → `DIR_B` (`PRU0 R30[3]`)
+- `P9_28` → `EN_B` (`PRU0 R30[3]`, active-low)
+- `P9_31` → `DIR_B` (`PRU0 R30[0]`)
 - `P9_30` → `STEP_B` (`PRU0 R30[2]`)
 
 Endstops (PRU0 inputs — read by PRU0 via R31):
@@ -244,7 +244,6 @@ Additional board IO:
 
 Rules:
 - Do not remap these pins unless the user explicitly requests it.
-- Keep `P9_29` and `P9_31` reserved for future TMC2209 UART migration.
 - Any PRU pin change must update firmware + DTS + documentation in one commit.
 
 ### 3.2 Linux Daemon Safety
