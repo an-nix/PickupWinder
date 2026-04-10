@@ -1,4 +1,4 @@
-/* pru1_orchestration/main.c — PRU1: orchestrator and sole host interface.
+/* orchestrator/main.c — PRU orchestrator firmware (runs on PRU0 at runtime).
  *
  * Architecture layer 2/4.
  *
@@ -15,8 +15,8 @@
  *   5. On HOST_CMD_HOME_START: enter homing state machine.
  *   6. On HOST_CMD_ACK_EVENT: clear pending event.
  *   7. On HOST_CMD_RESET_POS: request PRU0 to reset counters.
- *   8. Monitor endstop_mask from motor_telem for homing completion.
- *   9. Synchronize lateral/spindle speeds (future).
+ *   8. Read R31 endstop inputs (P9_28/P9_30), halt lateral on assertion.
+ *   9. Monitor endstop_mask for homing completion.
  *  10. Publish pru_status_t every STATUS_STRIDE iterations.
  *
  * Rules:
@@ -24,10 +24,12 @@
  *   - PRU1 must NOT write motor pins (R30 STEP/DIR/EN).
  *   - PRU1 writes motor_params_t; PRU0 reads it.
  *   - PRU1 reads motor_telem_t; PRU0 writes it.
+ *   - PRU1 reads R31 for endstop inputs (P9_28=R31[6], P9_30=R31[2]).
  */
 
 #include <stdint.h>
 #include "../include/pru_ipc.h"
+#include "../include/pru_regs.h"  /* register volatile __R31 */
 
 /* ── Shared RAM pointers ─────────────────────────────────────────────────── */
 static volatile host_cmd_t     *host_cmd =
@@ -45,6 +47,15 @@ static volatile pru_status_t   *status =
 /* ── Cadence ─────────────────────────────────────────────────────────────── */
 #define CMD_CHECK_STRIDE    1000u      /* check host cmd every ~1000 loops   */
 #define STATUS_STRIDE       500000u    /* publish status every ~2.5 ms       */
+
+/* ── Endstop inputs (PRU0 R31) ───────────────────────────────────────────── */
+/* P9_28 = conf_mcasp0_ahclkr  MODE6 = pr1_pru0_pru_r31[6]                  */
+/* P9_30 = conf_mcasp0_axr0    MODE6 = pr1_pru0_pru_r31[2]                  */
+#define ES1_BIT  (1u << 6)   /* R31[6]  P9_28  ENDSTOP_1  (active-HIGH)     */
+#define ES2_BIT  (1u << 2)   /* R31[2]  P9_30  ENDSTOP_2  (active-HIGH)     */
+
+static uint8_t g_endstop_mask      = 0u;  /* live endstop state (R31)        */
+static uint8_t g_prev_endstop_mask = 0u;  /* previous state for edge detect  */
 
 /* ── Homing state machine ────────────────────────────────────────────────── */
 typedef enum {
@@ -68,6 +79,29 @@ static uint8_t  g_saved_lat_dir      = 0u;
 static inline void ack_cmd(uint8_t opcode) {
     host_cmd->cmd_ack = opcode;
     host_cmd->cmd     = HOST_CMD_NOP;
+}
+
+/* ── Endstop tick: read R31, safety-stop lateral on assertion ───────────── */
+static void endstop_tick(void) {
+    uint32_t r31 = __R31;
+    uint8_t es = 0u;
+    if (r31 & ES1_BIT) es |= ENDSTOP1_MASK;
+    if (r31 & ES2_BIT) es |= ENDSTOP2_MASK;
+    g_endstop_mask = es;
+
+    /* Rising edge: new endstop assertion */
+    if (es && !g_prev_endstop_mask) {
+        /* Unconditional lateral safety stop */
+        params->lat_run = 0u;
+        status->lat_faults |= FAULT_ENDSTOP_HIT;
+
+        /* Notify host if not in homing (homing_tick handles the homing case) */
+        if (g_homing == HOMING_IDLE && !status->event_pending) {
+            status->event_type    = EVENT_ENDSTOP_HIT;
+            status->event_pending = 1u;
+        }
+    }
+    g_prev_endstop_mask = es;
 }
 
 /* ── Helper: emergency stop ──────────────────────────────────────────────── */
@@ -176,18 +210,18 @@ static void process_host_cmd(void) {
 static void homing_tick(void) {
     if (g_homing == HOMING_IDLE) return;
 
-    uint8_t es = telem->endstop_mask;
+    uint8_t es = g_endstop_mask;  /* set by endstop_tick() */
 
     switch (g_homing) {
 
     case HOMING_APPROACH:
         if (es & (ENDSTOP1_MASK | ENDSTOP2_MASK)) {
-            /* Endstop hit: PRU0 already stopped the lateral motor (safety).
+            /* Endstop hit: endstop_tick() already stopped the lateral motor.
              * Reset lateral position to zero. */
             params->lat_run = 0u;
             telem->lat_step_count = 0u;
             telem->lat_position   = 0;
-            telem->lat_faults     = 0u;  /* clear FAULT_ENDSTOP_HIT */
+            status->lat_faults    = 0u;  /* clear FAULT_ENDSTOP_HIT */
             g_homing = HOMING_HIT;
         }
         break;
@@ -216,25 +250,18 @@ static void publish_status(void) {
     status->lat_position      = telem->lat_position;
     status->sp_interval_actual  = telem->sp_interval_actual;
     status->lat_interval_actual = telem->lat_interval_actual;
-    status->endstop_mask      = telem->endstop_mask;
-    status->sp_faults         = telem->sp_faults;
-    status->lat_faults        = telem->lat_faults;
+    status->endstop_mask        = g_endstop_mask;    /* from R31 directly    */
+    status->sp_faults           = telem->sp_faults;
+    /* status->lat_faults managed by endstop_tick(); do not overwrite here  */
 
     /* PRU1 state. */
     uint8_t st = PRU1_STATE_IDLE;
-    if (g_homing != HOMING_IDLE)          st |= PRU1_STATE_HOMING;
-    if (params->sp_run || params->lat_run) st |= PRU1_STATE_RUNNING;
-    if (telem->endstop_mask)               st |= PRU1_STATE_AT_HOME;
-    if (telem->sp_faults || telem->lat_faults) st |= PRU1_STATE_FAULT;
+    if (g_homing != HOMING_IDLE)                       st |= PRU1_STATE_HOMING;
+    if (params->sp_run || params->lat_run)             st |= PRU1_STATE_RUNNING;
+    if (g_endstop_mask)                                st |= PRU1_STATE_AT_HOME;
+    if (telem->sp_faults || status->lat_faults)        st |= PRU1_STATE_FAULT;
     status->pru1_state = st;
-
-    /* Endstop event (outside homing): notify host of safety stop. */
-    if (g_homing == HOMING_IDLE &&
-        (telem->lat_faults & FAULT_ENDSTOP_HIT) &&
-        !status->event_pending) {
-        status->event_type    = EVENT_ENDSTOP_HIT;
-        status->event_pending = 1u;
-    }
+    /* Endstop events are raised in endstop_tick(); no duplicate check here */
 
     status->seq++;
 }
@@ -259,12 +286,17 @@ int main(void) {
             process_host_cmd();
         }
 
-        /* ── 2. Homing state machine ────────────────────────────────────── */
+        /* ── 2. Read endstops + safety stop (throttled) ─────────────────── */
+        if (loop_cnt % CMD_CHECK_STRIDE == 0u) {
+            endstop_tick();
+        }
+
+        /* ── 3. Homing state machine ────────────────────────────────────── */
         if (loop_cnt % CMD_CHECK_STRIDE == 0u) {
             homing_tick();
         }
 
-        /* ── 3. Publish status (throttled) ──────────────────────────────── */
+        /* ── 4. Publish status (throttled) ──────────────────────────────── */
         if (loop_cnt % STATUS_STRIDE == 0u) {
             publish_status();
         }

@@ -62,13 +62,13 @@ all: $(OUT_DIR)/$(FW_NAME_0) $(OUT_DIR)/$(FW_NAME_1)
 $(OUT_DIR):
 	mkdir -p $(OUT_DIR)
 
-$(OUT_DIR)/$(FW_NAME_0): pru0_motor_control/main.c include/pru_ipc.h include/pru_stepper.h include/pru_regs.h | $(OUT_DIR)
+$(OUT_DIR)/$(FW_NAME_0): orchestrator/main.c include/pru_ipc.h include/pru_regs.h | $(OUT_DIR)
 	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
-	@echo "[PRU0] built -> $@"
+	@echo "[PRU orchestrator -> PRU0] built -> $@"
 
-$(OUT_DIR)/$(FW_NAME_1): pru1_orchestration/main.c include/pru_ipc.h | $(OUT_DIR)
+$(OUT_DIR)/$(FW_NAME_1): motor_control/main.c include/pru_ipc.h include/pru_stepper.h include/pru_regs.h | $(OUT_DIR)
 	$(PRU_CC) $(PRU_CFLAGS) -o $@ $<
-	@echo "[PRU1] built -> $@"
+	@echo "[PRU motor -> PRU1] built -> $@"
 
 # ── Standalone spindle test (no IPC, no daemon) ──────────────────────────────
 # Drives spindle at 25 RPM directly from PRU0 to validate hardware wiring.

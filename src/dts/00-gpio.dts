@@ -6,16 +6,17 @@
  * 3-cell format: <offset config_flags mux_mode>
  *
  * Bank mapping:
- *   GPIO1 bank : P8_15 (ENDSTOP_1, PRU1 R31[15])
- *                P8_16 (ENDSTOP_2, PRU1 R31[14])
- *                P9_23 (footswitch input, GPIO1[17])
+ *   GPIO3 bank : P9_28 (ENDSTOP_1, PRU0 R31[6])   ← PRU0 orchestrateur
+ *                P9_30 (ENDSTOP_2, PRU0 R31[2])   ← PRU0 orchestrateur
  *
- *   GPIO3 bank : P9_25 (EN_A,   PRU0 R30[7])
- *                P9_27 (DIR_A,  PRU0 R30[5])
- *                P9_29 (STEP_A, PRU0 R30[1])
- *                P9_28 (EN_B,   PRU0 R30[3])
- *                P9_31 (DIR_B,  PRU0 R30[0])
- *                P9_30 (STEP_B, PRU0 R30[2])
+ *   GPIO1 bank : P9_23 (footswitch input, GPIO1[17])
+ *
+ *   GPIO0 bank : P8_41 (EN_A,   PRU1 R30[7])
+ *                P8_43 (DIR_A,  PRU1 R30[5])
+ *                P8_45 (STEP_A, PRU1 R30[1])
+ *                P8_42 (EN_B,   PRU1 R30[3])
+ *                P8_44 (DIR_B,  PRU1 R30[0])
+ *                P8_46 (STEP_B, PRU1 R30[2])
  *
  * Note: bone-pinmux-helper absent sur kernel 6.12 → pinmux attaché via &gpioN.
  * Chaque groupe est attaché au contrôleur GPIO propriétaire des pads.
@@ -26,12 +27,14 @@
 
 &am33xx_pinmux {
 
-    /* ── GPIO1 : entrées endstop PRU1 (P8_15 / P8_16) ─────────────────
-     * MODE6 = PRU1 R31 direct input, pull désactivé (circuit externe)    */
+    /* ── GPIO3 : entrées endstop PRU0 (P9_28 / P9_30) ──────────────────
+     * P9_28 = conf_mcasp0_ahclkr  offset 0x19C  MODE6 = PRU0 R31[6] input
+     * P9_30 = conf_mcasp0_axr0    offset 0x198  MODE6 = PRU0 R31[2] input
+     * pull-up activé (0x30) : protège si le câble capteur est déconnecté  */
     pru_endstop_pins: pru-endstop-pins {
         pinctrl-single,pins = <
-            0x03C 0x28 0x06  /* P8_15 ENDSTOP_1 (PRU1 R31[15]) rx-en, pull-disabled */
-            0x038 0x28 0x06  /* P8_16 ENDSTOP_2 (PRU1 R31[14]) rx-en, pull-disabled */
+            0x19C 0x30 0x06  /* P9_28 ENDSTOP_1 (PRU0 R31[6]) rx-en, pull-up, MODE6 */
+            0x198 0x30 0x06  /* P9_30 ENDSTOP_2 (PRU0 R31[2]) rx-en, pull-up, MODE6 */
         >;
     };
 
@@ -43,34 +46,41 @@
         >;
     };
 
-    /* ── GPIO3 : sorties stepper PRU0 ──────────────────────────────────
-     * MODE5 = PRU0 R30 direct OUTPUT  (MODE6 = R31 INPUT — ne pas confondre)
-     * AM335x MCASP0 pins: MODE5 → pr1_pru0_pru_r30_N (output)
-     *                     MODE6 → pr1_pru0_pru_r31_N (input)  ← MAUVAIS pour sorties
+    /* ── GPIO0 : sorties stepper PRU1 (P8_41..P8_46) ────────────────────
+     * MODE6 = PRU1 R30 direct OUTPUT  (MODE5 = PRU0 R30 output on GPMC pins)
+     * AM335x GPMC pins: MODE6 → pr1_pru1_pru_r30_N (output)
      * EN_A/EN_B : pull-up (active-low, état safe = driver désactivé si PRU OFF)
-     * STEP/DIR   : pull désactivé (piloté directement par PRU0)           */
+     * STEP/DIR : pull désactivé (piloté directement par PRU1)           */
     pru_step_pins: pru-step-pins {
         pinctrl-single,pins = <
-            0x1AC 0x10 0x05  /* P9_25 EN_A   (PRU0 R30[7]) pull-up, active-low, MODE5=R30 out */
-            0x1A4 0x08 0x05  /* P9_27 DIR_A  (PRU0 R30[5]) no pull,             MODE5=R30 out */
-            0x194 0x08 0x05  /* P9_29 STEP_A (PRU0 R30[1]) no pull,             MODE5=R30 out */
-            0x19C 0x10 0x05  /* P9_28 EN_B   (PRU0 R30[3]) pull-up, active-low, MODE5=R30 out */
-            0x190 0x08 0x05  /* P9_31 DIR_B  (PRU0 R30[0]) no pull,             MODE5=R30 out */
-            0x198 0x08 0x05  /* P9_30 STEP_B (PRU0 R30[2]) no pull,             MODE5=R30 out */
+            0x0B0 0x10 0x06  /* P8_41 EN_A   (PRU1 R30 output) pull-up, active-low, MODE6=R30 out */
+            0x0B4 0x10 0x06  /* P8_42 EN_B   (PRU1 R30 output) pull-up, active-low, MODE6=R30 out */
+            0x0A8 0x08 0x06  /* P8_43 DIR_A  (PRU1 R30 output) no pull,             MODE6=R30 out */
+            0x0AC 0x08 0x06  /* P8_44 DIR_B  (PRU1 R30 output) no pull,             MODE6=R30 out */
+            0x0A0 0x08 0x06  /* P8_45 STEP_A (PRU1 R30 output) no pull,             MODE6=R30 out */
+            0x0A4 0x08 0x06  /* P8_46 STEP_B (PRU1 R30 output) no pull,             MODE6=R30 out */
         >;
     };
 };
 
-/* ── Attache GPIO1 : endstops (PRU1) + footswitch (host) ───────────────
- * P8_15, P8_16 et P9_23 appartiennent tous au bank GPIO1.
- * Fusionner dans un seul fragment évite un écrasement de pinctrl-0.      */
-&gpio1 {
+/* ── Attache GPIO3 : endstops PRU0 (P9_28 / P9_30) ─────────────────────
+ * P9_28 et P9_30 appartiennent au bank GPIO3.
+ * Muxés en MODE6 (PRU0 R31 input) — lus par l'orchestrateur PRU0.         */
+&gpio3 {
     pinctrl-names = "default";
-    pinctrl-0 = <&pru_endstop_pins &host_gpio_input_pins>;
+    pinctrl-0 = <&pru_endstop_pins>;
 };
 
-/* ── Attache GPIO3 : sorties stepper PRU0 ──────────────────────────────  */
-&gpio3 {
+/* ── Attache GPIO1 : footswitch host (P9_23) ─────────────────────────────
+ * P9_23 appartient au bank GPIO1 (GPIO1[17]).                              */
+&gpio1 {
+    pinctrl-names = "default";
+    pinctrl-0 = <&host_gpio_input_pins>;
+};
+
+/* ── Attache GPIO0 : sorties stepper PRU1 (P8_41..P8_46) ───────────────
+ * Ces pins appartiennent au bank GPIO0. */
+&gpio0 {
     pinctrl-names = "default";
     pinctrl-0 = <&pru_step_pins>;
 };

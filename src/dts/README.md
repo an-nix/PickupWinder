@@ -6,9 +6,9 @@ target typically allows up to 4 overlay slots at boot; group overlays so you
 can enable the set you need (the repo provides 4 canonical overlays).
 
 Overlays in this directory:
-- 00-gpio.dts    : All GPIO pinmux (steppers PRU0 + endstops PRU1 + footswitch P9_23).
+- 00-gpio.dts    : All GPIO pinmux (steppers PRU1 + endstops PRU1 + footswitch P9_23).
                    Attaches pru_endstop_pins + host_gpio_input_pins → &gpio1
-                   Attaches pru_step_pins → &gpio3
+                   Attaches pru_step_pins → &gpio0
                    **Remplace l'ancien 00-pru-steppers-endstops.dts.**
 - 02-eqep.dts    : eQEP overlays (eQEP0 on P9_42/P9_27, eQEP2 on P8_12/P8_11).
 

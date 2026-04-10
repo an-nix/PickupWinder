@@ -2,25 +2,25 @@
 
 Two PRU firmware images for the AM335x PRUs:
 
-- `am335x-pru0-fw` — PRU0: dual-motor real-time pulse generator + endstop safety
-- `am335x-pru1-fw` — PRU1: orchestrator / brain + host communication
+- `am335x-pru0-fw` — motor-control firmware (runs on PRU1 at runtime)
+- `am335x-pru1-fw` — orchestration firmware (runs on PRU0 at runtime)
 
 ---
 
 ## Architecture: Option A — Continuous Shared Parameters
 
-PRU0 is a **dumb motor driver**. It reads motor parameters from PRU1 and
+PRU1 is a **dumb motor driver**. It reads motor parameters from PRU0 and
 generates STEP/DIR/EN pulses via the IEP hardware counter. It knows nothing
 about commands, homing, or the host.
 
-PRU1 is the **orchestrator**. It reads commands from the host (via shared RAM),
-manages the homing state machine, writes motor parameters for PRU0, and
+PRU0 is the **orchestrator**. It reads commands from the host (via shared RAM),
+manages the homing state machine, writes motor parameters for PRU1, and
 publishes aggregated status for the daemon.
 
 ```
-Host ──host_cmd_t──→ PRU1 ──motor_params_t──→ PRU0
-                     PRU1 ←──motor_telem_t── PRU0
-Host ←─pru_status_t─ PRU1
+Host ──host_cmd_t──→ PRU0 ──motor_params_t──→ PRU1
+                     PRU0 ←──motor_telem_t── PRU1
+Host ←─pru_status_t─ PRU0
 ```
 
 **No move rings.** Speed changes are instantaneous. The host sets target
@@ -35,27 +35,24 @@ PRU0 reads and generates continuous pulses.
 
 Responsibilities:
 - Initialize and own the IEP timer (`IEP_INIT()`)
-- Read `motor_params_t` from PRU1 continuously
+- Read `motor_params_t` from PRU1 (orchestrator) continuously
 - Apply STEP/DIR/EN GPIO for both axes
 - IEP-based pulse generation via `pulse_gen_t` engine (`pulse_update()`)
-- Read R31 endstops — unconditional lateral safety stop
-- Publish `motor_telem_t` (step counts, positions, faults, endstop mask)
+- Publish `motor_telem_t` (step counts, positions, faults)
 
 **PRU0 does NOT**: process commands, perform homing, communicate with the host,
-make decisions. It is a pure real-time motor driver.
+make decisions, read endstops. It is a pure real-time motor driver.
 
-### PRU0 Pin Table
+### PRU0 Pin Table (motor firmware on PRU1 at runtime)
 
 | Header pin | PRU bit  | Function   | Notes |
 |------------|----------|------------|-------|
-| P9_25      | R30\[7\] | EN_A       | Spindle enable (active-low) |
-| P9_29      | R30\[1\] | DIR_A      | Spindle direction |
-| P9_31      | R30\[0\] | STEP_A     | Spindle step |
-| P9_41      | R30\[6\] | EN_B       | Lateral enable (active-low) |
-| P9_28      | R30\[3\] | DIR_B      | Lateral direction |
-| P9_30      | R30\[2\] | STEP_B     | Lateral step |
-| P8_15      | R31\[15\] | ENDSTOP_1 | Lateral endstop input |
-| P8_16      | R31\[14\] | ENDSTOP_2 | Lateral endstop input |
+| P8_41      | R30\[7\] | EN_A       | Spindle enable (active-low) |
+| P8_43      | R30\[5\] | DIR_A      | Spindle direction |
+| P8_45      | R30\[1\] | STEP_A     | Spindle step |
+| P8_42      | R30\[3\] | EN_B       | Lateral enable (active-low) |
+| P8_44      | R30\[0\] | DIR_B      | Lateral direction |
+| P8_46      | R30\[2\] | STEP_B     | Lateral step |
 
 ### Pulse Generation Engine
 
@@ -97,6 +94,13 @@ Responsibilities:
 
 **PRU1 does NOT**: generate pulses, toggle STEP/DIR/EN pins, own the IEP timer,
 read R31 endstops directly.
+
+### PRU1 (Orchestrator) Pin Table
+
+| Header pin | PRU bit   | Function   | Notes |
+|------------|-----------|------------|-------|
+| P9_28      | R31\[6\]  | ENDSTOP_1  | Lateral endstop input (pull-up, active-HIGH) |
+| P9_30      | R31\[2\]  | ENDSTOP_2  | Lateral endstop input (pull-up, active-HIGH) |
 
 ### Homing State Machine
 
@@ -206,6 +210,6 @@ Deploy to BeagleBone:
 
 ## Future TMC2209 UART Reservation
 
-`P9_29` and `P9_31` are intentionally selected because they can be switched to
-`pru_uart` TX later (TMC2209 UART mode). Keep this reservation unchanged unless
-explicitly requested.
+The current stepper mapping uses P8_41..P8_46 for PRU1 motor control. If a
+future hardware revision needs PRU UART, update the pin reservation and verify
+that the new pins support `pru_uart` TX.

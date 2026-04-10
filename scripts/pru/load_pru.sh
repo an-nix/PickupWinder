@@ -11,8 +11,8 @@ ENABLE_SERVICE=0
 ENABLE_BOOT_OVERLAY=0
 SKIP_PINMUX=0
 WAIT_FOR_RPROC_SECS=20
-FW0="am335x-pru0-fw"
-FW1="am335x-pru1-fw"
+FW0="am335x-pru0-fw"   # orchestrator → loaded on PRU0
+FW1="am335x-pru1-fw"   # motor control → loaded on PRU1
 DTBO="pickup-winder-p8-steppers.dtbo"
 SERVICE_NAME="pickupwinder-pru.service"
 INSTALL_BIN_DIR="/usr/local/bin"
@@ -98,8 +98,8 @@ set_runtime_pinmux() {
     fi
 
     info "Applying runtime PRU pinmux for motor outputs"
-    local out_pins=(P9_25 P9_29 P9_31 P9_41 P9_28 P9_30)
-    local in_pins=(P8_15 P8_16)
+    local out_pins=(P8_41 P8_42 P8_43 P8_44 P8_45 P8_46)
+    local in_pins=(P9_28 P9_30)
     local pin
 
     for pin in "${out_pins[@]}"; do

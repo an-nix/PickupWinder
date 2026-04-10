@@ -1,23 +1,25 @@
-/* pru0_motor_control/main.c — PRU0: minimal dual-axis motor driver.
+﻿/* motor_control/main.c — motor firmware (runs on PRU1 at runtime).
  *
- * Architecture layer 1/4.
+ * Architecture layer 1/4.  This firmware runs on PRU1 at runtime
+ * (loaded as am335x-pru0-fw by the PRU loader).
  *
- * PRU0 is a dumb pulse generator. It knows nothing about homing, recipes,
- * synchronization, or commands from the host. Its sole responsibilities:
+ * PRU0 (motor firmware) is a dumb pulse generator. It knows nothing about
+ * homing, recipes, synchronization, commands, or endstops. Its sole
+ * responsibilities:
  *
- *   1. Read motor_params_t (written by PRU1) every iteration.
+ *   1. Read motor_params_t (written by PRU1/orchestrator) every iteration.
  *   2. Generate STEP/DIR pulses using the IEP hardware counter.
- *   3. Read R31 endstop pins and publish them in motor_telem_t.
- *   4. If any endstop is active and lateral is running → immediate stop.
- *   5. Publish motor_telem_t for PRU1 (and host) to read.
+ *   3. Publish motor_telem_t for PRU1 (and host) to read.
  *
  * PRU0 owns and initializes the IEP timer. PRU1 may read IEP but never
  * resets it.
  *
- * Pin mapping (active-low enable):
- *   Motor A (spindle): STEP=R30[1] (P9_29), DIR=R30[5] (P9_27), EN=R30[7] (P9_25)
- *   Motor B (lateral): STEP=R30[2] (P9_30), DIR=R30[0] (P9_31), EN=R30[3] (P9_28)
- *   Endstops (R31):    ES1=R31[15] (P8_15), ES2=R31[14] (P8_16)   (active-HIGH)
+ * Pin mapping on PRU1 R30 (active-low enable) — GPMC pins in MODE6:
+ *   Motor A (spindle): STEP=R30[1] (P8_45), DIR=R30[5] (P8_43), EN=R30[7] (P8_41)
+ *   Motor B (lateral): STEP=R30[2] (P8_46), DIR=R30[0] (P8_44), EN=R30[3] (P8_42)
+ *
+ * Endstops are read by PRU0 (orchestrator) via its R31 (P9_28/P9_30).
+ * This firmware does NOT read R31 or perform any endstop logic.
  */
 
 #include <stdint.h>
@@ -26,16 +28,13 @@
 #include "../include/pru_regs.h"
 
 /* ── Pin bitmasks ────────────────────────────────────────────────────────── */
-#define SP_STEP_BIT    (1u << 1)   /* P9_29 R30[1] */
-#define SP_DIR_BIT     (1u << 5)   /* P9_27 R30[5] */
-#define SP_EN_BIT      (1u << 7)   /* P9_25 R30[7] active-low */
+#define SP_STEP_BIT    (1u << 1)   /* P8_45 R30[1] */
+#define SP_DIR_BIT     (1u << 5)   /* P8_43 R30[5] */
+#define SP_EN_BIT      (1u << 7)   /* P8_41 R30[7] active-low */
 
-#define LAT_STEP_BIT   (1u << 2)   /* P9_30 R30[2] */
-#define LAT_DIR_BIT    (1u << 0)   /* P9_31 R30[0] */
-#define LAT_EN_BIT     (1u << 3)   /* P9_28 R30[3] active-low */
-
-#define ES1_BIT        (1u << 15)  /* R31 endstop 1 */
-#define ES2_BIT        (1u << 14)  /* R31 endstop 2 */
+#define LAT_STEP_BIT   (1u << 2)   /* P8_46 R30[2] */
+#define LAT_DIR_BIT    (1u << 0)   /* P8_44 R30[0] */
+#define LAT_EN_BIT     (1u << 3)   /* P8_42 R30[3] active-low */
 
 /* ── Telemetry publish cadence ───────────────────────────────────────────── */
 #define TELEM_STRIDE   500000u     /* ~2.5 ms at 200 MHz (400 Hz) */
@@ -70,7 +69,7 @@ static inline void apply_enable_lat(uint8_t en) {
 }
 
 /* ── Publish telemetry ───────────────────────────────────────────────────── */
-static void publish_telem(uint8_t endstop_mask) {
+static void publish_telem(void) {
     telem->sp_step_count     = spindle.step_count;
     telem->lat_step_count    = lateral.step_count;
     telem->lat_position      = lateral.position;
@@ -89,7 +88,8 @@ static void publish_telem(uint8_t endstop_mask) {
     if (!(__R30 & LAT_EN_BIT)) lat_st |= MOTOR_STATE_ENABLED;
     telem->lat_state = lat_st;
 
-    telem->endstop_mask = endstop_mask;
+    /* endstop_mask is 0: endstops are owned by PRU0 (orchestrator) */
+    telem->endstop_mask = 0u;
     telem->seq++;
 }
 
@@ -130,32 +130,19 @@ int main(void) {
         apply_dir_sp(sp_dir);
         apply_dir_lat(lat_dir);
 
-        /* ── 4. Read endstops (R31) ─────────────────────────────────────── */
-        uint32_t r31 = __R31;
-        uint8_t endstop_mask = 0u;
-        if (r31 & ES1_BIT) endstop_mask |= ENDSTOP1_MASK;
-        if (r31 & ES2_BIT) endstop_mask |= ENDSTOP2_MASK;
 
-        /* ── 5. Safety: endstop stops lateral unconditionally ────────────── */
-        if (endstop_mask && lateral.running) {
-            pulse_stop(&lateral);
-            __R30 &= ~LAT_STEP_BIT;
-            telem->lat_faults |= FAULT_ENDSTOP_HIT;
-            lat_run = 0u;  /* override for this iteration */
-        }
-
-        /* ── 6. Spindle pulse generation ────────────────────────────────── */
+        /* ── 4. Spindle pulse generation ────────────────────────────────── */
         uint8_t sp_pin = pulse_update(&spindle, sp_iv, sp_dir, sp_run, now);
         if (sp_pin) __R30 |= SP_STEP_BIT; else __R30 &= ~SP_STEP_BIT;
 
-        /* ── 7. Lateral pulse generation ────────────────────────────────── */
+        /* ── 5. Lateral pulse generation ────────────────────────────────── */
         uint8_t lat_pin = pulse_update(&lateral, lat_iv, lat_dir, lat_run, now);
         if (lat_pin) __R30 |= LAT_STEP_BIT; else __R30 &= ~LAT_STEP_BIT;
 
-        /* ── 8. Publish telemetry (throttled) ───────────────────────────── */
+        /* ── 6. Publish telemetry (throttled) ───────────────────────────── */
         if (++loop_cnt >= TELEM_STRIDE) {
             loop_cnt = 0u;
-            publish_telem(endstop_mask);
+            publish_telem();
         }
     }
 

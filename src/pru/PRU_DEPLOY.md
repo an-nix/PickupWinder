@@ -1,24 +1,22 @@
-# Déploiement manuel PRU (PRU0 motor-control)
+# Déploiement manuel PRU (PRU1 motor-control)
 
 Ce fichier décrit la procédure manuelle pour déployer le firmware PRU0 `am335x-pru0-fw`
-qui pilote les deux moteurs (A + B) selon le mapping P9/P8 canonique.
+qui pilote les deux moteurs (A + B) sur PRU1 selon le mapping P8 canonique.
 
 Important
 - Le firmware PRU0 **possède** le compteur IEP (il appelle `IEP_INIT()`).
-- PRU1 reste réservé à l'orchestration/supervision et ne pilote aucun moteur.
+- PRU1 exécute maintenant le firmware moteur; PRU0 gère l'orchestration et la communication.
 - Les signaux ENABLE sont actifs LOW (0 = driver ON).
 
 Rappel GPIO (PRU0)
-- P9_25  → EN_A   (R30[7]) (active-low)
-- P9_29  → DIR_A  (R30[1])
-- P9_31  → STEP_A (R30[0])
-- P9_41  → EN_B   (R30[6]) (active-low)
-- P9_28  → DIR_B  (R30[3])
-- P9_30  → STEP_B (R30[2])
-- P8_15  → ENDSTOP_1 (R31[15])
-- P8_16  → ENDSTOP_2 (R31[14])
-- P8_15  → ENDSTOP_1 (R31[15])  (PRU1 sampled, published to PRU0)
-- P8_16  → ENDSTOP_2 (R31[14])  (PRU1 sampled, published to PRU0)
+- P8_41  → EN_A   (R30[7]) (active-low)
+- P8_43  → DIR_A  (R30[5])
+- P8_45  → STEP_A (R30[1])
+- P8_42  → EN_B   (R30[3]) (active-low)
+- P8_44  → DIR_B  (R30[0])
+- P8_46  → STEP_B (R30[2])
+- P9_28  → ENDSTOP_1 (PRU0 R31[6])  (PRU0 orchestrateur, pull-up)
+- P9_30  → ENDSTOP_2 (PRU0 R31[2])  (PRU0 orchestrateur, pull-up)
 
 ## Déploiement automatisé recommandé
 
@@ -44,7 +42,7 @@ Ce script :
 
 ```bash
 cd /home/nicolas/Documents/PlatformIO/Projects/PickupWinder/src/pru
-make         # compile les firmwares (PRU0 motor + PRU1 orchestration)
+make         # compile les firmwares (motor + orchestration)
 make dtbo    # compile les .dtbo depuis dts/ (optionnel pour pinmux persistant)
 ```
 
@@ -86,7 +84,7 @@ sudo /usr/local/bin/test_pru0_motor.sh
 ```
 
 Le script :
-- met les pins moteur/endstops sur le mapping PRU0 (`pruout`/`pruin`) via `config-pin`
+- met les pins moteur sur le mapping PRU1 (`pruout`) et les endstops sur PRU0 (`pruin`) via `config-pin`
 - arrête PRU0/PRU1, assigne `am335x-pru0-fw` + `am335x-pru1-fw` et démarre les deux PRUs
 - affiche l'état final
 
@@ -100,10 +98,10 @@ sudo /usr/local/bin/pru_spin_test.py --rpm 20 --seconds 6 --forward 1
 
 ```bash
 # config des pins (en local sur la BBB)
-for pin in P9_25 P9_27 P9_28 P9_29 P9_31 P9_42; do
+for pin in P8_41 P8_42 P8_43 P8_44 P8_45 P8_46; do
   sudo config-pin "$pin" pruout
 done
-for pin in P8_15 P8_16; do
+for pin in P9_28 P9_30; do
   sudo config-pin "$pin" pruin
 done
 
@@ -125,7 +123,7 @@ sudo dmesg | tail -20
 sudo /usr/local/bin/test_pru0_motor.sh --restore
 
 # ou manuellement
-for pin in P9_25 P9_27 P9_28 P9_29 P9_31 P9_42 P8_15 P8_16; do
+for pin in P8_41 P8_42 P8_43 P8_44 P8_45 P8_46 P8_15 P8_16; do
   sudo config-pin "$pin" default
 done
 ```
@@ -151,7 +149,7 @@ git clone https://github.com/beagleboard/bb.org-overlays.git /tmp/bb.org-overlay
 sudo cp /tmp/bb.org-overlays/tools/config-pin /usr/local/bin/
 sudo chmod +x /usr/local/bin/config-pin
 # vérifier
-which config-pin && config-pin -q P9_29 || echo "config-pin non opérationnel"
+which config-pin && config-pin -q P8_45 || echo "config-pin non opérationnel"
 ```
 
 2) Charger le `.dtbo` au boot (recommandé pour production)

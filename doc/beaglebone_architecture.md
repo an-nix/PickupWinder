@@ -10,8 +10,8 @@
 Le BeagleBone Black expose deux **PRU** (Programmable Real-time Units, 200 MHz,
 déterministes, 5 ns/cycle) aux côtés d'un **ARM Cortex-A8** exécutant Linux.
 
-Architecture à 4 couches. Le host écrit des vitesses cibles ; PRU1 orchestre ;
-PRU0 génère les impulsions à partir de paramètres continus.
+Architecture à 4 couches. Le host écrit des vitesses cibles ; PRU0 orchestre ;
+PRU1 génère les impulsions à partir de paramètres continus.
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -23,22 +23,22 @@ PRU0 génère les impulsions à partir de paramètres continus.
 │  Couche 3 — Daemon C matériel (pickup_daemon, ARM Linux)          │
 │  Mappe PRU Shared RAM via /dev/mem                                │
 │  Écrit host_cmd_t   (commandes: set_speed, enable, estop, home)   │
-│  Lit pru_status_t   (statut agrégé de PRU1)                       │
+│  Lit pru_status_t   (statut agrégé de PRU0)                       │
 │  Polling 10 ms, broadcast telem + events vers Python              │
-│  Communique UNIQUEMENT avec PRU1                                  │
+│  Communique UNIQUEMENT avec PRU0                                  │
 │                      │ /dev/mem mmap (PRU Shared RAM 0x4A310000)  │
 ├──────────────────────▼────────────────────────────────────────────┤
-│  Couche 2 — PRU1 orchestration (200 MHz, 5 ns/cycle)              │
+│  Couche 2 — PRU0 orchestration (200 MHz, 5 ns/cycle)              │
 │  Lit host_cmd_t du daemon (via shared RAM)                        │
 │  Machine d'état homing (IDLE → APPROACH → HIT)                    │
 │  Écrit motor_params_t (intervalles, dirs, enable, run)            │
-│  Lit motor_telem_t de PRU0                                        │
+│  Lit motor_telem_t de PRU1                                        │
 │  Publie pru_status_t (statut agrégé pour le daemon)               │
 │  PAS de contrôle moteur. PAS de STEP/DIR/EN.                      │
 │                      │ PRU Shared RAM                             │
 ├──────────────────────▼────────────────────────────────────────────┤
-│  Couche 1 — PRU0 contrôle moteur (200 MHz, propriétaire IEP)      │
-│  Lit motor_params_t de PRU1 en continu                            │
+│  Couche 1 — PRU1 contrôle moteur (200 MHz, propriétaire IEP)      │
+│  Lit motor_params_t de PRU0 en continu                            │
 │  Génération d'impulsions IEP : pulse_gen_t par axe                │
 │  GPIO STEP/DIR/EN pour spindle + lateral                          │
 │  Lit R31 endstops → arrêt latéral de sécurité inconditionnel      │
@@ -49,9 +49,9 @@ PRU0 génère les impulsions à partir de paramètres continus.
 
 **Flux de communication** (224 octets en shared RAM) :
 ```
-Host ──host_cmd_t──→ PRU1 ──motor_params_t──→ PRU0
-                     PRU1 ←──motor_telem_t── PRU0
-Host ←─pru_status_t─ PRU1
+Host ──host_cmd_t──→ PRU0 ──motor_params_t──→ PRU1
+                     PRU0 ←──motor_telem_t── PRU1
+Host ←─pru_status_t─ PRU0
 ```
 
 ---
@@ -232,12 +232,12 @@ typedef struct {
 
 | Pin header | Bit PRU   | Fonction   | Notes |
 |------------|-----------|------------|-------|
-| P9_25      | R30\[7\]  | EN_A       | Enable spindle (actif-bas) |
-| P9_27      | R30\[5\]  | DIR_A      | Direction spindle |
-| P9_29      | R30\[1\]  | STEP_A     | Step spindle |
-| P9_28      | R30\[3\]  | EN_B       | Enable latéral (actif-bas) |
-| P9_31      | R30\[0\]  | DIR_B      | Direction latéral |
-| P9_30      | R30\[2\]  | STEP_B     | Step latéral |
+| P8_41      | R30\[7\]  | EN_A       | Enable spindle (actif-bas) |
+| P8_43      | R30\[5\]  | DIR_A      | Direction spindle |
+| P8_45      | R30\[1\]  | STEP_A     | Step spindle |
+| P8_42      | R30\[3\]  | EN_B       | Enable latéral (actif-bas) |
+| P8_44      | R30\[0\]  | DIR_B      | Direction latéral |
+| P8_46      | R30\[2\]  | STEP_B     | Step latéral |
 | P8_15      | R31\[15\] | ENDSTOP_1  | Fin de course |
 | P8_16      | R31\[14\] | ENDSTOP_2  | Fin de course |
 
@@ -350,8 +350,8 @@ Toolchain PRU : `pru-unknown-elf-gcc` (crosstool-NG, auto-détecté dans `~/x-to
 src/
   pru/                          ← Firmware PRU (actif)
     include/                    ← pru_ipc.h, pru_stepper.h, pru_regs.h
-    pru0_motor_control/         ← PRU0 : pilote moteur aveugle
-    pru1_orchestration/         ← PRU1 : orchestrateur / cerveau
+    motor_control/          ← firmware moteur (tourne sur PRU1)
+    orchestrator/           ← firmware orchestrateur (tourne sur PRU0)
     Makefile                    ← Cross-compile PRU
   linux/
     daemon/                     ← pickup_daemon.c (Couche 3)

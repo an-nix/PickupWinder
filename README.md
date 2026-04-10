@@ -5,24 +5,24 @@ Real-time stepper control via PRU, with Linux daemon + Python application layer.
 
 ## Architecture — Option A (Continuous Shared Parameters)
 
-4-layer stack. **No move rings.** Host writes target speeds; PRU1 orchestrates;
-PRU0 generates pulses from continuous parameters.
+4-layer stack. **No move rings.** Host writes target speeds; PRU0 orchestrates;
+PRU1 generates pulses from continuous parameters.
 
 ```
 Layer 4  Python application   (pickup_test.py, pru_client.py)
          │ Unix socket /run/pickup-winder.sock
 Layer 3  C hardware daemon    (pickup_daemon)
          │ /dev/mem mmap
-Layer 2  PRU1 orchestration   (host_cmd → motor_params, homing FSM)
+Layer 2  PRU0 orchestration   (host_cmd → motor_params, homing FSM)
          │ PRU Shared RAM
-Layer 1  PRU0 motor control   (pulse_gen_t, STEP/DIR/EN, endstops)
+Layer 1  PRU1 motor control   (pulse_gen_t, STEP/DIR/EN, endstops)
 ```
 
 **Communication flow** (224 bytes shared RAM):
 ```
-Host ──host_cmd_t──→ PRU1 ──motor_params_t──→ PRU0
-                     PRU1 ←──motor_telem_t── PRU0
-Host ←─pru_status_t─ PRU1
+Host ──host_cmd_t──→ PRU0 ──motor_params_t──→ PRU1
+                     PRU0 ←──motor_telem_t── PRU1
+Host ←─pru_status_t─ PRU0
 ```
 
 See `doc/beaglebone_architecture.md` and `.github/copilot-instructions.md`
@@ -34,23 +34,23 @@ for the full architecture rationale.
 - **Steppers**: Two A4988/DRV8825 drivers — spindle + lateral traverse
 - **Microstepping**: 32 µstep (6400 steps/rev spindle, 3072 steps/mm lateral)
 - **Encoders**: eQEP1 (P8.33, P8.35)
-- **Endstops**: Dual-contact on PRU0 R31 (P8.15, P8.16)
+- **Endstops**: Dual-contact on PRU0 R31 (P9_28=R31[6], P9_30=R31[2], pull-up)
 - **Footswitch**: P9.23 (GPIO)
 
 ## Canonical Pin Mapping
 
-### PRU0 motor outputs
+### PRU1 motor outputs
 
 | Header pin | PRU bit   | Function | Notes |
 |------------|-----------|----------|-------|
-| P9_25      | R30\[7\]  | EN_A     | Spindle enable (active-low) |
-| P9_27      | R30\[5\]  | DIR_A    | Spindle direction |
-| P9_29      | R30\[1\]  | STEP_A   | Spindle step |
-| P9_28      | R30\[3\]  | EN_B     | Lateral enable (active-low) |
-| P9_31      | R30\[0\]  | DIR_B    | Lateral direction |
-| P9_30      | R30\[2\]  | STEP_B   | Lateral step |
+| P8_41      | R30\[7\]  | EN_A     | Spindle enable (active-low) |
+| P8_43      | R30\[5\]  | DIR_A    | Spindle direction |
+| P8_45      | R30\[1\]  | STEP_A   | Spindle step |
+| P8_42      | R30\[3\]  | EN_B     | Lateral enable (active-low) |
+| P8_44      | R30\[0\]  | DIR_B    | Lateral direction |
+| P8_46      | R30\[2\]  | STEP_B   | Lateral step |
 
-### PRU0 endstop inputs
+### PRU1 endstop inputs
 
 | Header pin | PRU bit   | Function   |
 |------------|-----------|------------|
@@ -75,8 +75,8 @@ for the full architecture rationale.
 src/
   pru/                          PRU firmware (pru-unknown-elf-gcc)
     include/                    pru_ipc.h, pru_stepper.h, pru_regs.h
-    pru0_motor_control/         PRU0: dumb pulse generator
-    pru1_orchestration/         PRU1: orchestrator / brain
+    motor_control/          motor firmware (runs on PRU1)
+    orchestrator/           orchestrator firmware (runs on PRU0)
     Makefile
   linux/
     daemon/                     pickup_daemon.c (Layer 3)

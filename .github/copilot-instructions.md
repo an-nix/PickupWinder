@@ -20,7 +20,7 @@
 ## 2. Architecture Overview — Option A (Continuous Shared Parameters)
 
 4-layer architecture. **No move rings.** Host writes target speeds;
-PRU1 orchestrates; PRU0 generates pulses from continuous parameters.
+PRU0 orchestrates; PRU1 generates pulses from continuous parameters.
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -32,23 +32,23 @@ PRU1 orchestrates; PRU0 generates pulses from continuous parameters.
 │  Layer 3 — C hardware daemon  (pickup_daemon, runs on ARM Linux)  │
 │  Maps PRU Shared RAM via /dev/mem                                 │
 │  Writes host_cmd_t   (commands: set_speed, enable, estop, home)   │
-│  Reads pru_status_t  (aggregated status from PRU1)                │
+│  Reads pru_status_t  (aggregated status from PRU0)                │
 │  Polls at 10 ms, broadcasts telem + events to Python              │
-│  ONLY talks to PRU1 — never accesses motor_params or motor_telem  │
+│  ONLY talks to PRU0 — never accesses motor_params or motor_telem  │
 │                      │ /dev/mem mmap (PRU Shared RAM 0x4A310000)  │
 ├──────────────────────▼────────────────────────────────────────────┤
-│  Layer 2 — PRU1 orchestration  (200 MHz, 5 ns/cycle)              │
+│  Layer 2 — PRU0 orchestration  (200 MHz, 5 ns/cycle)              │
 │  Reads host_cmd_t from daemon (via shared RAM)                    │
 │  Owns homing state machine (IDLE→APPROACH→HIT)                    │
 │  Writes motor_params_t (intervals, dirs, enable, run flags)       │
-│  Reads motor_telem_t from PRU0                                    │
+│  Reads motor_telem_t from PRU1                                    │
 │  Publishes pru_status_t (aggregated status for daemon)            │
 │  Detects events (endstop, home_complete, fault) → sets event flags│
 │  NO motor pin ownership. NO STEP/DIR/EN control.                  │
 │                      │ PRU Shared RAM (host_cmd / motor_params)   │
 ├──────────────────────▼────────────────────────────────────────────┤
-│  Layer 1 — PRU0 motor control  (200 MHz, IEP owner)               │
-│  Reads motor_params_t from PRU1 continuously                      │
+│  Layer 1 — PRU1 motor control  (200 MHz, IEP owner)               │
+│  Reads motor_params_t from PRU0 continuously                      │
 │  IEP-based pulse generation: pulse_gen_t per axis                 │
 │  STEP/DIR/EN GPIO for spindle + lateral                           │
 │  Reads R31 endstops → unconditional lateral safety stop           │
@@ -59,14 +59,14 @@ PRU1 orchestrates; PRU0 generates pulses from continuous parameters.
 
 **Communication flow** (total shared RAM: 224 bytes):
 ```
-Host ──host_cmd_t──→ PRU1 ──motor_params_t──→ PRU0
-                     PRU1 ←──motor_telem_t── PRU0
-Host ←─pru_status_t─ PRU1
+Host ──host_cmd_t──→ PRU0 ──motor_params_t──→ PRU1
+                     PRU0 ←──motor_telem_t── PRU1
+Host ←─pru_status_t─ PRU0
 ```
 
 Key files per layer:
-- Layer 1: `src/pru/pru0_motor_control/main.c`
-- Layer 2: `src/pru/pru1_orchestration/main.c`
+- Layer 1: `src/pru/motor_control/main.c`
+- Layer 2: `src/pru/orchestrator/main.c`
 - Layer 3: `src/linux/daemon/pickup_daemon.c`
 - Layer 4: `src/python/pickup_test.py`, `src/python/pru_client.py`
 
@@ -79,8 +79,8 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 | `pru/include/pru_ipc.h`               | IPC shared memory layout: host_cmd_t, motor_params_t, motor_telem_t, pru_status_t; HOST_CMD_* opcodes; fault/state/event flags |
 | `pru/include/pru_stepper.h`           | IEP timer macros; pulse_gen_t continuous engine; pulse_update() / pulse_stop() |
 | `pru/include/pru_regs.h`              | R30/R31 register aliases for STEP/DIR/EN/ENDSTOP pins |
-| `pru/pru0_motor_control/main.c`       | PRU0: IEP owner, dual-axis pulse generation, R31 endstop reading, motor_telem_t publisher |
-| `pru/pru1_orchestration/main.c`       | PRU1: host_cmd_t processor, homing FSM, motor_params_t writer, pru_status_t publisher |
+| `pru/motor_control/main.c`       | Motor firmware (PRU1 at runtime): IEP owner, dual-axis pulse generation, motor_telem_t publisher |
+| `pru/orchestrator/main.c`        | Orchestrator firmware (PRU0 at runtime): host_cmd_t processor, homing FSM, R31 endstop reading, motor_params_t writer, pru_status_t publisher |
 
 ### 2.2 Layer 3 — C Daemon (`pickup_daemon`)
 
@@ -223,18 +223,18 @@ sending progressive `set_speed` commands at the control loop cadence (~10 ms).
 ### 3.1.1 Canonical pin layout (MUST NOT change implicitly)
 
 Motor A — Spindle (Group 1):
-- `P9_25` → `EN_A` (`PRU0 R30[7]`, active-low)
-- `P9_27` → `DIR_A` (`PRU0 R30[5]`)
-- `P9_29` → `STEP_A` (`PRU0 R30[1]`)
+- `P8_41` → `EN_A` (`PRU0 R30[7]`, active-low)
+- `P8_43` → `DIR_A` (`PRU0 R30[5]`)
+- `P8_45` → `STEP_A` (`PRU0 R30[1]`)
 
 Motor B — Lateral (Group 2):
-- `P9_28` → `EN_B` (`PRU0 R30[3]`, active-low)
-- `P9_31` → `DIR_B` (`PRU0 R30[0]`)
-- `P9_30` → `STEP_B` (`PRU0 R30[2]`)
+- `P8_42` → `EN_B` (`PRU0 R30[3]`, active-low)
+- `P8_44` → `DIR_B` (`PRU0 R30[0]`)
+- `P8_46` → `STEP_B` (`PRU0 R30[2]`)
 
-Endstops (PRU0 inputs — read by PRU0 via R31):
-- `P8_15` → `ENDSTOP_1` (`PRU0 R31[15]`)
-- `P8_16` → `ENDSTOP_2` (`PRU0 R31[14]`)
+Endstops (PRU0 inputs — read by PRU0 orchestrateur via R31):
+- `P9_28` → `ENDSTOP_1` (`PRU0 R31[6]`, pull-up, active-HIGH)
+- `P9_30` → `ENDSTOP_2` (`PRU0 R31[2]`, pull-up, active-HIGH)
 
 Additional board IO:
 - Encoder1: `P8_11` (A), `P8_12` (B)
@@ -280,7 +280,7 @@ Rules:
 ### 3.6 Sensor Safety
 
 - Home sensor: NO=LOW + NC=HIGH → home. NO=HIGH + NC=HIGH → FAULT.
-- Endstops on PRU0 R31: unconditional lateral safety stop when any endstop asserts.
+- Endstops on PRU0 R31 (P9_28/P9_30): unconditional lateral safety stop when any endstop asserts.
 - PRU1 homing FSM reads endstop state from motor_telem_t.endstop_mask.
 
 ### 3.7 Build
@@ -413,8 +413,8 @@ IDLE --(start)--> PAUSED (positioning)
 src/
   pru/                          <- PRU firmware (active)
     include/                    <- pru_ipc.h, pru_stepper.h, pru_regs.h
-    pru0_motor_control/         <- PRU0 firmware (dumb motor driver)
-    pru1_orchestration/         <- PRU1 firmware (orchestrator/brain)
+    motor_control/          <- motor firmware (runs on PRU1 at runtime)
+    orchestrator/           <- orchestrator firmware (runs on PRU0 at runtime)
     Makefile                    <- PRU cross-compile (pru-unknown-elf-gcc)
   linux/
     daemon/                     <- pickup_daemon.c (Layer 3)
