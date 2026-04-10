@@ -16,6 +16,14 @@ Protocol (Option A — continuous shared parameters + autonomous move_to):
     {"cmd":"move_to",    "axis":1, "pos":<int>,
                           "start_hz":<uint>, "max_hz":<uint>,
                           "accel_steps":<uint>}
+    {"cmd":"set_mode",   "mode":"free"|"winding"}
+
+  Winding modes:
+    free    (default) — axes independent. set_speed controls spindle directly.
+                        move_to positions lateral without spindle sync.
+    winding           — spindle tracks lateral ramps proportionally.
+                        set_speed sets the reference speed; PRU0 adjusts
+                        spindle interval in real-time with lateral via Q6 ratio.
 
   daemon → Python (responses):
     {"ok":true}
@@ -60,6 +68,10 @@ import json
 from typing import Awaitable, Callable, Optional
 
 SOCKET_PATH = "/run/pickup-winder.sock"
+
+# Winding modes for set_mode()
+MODE_FREE    = "free"    # Independent axes; no spindle-lateral sync (default)
+MODE_WINDING = "winding" # Spindle tracks lateral ramps; turns/mm stays constant
 
 
 class PruClient:
@@ -232,6 +244,13 @@ class PruClient:
         PRU1 executes the profile autonomously — no further Python interaction
         is needed until the 'move_complete' event is received.
 
+        Consecutive same-direction calls while the motor is moving trigger a
+        hot retarget: the motor never decelerates between waypoints.
+        Direction-change calls wait for a full stop then re-accelerate.
+
+        In MODE_WINDING the daemon also sends a Q6 spindle-coordination ratio
+        so PRU0 keeps turns/mm constant during lateral ramps.
+
         Returns True when the command is acknowledged by the daemon.
         Listen for {'event':'move_complete','pos':<N>} via on_event().
         """
@@ -243,6 +262,27 @@ class PruClient:
             "max_hz":      max_hz,
             "accel_steps": accel_steps,
         })
+        return bool(r.get("ok"))
+
+    async def set_mode(self, mode: str) -> bool:
+        """Set the winding operating mode.
+
+        mode: MODE_FREE (default) or MODE_WINDING.
+
+        MODE_FREE    — axes independent. set_speed controls spindle directly.
+                       move_to positions lateral; no spindle sync.
+                       Use for: testing, homing, positioning.
+
+        MODE_WINDING — spindle tracks lateral ramps proportionally.
+                       Call set_speed() first to establish the reference speed,
+                       then move_to() activates coordination. PRU0 adjusts
+                       spindle interval every ~5 µs via Q6 ratio so turns/mm
+                       stays constant during accel/decel/reversal gaps.
+                       Coordination is disabled by any subsequent set_speed()
+                       call (Python re-takes direct spindle control).
+                       Use for: actual winding runs.
+        """
+        r = await self._send({"cmd": "set_mode", "mode": mode})
         return bool(r.get("ok"))
 
 

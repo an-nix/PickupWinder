@@ -151,6 +151,7 @@ The daemon listens on `/run/pickup-winder.sock` (Unix domain, newline-delimited 
 |---------------|-------------------------------------|-------------|
 | `set_speed`   | `sp_hz`, `lat_hz`, `sp_dir`, `lat_dir` | Set spindle speed (Hz). `lat_hz` activates continuous lateral (avoid during winding) |
 | `enable`      | `axis`, `value`                     | Enable/disable drivers |
+| `set_mode`    | `mode`                              | Set winding mode: `"free"` (default) or `"winding"` (spindle–lateral sync) |
 | `set_limits`  | `axis`, `min`, `max`                | Set software position limits (steps, signed) |
 | `move_to`     | `axis`, `pos`, `start_hz`, `max_hz`, `accel_steps` | Move lateral to absolute position with trapezoidal profile |
 | `e_stop`      |                                     | Emergency stop |
@@ -164,6 +165,27 @@ The daemon listens on `/run/pickup-winder.sock` (Unix domain, newline-delimited 
 - The daemon rejects a new command if the previous host command is still pending for more than ~50 ms. Returns `{"ok":false,"error":"busy"}`.
 - **Spindle** speed ramps: send progressive `set_speed` at ~**10 ms cadence**.
 - **Lateral axis**: use `move_to` — the motor stops at the target autonomously. `lat_hz` in `set_speed` is for continuous lateral modes only.
+
+### Winding modes
+
+```json
+{"cmd":"set_mode","mode":"free"}
+{"cmd":"set_mode","mode":"winding"}
+```
+
+Mode is a **daemon-only** concept — no IPC command is sent to the PRU. It controls
+whether each `move_to` includes a spindle-coordination ratio.
+
+| Mode | `set_speed` | `move_to` | Spindle follow lateral? |
+|------|-------------|-----------|-------------------------|
+| `free` *(default)* | direct spindle control | position target, no sync | ❌ |
+| `winding` | records reference speed | position target + Q6 coord ratio sent | ✅ |
+
+**`free`** — axes independent. Use for testing, homing, manual positioning.  
+**`winding`** — call `set_speed()` first to set the reference spindle speed, then
+`move_to()` activates coordination. The spindle slows/accelerates in real-time
+with every lateral ramp, including deceleration and reversal gaps. Coordination
+is automatically disabled by any subsequent `set_speed()` call.
 
 ### move_to — autonomous trapezoidal profile
 

@@ -18,9 +18,10 @@
  *     {"cmd":"e_stop"}
  *     {"cmd":"home_start"}
  *     {"cmd":"ack_event"}
+ *     {"cmd":"reset_pos","axis":0|1|255}
  *     {"cmd":"set_limits","axis":0|1,"min":<int>,"max":<int>}
  *     {"cmd":"move_to","axis":1,"pos":<int>,"start_hz":<uint>,"max_hz":<uint>,"accel_steps":<uint>}
- *     {"cmd":"reset_pos","axis":0|1|255}
+ *     {"cmd":"set_mode","mode":"free"|"winding"}
  *
  *   daemon → Python (responses):
  *     {"ok":true}
@@ -84,6 +85,19 @@ static uint8_t  g_last_event_sent = EVENT_NONE;
 
 /* ── Last spindle IEP interval (for move_to spindle coordination) ────────── */
 static uint32_t g_last_sp_iv = 0u;
+
+/* ── Winding mode ───────────────────────────────────────────────────── *
+ * WINDING_MODE_FREE    (0, default): no spindle–lateral coordination.       *
+ *   set_speed controls spindle directly.                                    *
+ *   move_to sends move_sp_lat_coord=0 → PRU0 coord_tick() is a no-op.      *
+ *                                                                            *
+ * WINDING_MODE_WINDING (1): spindle tracks lateral ramps proportionally.    *
+ *   set_speed records the target spindle speed (Q6 ratio base).             *
+ *   move_to computes and sends move_sp_lat_coord = sp_iv*64/lat_cruise_iv.  *
+ *   PRU0 coord_tick() adjusts spindle interval every ~5 µs.                */
+#define WINDING_MODE_FREE    0u
+#define WINDING_MODE_WINDING 1u
+static uint8_t  g_winding_mode = WINDING_MODE_FREE;
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; }
 
@@ -211,8 +225,10 @@ static int send_host_move_to(uint8_t axis, int32_t target_pos,
     /* Q6 spindle-lateral coordination ratio (0 if spindle not yet started). *
      * PRU0 computes: sp_adj = (move_sp_lat_coord * lat_iv) >> 6             *
      * This keeps turns/mm constant during lateral ramps and reversals.      */
-    g_host_cmd->move_sp_lat_coord = (g_last_sp_iv > 0u && cruise_iv > 0u)
-                                    ? (g_last_sp_iv * 64u) / cruise_iv : 0u;
+    g_host_cmd->move_sp_lat_coord =
+        (g_winding_mode == WINDING_MODE_WINDING &&
+         g_last_sp_iv > 0u && cruise_iv > 0u)
+        ? (g_last_sp_iv * 64u) / cruise_iv : 0u;
     g_host_cmd->cmd_ack        = HOST_CMD_NOP;
     g_host_cmd->cmd            = HOST_CMD_MOVE_TO;
     return 0;
@@ -349,6 +365,17 @@ static void handle_command(int client_fd, const char *line) {
         int rc = send_host_move_to(axis, target_pos, start_hz, max_hz, accel_steps);
         snprintf(resp, sizeof(resp),
             rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
+
+    } else if (HAS("\"cmd\":\"set_mode\"")) {
+        /* {"cmd":"set_mode","mode":"free"|"winding"} */
+        if (HAS("\"mode\":\"winding\"")) {
+            g_winding_mode = WINDING_MODE_WINDING;
+            fprintf(stderr, "[daemon] mode: WINDING (spindle coordinated)\n");
+        } else {
+            g_winding_mode = WINDING_MODE_FREE;
+            fprintf(stderr, "[daemon] mode: FREE (independent axes)\n");
+        }
+        snprintf(resp, sizeof(resp), "{\"ok\":true}\n");
 
     } else if (HAS("\"cmd\":\"ack_event\"")) {
         int rc = send_host_cmd(HOST_CMD_ACK_EVENT, 0, 0,0,0,0, 0);

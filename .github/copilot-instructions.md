@@ -96,6 +96,7 @@ Commands from Python:
 - `enable` — enable/disable stepper drivers
 - `e_stop` — immediate all-axis stop
 - `home_start` — start lateral homing sequence
+- `set_mode` — set winding mode: `"free"` (default, no sync) or `"winding"` (spindle tracks lateral). Daemon-only, no IPC sent to PRU.
 - `set_limits` — configure axis software position limits (steps)
 - `move_to` — move lateral to absolute position with trapezoidal profile
 - `ack_event` — acknowledge pending event and release limit locks
@@ -153,7 +154,7 @@ The application world is unstable by nature:
 **The contract between them is intentionally small and stable:**
 
 ```
-Commands (Python → C):  set_speed / enable / e_stop / home_start / set_limits / move_to / ack_event / reset_pos
+Commands (Python → C):  set_speed / enable / e_stop / home_start / set_mode / set_limits / move_to / ack_event / reset_pos
 Events   (C → Python):  endstop_hit / home_complete / fault / limit_hit / move_complete / telem
 ```
 

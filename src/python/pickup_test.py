@@ -268,6 +268,23 @@ def test_ack_event(c):
     print("  [ack_event] PASS")
 
 
+def test_set_mode(c):
+    """Test set_mode command: free and winding."""
+    print("  [set_mode] Set FREE mode...")
+    r = c.cmd({"cmd": "set_mode", "mode": "free"})
+    assert r.get("ok"), f"set_mode free failed: {r}"
+
+    print("  [set_mode] Set WINDING mode...")
+    r = c.cmd({"cmd": "set_mode", "mode": "winding"})
+    assert r.get("ok"), f"set_mode winding failed: {r}"
+
+    print("  [set_mode] Restore FREE mode...")
+    r = c.cmd({"cmd": "set_mode", "mode": "free"})
+    assert r.get("ok"), f"restore free failed: {r}"
+
+    print("  [set_mode] PASS")
+
+
 def test_set_limits(c):
     """Test set_limits command."""
     print("  [set_limits] Setting lateral limits [-5000, 5000]...")
@@ -350,6 +367,7 @@ TESTS = {
     "reset_pos":    test_reset_pos,
     "telem":        test_telem,
     "ack_event":    test_ack_event,
+    "set_mode":     test_set_mode,
     "set_limits":   test_set_limits,
     "move_to":      test_move_to,
 }
