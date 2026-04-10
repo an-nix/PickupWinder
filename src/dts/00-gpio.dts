@@ -54,10 +54,10 @@
     pru_step_pins: pru-step-pins {
         pinctrl-single,pins = <
             0x0B0 0x10 0x06  /* P8_41 EN_A   (PRU1 R30 output) pull-up, active-low, MODE6=R30 out */
-            0x0B4 0x10 0x06  /* P8_42 EN_B   (PRU1 R30 output) pull-up, active-low, MODE6=R30 out */
             0x0A8 0x08 0x06  /* P8_43 DIR_A  (PRU1 R30 output) no pull,             MODE6=R30 out */
-            0x0AC 0x08 0x06  /* P8_44 DIR_B  (PRU1 R30 output) no pull,             MODE6=R30 out */
             0x0A0 0x08 0x06  /* P8_45 STEP_A (PRU1 R30 output) no pull,             MODE6=R30 out */
+            0x0B4 0x10 0x06  /* P8_42 EN_B   (PRU1 R30 output) pull-up, active-low, MODE6=R30 out */
+            0x0AC 0x08 0x06  /* P8_44 DIR_B  (PRU1 R30 output) no pull,             MODE6=R30 out */
             0x0A4 0x08 0x06  /* P8_46 STEP_B (PRU1 R30 output) no pull,             MODE6=R30 out */
         >;
     };

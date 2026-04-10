@@ -7,8 +7,8 @@
  * reads pru_status_t, and forwards telemetry + events to Python over
  * a Unix domain socket.
  *
- * The daemon communicates ONLY with PRU1 (via shared RAM). It never
- * writes motor_params or motor_telem — those are PRU1↔PRU0 internal.
+ * The daemon communicates ONLY with PRU0 (via shared RAM). It never
+ * writes motor_params or motor_telem — those are PRU0↔PRU1 internal.
  *
  * Socket protocol (UNIX, SOCK_STREAM, newline-delimited JSON):
  *
@@ -18,6 +18,8 @@
  *     {"cmd":"e_stop"}
  *     {"cmd":"home_start"}
  *     {"cmd":"ack_event"}
+ *     {"cmd":"set_limits","axis":0|1,"min":<int>,"max":<int>}
+ *     {"cmd":"move_to","axis":1,"pos":<int>,"start_hz":<uint>,"max_hz":<uint>,"accel_steps":<uint>}
  *     {"cmd":"reset_pos","axis":0|1|255}
  *
  *   daemon → Python (responses):
@@ -79,6 +81,9 @@ static volatile int g_running = 1;
 
 /* ── Event tracking (debounce) ────────────────────────────────────────────── */
 static uint8_t  g_last_event_sent = EVENT_NONE;
+
+/* ── Last spindle IEP interval (for move_to spindle coordination) ────────── */
+static uint32_t g_last_sp_iv = 0u;
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; }
 
@@ -143,6 +148,73 @@ static int send_host_cmd(uint8_t cmd, uint8_t axis,
     /* Write cmd last to avoid race. */
     g_host_cmd->cmd               = cmd;
 
+    return 0;
+}
+
+/* Send limits command (signed min/max) */
+static int send_host_set_limits(uint8_t axis, int32_t limit_min, int32_t limit_max) {
+    if (!g_host_cmd) return -1;
+    for (int i = 0; i < 5000; i++) {
+        if (g_host_cmd->cmd == HOST_CMD_NOP) break;
+        usleep(10);
+    }
+    if (g_host_cmd->cmd != HOST_CMD_NOP) return -1;
+
+    g_host_cmd->axis = axis;
+    g_host_cmd->limit_min = limit_min;
+    g_host_cmd->limit_max = limit_max;
+    g_host_cmd->cmd_ack = HOST_CMD_NOP;
+    g_host_cmd->cmd = HOST_CMD_SET_LIMITS;
+    return 0;
+}
+
+/* Send move_to command with trapezoidal profile.
+ * Computes IEP intervals from Hz values (integer arithmetic only).
+ *   start_hz:      step frequency at start/end of ramp (slow)
+ *   max_hz:        cruise step frequency (fast)
+ *   accel_steps:   steps used for the acceleration ramp
+ */
+static int send_host_move_to(uint8_t axis, int32_t target_pos,
+                              uint32_t start_hz, uint32_t max_hz,
+                              uint32_t accel_steps) {
+    if (!g_host_cmd) return -1;
+
+    /* Guard: prevent division by zero */
+    if (start_hz == 0u)    start_hz = 1u;
+    if (max_hz   == 0u)    max_hz   = start_hz;
+    if (max_hz   < start_hz) max_hz = start_hz;
+    if (accel_steps == 0u) accel_steps = 1u;
+
+    /* Hz → IEP intervals. Min interval = 625 cycles (160 kHz). */
+    uint32_t start_iv  = PRU_CLOCK_HZ / (2u * start_hz);
+    uint32_t cruise_iv = PRU_CLOCK_HZ / (2u * max_hz);
+    if (cruise_iv < 625u) cruise_iv = 625u;
+    if (start_iv  < cruise_iv) start_iv = cruise_iv;
+
+    /* delta_iv = interval change per step during ramp (no division in PRU). */
+    uint32_t diff     = start_iv - cruise_iv;
+    uint32_t delta_iv = diff / accel_steps;
+    /* Ensure at least 1 cycle of change if there is a real ramp. */
+    if (delta_iv == 0u && diff > 0u) delta_iv = 1u;
+
+    for (int i = 0; i < 5000; i++) {
+        if (g_host_cmd->cmd == HOST_CMD_NOP) break;
+        usleep(10);
+    }
+    if (g_host_cmd->cmd != HOST_CMD_NOP) return -1;
+
+    g_host_cmd->axis           = axis;
+    g_host_cmd->move_target    = target_pos;
+    g_host_cmd->move_start_iv  = start_iv;
+    g_host_cmd->move_cruise_iv = cruise_iv;
+    g_host_cmd->move_delta_iv  = delta_iv;
+    /* Q6 spindle-lateral coordination ratio (0 if spindle not yet started). *
+     * PRU0 computes: sp_adj = (move_sp_lat_coord * lat_iv) >> 6             *
+     * This keeps turns/mm constant during lateral ramps and reversals.      */
+    g_host_cmd->move_sp_lat_coord = (g_last_sp_iv > 0u && cruise_iv > 0u)
+                                    ? (g_last_sp_iv * 64u) / cruise_iv : 0u;
+    g_host_cmd->cmd_ack        = HOST_CMD_NOP;
+    g_host_cmd->cmd            = HOST_CMD_MOVE_TO;
     return 0;
 }
 
@@ -222,6 +294,7 @@ static void handle_command(int client_fd, const char *line) {
 
         uint32_t sp_iv  = hz_to_interval(sp_hz);
         uint32_t lat_iv = hz_to_interval(lat_hz);
+        g_last_sp_iv = sp_iv;  /* track for move_to coordination ratio      */
 
         int rc = send_host_cmd(HOST_CMD_SET_SPEED, AXIS_ALL,
                                sp_iv, lat_iv, sp_dir, lat_dir, 0);
@@ -239,6 +312,41 @@ static void handle_command(int client_fd, const char *line) {
 
     } else if (HAS("\"cmd\":\"home_start\"")) {
         int rc = send_host_cmd(HOST_CMD_HOME_START, AXIS_LATERAL, 0,0,0,0, 0);
+        snprintf(resp, sizeof(resp),
+            rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
+
+    } else if (HAS("\"cmd\":\"set_limits\"")) {
+        /* {"cmd":"set_limits","axis":1,"min":-1000,"max":1000} */
+        uint8_t axis = HAS("\"axis\":1")   ? AXIS_LATERAL
+                     : HAS("\"axis\":255") ? AXIS_ALL
+                     : AXIS_SPINDLE;
+        int32_t minv = 0, maxv = 0;
+        const char *p;
+        p = strstr(line, "\"min\":");
+        if (p) minv = (int32_t)strtol(p + 6, NULL, 10);
+        p = strstr(line, "\"max\":");
+        if (p) maxv = (int32_t)strtol(p + 6, NULL, 10);
+        int rc = send_host_set_limits(axis, minv, maxv);
+        snprintf(resp, sizeof(resp),
+            rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
+
+    } else if (HAS("\"cmd\":\"move_to\"")) {
+        /* {"cmd":"move_to","axis":1,"pos":1000,"start_hz":200,"max_hz":4000,"accel_steps":300} */
+        uint8_t  axis       = HAS("\"axis\":1") ? AXIS_LATERAL : AXIS_SPINDLE;
+        int32_t  target_pos = 0;
+        uint32_t start_hz   = 200u;
+        uint32_t max_hz     = 4000u;
+        uint32_t accel_steps = 300u;
+        const char *p;
+        p = strstr(line, "\"pos\":");
+        if (p) target_pos = (int32_t)strtol(p + 6, NULL, 10);
+        p = strstr(line, "\"start_hz\":");
+        if (p) start_hz = (uint32_t)strtoul(p + 11, NULL, 10);
+        p = strstr(line, "\"max_hz\":");
+        if (p) max_hz = (uint32_t)strtoul(p + 9, NULL, 10);
+        p = strstr(line, "\"accel_steps\":");
+        if (p) accel_steps = (uint32_t)strtoul(p + 14, NULL, 10);
+        int rc = send_host_move_to(axis, target_pos, start_hz, max_hz, accel_steps);
         snprintf(resp, sizeof(resp),
             rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
 
@@ -345,6 +453,19 @@ int main(int argc, char **argv) {
                     break;
                 case EVENT_HOME_COMPLETE:
                     broadcast("{\"event\":\"home_complete\"}\n");
+                    break;
+                case EVENT_LIMIT_HIT:
+                    /* Notify host that a software limit was hit. */
+                    snprintf(buf, sizeof(buf),
+                        "{\"event\":\"limit_hit\",\"axis\":%u,\"pos\":%d}\n",
+                        AXIS_LATERAL, g_status->lat_position);
+                    broadcast(buf);
+                    break;
+                case EVENT_MOVE_COMPLETE:
+                    snprintf(buf, sizeof(buf),
+                        "{\"event\":\"move_complete\",\"pos\":%d}\n",
+                        g_status->lat_position);
+                    broadcast(buf);
                     break;
                 case EVENT_FAULT:
                     snprintf(buf, sizeof(buf),

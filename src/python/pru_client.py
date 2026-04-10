@@ -3,27 +3,34 @@
 Architecture layer 4 — Python application talks to Layer 3 C daemon
 over a Unix socket using newline-delimited JSON.
 
-Protocol (Option A — continuous shared parameters, no move rings):
+Protocol (Option A — continuous shared parameters + autonomous move_to):
 
   Python → daemon (commands):
     {"cmd":"set_speed",  "sp_hz":<uint>, "lat_hz":<uint>}
-    {"cmd":"enable",     "sp":0|1, "lat":0|1}
+    {"cmd":"enable",     "axis":0|1|255, "value":0|1}
     {"cmd":"e_stop"}
     {"cmd":"home_start"}
-    {"cmd":"reset_pos"}
+    {"cmd":"reset_pos",  "axis":0|1|255}
     {"cmd":"ack_event"}
+    {"cmd":"set_limits", "axis":1, "min":<int>, "max":<int>}
+    {"cmd":"move_to",    "axis":1, "pos":<int>,
+                          "start_hz":<uint>, "max_hz":<uint>,
+                          "accel_steps":<uint>}
 
   daemon → Python (responses):
     {"ok":true}
     {"ok":false,"error":"<reason>"}
 
   daemon → Python (async events, unsolicited):
-    {"event":"endstop_hit", "mask":<N>}
-    {"event":"fault", "sp_fault":<N>, "lat_fault":<N>}
-    {"event":"telem",
-     "pru1_state":<N>, "homing":<N>, "events":<N>,
-     "sp": {"steps":<N>,"interval":<N>,"speed_hz":<N>,"faults":<N>,"state":<N>},
-     "lat":{"steps":<N>,"pos":<N>,"interval":<N>,"speed_hz":<N>,"faults":<N>,"state":<N>,"endstops":<N>}}
+    {"event":"endstop_hit"}
+    {"event":"home_complete"}
+    {"event":"fault",         "sp_faults":<N>, "lat_faults":<N>}
+    {"event":"limit_hit",     "axis":<N>, "pos":<N>}
+    {"event":"move_complete", "pos":<N>}
+    {"event":"telem", "pru1_state":<N>,
+     "sp":  {"steps":<N>,"speed_hz":<N>,"faults":<N>},
+     "lat": {"steps":<N>,"pos":<N>,"speed_hz":<N>,"faults":<N>},
+     "endstop":<N>}
 
 Usage:
     import asyncio
@@ -190,8 +197,52 @@ class PruClient:
         return bool(r.get("ok"))
 
     async def ack_event(self) -> bool:
-        """Acknowledge last PRU event (clears event flags)."""
+        """Acknowledge last PRU event (clears event flags and limit locks)."""
         r = await self._send({"cmd": "ack_event"})
+        return bool(r.get("ok"))
+
+    async def set_limits(self, axis: int, min_steps: int,
+                         max_steps: int) -> bool:
+        """Set software position limits for an axis.
+
+        axis:      0=spindle, 1=lateral
+        min_steps: minimum allowed position (steps, signed)
+        max_steps: maximum allowed position (steps, signed)
+
+        If the axis position leaves the [min, max] range, PRU0 latches the
+        axis off and sends a 'limit_hit' event. Call ack_event() to release.
+        """
+        r = await self._send({
+            "cmd": "set_limits", "axis": axis,
+            "min": min_steps, "max": max_steps,
+        })
+        return bool(r.get("ok"))
+
+    async def move_to(self, pos: int, start_hz: int = 200,
+                      max_hz: int = 4000, accel_steps: int = 300) -> bool:
+        """Move the lateral axis to an absolute position with a trapezoidal
+        speed profile.
+
+        pos:         target position in steps (signed, relative to home=0)
+        start_hz:    step frequency at the start and end of the ramp (slow)
+        max_hz:      cruise step frequency (fast)
+        accel_steps: number of steps for the acceleration / deceleration ramp
+
+        The daemon converts Hz to IEP intervals and sends HOST_CMD_MOVE_TO.
+        PRU1 executes the profile autonomously — no further Python interaction
+        is needed until the 'move_complete' event is received.
+
+        Returns True when the command is acknowledged by the daemon.
+        Listen for {'event':'move_complete','pos':<N>} via on_event().
+        """
+        r = await self._send({
+            "cmd":         "move_to",
+            "axis":        1,
+            "pos":         pos,
+            "start_hz":    start_hz,
+            "max_hz":      max_hz,
+            "accel_steps": accel_steps,
+        })
         return bool(r.get("ok"))
 
 

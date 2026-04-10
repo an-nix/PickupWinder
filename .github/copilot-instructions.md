@@ -79,8 +79,8 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 | `pru/include/pru_ipc.h`               | IPC shared memory layout: host_cmd_t, motor_params_t, motor_telem_t, pru_status_t; HOST_CMD_* opcodes; fault/state/event flags |
 | `pru/include/pru_stepper.h`           | IEP timer macros; pulse_gen_t continuous engine; pulse_update() / pulse_stop() |
 | `pru/include/pru_regs.h`              | R30/R31 register aliases for STEP/DIR/EN/ENDSTOP pins |
-| `pru/motor_control/main.c`       | Motor firmware (PRU1 at runtime): IEP owner, dual-axis pulse generation, motor_telem_t publisher |
-| `pru/orchestrator/main.c`        | Orchestrator firmware (PRU0 at runtime): host_cmd_t processor, homing FSM, R31 endstop reading, motor_params_t writer, pru_status_t publisher |
+| `pru/motor_control/main.c`       | Motor firmware (PRU1 at runtime): IEP owner, dual-axis pulse generation, trapezoidal move_to profile FSM, motor_telem_t publisher |
+| `pru/orchestrator/main.c`        | Orchestrator firmware (PRU0 at runtime): host_cmd_t processor, homing FSM, software limits, move_to arming, R31 endstop reading, motor_params_t writer, pru_status_t publisher |
 
 ### 2.2 Layer 3 — C Daemon (`pickup_daemon`)
 
@@ -92,21 +92,23 @@ Socket path: `/run/pickup-winder.sock`
 Protocol: newline-delimited JSON.
 
 Commands from Python:
-- `set_speed` — set spindle/lateral Hz (daemon converts to IEP intervals)
+- `set_speed` — set spindle Hz (and optionally lateral Hz for continuous mode)
 - `enable` — enable/disable stepper drivers
 - `e_stop` — immediate all-axis stop
 - `home_start` — start lateral homing sequence
-- `ack_event` — acknowledge pending event
+- `set_limits` — configure axis software position limits (steps)
+- `move_to` — move lateral to absolute position with trapezoidal profile
+- `ack_event` — acknowledge pending event and release limit locks
 - `reset_pos` — reset step counters and positions
 
-Events to Python: `endstop_hit`, `home_complete`, `fault`, `telem`
+Events to Python: `endstop_hit`, `home_complete`, `fault`, `limit_hit`, `move_complete`, `telem`
 
 ### 2.3 Layer 4 — Python Application
 
 | Module               | File(s)                              | Responsibility |
 |----------------------|--------------------------------------|----------------|
 | `PruClient`          | `src/python/pru_client.py`           | Async socket client for pickup_daemon; JSON command/event protocol |
-| `pickup_test.py`     | `src/python/pickup_test.py`          | Test sketch: DaemonClient class + 9 test functions for validating the full stack |
+| `pickup_test.py`     | `src/python/pickup_test.py`          | Test sketch: DaemonClient class + 11 test functions for validating the full stack |
 
 > Python must NOT access /dev/mem directly. All PRU interaction goes through
 > `PruClient` → Unix socket → `pickup_daemon`.
@@ -123,10 +125,10 @@ Events to Python: `endstop_hit`, `home_complete`, `fault`, `telem`
 
 ```
 Offset   Size    Struct              Direction       Description
-0x0000   64 B    host_cmd_t          Host → PRU1     Commands (set_speed, enable, estop, home, etc.)
-0x0040   32 B    motor_params_t      PRU1 → PRU0     Motor intervals, dirs, enable/run flags
-0x0060   64 B    motor_telem_t       PRU0 → PRU1     Step counts, positions, faults, endstop mask
-0x00A0   64 B    pru_status_t        PRU1 → Host     Aggregated status for daemon broadcast
+0x0000   64 B    host_cmd_t          Host → PRU0     Commands (set_speed, enable, estop, home, set_limits, move_to, ...)
+0x0040   32 B    motor_params_t      PRU0 → PRU1     Motor intervals, dirs, enable/run flags, move_to profile params
+0x0060   64 B    motor_telem_t       PRU1 → PRU0     Step counts, positions, faults, endstop mask, lat_move_done
+0x00A0   64 B    pru_status_t        PRU0 → Host     Aggregated status for daemon broadcast
 Total:  224 bytes (well within 12 KB PRU shared RAM)
 ```
 
@@ -151,8 +153,8 @@ The application world is unstable by nature:
 **The contract between them is intentionally small and stable:**
 
 ```
-Commands (Python → C):  set_speed / enable / e_stop / home_start / ack_event / reset_pos
-Events   (C → Python):  endstop_hit / home_complete / fault / telem
+Commands (Python → C):  set_speed / enable / e_stop / home_start / set_limits / move_to / ack_event / reset_pos
+Events   (C → Python):  endstop_hit / home_complete / fault / limit_hit / move_complete / telem
 ```
 
 This contract exposes **no hardware detail**: no memory addresses, no register
@@ -177,7 +179,8 @@ In Python — never reference hardware concepts:
 motor_params.sp_interval = 31250
 
 # ✅ correct: socket contract only
-await client.set_speed(sp_hz=6400, lat_hz=200)
+await client.set_speed(sp_hz=6400)
+await client.move_to(pos=3072, start_hz=200, max_hz=4000, accel_steps=300)
 ```
 
 **Consequence:** If the hardware changes (new PRU firmware, new stepper driver,
@@ -185,23 +188,31 @@ new board revision), only `pickup_daemon.c` changes — Python is untouched.
 If the application logic changes (new recipe type, new UI feature), only Python
 changes — the C daemon is untouched.
 
-### 2.7 Option A — Why No Move Rings
+### 2.7 Option A with autonomous move_to (lateral) + hot retarget + spindle coordination
 
-This project uses the **continuous shared-parameter** model (Option A):
+This project uses the **continuous shared-parameter** model (Option A) for the spindle, and an **autonomous trapezoidal move_to** for the lateral axis:
 
-- Python sets target speeds in Hz via `set_speed` command.
-- Daemon converts Hz → IEP interval and writes to `host_cmd_t`.
-- PRU1 validates and copies to `motor_params_t`.
-- PRU0 reads `motor_params_t` and generates continuous pulses.
+- **Spindle**: Python sends progressive `set_speed` commands at ~10 ms cadence for ramps. No host timing risk since the spindle position is irrelevant.
+- **Lateral**: Python sends a `move_to` command. PRU1 executes the trapezoidal profile (accel → cruise → decel) and stops exactly at the target without any further host interaction. Python receives a `move_complete` event on arrival.
 
-Why this choice:
-- **No underrun possible**: PRU0 always has valid parameters. No ring to drain.
-- **Simpler PRU firmware**: No ring pointers, no move boundary logic.
-- **Instant speed changes**: New interval takes effect on next PRU0 cycle.
-- **Easier debugging**: One struct to inspect instead of ring head/tail state.
+**Hot retarget** — consecutive same-direction moves form a seamless stream:
 
-Speed transitions (accel/decel ramps) will be managed host-side by Python
-sending progressive `set_speed` commands at the control loop cadence (~10 ms).
+If a new `move_to` arrives while PRU1 is in ACCEL or CRUISE phase and the direction matches, PRU1 just updates `g_lat_target` without resetting `params->lat_interval` to `start_iv`. The motor never decelerates between waypoints. If in DECEL phase with same direction, the interval is snapped back to `lat_cruise_iv` (CRUISE resumed). For direction changes, a full re-arm occurs (motor decelerates to stop, then re-accelerates).
+
+**Spindle-lateral speed coordination** (PRU0 `coord_tick()`):
+
+- The daemon computes `move_sp_lat_coord = (sp_iv × 64) / lat_cruise_iv` (Q6 ratio) for each `move_to`.
+- PRU0 applies `sp_adj = (sp_lat_coord × params->lat_interval) >> 6` every `CMD_CHECK_STRIDE` iterations (≈5 µs). No division in PRU.
+- Coordination stays **active after `move_complete`** so the spindle stays at the proportional start speed during the reversal gap (waiting for the reverse `move_to`).
+- Coordination is **disabled by `set_speed`** (Python re-takes direct control) and by safety events (endstop, limit).
+- `SP_IV_MIN = 625` (160 kHz) / `SP_IV_MAX = 187500` (~534 Hz) bound the coordinated interval.
+
+Why this choice for lateral:
+- **No overshoot possible**: PRU1 owns position at step resolution. Motor STOPS at target regardless of Python scheduler jitter.
+- **No streaming required for single moves**: One command per move, not 50+ `set_speed` messages.
+- **Hot retarget for traversals**: Python can stream rapid waypoints — the motor maintains cruise speed.
+- **Consistent winding density**: Spindle tracks lateral speed during ramps, keeping turns/mm constant.
+- **Safety by design**: Even if Python crashes mid-move, the motor decelerates to its target and stops.
 
 ---
 

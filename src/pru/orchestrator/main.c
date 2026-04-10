@@ -2,10 +2,10 @@
  *
  * Architecture layer 2/4.
  *
- * PRU1 is the brain. It is the only PRU that communicates with the host
- * (daemon). It reads commands from host_cmd_t, manages the homing state
- * machine, writes motor_params_t for PRU0 to consume, reads motor_telem_t
- * feedback from PRU0, and publishes pru_status_t for the daemon.
+ * PRU0 is the orchestrator. It is the only PRU that communicates with the
+ * host (daemon). It reads commands from host_cmd_t, manages the homing state
+ * machine and software limits, writes motor_params_t for PRU1 to consume,
+ * reads motor_telem_t feedback from PRU1, and publishes pru_status_t.
  *
  * Responsibilities:
  *   1. Poll host_cmd_t for new commands from the daemon.
@@ -13,18 +13,22 @@
  *   3. On HOST_CMD_ENABLE: enable/disable motor drivers via motor_params.
  *   4. On HOST_CMD_ESTOP: stop everything, disable drivers.
  *   5. On HOST_CMD_HOME_START: enter homing state machine.
- *   6. On HOST_CMD_ACK_EVENT: clear pending event.
- *   7. On HOST_CMD_RESET_POS: request PRU0 to reset counters.
- *   8. Read R31 endstop inputs (P9_28/P9_30), halt lateral on assertion.
- *   9. Monitor endstop_mask for homing completion.
- *  10. Publish pru_status_t every STATUS_STRIDE iterations.
+ *   6. On HOST_CMD_ACK_EVENT: clear pending event and limit locks.
+ *   7. On HOST_CMD_RESET_POS: zero telem step counts and position.
+ *   8. On HOST_CMD_SET_LIMITS: configure axis software limits.
+ *   9. On HOST_CMD_MOVE_TO: arm trapezoidal profile in PRU1 (motor_params).
+ *  10. Read R31 endstop inputs (P9_28/P9_30), halt lateral on assertion.
+ *  11. Check software limits; latch axis if position out of range.
+ *  12. Check telem->lat_move_done → publish EVENT_MOVE_COMPLETE.
+ *  13. Coordinate spindle speed with lateral ramps (Q6 sp_lat_coord ratio).
+ *  14. Publish pru_status_t every STATUS_STRIDE iterations.
  *
  * Rules:
- *   - PRU1 must NEVER call IEP_INIT() — PRU0 owns the IEP.
- *   - PRU1 must NOT write motor pins (R30 STEP/DIR/EN).
- *   - PRU1 writes motor_params_t; PRU0 reads it.
- *   - PRU1 reads motor_telem_t; PRU0 writes it.
- *   - PRU1 reads R31 for endstop inputs (P9_28=R31[6], P9_30=R31[2]).
+ *   - PRU0 must NEVER call IEP_INIT() — PRU1 (motor) owns the IEP.
+ *   - PRU0 must NOT write motor pins (R30 STEP/DIR/EN).
+ *   - PRU0 writes motor_params_t; PRU1 reads it.
+ *   - PRU0 reads motor_telem_t; PRU1 writes it.
+ *   - PRU0 reads R31 for endstop inputs (P9_28=R31[6], P9_30=R31[2]).
  */
 
 #include <stdint.h>
@@ -56,6 +60,23 @@ static volatile pru_status_t   *status =
 
 static uint8_t g_endstop_mask      = 0u;  /* live endstop state (R31)        */
 static uint8_t g_prev_endstop_mask = 0u;  /* previous state for edge detect  */
+
+/* Software limits (per-axis). Defaults: disabled. */
+static int32_t  g_limit_min[2]     = {0, 0};
+static int32_t  g_limit_max[2]     = {0, 0};
+static uint8_t  g_limits_enabled[2]= {0, 0};
+static uint8_t  g_limit_locked[2]  = {0, 0};
+
+/* Flag: a move_to profile is in progress on the lateral axis. While set,   *
+ * SET_SPEED commands are ignored for the lateral axis.                      */
+static uint8_t  g_lat_in_move      = 0u;
+
+/* Spindle-lateral coordination (spindle speed tracks lateral ramps).       *
+ * g_sp_lat_coord: Q6 ratio = (sp_iv * 64) / lat_cruise_iv, set by MOVE_TO. *
+ *   Non-zero while coordination is active. Cleared by set_speed or e_stop. *
+ * g_sp_requested_iv: last spindle speed set by host (restored on stop).    */
+static uint32_t g_sp_lat_coord     = 0u;
+static uint32_t g_sp_requested_iv  = 0u;
 
 /* ── Homing state machine ────────────────────────────────────────────────── */
 typedef enum {
@@ -93,6 +114,13 @@ static void endstop_tick(void) {
     if (es && !g_prev_endstop_mask) {
         /* Unconditional lateral safety stop */
         params->lat_run = 0u;
+        params->lat_move_active = 0u;  /* abort any armed move               */
+        g_lat_in_move   = 0u;
+        /* Restore spindle from coordination to last requested speed.        */
+        if (g_sp_lat_coord != 0u && g_sp_requested_iv > 0u) {
+            params->sp_interval = g_sp_requested_iv;
+        }
+        g_sp_lat_coord = 0u;
         status->lat_faults |= FAULT_ENDSTOP_HIT;
 
         /* Notify host if not in homing (homing_tick handles the homing case) */
@@ -104,6 +132,30 @@ static void endstop_tick(void) {
     g_prev_endstop_mask = es;
 }
 
+/* ── Software limits check: latch and notify on overrun ──────────────── */
+static void limits_check(void) {
+    /* Only check lateral axis for now (AXIS_LATERAL). */
+    if (!g_limits_enabled[AXIS_LATERAL] || g_limit_locked[AXIS_LATERAL]) return;
+    int32_t pos = telem->lat_position;
+    if (pos < g_limit_min[AXIS_LATERAL] || pos > g_limit_max[AXIS_LATERAL]) {
+        /* Latch: stop lateral motor and disable until host acknowledges. */
+        params->lat_run    = 0u;
+        params->lat_enable = 0u;
+        status->lat_faults |= FAULT_OVERRUN;
+        if (!status->event_pending) {
+            status->event_type    = EVENT_LIMIT_HIT;
+            status->event_pending = 1u;
+        }
+        g_limit_locked[AXIS_LATERAL] = 1u;
+        g_lat_in_move  = 0u;
+        /* Restore spindle from coordination to last requested speed.        */
+        if (g_sp_lat_coord != 0u && g_sp_requested_iv > 0u) {
+            params->sp_interval = g_sp_requested_iv;
+        }
+        g_sp_lat_coord = 0u;
+    }
+}
+
 /* ── Helper: emergency stop ──────────────────────────────────────────────── */
 static void do_estop(void) {
     params->sp_run     = 0u;
@@ -112,7 +164,10 @@ static void do_estop(void) {
     params->lat_enable = 0u;
     params->sp_interval  = 0u;
     params->lat_interval = 0u;
-    g_homing = HOMING_IDLE;
+    params->lat_move_active = 0u;  /* abort any armed move                 */
+    g_homing       = HOMING_IDLE;
+    g_lat_in_move  = 0u;
+    g_sp_lat_coord = 0u;  /* disable spindle coordination on estop         */
 }
 
 /* ── Process one host command ────────────────────────────────────────────── */
@@ -123,21 +178,26 @@ static void process_host_cmd(void) {
     switch (cmd) {
 
     case HOST_CMD_SET_SPEED:
-        /* Update target speeds. PRU0 picks them up immediately. */
-        params->sp_interval  = host_cmd->sp_interval_target;
-        params->lat_interval = host_cmd->lat_interval_target;
-        params->sp_dir       = host_cmd->sp_dir;
-        params->lat_dir      = host_cmd->lat_dir;
-        /* Auto-start if intervals are non-zero and drivers enabled. */
-        if (host_cmd->sp_interval_target > 0u && params->sp_enable)
+        /* Track requested spindle speed; disable active coordination.       */
+        g_sp_requested_iv  = host_cmd->sp_interval_target;
+        g_sp_lat_coord     = 0u;  /* set_speed re-takes direct spindle ctrl  */
+        /* Update spindle unconditionally. Update lateral only when no
+         * move_to profile is active (g_lat_in_move guards the profile). */
+        params->sp_interval = g_sp_requested_iv;
+        params->sp_dir      = host_cmd->sp_dir;
+        if (g_sp_requested_iv > 0u && params->sp_enable)
             params->sp_run = 1u;
-        if (host_cmd->lat_interval_target > 0u && params->lat_enable)
-            params->lat_run = 1u;
-        /* Stop if interval is zero. */
-        if (host_cmd->sp_interval_target == 0u)
+        if (g_sp_requested_iv == 0u)
             params->sp_run = 0u;
-        if (host_cmd->lat_interval_target == 0u)
-            params->lat_run = 0u;
+
+        if (!g_lat_in_move) {
+            params->lat_interval = host_cmd->lat_interval_target;
+            params->lat_dir      = host_cmd->lat_dir;
+            if (host_cmd->lat_interval_target > 0u && params->lat_enable)
+                params->lat_run = 1u;
+            if (host_cmd->lat_interval_target == 0u)
+                params->lat_run = 0u;
+        }
         ack_cmd(cmd);
         break;
 
@@ -145,12 +205,18 @@ static void process_host_cmd(void) {
         uint8_t en = (host_cmd->value_a != 0u) ? 1u : 0u;
         uint8_t ax = host_cmd->axis;
         if (ax == AXIS_SPINDLE || ax == AXIS_ALL) {
+            /* Allow spindle enable regardless of lateral locks. */
             params->sp_enable = en;
             if (!en) params->sp_run = 0u;
         }
         if (ax == AXIS_LATERAL || ax == AXIS_ALL) {
-            params->lat_enable = en;
-            if (!en) params->lat_run = 0u;
+            /* Do not enable lateral if a software limit lock or move is active. */
+            if (en && (g_limit_locked[AXIS_LATERAL] || g_lat_in_move)) {
+                /* Ignore enable request while locked or move_to in progress. */
+            } else {
+                params->lat_enable = en;
+                if (!en) params->lat_run = 0u;
+            }
         }
         ack_cmd(cmd);
         break;
@@ -178,8 +244,13 @@ static void process_host_cmd(void) {
         break;
 
     case HOST_CMD_ACK_EVENT:
+        /* Clear pending event and release any software lock. */
         status->event_pending = 0u;
         status->event_type    = EVENT_NONE;
+        /* Clear all limit locks on ack so host can re-enable safely. */
+        g_limit_locked[AXIS_SPINDLE] = 0u;
+        g_limit_locked[AXIS_LATERAL] = 0u;
+        status->lat_faults = 0u;  /* clear latched fault that caused the event */
         ack_cmd(cmd);
         break;
 
@@ -200,10 +271,81 @@ static void process_host_cmd(void) {
         ack_cmd(cmd);
         break;
 
+    case HOST_CMD_SET_LIMITS: {
+        uint8_t ax = host_cmd->axis;
+        /* Store limits and enable the software limit for that axis. */
+        if (ax == AXIS_SPINDLE || ax == AXIS_LATERAL) {
+            g_limit_min[ax]      = host_cmd->limit_min;
+            g_limit_max[ax]      = host_cmd->limit_max;
+            g_limits_enabled[ax] = 1u;
+            /* Clearing any previous lock when new limits are set. */
+            g_limit_locked[ax]   = 0u;
+        }
+        ack_cmd(cmd);
+        break;
+    }
+
+    case HOST_CMD_MOVE_TO:
+        /* Only lateral axis is supported for move_to. */
+        if (!g_limit_locked[AXIS_LATERAL]) {
+            params->lat_target_pos  = host_cmd->move_target;
+            params->lat_start_iv    = host_cmd->move_start_iv;
+            params->lat_cruise_iv   = host_cmd->move_cruise_iv;
+            params->lat_delta_iv    = host_cmd->move_delta_iv;
+            /* Store Q6 coordination ratio (0 = coordination disabled).      */
+            g_sp_lat_coord          = host_cmd->move_sp_lat_coord;
+            /* Set spindle to proportional starting speed immediately.       *
+             * lat_run==1: hot retarget — track current interval (≈cruise). *
+             * lat_run==0: cold start — both start from their slow speed.   */
+            if (g_sp_lat_coord != 0u && params->sp_enable) {
+                uint32_t lat_ref = params->lat_run ? params->lat_interval
+                                                   : host_cmd->move_start_iv;
+                uint32_t sp_init = (g_sp_lat_coord * lat_ref) >> 6u;
+                if (sp_init < SP_IV_MIN) sp_init = SP_IV_MIN;
+                if (sp_init > SP_IV_MAX) sp_init = SP_IV_MAX;
+                params->sp_interval = sp_init;
+                params->sp_run      = 1u;
+            }
+            params->lat_enable      = 1u;
+            /* Arm: PRU1 reads this flag and self-clears it. */
+            params->lat_move_active = 1u;
+            g_lat_in_move           = 1u;
+        }
+        ack_cmd(cmd);
+        break;
+
     default:
         ack_cmd(cmd);
         break;
     }
+}
+
+/* ── Spindle-lateral speed coordination ──────────────────────────────────── *
+ * Adjusts spindle interval proportionally to lateral interval so that       *
+ * turns/mm stays constant during lateral ramps, stops, and reversals.       *
+ * Stays active after move_complete (covers the reversal-gap period too).    *
+ * Formula (Q6, no division in PRU): sp_adj = (sp_lat_coord * lat_iv) >> 6  *
+ * where sp_lat_coord = (sp_cruise_iv * 64) / lat_cruise_iv (daemon-side).   */
+static void coord_tick(void) {
+    if (g_sp_lat_coord == 0u) return;
+    uint32_t lat_iv = params->lat_interval;
+    if (lat_iv == 0u) return;  /* lateral parked; leave spindle alone       */
+    uint32_t sp_adj  = (g_sp_lat_coord * lat_iv) >> 6u;
+    if (sp_adj < SP_IV_MIN) sp_adj = SP_IV_MIN;
+    if (sp_adj > SP_IV_MAX) sp_adj = SP_IV_MAX;
+    params->sp_interval = sp_adj;
+    if (params->sp_enable && sp_adj > 0u) params->sp_run = 1u;
+}
+
+/* ── Detect lateral move completion from PRU1 ────────────────────────── */
+static void move_complete_check(void) {
+    if (!telem->lat_move_done) return;
+    if (status->event_pending) return;  /* hold until previous event is acked */
+    telem->lat_move_done  = 0u;
+    g_lat_in_move         = 0u;         /* release lateral SET_SPEED lock     */
+    /* g_sp_lat_coord intentionally kept: spindle stays slow during reversal */
+    status->event_type    = EVENT_MOVE_COMPLETE;
+    status->event_pending = 1u;
 }
 
 /* ── Homing state machine ────────────────────────────────────────────────── */
@@ -296,6 +438,18 @@ int main(void) {
             homing_tick();
         }
 
+        /* ── 3b. Software limits check (throttled) ─────────────────────── */
+        if (loop_cnt % CMD_CHECK_STRIDE == 0u) {
+            limits_check();
+        }
+        /* ── 3c. Spindle-lateral coordination (throttled) ────────────────── */
+        if (loop_cnt % CMD_CHECK_STRIDE == 0u) {
+            coord_tick();
+        }
+        /* ── 3d. Move completion check (throttled) ─────────────────────── */
+        if (loop_cnt % CMD_CHECK_STRIDE == 0u) {
+            move_complete_check();
+        }
         /* ── 4. Publish status (throttled) ──────────────────────────────── */
         if (loop_cnt % STATUS_STRIDE == 0u) {
             publish_status();

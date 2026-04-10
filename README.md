@@ -50,12 +50,12 @@ for the full architecture rationale.
 | P8_44      | R30\[0\]  | DIR_B    | Lateral direction |
 | P8_46      | R30\[2\]  | STEP_B   | Lateral step |
 
-### PRU1 endstop inputs
+### PRU0 endstop inputs
 
 | Header pin | PRU bit   | Function   |
 |------------|-----------|------------|
-| P8_15      | R31\[15\] | ENDSTOP_1  |
-| P8_16      | R31\[14\] | ENDSTOP_2  |
+| P9_28      | R31\[6\]  | ENDSTOP_1  |
+| P9_30      | R31\[2\]  | ENDSTOP_2  |
 
 ### Other IO
 
@@ -149,20 +149,86 @@ The daemon listens on `/run/pickup-winder.sock` (Unix domain, newline-delimited 
 **Commands** (Python → daemon):
 | Command       | Fields                              | Description |
 |---------------|-------------------------------------|-------------|
-| `set_speed`   | `sp_hz`, `lat_hz`, `sp_dir`, `lat_dir` | Set motor speeds (Hz) |
+| `set_speed`   | `sp_hz`, `lat_hz`, `sp_dir`, `lat_dir` | Set spindle speed (Hz). `lat_hz` activates continuous lateral (avoid during winding) |
 | `enable`      | `axis`, `value`                     | Enable/disable drivers |
+| `set_limits`  | `axis`, `min`, `max`                | Set software position limits (steps, signed) |
+| `move_to`     | `axis`, `pos`, `start_hz`, `max_hz`, `accel_steps` | Move lateral to absolute position with trapezoidal profile |
 | `e_stop`      |                                     | Emergency stop |
 | `home_start`  |                                     | Start lateral homing |
 | `reset_pos`   | `axis`                              | Reset step counters |
-| `ack_event`   |                                     | Acknowledge event |
+| `ack_event`   |                                     | Acknowledge event and release locks |
+
+### Command payloads and rate
+
+- Each command is a single JSON object on its own line (newline-delimited JSON).
+- The daemon rejects a new command if the previous host command is still pending for more than ~50 ms. Returns `{"ok":false,"error":"busy"}`.
+- **Spindle** speed ramps: send progressive `set_speed` at ~**10 ms cadence**.
+- **Lateral axis**: use `move_to` — the motor stops at the target autonomously. `lat_hz` in `set_speed` is for continuous lateral modes only.
+
+### move_to — autonomous trapezoidal profile
+
+```json
+{"cmd":"move_to","axis":1,"pos":3072,"start_hz":200,"max_hz":4000,"accel_steps":300}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `pos` | int | Absolute target position in steps (signed, 0 = home) |
+| `start_hz` | uint | Step frequency at ramp start/end (slow, e.g. 200) |
+| `max_hz` | uint | Cruise step frequency (fast, e.g. 4000–16000) |
+| `accel_steps` | uint | Steps for accel and decel (≥ 1) |
+
+The daemon converts Hz → IEP intervals (integer only) and sends `HOST_CMD_MOVE_TO`.
+PRU1 executes the profile autonomously and stops exactly at `pos`. On completion, PRU0 fires `EVENT_MOVE_COMPLETE` and the daemon broadcasts:
+
+```json
+{"event":"move_complete","pos":3072}
+```
+
+Call `ack_event` after receiving `move_complete`.
+
+**Hot retarget** — consecutive same-direction moves without stopping:
+
+If a new `move_to` arrives while the lateral is already moving in the **same direction** (ACCEL or CRUISE phase), PRU1 simply updates its destination without resetting the speed to `start_hz`. The motor keeps running at cruise speed and decelerates only when approaching the new target. This enables seamless winding traversals made of many small steps:
+
+```python
+# Winding traversal: stream small moves; motor never stops between them
+for waypoint in traverse_waypoints:
+    await client.move_to(pos=waypoint, start_hz=500, max_hz=8000, accel_steps=100)
+    # No need to wait for move_complete between waypoints
+```
+
+For **direction reversals** (e.g. at the coil edge), Python must wait for `move_complete` before sending the reverse move — the motor decelerates to a full stop then re-accelerates in the new direction.
+
+**Spindle-lateral speed coordination:**
+
+The daemon includes a Q6 ratio `move_sp_lat_coord = (sp_iv × 64) / lat_cruise_iv` in each `move_to`. PRU0's `coord_tick()` reads `params->lat_interval` and adjusts the spindle proportionally every `CMD_CHECK_STRIDE` iterations (≈ 5 µs), so turns/mm stays constant during lateral ramps:
+
+```
+sp_adj = (sp_lat_coord × lat_iv) >> 6
+```
+
+Coordination is **activated** by `move_to` and **deactivated** by `set_speed` (Python re-takes direct spindle control). It persists across `move_complete` during the reversal gap so the spindle stays slow while the lateral is momentarily stopped.
+
+**Safety layering for lateral:**
+1. PRU1 stops exactly at target (primary — no host timing dependency).
+2. Software limits (`set_limits`) halt the axis if position leaves the configured range (secondary).
+3. Hardware endstops (P9\_28, P9\_30) cut the lateral immediately (hardware failsafe).
+
+Additional commands:
+- `{"cmd":"set_limits","axis":1,"min":-10000,"max":10000}` — install soft limits.  If exceeded, PRU0 latches the axis and fires `limit_hit`. Send `ack_event` to release.
+- `{"cmd":"set_speed","sp_hz":8000,"sp_dir":0}` — spindle speed change (10 ms ramp cadence).
+- `axis` can be `0` (spindle), `1` (lateral), or `255` (all).
 
 **Events** (daemon → Python):
-| Event           | Description |
-|-----------------|-------------|
-| `endstop_hit`   | Lateral endstop triggered |
-| `home_complete` | Homing sequence finished |
-| `fault`         | Motor fault detected |
-| `telem`         | Periodic telemetry broadcast |
+| Event           | Fields               | Description |
+|-----------------|----------------------|-------------|
+| `endstop_hit`   |                      | Lateral endstop triggered |
+| `home_complete` |                      | Homing sequence finished |
+| `fault`         | `sp_faults`, `lat_faults` | Motor fault detected |
+| `limit_hit`     | `axis`, `pos`        | Software position limit exceeded |
+| `move_complete` | `pos`                | Autonomous move_to finished; motor stopped at target |
+| `telem`         | `pru1_state`, `sp`, `lat`, `endstop` | Periodic telemetry (100 ms) |
 
 ## Testing
 
@@ -181,10 +247,16 @@ python3 src/python/pickup_test.py --list
 
 - The active BeagleBone port is the current target; ESP32/PlatformIO content
   in `resources/esp32/` is legacy reference only.
-- PRU firmware is split: PRU0 for real-time motor control, PRU1 for
-  orchestration and host communication.
-- Speed ramps (accel/decel) are managed host-side by Python sending
-  progressive `set_speed` commands at ~10 ms cadence.
+- PRU0 is the orchestrator (homing, limits, move_to arming, spindle coordination); PRU1 drives
+  the steppers (IEP owner, STEP/DIR/EN, trapezoidal profile + hot retarget execution).
+- Spindle speed ramps are managed host-side via `set_speed` at ~10 ms cadence.
+- Lateral moves use `move_to` — PRU1 executes the profile autonomously; Python
+  only needs to send one command and wait for `move_complete`.
+- Consecutive same-direction `move_to` commands trigger hot retarget — the lateral
+  motor never decelerates between waypoints. Direction reversal requires waiting for
+  `move_complete` first.
+- Spindle speed is automatically coordinated with lateral ramps via Q6 ratio
+  (`move_sp_lat_coord`) so turns/mm stays constant. Deactivated by `set_speed`.
 
 ## References
 

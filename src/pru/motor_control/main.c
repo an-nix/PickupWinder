@@ -39,6 +39,12 @@
 /* ── Telemetry publish cadence ───────────────────────────────────────────── */
 #define TELEM_STRIDE   500000u     /* ~2.5 ms at 200 MHz (400 Hz) */
 
+/* ── Trapezoidal move profile phases ────────────────────────────────────── */
+#define MOVE_IDLE    0u
+#define MOVE_ACCEL   1u
+#define MOVE_CRUISE  2u
+#define MOVE_DECEL   3u
+
 /* ── Shared RAM pointers ─────────────────────────────────────────────────── */
 static volatile motor_params_t *params =
     (volatile motor_params_t *)(PRU_SRAM_PHYS_BASE + IPC_MOTOR_PARAMS_OFFSET);
@@ -49,6 +55,126 @@ static volatile motor_telem_t *telem =
 /* ── Pulse generators ────────────────────────────────────────────────────── */
 static pulse_gen_t spindle = {0};
 static pulse_gen_t lateral = {0};
+
+/* ── Trapezoidal move profile state (lateral axis) ──────────────────────── */
+static uint8_t  g_lat_phase        = MOVE_IDLE;
+static int32_t  g_lat_target       = 0;
+static uint32_t g_lat_start_iv     = 0u;
+static uint32_t g_lat_cruise_iv    = 0u;
+static uint32_t g_lat_delta_iv     = 0u;
+static uint32_t g_lat_accel_steps  = 0u; /* steps taken during accel phase  */
+static uint8_t  g_prev_lat_pin     = 0u; /* for rising-edge detection        */
+
+/* ── Integer abs (no stdlib) ───────────────────────────────────────────── */
+static inline uint32_t u32abs(int32_t v) {
+    return (v < 0) ? (uint32_t)(-v) : (uint32_t)v;
+}
+
+/* ── Arm a new move_to profile ───────────────────────────────────────────── *
+ * Called once when params->lat_move_active transitions to 1.               *
+ * Reads profile params from motor_params_t, derives direction from sign of  *
+ * (target - current_position), enables & runs lateral motor.               */
+static void lat_move_arm(void) {
+    int32_t delta = params->lat_target_pos - lateral.position;
+    if (delta == 0) {
+        telem->lat_move_done    = 1u;
+        params->lat_move_active = 0u;
+        return;
+    }
+
+    uint8_t new_dir = (delta < 0) ? 1u : 0u;
+
+    /* ── Hot retarget: motor already moving in the same direction. ─────── *
+     * Just update destination + profile constants. Keep current interval   *
+     * to avoid deceleration between consecutive small moves.               */
+    if (g_lat_phase != MOVE_IDLE && new_dir == params->lat_dir) {
+        telem->lat_move_done    = 0u;
+        g_lat_target            = params->lat_target_pos;
+        g_lat_start_iv          = params->lat_start_iv;
+        g_lat_cruise_iv         = params->lat_cruise_iv;
+        g_lat_delta_iv          = params->lat_delta_iv;
+        /* If currently decelerating toward old target: snap back to cruise *
+         * so remaining-distance decel trigger fires for the new target.    */
+        if (g_lat_phase == MOVE_DECEL) {
+            params->lat_interval = g_lat_cruise_iv;
+            g_lat_phase          = MOVE_CRUISE;
+        }
+        params->lat_move_active = 0u;
+        return;
+    }
+
+    /* ── Cold start or direction reversal: full re-arm from start speed. ── */
+    telem->lat_move_done    = 0u;
+    g_lat_phase             = MOVE_IDLE;
+    g_lat_target            = params->lat_target_pos;
+    g_lat_start_iv          = params->lat_start_iv;
+    g_lat_cruise_iv         = params->lat_cruise_iv;
+    g_lat_delta_iv          = params->lat_delta_iv;
+    g_lat_accel_steps       = 0u;
+
+    params->lat_dir         = new_dir;
+    params->lat_interval    = g_lat_start_iv;
+    params->lat_enable      = 1u;
+    params->lat_run         = 1u;
+
+    g_lat_phase             = MOVE_ACCEL;
+    params->lat_move_active = 0u;  /* self-clear the arm flag               */
+}
+
+/* ── Update profile on each lateral rising edge ─────────────────────────── *
+ * No division, no float. Pure addition/subtraction + comparisons.          *
+ * Called only when g_lat_phase != MOVE_IDLE and a rising step edge fires.  */
+static void lat_move_on_step(void) {
+    uint32_t remaining = u32abs(g_lat_target - lateral.position);
+
+    switch (g_lat_phase) {
+
+    case MOVE_ACCEL:
+        g_lat_accel_steps++;
+        /* Decrease interval toward cruise speed. */
+        if (g_lat_delta_iv > 0u &&
+            params->lat_interval > g_lat_cruise_iv + g_lat_delta_iv) {
+            params->lat_interval -= g_lat_delta_iv;
+        } else {
+            params->lat_interval = g_lat_cruise_iv;
+        }
+        /* Transition: remaining <= accel_steps → skip cruise, go to decel. */
+        if (remaining <= g_lat_accel_steps) {
+            g_lat_phase = MOVE_DECEL;
+        } else if (params->lat_interval <= g_lat_cruise_iv) {
+            params->lat_interval = g_lat_cruise_iv;
+            g_lat_phase = MOVE_CRUISE;
+        }
+        break;
+
+    case MOVE_CRUISE:
+        /* Enter decel when distance left equals ramp distance. */
+        if (remaining <= g_lat_accel_steps) {
+            g_lat_phase = MOVE_DECEL;
+        }
+        break;
+
+    case MOVE_DECEL:
+        /* Increase interval back toward start speed. */
+        if (g_lat_delta_iv > 0u) {
+            params->lat_interval += g_lat_delta_iv;
+            if (params->lat_interval >= g_lat_start_iv) {
+                params->lat_interval = g_lat_start_iv;
+            }
+        }
+        /* Stop when target reached. */
+        if (remaining == 0u) {
+            g_lat_phase      = MOVE_IDLE;
+            params->lat_run  = 0u;
+            telem->lat_move_done = 1u;
+        }
+        break;
+
+    default:
+        g_lat_phase = MOVE_IDLE;
+        break;
+    }
+}
 
 /* ── Apply direction GPIO ────────────────────────────────────────────────── */
 static inline void apply_dir_sp(uint8_t dir) {
@@ -112,6 +238,11 @@ int main(void) {
     while (1) {
         uint32_t now = IEP_NOW();
 
+        /* ── 0. Arm move profile if requested ──────────────────────────── */
+        if (params->lat_move_active) {
+            lat_move_arm();
+        }
+
         /* ── 1. Read motor parameters from PRU1 ─────────────────────────── */
         uint32_t sp_iv   = params->sp_interval;
         uint32_t lat_iv  = params->lat_interval;
@@ -138,6 +269,12 @@ int main(void) {
         /* ── 5. Lateral pulse generation ────────────────────────────────── */
         uint8_t lat_pin = pulse_update(&lateral, lat_iv, lat_dir, lat_run, now);
         if (lat_pin) __R30 |= LAT_STEP_BIT; else __R30 &= ~LAT_STEP_BIT;
+
+        /* ── 5b. Trapezoidal profile step update ────────────────────────── */
+        if (lat_pin && !g_prev_lat_pin && g_lat_phase != MOVE_IDLE) {
+            lat_move_on_step();
+        }
+        g_prev_lat_pin = lat_pin;
 
         /* ── 6. Publish telemetry (throttled) ───────────────────────────── */
         if (++loop_cnt >= TELEM_STRIDE) {

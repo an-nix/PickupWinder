@@ -122,10 +122,10 @@ Offsets from PRU Shared RAM base (PRU: `0x00010000`, Host: `0x4A310000`):
 
 ```
 Offset   Size    Struct              Direction       Description
-0x0000   64 B    host_cmd_t          Host → PRU1     Commands from daemon
-0x0040   32 B    motor_params_t      PRU1 → PRU0     Motor intervals/dirs/flags
-0x0060   64 B    motor_telem_t       PRU0 → PRU1     Step counts/positions/faults
-0x00A0   64 B    pru_status_t        PRU1 → Host     Aggregated status for daemon
+0x0000   64 B    host_cmd_t          Host → PRU0     Commands from daemon (set_speed, enable, estop, home, move_to, ...)
+0x0040   32 B    motor_params_t      PRU0 → PRU1     Motor intervals/dirs/flags/move profile
+0x0060   64 B    motor_telem_t       PRU1 → PRU0     Step counts/positions/faults/lat_move_done
+0x00A0   64 B    pru_status_t        PRU0 → Host     Aggregated status for daemon
 Total: 224 bytes (out of 12 KB available)
 ```
 
@@ -138,8 +138,10 @@ Total: 224 bytes (out of 12 KB available)
 | `HOST_CMD_ENABLE`     | 2     | Enable/disable stepper drivers |
 | `HOST_CMD_ESTOP`      | 3     | Emergency stop: immediate all-halt |
 | `HOST_CMD_HOME_START` | 4     | Start lateral homing sequence |
-| `HOST_CMD_ACK_EVENT`  | 5     | Acknowledge last PRU event |
+| `HOST_CMD_ACK_EVENT`  | 5     | Acknowledge last PRU event; clear limit lock |
 | `HOST_CMD_RESET_POS`  | 6     | Reset step counters + position |
+| `HOST_CMD_SET_LIMITS` | 7     | Configure axis software position limits (steps) |
+| `HOST_CMD_MOVE_TO`    | 8     | Arm autonomous trapezoidal lateral move in PRU1 |
 
 ---
 
@@ -205,6 +207,8 @@ Deploy to BeagleBone:
 | `EVENT_ENDSTOP_HIT`   | 1    | Lateral endstop triggered |
 | `EVENT_HOME_COMPLETE` | 2    | Homing sequence finished |
 | `EVENT_FAULT`         | 3    | Motor fault detected |
+| `EVENT_LIMIT_HIT`     | 4    | Axis software limit exceeded; axis latched |
+| `EVENT_MOVE_COMPLETE` | 5    | Autonomous move_to profile reached target |
 
 ---
 

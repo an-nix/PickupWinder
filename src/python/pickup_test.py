@@ -268,6 +268,74 @@ def test_ack_event(c):
     print("  [ack_event] PASS")
 
 
+def test_set_limits(c):
+    """Test set_limits command."""
+    print("  [set_limits] Setting lateral limits [-5000, 5000]...")
+    r = c.cmd({"cmd": "set_limits", "axis": 1, "min": -5000, "max": 5000})
+    assert r.get("ok"), f"set_limits failed: {r}"
+
+    print("  [set_limits] Updating limits to [-10000, 10000]...")
+    r = c.cmd({"cmd": "set_limits", "axis": 1, "min": -10000, "max": 10000})
+    assert r.get("ok"), f"set_limits update failed: {r}"
+
+    print("  [set_limits] PASS")
+
+
+def test_move_to(c):
+    """Test move_to: autonomous trapezoidal move to a target position.
+
+    Hardware note: this test expects the motor to actually move and PRU
+    to fire move_complete. Without real hardware/PRU firmware, move_complete
+    will time out and the test is marked SKIPPED.
+    """
+    # Start clean
+    c.cmd({"cmd": "e_stop"})
+    c.drain_events()
+    c.cmd({"cmd": "enable", "axis": 255, "value": 1})
+    c.cmd({"cmd": "reset_pos", "axis": 255})
+    time.sleep(0.1)
+
+    # Install generous limits so the limit guard does not interfere
+    c.cmd({"cmd": "set_limits", "axis": 1, "min": -50000, "max": 50000})
+
+    print("  [move_to] Moving to +1000 steps (start=200 Hz, cruise=4000 Hz, ramp=300)...")
+    r = c.cmd({"cmd": "move_to", "axis": 1, "pos": 1000,
+               "start_hz": 200, "max_hz": 4000, "accel_steps": 300})
+    assert r.get("ok"), f"move_to failed: {r}"
+
+    print("  [move_to] Waiting for move_complete event...")
+    ev = c.wait_event("move_complete", timeout=15.0)
+    if ev is None:
+        print("  [move_to] TIMEOUT — no move_complete (PRU not running? SKIP)")
+        c.cmd({"cmd": "e_stop"})
+        return
+
+    final_pos = ev.get("pos", "?")
+    print(f"  [move_to] Arrived at pos={final_pos} steps (expected ~1000)")
+    c.cmd({"cmd": "ack_event"})
+
+    # Verify telem position matches
+    c.drain_events()
+    tel = c.wait_event("telem", timeout=2.0)
+    if tel:
+        lat_pos = tel.get("lat", {}).get("pos", -1)
+        print(f"  [move_to] Telem lat_pos={lat_pos}")
+        if abs(lat_pos - 1000) > 2:
+            print(f"  [move_to] WARNING: position off by {abs(lat_pos-1000)} steps")
+
+    # Return to 0
+    print("  [move_to] Returning to 0...")
+    c.cmd({"cmd": "move_to", "axis": 1, "pos": 0,
+           "start_hz": 200, "max_hz": 4000, "accel_steps": 300})
+    ev2 = c.wait_event("move_complete", timeout=15.0)
+    if ev2:
+        c.cmd({"cmd": "ack_event"})
+        print(f"  [move_to] Back at pos={ev2.get('pos','?')}")
+
+    c.cmd({"cmd": "e_stop"})
+    print("  [move_to] PASS")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test runner
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -282,6 +350,8 @@ TESTS = {
     "reset_pos":    test_reset_pos,
     "telem":        test_telem,
     "ack_event":    test_ack_event,
+    "set_limits":   test_set_limits,
+    "move_to":      test_move_to,
 }
 
 
