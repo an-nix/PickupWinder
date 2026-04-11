@@ -45,15 +45,16 @@ DEFAULT_HOST   = "192.168.74.171"
 DEFAULT_USER   = "beagle"
 SOCKET_PATH    = "/run/pickup-winder.sock"
 
-# Spindle test profile
+# Spindle test profile  (constant-speed steps, no ramp)
+# Hz = steps/s = RPM * steps_per_rev / 60  (steps_per_rev=6400)
 SPINDLE_TESTS = [
-    # (name,               sp_hz,  direction, duration_s)
-    ("Slow CW  ~100 RPM",     640,   0,          30.0),
-    ("Mid  CW  ~500 RPM",    3200,   0,          30.0),
-    ("Fast CW ~1500 RPM",    9600,   0,          30.0),
-    ("Fast CCW ~1500 RPM",   9600,   1,          30.0),
-    ("Mid  CCW ~500 RPM",    3200,   1,          30.0),
-    ("Slow CCW ~100 RPM",     640,   1,          30.0),
+    # (name,                 sp_hz,  direction, duration_s)
+    ("Slow  CW  ~6 RPM",      640,   0,          3.0),   #  640/6400*60 =  6 RPM
+    ("Mid   CW  ~30 RPM",    3200,   0,          3.0),   # 3200/6400*60 = 30 RPM
+    ("Fast  CW  ~90 RPM",    9600,   0,          3.0),   # 9600/6400*60 = 90 RPM
+    ("Fast  CCW ~90 RPM",    9600,   1,          3.0),
+    ("Mid   CCW ~30 RPM",    3200,   1,          3.0),
+    ("Slow  CCW ~6 RPM",      640,   1,          3.0),
 ]
 
 # Lateral test profile (requires homed axis)
@@ -172,7 +173,8 @@ class DaemonClient:
                         print(f"  {CC}telem{CX}  sp={sp.get('steps'):>8}  "
                               f"lat={lat.get('pos'):>7}  endstop={obj.get('endstop')}")
                 elif obj.get("event") in ("endstop_hit", "home_complete",
-                                           "fault", "limit_hit", "move_complete"):
+                                           "fault", "limit_hit",
+                                           "move_complete", "ramp_complete"):
                     results.append(obj)
                     print(f"  {CY}event{CX}  {obj.get('event')}")
         self._sock.settimeout(2.0)
@@ -351,9 +353,27 @@ def test_lateral(client: DaemonClient, do_home: bool = True) -> bool:
 
 
 def test_ramp_spindle(client: DaemonClient) -> bool:
-    """Ramp spindle from 100 RPM to 1500 RPM and back in fine steps."""
-    section("SPINDLE RAMP TEST  (100 → 1500 → 100 RPM)")
-    print("  Smooth ramp in 20 steps, 0.3s per step")
+    """Test spindle Klipper multi-segment ramp via the daemon's ramp_to command.
+
+    Architecture note:
+        The daemon (C, ARM) pre-computes the full Klipper ramp (16 sub-segments,
+        equal Δiv partitioning) and writes sp_ramp_seg_t[16] into PRU shared RAM
+        before issuing HOST_CMD_RAMP_TO.  PRU1 executes the segments autonomously
+        using "interval += add" per step, force-loading start_iv at each boundary
+        (Klipper stepper_load_next equivalent).  No Python timing is involved in
+        the ramp execution — Python only sends one command and waits for the event.
+
+    Test sequence:
+        1. enable + ack_event
+        2. ramp_to 100 → 300 RPM  (CW)  — wait ramp_complete
+        3. ramp_to 300 → 1500 RPM (CW)  — wait ramp_complete
+        4. ramp_to 1500 → 100 RPM (CW)  — wait ramp_complete (decel ramp)
+        5. ramp_to 100 → 1500 RPM (CCW) — wait ramp_complete
+        6. e_stop
+    """
+    section("SPINDLE KLIPPER RAMP TEST  (daemon pre-computes, PRU1 executes)")
+    print("  Ramp profiles computed by daemon (ARM), executed by PRU1 autonomously.")
+    print("  Python sends one {'cmd':'ramp_to'} and waits for {'event':'ramp_complete'}.")
     print()
 
     all_ok = True
@@ -364,49 +384,60 @@ def test_ramp_spindle(client: DaemonClient) -> bool:
     r = client.send({"cmd": "ack_event"})
     all_ok &= check(r, "ack_event")
 
-    # Build ramp: 100 RPM → 1500 RPM
-    rpm_min, rpm_max, n_steps = 100, 1500, 20
-    step_size = (rpm_max - rpm_min) / n_steps
+    # (name, start_hz, target_hz, accel_steps, sp_dir, timeout_s)
+    RAMP_TESTS = [
+        ("100 → 300 RPM  CW",   6400,  32000,  500, 0, 10.0),
+        ("300 → 1500 RPM CW",  32000, 75000, 1000, 0, 15.0),
+        ("300 → 1500 RPM CW",  75000, 100000, 1000, 0, 15.0),
+        ("1500 → 100 RPM CW", 75000,   6400,  500, 0, 10.0),  # decel ramp
+        ("100 → 1500 RPM CCW",  6400, 16000, 1000, 1, 15.0),
+    ]
 
-    all_rpms  = []
-    all_steps = []
+    print(f"  {'Ramp':<28} {'start':>8} {'target':>8} {'accel':>7}  {'Event':>14}  {'Status':>8}")
+    print(f"  {'-'*28} {'-'*8} {'-'*8} {'-'*7}  {'-'*14}  {'-'*8}")
 
-    def run_ramp(rpm_list):
-        prev_steps = None
-        prev_time  = None
-        for rpm in rpm_list:
-            hz = int(rpm * steps_per_rev / 60)
-            hz = max(hz, 1)
-            client.send({"cmd": "set_speed", "sp_hz": hz})
-            time.sleep(0.3)
-            telem = client.read_telem(0.0)
-            if telem:
-                steps = telem[-1].get("sp", {}).get("steps", 0)
-                t_now = time.monotonic()
-                if prev_steps is not None and prev_time is not None:
-                    delta = abs(steps - prev_steps)
-                    elapsed = t_now - prev_time
-                    meas = steps_to_rpm(delta, elapsed)
-                    all_rpms.append(rpm)
-                    all_steps.append(meas)
-                    bar_len = int(meas / 20)
-                    bar = "█" * min(bar_len, 60)
-                    print(f"  {rpm:>6.0f} RPM target │ {meas:>7.1f} meas │ {bar}")
-                prev_steps = steps
-                prev_time  = t_now
+    for name, start_hz, sp_hz, accel_steps, sp_dir, timeout_s in RAMP_TESTS:
+        r = client.send({
+            "cmd":         "ramp_to",
+            "sp_hz":       sp_hz,
+            "start_hz":    start_hz,
+            "accel_steps": accel_steps,
+            "sp_dir":      sp_dir,
+        })
+        if not r.get("ok"):
+            print(f"  {CR}✗  ramp_to failed: {r}{CX}")
+            all_ok = False
+            continue
 
-    ramp_up   = [rpm_min + i * step_size for i in range(n_steps + 1)]
-    ramp_down = list(reversed(ramp_up))
+        # Wait for ramp_complete event (autonomous PRU1 execution, no Python jitter)
+        ramp_done    = False
+        reported_hz  = "?"
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            telem = client.read_telem(0.2)
+            for obj in telem:
+                if obj.get("event") == "ramp_complete":
+                    ramp_done   = True
+                    reported_hz = obj.get("sp_hz", "?")
+                    break
+            if ramp_done:
+                break
 
-    print(f"  {'Target RPM':>10}  {'Measured RPM':>13}  Chart")
-    print(f"  {'-'*10}  {'-'*13}  {'-'*40}")
-    run_ramp(ramp_up)
-    print(f"  {'─'*65}")
-    run_ramp(ramp_down)
+        target_rpm = sp_hz / steps_per_rev * 60
+        if ramp_done:
+            status_str = f"{CG}OK{CX}"
+        else:
+            status_str = f"{CR}TIMEOUT{CX}"
+            all_ok = False
 
-    client.send({"cmd": "e_stop"})
-    check({"ok": True}, "e_stop")
+        print(f"  {name:<28} {start_hz:>8} {sp_hz:>8} {accel_steps:>7}  "
+              f"{str(reported_hz):>14}  {status_str}")
+        # Brief cruise phase before next ramp
+        client.read_telem(0.5)
+        client.send({"cmd": "ack_event"})
 
+    r = client.send({"cmd": "e_stop"})
+    check(r, "e_stop")
     return all_ok
 
 

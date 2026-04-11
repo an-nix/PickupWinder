@@ -44,6 +44,7 @@
 #define PRU_STEPPER_H
 
 #include <stdint.h>
+#include "pru_ipc.h"  /* ramp_seg_t, MAX_RAMP_SEGS */
 
 /* ── IEP register access ────────────────────────────────────────────────────
  * AM335x IEP base: PRU constant table entry 26 (CREGISTER=26) → local 0x0002E000.
@@ -241,40 +242,38 @@ static inline void pulse_reset_counters(pulse_gen_t *pg) {
  *
  * Shared between test_spindle and production orchestrator firmware.         */
 
-#define PRU_N_ACCEL_SEG  16u   /* sub-segments per ramp phase                */
+#define PRU_N_ACCEL_SEG  MAX_RAMP_SEGS  /* alias for backward compatibility  */
 
-typedef struct {
-    uint32_t start_iv;   /* IEP interval at segment start (force-loaded)     */
-    int32_t  add;        /* signed interval delta per step (0 = constant)    */
-    uint32_t count;      /* number of steps in this segment                  */
-} accel_seg_t;
+/* accel_seg_t is now ramp_seg_t from pru_ipc.h (identical layout).           */
+typedef ramp_seg_t accel_seg_t;
 
 /* compute_accel_ramp — fill segs[PRU_N_ACCEL_SEG] for a constant-accel ramp
  * from start_iv to end_iv.  Precondition: start_iv > end_iv (accelerating).
  * All divisions done here — ZERO division in the step loop.
  *
- * Partitioning strategy: equal interval sub-ranges (Δiv uniform).
- *   div_iv = (start_iv - end_iv) / PRU_N_ACCEL_SEG
- *   Segment i: ivs = start_iv - i*div_iv,  ive = ivs - div_iv
- *
- * This guarantees every segment has |gap| = div_iv ≥ 1, so add is always
- * non-zero (no flat-speed plateaux visible as staircases).                  */
-static void compute_accel_ramp(accel_seg_t *segs,
-                                uint32_t start_iv, uint32_t end_iv,
-                                uint32_t accel_s2)
+ * Used by the daemon (ARM) and potentially by test firmware.
+ * The PRU1 motor firmware does not use this function (it uses the
+ * sp_ramp_seg_t[]/sp_ramp_ctrl_t mechanism via IPC).
+ * The static qualifier is kept for header-only inclusion; the __attribute__
+ * suppresses the -Wunused-function warning in translation units that include
+ * this header without calling compute_accel_ramp.                           */
+static void __attribute__((unused))
+compute_accel_ramp(ramp_seg_t *segs,
+                   uint32_t start_iv, uint32_t end_iv,
+                   uint32_t accel_s2)
 {
     uint32_t div_iv, i;
 
     /* Integer division: last segment absorbs the remainder by using end_iv  */
-    div_iv = (start_iv - end_iv) / PRU_N_ACCEL_SEG;
+    div_iv = (start_iv - end_iv) / MAX_RAMP_SEGS;
     if (div_iv < 1u) div_iv = 1u;
 
-    for (i = 0u; i < PRU_N_ACCEL_SEG; i++) {
+    for (i = 0u; i < MAX_RAMP_SEGS; i++) {
         uint32_t ivs, ive, vs, ve, cnt;
         int32_t  gap;
 
         ivs = start_iv - div_iv * i;
-        ive = (i == PRU_N_ACCEL_SEG - 1u) ? end_iv : (ivs - div_iv);
+        ive = (i == MAX_RAMP_SEGS - 1u) ? end_iv : (ivs - div_iv);
 
         /* Clamp */
         if (ive < 1u) ive = 1u;

@@ -10,8 +10,9 @@
 Le BeagleBone Black expose deux **PRU** (Programmable Real-time Units, 200 MHz,
 déterministes, 5 ns/cycle) aux côtés d'un **ARM Cortex-A8** exécutant Linux.
 
-Architecture à 4 couches. Le host écrit des vitesses cibles ; PRU0 orchestre ;
-PRU1 génère les impulsions à partir de paramètres continus.
+Architecture à 4 couches.  Le host écrit des commandes (vitesses cibles,
+rampes d'accélération, moves) ; PRU0 orchestre et gère les segments de rampe ;
+PRU1 génère les impulsions comme un pilote moteur aveugle.
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -22,8 +23,9 @@ PRU1 génère les impulsions à partir de paramètres continus.
 ├──────────────────────▼────────────────────────────────────────────┤
 │  Couche 3 — Daemon C matériel (pickup_daemon, ARM Linux)          │
 │  Mappe PRU Shared RAM via /dev/mem                                │
-│  Écrit host_cmd_t   (commandes: set_speed, enable, estop, home)   │
-│  Lit pru_status_t   (statut agrégé de PRU0)                       │
+│  Pré-calcule les rampes Klipper (ramp_seg_t[16] par axe)          │
+│  Écrit host_cmd_t + segments dans shared RAM                      │
+│  Lit pru_status_t (statut agrégé de PRU0)                         │
 │  Polling 10 ms, broadcast telem + events vers Python              │
 │  Communique UNIQUEMENT avec PRU0                                  │
 │                      │ /dev/mem mmap (PRU Shared RAM 0x4A310000)  │
@@ -31,58 +33,66 @@ PRU1 génère les impulsions à partir de paramètres continus.
 │  Couche 2 — PRU0 orchestration (200 MHz, 5 ns/cycle)              │
 │  Lit host_cmd_t du daemon (via shared RAM)                        │
 │  Machine d'état homing (IDLE → APPROACH → HIT)                    │
-│  Écrit motor_params_t (intervalles, dirs, enable, run)            │
-│  Lit motor_telem_t de PRU1                                        │
+│  Gestion séquentielle des segments de rampe (ramp_tick)           │
+│  Coordination spindle ↔ latéral (Q6 ratio)                       │
+│  Écrit motor_params_t (motor_ctl_t par axe : interval, ramp_arm)  │
+│  Lit motor_telem_t de PRU1 (seg_done, step_count, position)      │
 │  Publie pru_status_t (statut agrégé pour le daemon)               │
 │  PAS de contrôle moteur. PAS de STEP/DIR/EN.                      │
 │                      │ PRU Shared RAM                             │
 ├──────────────────────▼────────────────────────────────────────────┤
 │  Couche 1 — PRU1 contrôle moteur (200 MHz, propriétaire IEP)      │
 │  Lit motor_params_t de PRU0 en continu                            │
+│  Détecte ramp_arm=1 → arme pulse_set_ramp → clear ramp_arm=0     │
 │  Génération d'impulsions IEP : pulse_gen_t par axe                │
-│  GPIO STEP/DIR/EN pour spindle + lateral                          │
-│  Lit R31 endstops → arrêt latéral de sécurité inconditionnel      │
-│  Publie motor_telem_t (compteurs pas, positions, faults, endstop) │
+│  GPIO STEP/DIR/EN pour spindle + lateral (PRU1 R30)               │
+│  Quand seg terminé (accel_count==0) → seg_done=1 dans telem      │
+│  Publie motor_telem_t (compteurs pas, positions, seg_done)        │
 │  PILOTE MOTEUR AVEUGLE — aucune logique homing, aucune commande   │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-**Flux de communication** (224 octets en shared RAM) :
+**Flux de communication** (608 octets en shared RAM) :
 ```
-Host ──host_cmd_t──→ PRU0 ──motor_params_t──→ PRU1
-                     PRU0 ←──motor_telem_t── PRU1
-Host ←─pru_status_t─ PRU0
+Host ──host_cmd_t + ramp_seg_t[16]×2──→ PRU0 ──motor_params_t──→ PRU1
+                                         PRU0 ←──motor_telem_t── PRU1
+Host ←─pru_status_t─────────────────── PRU0
 ```
 
 ---
 
 ## 2. Règle de découpage
 
-| Critère                                          | PRU0 | PRU1 | Linux |
-|--------------------------------------------------|:----:|:----:|:-----:|
-| Latence < 1 µs (timing IEP des edges)           | ✓    |      |       |
-| Génération STEP/DIR/ENABLE                       | ✓    |      |       |
-| Lecture endstops (R31) + arrêt de sécurité       | ✓    |      |       |
-| Comptage pas / position                          | ✓    |      |       |
-| Publication motor_telem_t                        | ✓    |      |       |
-| Orchestration (traitement commandes host)        |      | ✓    |       |
-| Machine d'état homing (IDLE/APPROACH/HIT)        |      | ✓    |       |
-| Écriture motor_params_t                          |      | ✓    |       |
-| Publication pru_status_t                         |      | ✓    |       |
-| Détection événements (endstop, home, fault)      |      | ✓    |       |
-| Conversion Hz → intervalles IEP                  |      |      | ✓     |
-| Compensation spindle ↔ lateral                   |      |      | ✓     |
-| Rampes d'accélération (set_speed progressifs)    |      |      | ✓     |
-| Machine d'état winding (IDLE/PAUSED/WINDING/…)   |      |      | ✓     |
-| UI WebSocket / REST / UART                       |      |      | ✓     |
-| Persistance recettes (JSON/fichiers)             |      |      | ✓     |
-| Session arbitration (pot/IHM/footswitch)         |      |      | ✓     |
+| Critère                                          | PRU1 (L1) | PRU0 (L2) | Linux (L3-4) |
+|--------------------------------------------------|:---------:|:---------:|:------------:|
+| Latence < 1 µs (timing IEP des edges)           | ✓         |           |              |
+| Génération STEP/DIR/ENABLE                       | ✓         |           |              |
+| Comptage pas / position                          | ✓         |           |              |
+| Exécution `interval += add` (boucle Klipper)     | ✓         |           |              |
+| Détection seg_done (accel_count==0)              | ✓         |           |              |
+| Publication motor_telem_t                        | ✓         |           |              |
+| Traitement commandes host (host_cmd_t)           |           | ✓         |              |
+| Machine d'état homing (IDLE/APPROACH/HIT)        |           | ✓         |              |
+| Gestion séquentielle segments rampe (ramp_tick)  |           | ✓         |              |
+| Coordination spindle ↔ latéral (coord_tick)      |           | ✓         |              |
+| Lecture endstops (R31) + arrêt de sécurité       |           | ✓         |              |
+| Écriture motor_params_t + ramp_arm handshake     |           | ✓         |              |
+| Publication pru_status_t                         |           | ✓         |              |
+| Détection événements → event_pending             |           | ✓         |              |
+| Conversion Hz → intervalles IEP                  |           |           | ✓            |
+| Calcul rampes Klipper (ramp_seg_t[16])           |           |           | ✓            |
+| Protocole JSON socket (cmds/events/telem)        |           |           | ✓            |
+| Machine d'état winding (IDLE/PAUSED/WINDING/…)   |           |           | ✓            |
+| UI WebSocket / REST / UART                       |           |           | ✓            |
+| Persistance recettes (JSON/fichiers)             |           |           | ✓            |
+| Session arbitration (pot/IHM/footswitch)         |           |           | ✓            |
 
 **Principes absolus** :
 - Aucun flottant, aucune alloc dynamique, aucun appel OS dans les PRU.
-- Pas de division dans la boucle PRU0 (intervalles pré-calculés côté host).
-- PRU0 = pilote moteur aveugle. PRU1 = cerveau/orchestrateur.
-- Le daemon ne parle qu'à PRU1 (jamais directement à PRU0).
+- Pas de division dans la boucle PRU (intervalles et segments pré-calculés côté ARM).
+- PRU1 = pilote moteur aveugle (ne connaît ni les commandes, ni le homing, ni les segments).
+- PRU0 = cerveau/orchestrateur (gère les segments un par un via ramp_arm handshake).
+- Le daemon ne parle qu'à PRU0 (jamais directement à PRU1).
 
 ---
 
@@ -91,77 +101,79 @@ Host ←─pru_status_t─ PRU0
 Zone d'échange : **PRU Shared RAM** (AM335x)
 - Adresse PRU locale : `0x00010000`
 - Adresse physique hôte : `0x4A310000`
-- Taille : 12 KB (seuls 224 octets utilisés)
+- Taille : 12 KB (608 octets utilisés)
 
-### 3.1 Plan mémoire (Option A)
+### 3.1 Plan mémoire
 
 ```
 Offset   Taille  Struct              Direction       Description
-0x0000   64 o    host_cmd_t          Host → PRU1     Commandes (set_speed, enable, estop, home, etc.)
-0x0040   32 o    motor_params_t      PRU1 → PRU0     Intervalles moteur, directions, flags enable/run
-0x0060   64 o    motor_telem_t       PRU0 → PRU1     Compteurs pas, positions, faults, masque endstop
-0x00A0   64 o    pru_status_t        PRU1 → Host     Statut agrégé pour broadcast daemon
-Total :  224 octets
+0x0000   64 o    host_cmd_t          Host → PRU0     Commandes + paramètres
+0x0040   32 o    motor_params_t      PRU0 → PRU1     motor_ctl_t[2] (interval, ramp_arm, etc.)
+0x0060   64 o    motor_telem_t       PRU1 → PRU0     motor_t[2] (step_count, position, seg_done)
+0x00A0   64 o    pru_status_t        PRU0 → Host     Statut agrégé pour daemon broadcast
+0x00E0   192 o   ramp_seg_t[16]      Host → PRU0     Segments rampe axe 0 (spindle)
+0x01A0   192 o   ramp_seg_t[16]      Host → PRU0     Segments rampe axe 1 (latéral)
+Total :  608 octets
 ```
 
-### 3.2 Structures clés (`pru_ipc.h`)
+### 3.2 Abstraction moteur (`pru_ipc.h`)
+
+**Convention d'index :**
+- `MOTOR_0` = 0 → spindle (Motor B, pins paires P8)
+- `MOTOR_1` = 1 → latéral (Motor A, pins impaires P8)
+
+**Structures clés (version actuelle) :**
 
 ```c
-/* Host → PRU1 : commande (64 octets) */
-typedef struct __attribute__((packed, aligned(4))) {
-    uint8_t  cmd;                    /* HOST_CMD_* opcode                    */
-    uint8_t  axis;                   /* AXIS_SPINDLE / LATERAL / ALL         */
-    uint8_t  sp_dir;                 /* direction spindle (0=fwd, 1=rev)     */
-    uint8_t  lat_dir;                /* direction latéral (0=fwd, 1=rev)     */
-    uint32_t sp_interval_target;     /* intervalle IEP cible spindle         */
-    uint32_t lat_interval_target;    /* intervalle IEP cible latéral         */
-    uint32_t value_a;                /* usage général (ex: enable=1/0)       */
-    uint32_t value_b;                /* usage général                        */
-    uint8_t  cmd_ack;                /* PRU1 copie l'opcode ici quand traité */
-    uint8_t  _pad[3];
-    uint32_t _reserved[9];
-} host_cmd_t;
-
-/* PRU1 → PRU0 : paramètres moteur (32 octets) */
-typedef struct __attribute__((packed, aligned(4))) {
-    uint32_t sp_interval;            /* cycles IEP entre edges spindle       */
-    uint32_t lat_interval;           /* cycles IEP entre edges latéral       */
-    uint8_t  sp_dir, lat_dir;        /* directions                           */
-    uint8_t  sp_enable, lat_enable;  /* 1=driver activé                      */
-    uint8_t  sp_run, lat_run;        /* 1=générer des impulsions             */
+/* motor_t — télémétrie universelle par moteur (24 octets) */
+typedef struct {
+    uint32_t interval;          /* intervalle IEP courant                    */
+    uint8_t  dir, enable, run;  /* état moteur                               */
+    uint8_t  seg_done;          /* 1 = segment rampe terminé (PRU1→PRU0)     */
+    uint32_t step_count;        /* pas depuis dernier reset                  */
+    int32_t  position;          /* position signée (pas)                     */
+    uint32_t interval_actual;   /* intervalle IEP mesuré                     */
+    uint8_t  state, faults;     /* MOTOR_STATE_*, FAULT_*                    */
     uint8_t  _pad[2];
-    uint32_t _reserved[4];
+} motor_t;
+
+/* motor_ctl_t — contrôle par moteur PRU0→PRU1 (16 octets) */
+typedef struct {
+    uint32_t interval;          /* intervalle IEP / start_iv rampe           */
+    uint8_t  dir, enable, run;  /* commandes                                 */
+    uint8_t  ramp_arm;          /* 1 = nouveau segment prêt (PRU0→PRU1)      */
+    int32_t  ramp_add;          /* delta intervalle par pas (Klipper)        */
+    uint32_t ramp_count;        /* nombre de pas dans le segment             */
+} motor_ctl_t;
+
+/* motor_params_t — PRU0 → PRU1 (32 octets) */
+typedef struct {
+    motor_ctl_t motor[2];       /* spindle + latéral                         */
 } motor_params_t;
 
-/* PRU0 → PRU1 : télémétrie moteur (64 octets) */
-typedef struct __attribute__((packed, aligned(4))) {
-    uint32_t sp_step_count;          /* pas spindle depuis dernier reset     */
-    uint32_t lat_step_count;         /* pas latéral depuis dernier reset     */
-    int32_t  lat_position;           /* position latérale signée (pas)       */
-    uint32_t sp_interval_actual;     /* intervalle spindle actuel            */
-    uint32_t lat_interval_actual;    /* intervalle latéral actuel            */
-    uint8_t  sp_state, lat_state;    /* MOTOR_STATE_* flags                  */
-    uint8_t  sp_faults, lat_faults;  /* FAULT_* flags                        */
-    uint8_t  endstop_mask;           /* bit0=ES1, bit1=ES2                   */
+/* motor_telem_t — PRU1 → PRU0 (64 octets) */
+typedef struct {
+    motor_t  motor[2];          /* 48 o — télémétrie par moteur              */
+    uint8_t  endstop_mask;      /* bit0=ES1, bit1=ES2                        */
     uint8_t  _pad[3];
-    uint32_t seq;                    /* compteur monotone (wrap)             */
-    uint32_t _reserved[8];
+    uint32_t seq;               /* compteur monotone                         */
+    uint32_t _reserved[2];
 } motor_telem_t;
 
-/* PRU1 → Host : statut agrégé (64 octets) */
-typedef struct __attribute__((packed, aligned(4))) {
+/* pru_status_t — PRU0 → Host (64 octets) */
+typedef struct {
     uint32_t seq;
-    uint8_t  pru1_state;             /* PRU1_STATE_* flags                   */
-    uint8_t  event_pending;          /* 1 = événement en attente d'ack host  */
-    uint8_t  event_type;             /* EVENT_* type                         */
-    uint8_t  _pad0;
-    /* Champs copiés de motor_telem_t : */
-    uint32_t sp_step_count, lat_step_count;
-    int32_t  lat_position;
-    uint32_t sp_interval_actual, lat_interval_actual;
-    uint8_t  endstop_mask, sp_faults, lat_faults, _pad1;
-    uint32_t _reserved[7];
+    uint8_t  pru1_state, event_pending, event_type, endstop_mask;
+    motor_t  motor[2];          /* 48 o — copie de la télémétrie             */
+    uint32_t _reserved[2];
 } pru_status_t;
+
+/* ramp_seg_t — segment de rampe universel (12 octets) */
+typedef struct {
+    uint32_t start_iv;          /* intervalle forcé au début du segment      */
+    int32_t  add;               /* delta signé par pas (0 = cruise)          */
+    uint32_t count;             /* nombre de pas (0 = skip)                  */
+} ramp_seg_t;
 ```
 
 ### 3.3 Opcodes de commande
@@ -169,40 +181,53 @@ typedef struct __attribute__((packed, aligned(4))) {
 | Opcode                | Valeur | Description |
 |-----------------------|--------|-------------|
 | `HOST_CMD_NOP`        | 0      | Idle / acquitté |
-| `HOST_CMD_SET_SPEED`  | 1      | Définir intervalles IEP cibles + directions |
+| `HOST_CMD_SET_SPEED`  | 1      | Vitesse constante (intervalle direct) |
 | `HOST_CMD_ENABLE`     | 2      | Activer/désactiver drivers |
 | `HOST_CMD_ESTOP`      | 3      | Arrêt d'urgence immédiat |
 | `HOST_CMD_HOME_START` | 4      | Démarrer séquence homing latéral |
 | `HOST_CMD_ACK_EVENT`  | 5      | Acquitter dernier événement PRU |
 | `HOST_CMD_RESET_POS`  | 6      | Remettre compteurs/position à zéro |
+| `HOST_CMD_SET_LIMITS` | 7      | Définir limites logicielles (min, max) |
+| `HOST_CMD_MOVE_TO`    | 8      | Mouvement position (trapèze) |
+| `HOST_CMD_RAMP_TO`    | 9      | Rampe vitesse (accélération Klipper) |
 
-### 3.4 Protocole commande/acquittement
+### 3.4 Événements (PRU0 → Host)
 
-1. Host écrit `cmd` dans `host_cmd_t` (+ paramètres).
-2. PRU1 lit `cmd`, exécute, copie l'opcode dans `cmd_ack`, remet `cmd = NOP`.
+| Événement              | Code | Condition |
+|------------------------|------|-----------|
+| `EVENT_ENDSTOP_HIT`    | 1    | Fin de course activé (hors homing) |
+| `EVENT_HOME_COMPLETE`  | 2    | Homing terminé |
+| `EVENT_FAULT`          | 3    | Fault moteur détecté |
+| `EVENT_LIMIT_HIT`      | 4    | Limite logicielle atteinte |
+| `EVENT_MOVE_COMPLETE`  | 5    | Profil move_to terminé |
+| `EVENT_RAMP_COMPLETE`  | 6    | Rampe ramp_to terminée |
+
+### 3.5 Protocole commande/acquittement
+
+1. Host écrit `cmd` dans `host_cmd_t` (+ paramètres + segments si RAMP_TO/MOVE_TO).
+2. PRU0 lit `cmd`, exécute, copie l'opcode dans `cmd_ack`, remet `cmd = NOP`.
 3. Host poll `cmd` — quand il voit `NOP`, la commande est acquittée.
 4. Host ne doit PAS écrire de nouvelle commande avant acquittement.
 
 ---
 
-## 4. PRU0 — Pilote Moteur (Couche 1)
+## 4. PRU1 — Pilote Moteur Aveugle (Couche 1)
 
-**Propriétaire du timer IEP** : PRU0 initialise le compteur IEP au démarrage.
-PRU1 le lit seulement — ne le réinitialise jamais.
+**Propriétaire du timer IEP** : PRU1 initialise le compteur IEP au démarrage.
+PRU0 le lit seulement — ne le réinitialise jamais.
 
-### 4.1 Boucle principale
+### 4.1 Responsabilités
 
-```
-Initialiser IEP (IEP_INIT)
-Boucle infinie :
-  1. Lire motor_params_t
-  2. Appliquer enable/direction sur R30 (STEP/DIR/EN)
-  3. Lire R31 → endstop_mask
-  4. Si endstop actif ET latéral en marche → arrêt immédiat latéral
-  5. pulse_update(&sp_gen, STEP_A_BIT, iep_now)
-  6. pulse_update(&lat_gen, STEP_B_BIT, iep_now)
-  7. (tous les N cycles) Publier motor_telem_t
-```
+PRU1 est un générateur d'impulsions minimal (~180 lignes de C).  Il ne connaît
+ni les commandes host, ni le homing, ni les tableaux de segments.
+
+1. Détecter `ramp_arm=1` → armer `pulse_set_ramp()` → clear `ramp_arm=0`
+2. Lire `motor_ctl_t` : interval, dir, enable, run
+3. Appliquer STEP/DIR/EN sur R30
+4. `pulse_update()` par axe : génération IEP continue avec `interval += add`
+5. Quand segment terminé (`accel_count==0`) : écrire l'intervalle final dans
+   `params` (prévient le saut de vitesse) et `seg_done=1` dans telem
+6. Publier `motor_telem_t` (~400 Hz)
 
 ### 4.2 Moteur de génération d'impulsions
 
@@ -211,74 +236,143 @@ d'impulsions basée sur le timer IEP :
 
 ```c
 typedef struct {
-    uint32_t next_edge;    /* timestamp IEP pour prochain toggle STEP  */
-    uint32_t interval;     /* cycles IEP entre edges                   */
-    uint32_t step_count;   /* pas total depuis dernier reset           */
-    int32_t  position;     /* position signée (pas)                    */
-    uint8_t  phase;        /* 0=montée, 1=descente                     */
-    uint8_t  direction;    /* direction cachée pour tracking position   */
-    uint8_t  running;      /* génère activement des impulsions          */
+    uint32_t next_edge_time;    /* timestamp IEP pour prochain toggle STEP  */
+    uint32_t interval;          /* cycles IEP courant entre edges           */
+    uint32_t step_count;        /* pas total depuis dernier reset           */
+    int32_t  position;          /* position signée (pas)                    */
+    int32_t  accel_add;         /* Klipper: delta intervalle par pas        */
+    uint32_t accel_count;       /* Klipper: pas restants dans ce segment    */
+    uint8_t  direction;         /* direction cachée                         */
+    uint8_t  step_pin_state;    /* état courant du pin STEP (0 ou 1)       */
+    uint8_t  running;           /* génère activement des impulsions          */
     uint8_t  _pad;
 } pulse_gen_t;
 ```
 
-`pulse_update()` à chaque edge :
-- Si pas running ou interval==0 : skip
-- Si IEP a dépassé `next_edge` : toggle pin STEP, incrémenter compteur,
-  avancer next_edge
-- Gère rising et falling edges (duty cycle 50%)
+**Boucle interne Klipper** (`pulse_update`, sur chaque rising edge) :
+```c
+if (accel_count > 0) {
+    interval += accel_add;     // interval += add (Klipper stepper_event_edge)
+    accel_count--;
+}
+```
 
-### 4.3 Table des pins PRU0
+Quand `accel_count` atteint 0, `pulse_update` passe en mode vitesse constante
+et accepte les changements d'intervalle externes immédiatement.
 
-| Pin header | Bit PRU   | Fonction   | Notes |
-|------------|-----------|------------|-------|
-| P8_41      | R30\[7\]  | EN_A       | Enable spindle (actif-bas) |
-| P8_43      | R30\[5\]  | DIR_A      | Direction spindle |
-| P8_45      | R30\[1\]  | STEP_A     | Step spindle |
-| P8_42      | R30\[3\]  | EN_B       | Enable latéral (actif-bas) |
-| P8_44      | R30\[0\]  | DIR_B      | Direction latéral |
-| P8_46      | R30\[2\]  | STEP_B     | Step latéral |
-| P8_15      | R31\[15\] | ENDSTOP_1  | Fin de course |
-| P8_16      | R31\[14\] | ENDSTOP_2  | Fin de course |
+### 4.3 Handshake rampe (ramp_arm / seg_done)
+
+```
+PRU0                                    PRU1
+  ├─ Écrit interval=start_iv, ──────────→
+  │  ramp_add, ramp_count              │
+  │  ramp_arm=1                        │
+  │                                     │
+  │                    ramp_arm==1 ─────┤
+  │                    pulse_set_ramp()  │
+  │  ←───── ramp_arm=0 ────────────────┤
+  │                    seg_done=0        │
+  │                                     │
+  │                    exécute segment   │
+  │                    interval += add   │
+  │                    count--           │
+  │                    ...               │
+  │                    accel_count==0    │
+  │                    params.iv=final   │
+  │  ←───── seg_done=1 ────────────────┤
+  │                                     │
+  ├─ (ramp_tick détecte seg_done=1)    │
+  ├─ Charge segment suivant...         │
+```
+
+### 4.4 Table des pins PRU1
+
+| Pin header | Bit R30    | Signal   | Notes |
+|------------|------------|----------|-------|
+| P8_45      | R30\[0\]   | LAT_STEP | Step latéral |
+| P8_46      | R30\[1\]   | SP_STEP  | Step spindle |
+| P8_43      | R30\[2\]   | LAT_DIR  | Direction latéral |
+| P8_44      | R30\[3\]   | SP_DIR   | Direction spindle |
+| P8_41      | R30\[4\]   | LAT_EN   | Enable latéral (actif-bas) |
+| P8_42      | R30\[5\]   | SP_EN    | Enable spindle (actif-bas) |
 
 ---
 
-## 5. PRU1 — Orchestrateur (Couche 2)
+## 5. PRU0 — Orchestrateur (Couche 2)
 
-**Lecteur IEP** : PRU1 lit le timer IEP de PRU0. Ne le réinitialise jamais.
+**Lecteur IEP** : PRU0 lit le timer IEP de PRU1.  Ne le réinitialise jamais.
 
 ### 5.1 Responsabilités
 
-- Lire `host_cmd_t` du daemon
-- Traiter les commandes : SET_SPEED, ENABLE, ESTOP, HOME_START, ACK_EVENT, RESET_POS
+- Lire et traiter `host_cmd_t` du daemon
+- **Gestion séquentielle des segments de rampe** pour les deux axes (`ramp_tick`)
 - Machine d'état homing (IDLE → APPROACH → HIT)
-- Écrire `motor_params_t` pour PRU0
-- Lire `motor_telem_t` de PRU0
-- Publier `pru_status_t` pour le daemon
-- Détecter événements (endstop, home complete, fault) et signaler au host
+- Lecture endstops R31 + arrêt de sécurité latéral inconditionnel
+- Coordination spindle ↔ latéral (Q6 ratio, `coord_tick`)
+- Vérification des limites logicielles (`limits_check`)
+- Publication `pru_status_t` pour le daemon
 
-### 5.2 Machine d'état homing
+### 5.2 Architecture rampe générique (ramp_tick)
+
+L'architecture de rampe est **identique pour les deux axes**.  Le daemon
+pré-calcule `ramp_seg_t[MAX_RAMP_SEGS]` dans la shared RAM, et PRU0 les
+charge un par un via le handshake ramp_arm/seg_done :
+
+```
+État par axe :
+  g_ramp_active[ax]     — rampe en cours ?
+  g_ramp_seg_idx[ax]    — index du segment courant (0..seg_count-1)
+  g_ramp_seg_count[ax]  — nombre total de segments
+  g_ramp_op[ax]         — RAMP_OP_RAMP_TO ou RAMP_OP_MOVE_TO
+
+ramp_tick() :
+  pour chaque axe :
+    si !g_ramp_active[ax] → skip
+    si !telem->motor[ax].seg_done → skip  (segment pas encore terminé)
+    avancer g_ramp_seg_idx++
+    si < seg_count → charger segment suivant (load_ramp_seg)
+    sinon → lever EVENT_RAMP_COMPLETE ou EVENT_MOVE_COMPLETE
+```
+
+Types d'opérations :
+- `RAMP_OP_RAMP_TO` : rampe vitesse → EVENT_RAMP_COMPLETE, moteur continue à cruiser
+- `RAMP_OP_MOVE_TO` : mouvement position → EVENT_MOVE_COMPLETE, moteur s'arrête
+
+### 5.3 Machine d'état homing
 
 ```
 IDLE ──(HOST_CMD_HOME_START)──→ APPROACH
   (lat_dir=HOMING_DIR, lat_interval=HOMING_INTERVAL, lat_run=1)
 
 APPROACH ──(endstop_mask != 0)──→ HIT
-  (lat_run=0, EVENT_HOME_COMPLETE, PRU1_STATE_AT_HOME)
+  (lat_run=0, reset position, EVENT_HOME_COMPLETE)
 
-HIT ──(host acquitte)──→ IDLE
+HIT ──(immédiat)──→ IDLE
 ```
 
-### 5.3 Détection d'événements
+### 5.4 Endstops (R31 inputs)
 
-PRU1 surveille `motor_telem_t` et signale les événements au host via
-`pru_status_t.event_pending` + `event_type` :
+| Pin header | Bit R31 | Signal     |
+|------------|---------|------------|
+| P9_28      | R31[3]  | ENDSTOP_1  |
+| P9_30      | R31[2]  | ENDSTOP_2  |
 
-| Événement             | Code | Condition |
-|-----------------------|------|-----------|
-| `EVENT_ENDSTOP_HIT`   | 1    | `lat_faults & FAULT_ENDSTOP_HIT` (hors homing) |
-| `EVENT_HOME_COMPLETE` | 2    | Homing FSM atteint l'état HIT |
-| `EVENT_FAULT`         | 3    | Fault moteur détecté |
+Les endstops sont **actifs-HIGH** avec pull-up.  Sur front montant :
+- Arrêt latéral inconditionnel (`run=0`, cancel_ramp)
+- Restauration spindle depuis coordination vers vitesse demandée
+- Événement `EVENT_ENDSTOP_HIT` (si hors homing)
+
+### 5.5 Coordination spindle ↔ latéral
+
+Pendant un `MOVE_TO`, le daemon calcule un ratio Q6 :
+`sp_lat_coord = (sp_iv × 64) / lat_cruise_iv`
+
+PRU0 applique `coord_tick()` à chaque itération :
+```c
+sp_adj = (sp_lat_coord × lat_interval_actual) >> 6;
+```
+Ceci maintient le spindle proportionnel au latéral pendant les rampes,
+assurant une densité de bobinage constante (tours/mm).
 
 ---
 
@@ -290,21 +384,26 @@ Le daemon est la **seule interface** entre le monde matériel (PRU, /dev/mem)
 et le monde applicatif (Python, recettes, UI).
 
 - Mappe `/dev/mem` sur PRU Shared RAM
-- Écrit `host_cmd_t`, lit `pru_status_t`
+- Écrit `host_cmd_t` + `ramp_seg_t[]`, lit `pru_status_t`
+- **Pré-calcule les rampes Klipper** (16 sous-segments par axe) via `compute_ramp()`
 - Serveur Unix socket `/run/pickup-winder.sock`
 - Protocole : JSON ligne par ligne (newline-delimited)
 - Polling à 10 ms : broadcast telem + détection événements
 
-Commandes : `set_speed`, `enable`, `e_stop`, `home_start`, `ack_event`, `reset_pos`
-Événements : `endstop_hit`, `home_complete`, `fault`, `telem`
+Commandes : `set_speed`, `enable`, `e_stop`, `home_start`, `set_limits`,
+`move_to`, `ramp_to`, `ack_event`, `reset_pos`
+
+Événements : `endstop_hit`, `home_complete`, `fault`, `limit_hit`,
+`move_complete`, `ramp_complete`, `telem`
 
 ### 6.2 Application Python
 
 - `pru_client.py` : Client async socket pour le daemon
-- `pickup_test.py` : Sketch de test (9 fonctions) validant toute la chaîne
+- `pickup_test.py` : Sketch de test validant toute la chaîne
+- `scripts/test_motor.py` : Tests automatisés (rotation + rampes)
 - (futur) `WinderApp` : machine d'état winding, recettes, patterns, UI WebSocket
 
-Python ne doit JAMAIS accéder directement à /dev/mem. Toute interaction PRU
+Python ne doit JAMAIS accéder directement à /dev/mem.  Toute interaction PRU
 passe par `PruClient` → socket → `pickup_daemon`.
 
 ### 6.3 Contrat HAL
@@ -312,17 +411,87 @@ passe par `PruClient` → socket → `pickup_daemon`.
 Le contrat entre daemon et Python est petit et stable :
 
 ```
-Commandes (Python → C) :  set_speed / enable / e_stop / home_start / ack_event / reset_pos
-Événements (C → Python) :  endstop_hit / home_complete / fault / telem
+Commandes (Python → C) :  set_speed / enable / e_stop / home_start /
+                           set_limits / move_to / ramp_to /
+                           ack_event / reset_pos
+Événements (C → Python) :  endstop_hit / home_complete / fault /
+                            limit_hit / move_complete / ramp_complete / telem
 ```
 
-Aucun détail matériel n'est exposé : pas d'adresses mémoire, pas de valeurs
-de registres, pas d'opcodes PRU. Si le matériel change, seul le daemon change.
+Aucun détail matériel n'est exposé.  Si le matériel change, seul le daemon change.
 Si l'application change, seul Python change.
 
 ---
 
-## 7. Build System
+## 7. Modèle d'accélération — Klipper multi-segments
+
+### 7.1 Pourquoi un seul segment `interval += add` ne suffit pas
+
+Le modèle `interval += add` (add constant) est le cœur de Klipper.
+Mais `v = clock / iv` est hyperbolique :
+
+| Vitesse   | iv      | Effet de add=-14 | Δv relative |
+|-----------|---------|-------------------|-------------|
+| 10 RPM    | 93 809  | 93809→93795       | 0.015%      |
+| 1500 RPM  | 625     | 625→611           | 2.24%       |
+
+L'accélération est ~150× plus rapide à haute vitesse.  Avec un seul segment,
+le moteur passe une éternité à basse vitesse puis stall à haute vitesse.
+
+### 7.2 Solution : 16 sous-segments avec force-load
+
+Le **daemon ARM** pré-calcule `MAX_RAMP_SEGS=16` sous-segments couvrant
+des plages d'intervalle uniformes.  Chaque segment a son propre
+`{start_iv, add, count}`.  L'intervalle est **force-loaded** au début de
+chaque segment (= `stepper_load_next()` de Klipper).
+
+**Algorithme `compute_ramp(start_iv, end_iv, accel_s2)` :**
+
+1. Diviser `[start_iv, end_iv]` en 16 sous-plages uniformes
+2. Pour chaque segment i :
+   - `ivs, ive` = bornes de la sous-plage
+   - `vs, ve` = vitesses correspondantes (Hz = clock/2/iv)
+   - `count = |v²_hi - v²_lo| / (2 × accel)` — cinématique
+   - `add = (ive - ivs) / count` — tronqué, signe correct
+3. Écrire les segments dans `g_ramp_segs[ax][]` (shared RAM)
+
+### 7.3 Exécution (PRU1 via PRU0 séquentiel)
+
+```
+Pour chaque segment (géré par PRU0 ramp_tick) :
+  PRU0 → load_ramp_seg(ax, idx) :
+    params->motor[ax].interval   = seg.start_iv   // force-load
+    params->motor[ax].ramp_add   = seg.add
+    params->motor[ax].ramp_count = seg.count
+    params->motor[ax].ramp_arm   = 1
+
+  PRU1 → détecte ramp_arm=1 :
+    pulse_set_ramp(pg, start_iv, add, count)
+    ramp_arm = 0, seg_done = 0
+
+  PRU1 → boucle IEP (par pas) :
+    interval += add
+    count--
+    ... jusqu'à accel_count == 0
+
+  PRU1 → segment terminé :
+    params.interval = interval_final  (empêche saut de vitesse)
+    seg_done = 1
+
+  PRU0 → ramp_tick détecte seg_done :
+    charge segment N+1 ou lève EVENT_RAMP_COMPLETE
+```
+
+### 7.4 Décel (ralentissement)
+
+Le même mécanisme supporte l'accélération et la décélération.  Pour une décel :
+- `start_iv < end_iv` (intervalles croissants = vitesse décroissante)
+- `add > 0` (intervalle augmente à chaque pas)
+- `compute_ramp()` gère les deux cas avec arithmétique signée
+
+---
+
+## 8. Build System
 
 ```bash
 make all         # Tout construire (DTBOs + PRU firmware + daemon)
@@ -330,36 +499,50 @@ make dtbo        # Overlays device-tree seulement
 make pru         # Firmware PRU seulement
 make daemon      # Daemon C seulement
 make clean       # Supprimer tous les artefacts
-make deploy BBB_IP=192.168.x.x  # Déployer via SSH
+
+# Docker cross-compile (recommandé) :
+./docker-build.sh --jobs 4
+
+# Déploiement :
+./scripts/deploy.sh                # build + deploy
+./scripts/deploy.sh --no-build     # deploy seulement
 ```
 
 Sorties dans `build/` :
 - `build/dtbo/*.dtbo` — Overlays DT compilés
-- `build/pru/am335x-pru0-fw` — Firmware PRU0
-- `build/pru/am335x-pru1-fw` — Firmware PRU1
+- `build/pru/am335x-pru0-fw` — Firmware PRU0 (orchestrateur)
+- `build/pru/am335x-pru1-fw` — Firmware PRU1 (moteur)
 - `build/daemon/pickup_daemon` — Binaire daemon
 
-Toolchain PRU : `pru-unknown-elf-gcc` (crosstool-NG, auto-détecté dans `~/x-tools`).
+### 8.1 Tailles firmware (contrainte 8 KB IRAM)
+
+| Firmware | text | data | bss | total | Marge |
+|----------|------|------|-----|-------|-------|
+| PRU0 (orchestrateur) | 7256 | 654 | 544 | 8454 | ~0.7 KB |
+| PRU1 (moteur) | 5388 | 648 | 544 | 6580 | ~2.6 KB |
 
 ---
 
-## 8. Arborescence
+## 9. Arborescence
 
 ```
 .github/                        ← CI + copilot instructions
 src/
   pru/                          ← Firmware PRU (actif)
     include/                    ← pru_ipc.h, pru_stepper.h, pru_regs.h
-    motor_control/          ← firmware moteur (tourne sur PRU1)
-    orchestrator/           ← firmware orchestrateur (tourne sur PRU0)
+    motor_control/              ← firmware moteur (tourne sur PRU1)
+    orchestrator/               ← firmware orchestrateur (tourne sur PRU0)
     Makefile                    ← Cross-compile PRU
   linux/
     daemon/                     ← pickup_daemon.c (Couche 3)
   python/                       ← Application Python (Couche 4)
-    pickup_test.py              ← Sketch de test (9 fonctions)
+    pickup_test.py              ← Sketch de test
     pru_client.py               ← Client async socket
   dts/                          ← Overlays device-tree
 build/                          ← Sorties de build
+scripts/
+  deploy.sh                     ← Déploiement automatisé (build + SSH + service)
+  test_motor.py                 ← Tests automatisés (rotation + rampes)
 doc/                            ← Documentation architecture
 resources/                      ← Référence (ESP32, eQEP, Klipper)
 test/                           ← Tests unitaires (planifié)
@@ -368,302 +551,76 @@ Makefile                        ← Orchestrateur de build racine
 
 ---
 
-## 9. Synchronisation Spindle ↔ Lateral
+## 10. Déploiement et procédure de démarrage
 
-La vitesse latérale est calculée par Python en fonction de :
-- Largeur effective de la bobine (mm)
-- Vitesse de bobinage (Hz)
-- Tours par passe (TPP)
-- Pattern (STRAIGHT / SCATTER / HUMAN)
+### 10.1 Mapping remoteproc ↔ PRU (critique)
 
-Python envoie des commandes `set_speed` progressives à ~10 ms de cadence.
-Les changements de vitesse prennent effet immédiatement (pas de flush de ring
-nécessaire). Les rampes d'accélération sont gérées côté host.
-
----
-
-## 10. Modèle d'accélération — Klipper multi-segments
-
-### 10.1 Pourquoi un seul segment `interval += add` ne suffit pas
-
-Le modèle `interval += add` (add constant) est le cœur de Klipper
-(`stepper_event_edge()` dans `stepper.c`). Mais il ne produit une accélération
-constante que sur une **plage de vitesse étroite**.
-
-La relation entre intervalle IEP et vitesse est **hyperbolique** :
-`v = 100 MHz / iv`. Un `add` constant donne :
-
-| Vitesse   | iv      | Effet de add=-14 | Δv relative |
-|-----------|---------|-------------------|-------------|
-| 10 RPM    | 93 809  | 93809→93795       | 0.015%      |
-| 1500 RPM  | 625     | 625→611           | 2.24%       |
-
-L'accélération est ~150× plus rapide à haute vitesse qu'à basse vitesse.
-Avec un seul segment, le moteur passe une éternité à basse vitesse puis
-traverse la haute vitesse instantanément → **stall**.
-
-### 10.2 Solution Klipper : file de segments
-
-Dans Klipper, le **host** pré-calcule de nombreux petits segments
-`{interval, count, add}`. Le MCU (ou PRU) fait en boucle :
-
-```c
-// stepper_event_edge() — resources/klipper/stepper.c
-interval += add;
-count--;
-if (count == 0) stepper_load_next();  // charge le segment suivant
-```
-
-Chaque segment couvre une plage de vitesse étroite où l'approximation linéaire
-`iv(n) ≈ iv_start + n × add` est précise. C'est l'équivalent de
-`queue_step(interval, count, add)` envoyé par le host.
-
-Types de données Klipper :
-- `interval` : `uint32_t` (ticks d'horloge MCU)
-- `add` : `int16_t` (±32767 max dans `stepper_move`, promu `int16_t` dans `stepper`)
-- `count` : `uint16_t` (max 65535 dans `stepper_move`, promu `uint32_t` dans `stepper`)
-
-### 10.3 Notre implémentation : `compute_accel_ramp()` + `run_ramp_forward/reverse`
-
-Puisque le test_spindle est autonome (pas de host Python pendant la rampe),
-le PRU pré-calcule **N_SEG=16 segments** avant la boucle moteur.
-
-**Algorithme `compute_accel_ramp(start_iv, end_iv, accel_s2)` :**
-
-1. Convertir intervalles en vitesses : `v_start = 100M/start_iv`, `v_end = 100M/end_iv`
-2. Diviser la plage en N_SEG sous-plages de vitesse égales : `Δv_seg = (v_end - v_start) / N_SEG`
-3. Pour chaque segment i :
-   - `vs = v_start + i × Δv_seg` → `ivs = 100M / vs` (force-loaded au début du segment)
-   - `ve = v_start + (i+1) × Δv_seg` → `ive = 100M / ve`
-   - `count = (vs + ve) × (ve - vs) / (2 × accel)` — équation cinématique $s = (v_e^2 - v_s^2) / (2a)$
-   - `add = (ive - ivs) / count` — tronqué vers zéro
-
-**Exécution :**
-```c
-for (seg = 0; seg < N_SEG; seg++) {
-    iv = segs[seg].start_iv;       // force-load = stepper_load_next()
-    for (s = 0; s < segs[seg].count; s++) {
-        one_step(iv);
-        iv += segs[seg].add;       // Klipper: interval += add
-    }
-}
-```
-
-La **décel** ré-utilise les mêmes segments en ordre inverse avec `add` négé.
-
-### 10.4 Pourquoi le force-load est critique
-
-L'erreur de troncature de `add` fait que chaque segment n'atteint pas
-exactement l'intervalle cible. Sans correction, l'erreur s'accumule.
-
-En chargeant `start_iv` au début de chaque segment (= `stepper_load_next()`
-dans Klipper qui charge `m->interval`), l'erreur est confinée au segment
-courant et ne se propage pas. L'erreur maximale dans un segment est
-`|gap mod count|` cycles, soit < 1 step de déviation.
-
-### 10.5 Intégration future dans le firmware de production
-
-Le test_spindle valide le modèle. Pour la production (`motor_control/main.c`
-+ `orchestrator/main.c`) :
-
-- **PRU0 (orchestrator)** reçoit du daemon `move_to(target, start_hz, max_hz, accel_steps)`.
-  Il calcule les segments (comme `compute_accel_ramp`) et les écrit dans
-  `motor_params_t` en séquence, un segment à la fois.
-- **PRU1 (motor_control)** exécute `interval += add; count--` dans la boucle IEP.
-  Quand `count == 0`, il signale à PRU0 qui charge le segment suivant.
-- **Le daemon** ne calcule PAS les segments — il envoie des paramètres cinématiques
-  (vitesses Hz + accélération). PRU0 fait la conversion Hz→intervalles et le
-  découpage en segments.
-- Les divisions (N_SEG divisions par rampe) se font dans PRU0 avant le démarrage
-  de la rampe, pas dans la boucle moteur de PRU1.
-
----
-
-## 11. Option A — Pourquoi pas de move rings (rappel)
-
-Ce projet utilise le modèle à **paramètres continus partagés** :
-
-- Python définit les vitesses cibles en Hz via `set_speed`
-- Le daemon convertit Hz → intervalles IEP et écrit `host_cmd_t`
-- PRU1 valide et copie dans `motor_params_t`
-- PRU0 lit `motor_params_t` et génère des impulsions continues
-
-Avantages :
-- **Pas d'underrun possible** : PRU0 a toujours des paramètres valides
-- **Firmware PRU plus simple** : pas de pointeurs de ring, pas de logique de frontière de move
-- **Changements de vitesse instantanés** : le nouvel intervalle prend effet au cycle suivant
-- **Debug plus facile** : un seul struct à inspecter
-
----
-
-## 12. Déploiement et procédure de démarrage
-
-### 12.1 Mapping remoteproc ↔ PRU (critique)
-
-Sur Debian 12 / kernel 6.12, le mapping est **inversé par rapport aux noms** :
-
-| sysfs | Adresse physique | Rôle réel | Firmware chargé |
-|-------|-----------------|-----------|-----------------|
+| sysfs | Adresse physique | Rôle | Firmware |
+|-------|-----------------|------|----------|
 | `remoteproc1` | `4a334000.pru` = PRU0 | **Orchestrateur** | `am335x-pru0-fw` |
 | `remoteproc2` | `4a338000.pru` = PRU1 | **Contrôle moteur** | `am335x-pru1-fw` |
 
-> ⚠️ PRU0 = orchestrateur, PRU1 = moteur. L'architecture nommée (couche 1/2)
-> correspond aux rôles, pas aux indices sysfs.
-
-### 12.2 IRAM PRU — chargement via remoteproc uniquement
-
-L'IRAM des PRU n'est **pas accessible via `/dev/mem`** : les écritures sont
-silencieusement ignorées par le kernel même quand le PRU est à l'arrêt.
-Le seul mécanisme valide est le driver `remoteproc` :
+### 10.2 Service systemd
 
 ```bash
-# Arrêt
-sudo sh -c 'echo stop > /sys/class/remoteproc/remoteproc1/state'
-sudo sh -c 'echo stop > /sys/class/remoteproc/remoteproc2/state'
-# Copier les binaires
-sudo cp build/pru/am335x-pru0-fw /lib/firmware/
-sudo cp build/pru/am335x-pru1-fw /lib/firmware/
-# Démarrage (charge l'IRAM depuis /lib/firmware/)
-sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc1/state'
-sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state'
+sudo systemctl start pickup-winder   # Démarre PRU + daemon
+sudo systemctl stop pickup-winder    # Arrête tout
+sudo systemctl status pickup-winder  # État
+sudo journalctl -fu pickup-winder    # Logs temps réel
 ```
 
-### 12.3 Initialisation critique de la shared RAM
-
-**CRITIQUE** : à chaque démarrage PRU, l'orchestrateur (PRU0) commence par
-zérer toute la `host_cmd_t` :
-
-```c
-/* orchestrator/main.c — début de main() */
-*host_cmd  = (host_cmd_t){0};   /* CRITIQUE : pas de cmd garbage au boot */
-*params    = (motor_params_t){0};
-*status    = (pru_status_t){0};
-host_cmd->cmd     = HOST_CMD_NOP;
-host_cmd->cmd_ack = HOST_CMD_NOP;
-```
-
-Sans ce zéro, des octets aléatoires de boot précédent dans la shared RAM
-peuvent faire interpréter un opcode fantôme par l'orchestrateur
-(ex. `cmd=0x44`), causant un comportement indéfini ou un blocage.
-
-### 12.4 Build et déploiement complet
+### 10.3 Tests
 
 ```bash
-# Depuis le répertoire racine du projet (Linux build host)
-cd /home/nicolas/Documents/PlatformIO/Projects/PickupWinder
+# Tests complets (spindle rotation + rampes Klipper) :
+python3 scripts/test_motor.py --host 192.168.74.171
 
-# Build PRU uniquement
-cd src/pru && make bbb-deploy BBB_IP=192.168.74.171 BBB_USER=beagle
+# Spindle seulement :
+python3 scripts/test_motor.py --host 192.168.74.171 --spindle-only
 
-# Build + déploiement daemon (compilé nativement sur BBB)
-scp src/linux/daemon/pickup_daemon.c  beagle@BBB:/tmp/build/src/linux/daemon/
-scp src/pru/include/pru_ipc.h         beagle@BBB:/tmp/build/src/pru/include/
-scp src/pru/include/pru_stepper.h     beagle@BBB:/tmp/build/src/pru/include/
-ssh beagle@BBB "cd /tmp/build/src/linux/daemon && \
-    gcc -O2 -Wall -Wextra pickup_daemon.c -lm -o /tmp/daemon && \
-    sudo cp /tmp/daemon /usr/local/bin/pickup_daemon"
-```
-
-### 12.5 Procédure de démarrage sur BBB
-
-```bash
-sudo pkill pickup_daemon 2>/dev/null
-sudo rm -f /run/pickup-winder.sock
-sudo sh -c 'echo stop > /sys/class/remoteproc/remoteproc1/state 2>/dev/null; true'
-sudo sh -c 'echo stop > /sys/class/remoteproc/remoteproc2/state 2>/dev/null; true'
-sleep 0.5
-sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc1/state'
-sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state'
-sleep 0.5
-sudo /usr/local/bin/pickup_daemon &
+# Rampes seulement :
+python3 scripts/test_motor.py --host 192.168.74.171 --ramp
 ```
 
 ---
 
-## 13. Problèmes rencontrés et solutions
+## 11. Problèmes rencontrés et solutions
 
-### 13.1 Shared RAM garbage → PRU bloqué au boot
+### 11.1 Shared RAM garbage → PRU bloqué au boot
 
-**Symptôme** : le moteur ne tourne pas, le PC du PRU est bloqué à une adresse
-fixe, les step counters ne progressent pas.
-
-**Cause** : la shared RAM conserve son contenu entre reboots logiciels (arrêt/
-démarrage remoteproc sans power cycle). Un `cmd` résiduel non-NOP dans
-`host_cmd_t` est traité comme une commande fantôme avant même que le daemon
-n'écrive quoi que ce soit.
-
+**Cause** : la shared RAM conserve son contenu entre reboots logiciels.
 **Fix** : `*host_cmd = (host_cmd_t){0}` au début de `orchestrator/main.c`.
 
----
+### 11.2 JSON avec espaces → "unknown cmd"
 
-### 13.2 JSON avec espaces → "unknown cmd"
+**Cause** : `json.dumps()` Python avec espaces.
+**Fix** : `compact_json()` dans le daemon normalise avant dispatch.
 
-**Symptôme** : toutes les commandes Python retournent `{"ok":false,"error":"unknown cmd"}`.
+### 11.3 Socket permissions + read EAGAIN
 
-**Cause** : `json.dumps()` Python produit `{"cmd": "enable"}` (espace après `:`).
-Le daemon cherchait `"cmd":"enable"` (sans espace) via `strstr()`.
+**Fix** : `chmod(0666)` après `bind()`, garde `O_NONBLOCK`, EAGAIN → continue.
 
-**Fix** : `compact_json()` dans le daemon normalise l'entrée en place avant dispatch.
+### 11.4 Événement ramp_complete non reçu
 
-```c
-/* pickup_daemon.c */
-static void compact_json(char *s) {
-    char *r = s, *w = s;
-    while (*r) {
-        *w++ = *r;
-        if (*r == ':' || *r == ',') { ++r; while (*r == ' ' || *r == '\t') ++r; }
-        else { ++r; }
-    }
-    *w = '\0';
-}
-```
+**Cause 1** : `read_telem()` dans test_motor.py filtrait les événements ;
+`ramp_complete` manquait dans la liste.  Fix : ajout à la liste de filtres.
 
----
+**Cause 2** : débounce par type (`g_last_event_sent == event_type`) bloquait les
+événements consécutifs du même type.  Fix : remplacement par flag one-shot
+`g_event_broadcast` qui se reset sur `ack_event` ou quand `event_pending→0`.
 
-### 13.3 Socket Unix — permissions et read() EAGAIN
+### 11.5 Rampe décel non supportée
 
-**Symptôme** : connexions immédiatement refusées (Broken pipe) ou silencieusement
-fermées sans réponse.
-
-**Causes et fixes** :
-
-1. **Permissions 755** sur le socket (créé par root via `sudo`) : seul root
-   peut se connecter. Fix : `chmod(SOCKET_PATH, 0666)` après `bind()`.
-
-2. **`read()` non-bloquant retourne EAGAIN** : le socket client est mis en
-   `O_NONBLOCK` pour que `broadcast()` ne bloque pas. Si poll retourne POLLIN
-   mais que `read()` retourne -1/EAGAIN (race condition), `n <= 0` fermait
-   le socket. Fix :
-   ```c
-   ssize_t n = read(g_clients[i], buf, sizeof(buf) - 1);
-   if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-   if (n <= 0) { /* fermer le client */ }
-   ```
+**Cause** : `send_host_ramp_to` clampait `start_hz > target_hz → start_hz = target_hz`.
+`compute_ramp` utilisait `start_iv - end_iv` (underflow si décel).
+**Fix** : arithmétique signée dans `compute_ramp`, suppression du clamp dans
+`send_host_ramp_to`.
 
 ---
 
-### 13.4 Bitmasks des pins moteur
-
-Pin layout confirmé via `cat /sys/kernel/debug/pinctrl/44e10800.pinmux-pinctrl-single/pins` :
-
-| Pin | Bit R30 | Signal |
-|-----|---------|--------|
-| P8_45 | R30[0] | LAT_STEP |
-| P8_46 | R30[1] | SP_STEP |
-| P8_43 | R30[2] | LAT_DIR |
-| P8_44 | R30[3] | SP_DIR |
-| P8_41 | R30[4] | LAT_EN (active-low) |
-| P8_42 | R30[5] | SP_EN (active-low) |
-
-Endstop P9_28 → `pr1_pru0_pru_r31_3` (MODE6) → `ES1_BIT = (1u << 3)`.
-
----
-
-## 14. Références
+## 12. Références
 
 - `.github/copilot-instructions.md` — conventions de code et règles
-- `src/pru/README.md` — firmware PRU détails
-- `src/dts/README.md` — overlays device-tree
-- `src/pru/PRU_DEPLOY.md` — déploiement et scripts runtime
+- `resources/klipper/stepper.c` — implémentation Klipper de référence
 - AM335x PRU Reference Guide (TI SPRUHF8)
 - AM335x Technical Reference Manual (TI SPRUH73)
