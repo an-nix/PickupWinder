@@ -8,15 +8,43 @@ Important
 - PRU1 exécute maintenant le firmware moteur; PRU0 gère l'orchestration et la communication.
 - Les signaux ENABLE sont actifs LOW (0 = driver ON).
 
-Rappel GPIO (PRU0)
-- P8_41  → EN_A   (R30[7]) (active-low)
-- P8_43  → DIR_A  (R30[5])
-- P8_45  → STEP_A (R30[1])
-- P8_42  → EN_B   (R30[3]) (active-low)
-- P8_44  → DIR_B  (R30[0])
-- P8_46  → STEP_B (R30[2])
-- P9_28  → ENDSTOP_1 (PRU0 R31[6])  (PRU0 orchestrateur, pull-up)
-- P9_30  → ENDSTOP_2 (PRU0 R31[2])  (PRU0 orchestrateur, pull-up)
+Rappel GPIO (PRU1 R30 — P8 GPMC group, confirmed pinctrl debugfs)
+- P8_45  → STEP_A (R30[0])          Motor A
+- P8_46  → STEP_B (R30[1])          Motor B (spindle câblé ici)
+- P8_43  → DIR_A  (R30[2])          Motor A
+- P8_44  → DIR_B  (R30[3])          Motor B (spindle câblé ici)
+- P8_41  → EN_A   (R30[4]) active-low   Motor A
+- P8_42  → EN_B   (R30[5]) active-low   Motor B (spindle câblé ici)
+
+Endstops (PRU0 R31 — P9 header)
+- P9_28  → ENDSTOP_1 (R31[3])  (PRU0 orchestrateur, pull-up)
+- P9_30  → ENDSTOP_2 (R31[2])  (PRU0 orchestrateur, pull-up)
+
+## Modèle d'accélération (Klipper-style interval += add)
+
+Le firmware PRU utilise le même modèle d'accélération que Klipper (stepper.c) :
+
+```
+À chaque pas (front montant STEP) :
+  interval += add
+  count--
+Quand count == 0 → vitesse constante (coast)
+```
+
+Le host (daemon ou test firmware) pré-calcule trois valeurs par segment :
+- **interval** — demi-période IEP initiale du segment
+- **add** — delta signé ajouté à interval à chaque pas
+- **count** — nombre de pas dans le segment
+
+Profil trapézoïdal = 3 segments : accel (add < 0) + cruise (add = 0) + decel (add > 0).
+
+Formule pour `add` :
+```
+add = (end_iv - start_iv) / ramp_steps
+```
+Une seule division, faite côté host. Le PRU ne fait qu'une addition entière par pas.
+
+Référence : Klipper `resources/klipper/stepper.c` (stepper_event_edge)
 
 ## Déploiement automatisé recommandé
 

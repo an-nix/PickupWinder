@@ -77,7 +77,7 @@ Full architecture: see `doc/beaglebone_architecture.md`.
 | File                                   | Responsibility |
 |----------------------------------------|----------------|
 | `pru/include/pru_ipc.h`               | IPC shared memory layout: host_cmd_t, motor_params_t, motor_telem_t, pru_status_t; HOST_CMD_* opcodes; fault/state/event flags |
-| `pru/include/pru_stepper.h`           | IEP timer macros; pulse_gen_t continuous engine; pulse_update() / pulse_stop() |
+| `pru/include/pru_stepper.h`           | IEP timer macros; pulse_gen_t continuous engine with Klipper-style acceleration (`interval += add` per step); pulse_update() / pulse_set_ramp() / pulse_stop() |
 | `pru/include/pru_regs.h`              | R30/R31 register aliases for STEP/DIR/EN/ENDSTOP pins |
 | `pru/motor_control/main.c`       | Motor firmware (PRU1 at runtime): IEP owner, dual-axis pulse generation, trapezoidal move_to profile FSM, motor_telem_t publisher |
 | `pru/orchestrator/main.c`        | Orchestrator firmware (PRU0 at runtime): host_cmd_t processor, homing FSM, software limits, move_to arming, R31 endstop reading, motor_params_t writer, pru_status_t publisher |
@@ -119,7 +119,7 @@ Events to Python: `endstop_hit`, `home_complete`, `fault`, `limit_hit`, `move_co
 | Header                        | Content |
 |-------------------------------|---------|
 | `pru/include/pru_ipc.h`      | `host_cmd_t` (64B), `motor_params_t` (32B), `motor_telem_t` (64B), `pru_status_t` (64B); HOST_CMD_* opcodes; MOTOR_STATE_*, FAULT_*, EVENT_* flags |
-| `pru/include/pru_stepper.h`  | `pulse_gen_t` (continuous IEP engine), `pulse_update()`, `IEP_NOW()`, `IEP_INIT()` |
+| `pru/include/pru_stepper.h`  | `pulse_gen_t` (continuous IEP engine with Klipper-style acceleration: `interval += add` per step), `pulse_update()`, `pulse_set_ramp()`, `IEP_NOW()`, `IEP_INIT()` |
 | `pru/include/pru_regs.h`     | R30/R31 hardware register aliases — **`register volatile` is mandatory**; without `register` writes go to RAM, not pins |
 
 ### 2.5 IPC Shared RAM Layout
@@ -215,6 +215,79 @@ Why this choice for lateral:
 - **Consistent winding density**: Spindle tracks lateral speed during ramps, keeping turns/mm constant.
 - **Safety by design**: Even if Python crashes mid-move, the motor decelerates to its target and stops.
 
+### 2.8 Acceleration Model — Klipper-style multi-segment `interval += add`
+
+Both spindle and lateral axes use the same acceleration model inspired by
+Klipper's `stepper.c` (`resources/klipper/stepper.c`).
+
+**Core principle:** On each rising STEP edge, the PRU executes:
+```c
+interval += add;
+count--;
+// when count == 0 → load next segment (stepper_load_next)
+```
+
+**CRITICAL: a single {interval, add, count} segment does NOT produce constant
+acceleration over a wide speed range.** Since `v = clock / interval`, the
+relationship is hyperbolic. A constant `add` gives:
+- At iv=93000 (10 RPM): subtracting 14 → Δv ≈ 0.015% per step
+- At iv=625 (1500 RPM): subtracting 14 → Δv ≈ 2.2% per step
+
+The acceleration is ~150× faster at high speed. A single segment spends
+forever at low speed then shoots through high speed → motor stalls.
+
+**Solution (identical to Klipper):** break each ramp into **N_SEG=16
+sub-segments**, each covering an equal velocity sub-range. Each segment has
+its own `{start_iv, add, count}`. The interval is **force-loaded** at each
+segment boundary (= Klipper's `stepper_load_next()` loading `m->interval`).
+
+**Segment computation** (done by host/orchestrator BEFORE the step loop):
+```
+for each segment i in [0, N_SEG):
+    vs = v_start + i × Δv_seg          # segment start velocity
+    ve = v_start + (i+1) × Δv_seg      # segment end velocity
+    start_iv = 100M / vs               # force-loaded at segment start
+    end_iv   = 100M / ve
+    count    = (vs + ve) × (ve - vs) / (2 × accel)   # kinematic s=(v²-v₀²)/2a
+    add      = (end_iv - start_iv) / count            # truncated toward zero
+```
+
+**Execution** (Klipper inner loop + stepper_load_next):
+```c
+for (seg = 0; seg < N_SEG; seg++) {
+    iv = segs[seg].start_iv;           // force-load (stepper_load_next)
+    for (s = 0; s < segs[seg].count; s++) {
+        one_step(iv);
+        iv += segs[seg].add;           // interval += add
+    }
+}
+```
+
+**Trapezoidal profile** = accel segments (forward) + cruise + decel segments
+(same segments in reverse order with negated add).
+
+**API (`pru_stepper.h`):**
+```c
+pulse_set_ramp(pg, start_iv, add, count);  // arm a ramp segment
+// pg->accel_count > 0 while ramp is active
+// pg->accel_count == 0 → ramp complete, constant speed
+```
+
+When `accel_count == 0` (no ramp active), `pulse_update()` accepts external
+`new_interval` changes immediately (backward compatible with constant-speed
+mode).
+
+**Why Klipper over FastAccelStepper:**
+- FastAccelStepper uses `ticks = f/sqrt(2·a·s)` via a ~300-line log₂
+  fixed-point library. Too complex for PRU's 8 KB instruction RAM.
+- Klipper: one add per step, 5 lines of code in the ISR, host does all math.
+- Both are reference implementations in `resources/`.
+
+**Accuracy note:** Each sub-segment's linear approximation has a bounded
+error confined within the segment (force-load at boundaries prevents
+accumulation). With N_SEG=16 and a 150:1 speed range, each segment covers
+about 10:1 velocity ratio — sufficient for smooth stepper operation.
+
 ---
 
 ## 3. Hard Rules (Must-follow)
@@ -234,18 +307,22 @@ Why this choice for lateral:
 
 ### 3.1.1 Canonical pin layout (MUST NOT change implicitly)
 
-Motor A — Spindle (Group 1):
-- `P8_41` → `EN_A` (`PRU0 R30[7]`, active-low)
-- `P8_43` → `DIR_A` (`PRU0 R30[5]`)
-- `P8_45` → `STEP_A` (`PRU0 R30[1]`)
+Motor pins run through **PRU1** (`4a338000.pru` = `remoteproc2`), not PRU0.
+R30 bit assignments confirmed via `pinctrl-single/pins` debugfs dump on the
+target. All P8 MCASP0 pins are in **MODE5** (`pr1_pru1_pru_r30_N`, output).
 
-Motor B — Lateral (Group 2):
-- `P8_42` → `EN_B` (`PRU0 R30[3]`, active-low)
-- `P8_44` → `DIR_B` (`PRU0 R30[0]`)
-- `P8_46` → `STEP_B` (`PRU0 R30[2]`)
+Motor A — Group A (odd P8 pins):
+- `P8_45` → `STEP_A` (`PRU1 R30[0]`)
+- `P8_43` → `DIR_A`  (`PRU1 R30[2]`)
+- `P8_41` → `EN_A`   (`PRU1 R30[4]`, active-low)
+
+Motor B — Group B (even P8 pins) — **spindle câblé ici**:
+- `P8_46` → `STEP_B` (`PRU1 R30[1]`)
+- `P8_44` → `DIR_B`  (`PRU1 R30[3]`)
+- `P8_42` → `EN_B`   (`PRU1 R30[5]`, active-low)
 
 Endstops (PRU0 inputs — read by PRU0 orchestrateur via R31):
-- `P9_28` → `ENDSTOP_1` (`PRU0 R31[6]`, pull-up, active-HIGH)
+- `P9_28` → `ENDSTOP_1` (`PRU0 R31[3]`, pull-up, active-HIGH)
 - `P9_30` → `ENDSTOP_2` (`PRU0 R31[2]`, pull-up, active-HIGH)
 
 Additional board IO:
@@ -400,6 +477,15 @@ IDLE --(start)--> PAUSED (positioning)
 | `__R30`/`__R31` declared without `register` keyword | `volatile uint32_t __R30 __asm__("r30")` without `register` creates a RAM variable named `r30` — writes never reach the physical pins. PRU appears to run (step counts increment in RAM) but no GPIO changes. **Always use `register volatile uint32_t __R30 __asm__("r30")`** — see `pru/include/pru_regs.h`. |
 | MODE6 on PRU0 output pins instead of MODE5 | On AM335x MCASP0 pins used by PRU0: MODE5 = `pr1_pru0_pru_r30_N` (output), MODE6 = `pr1_pru0_pru_r31_N` (input). Using MODE6 on STEP/DIR/EN pins in the DTS silently configures them as inputs — `__R30` writes are correct but the pads never drive. Verify with `cat /sys/kernel/debug/pinctrl/.../pins`: must show `pru 0 out`, not `pru 0 in`. |
 | Blocking `write()` in daemon `broadcast()` | Single-threaded daemon with blocking `write()` on client fds: one slow/stuck `socat` client freezes the entire event loop (no commands, no telem, SIGINT ignored). Fix: `fcntl(cfd, F_SETFL, O_NONBLOCK)` on accept + tolerate `EAGAIN` in `broadcast()`. |
+| Linear-interval ramp (interval -= constant) | Produces exponential RPM curve: too slow at low speeds, instant jump at high speeds. Motor stalls at high RPM. **Use Klipper `interval += add` with multi-segment ramp instead.** |
+| Single-segment ramp over wide speed range | A single `{interval, add, count}` covering e.g. 10→1500 RPM has ~150:1 speed ratio. `add` is constant but velocity change per step is hyperbolic — acceleration is 150× faster at high speed vs low speed. Motor spends forever at low RPM then shoots through high RPM → stall. **Always use N_SEG=16+ sub-segments with force-loaded `start_iv` at each boundary.** See `compute_accel_ramp()` in test_spindle and section 2.8. |
+| Overwriting interval during active ramp | When `accel_count > 0`, `pulse_update()` ignores external `new_interval`. Wait for `accel_count == 0` or call `pulse_set_ramp()` to override. |
+| Shared RAM garbage at PRU boot | The PRU shared RAM retains its content between soft reboots (remoteproc stop/start without power cycle). A residual non-NOP `cmd` byte in `host_cmd_t` is processed as a spurious command before the daemon sends anything → PRU stuck in unexpected state (PC loops at one address, step counters never advance). **Always zero `*host_cmd = (host_cmd_t){0}` as the very first thing in `orchestrator/main()`**. |
+| JSON spaces in Python → "unknown cmd" | `json.dumps()` produces `{"cmd": "enable"}` (space after `:`). If the daemon matches with `strstr(line, "\"cmd\":\"enable\"")` (no space), every command returns "unknown cmd". **Fix: `compact_json()` normalises the input in-place before dispatch** (already in `pickup_daemon.c`). |
+| Unix socket permissions 755 after `sudo` daemon | When `pickup_daemon` is launched with `sudo`, the socket file is created as root:root with mode 755. Non-root Python clients get `EACCES` on `connect()`. **Fix: `chmod(SOCKET_PATH, 0666)` immediately after `bind()`** (already in `create_server_socket()`). |
+| `read()` EAGAIN closes client socket | Client sockets are set `O_NONBLOCK` so `broadcast()` never blocks. If `read()` returns -1 with EAGAIN (no data yet, race with poll), `n <= 0` would close the socket. **Always guard: `if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;`** before the `n <= 0` close path. |
+| remoteproc1/remoteproc2 naming confusion | On Debian 12 BBB, `remoteproc1` maps to `4a334000.pru` = **PRU0** (orchestrator) and `remoteproc2` maps to `4a338000.pru` = **PRU1** (motor). The index in sysfs is NOT the PRU number. Confirm with `cat /sys/class/remoteproc/remoteproc1/name`. |
+| PRU IRAM not writable via `/dev/mem` | Writes to PRU IRAM via `/dev/mem` mmap are silently dropped by the kernel even when the PRU is stopped. The ONLY way to load PRU code is `echo start > /sys/class/remoteproc/remoteproc*/state` which triggers the remoteproc driver to load `/lib/firmware/am335x-pru*-fw`. Direct memory manipulation of IRAM is futile. |
 
 ---
 
@@ -439,7 +525,7 @@ build/                          <- Build outputs
   pru/                          <- PRU firmware binaries
   daemon/                       <- Daemon binary
 doc/                            <- Architecture docs
-resources/                      <- Reference material (ESP32, eQEP, Klipper)
+resources/                      <- Reference material (ESP32, eQEP, Klipper, FastAccelStepper)
 test/                           <- Unit tests (gtest, planned)
 Makefile                        <- Root build orchestrator
 ```
@@ -565,3 +651,31 @@ echo 1 | sudo tee .../count0/enable
 
 Common failures: `ceiling=0` → stays at zero; `function` wrong → no counting;
 2-cell pinmux → only first pin applied.
+
+---
+### PRU / ARM responsibility split — stepper motor step generation
+
+Platform: BeagleBone Black, Debian 12, kernel 6.12, remoteproc + rpmsg.
+PRU0 = orchestration (remoteproc0). PRU1 = motor control (remoteproc1).
+
+**Step generation architecture (Klipper-style):**
+
+- The ARM computes all step timing before each move using an iterative solver
+  (secant method) applied to the exact physics equations of the trapezoid
+  profile. Never generate code that computes step times or ramp tables inside
+  any PRU.
+
+- Step times are compressed into (interval, count, add) blocks on the ARM and
+  written to PRUSS shared RAM. A full trapezoidal move fits in 3 blocks.
+
+- PRU1 executes a trivial loop: wait `interval` cycles, toggle GPIO,
+  interval += add. This is the only arithmetic allowed on PRU1.
+
+- PRU0 relays commands and flags between ARM and PRU1. No motion logic.
+
+- Never use Austin (1995) recurrence or any delay-table approach: they
+  accumulate rounding errors at high step rates and waste shared memory.
+
+**Reason:** the PRU has no hardware divider, 8 KB program memory, and no
+debugger. All computation belongs on the ARM where it can be tested, logged,
+and tuned without reflashing firmware.

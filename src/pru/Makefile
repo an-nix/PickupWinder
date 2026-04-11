@@ -36,7 +36,7 @@ PRU_INCLUDES += -I$(PRU_SWPKG)/include -I$(PRU_SWPKG)/include/am335x
 endif
 
 # ── Compiler flags ──────────────────────────────────────────────────────────
-PRU_CFLAGS = -O2 -Wall -Wextra \
+PRU_CFLAGS = -O1 -Wall -Wextra \
              -Wno-volatile-register-var \
              $(PRU_INCLUDES) \
              -DPRU_FIRMWARE \
@@ -50,12 +50,39 @@ FW_NAME_TEST_SP   = am335x-pru0-fw-test-spindle
 FW_NAME_TEST_GPIO = am335x-pru0-fw-test-gpio
 FW_NAME_TEST_STATIC = am335x-pru0-fw-test-static
 
-# ── Remote deploy ───────────────────────────────────────────────────────────
-BBB_USER ?= debian
-BBB_IP   ?=
+# ── BBB-native build (clpru) ────────────────────────────────────────────────
+# NOTE: pru-elf-gcc inline-asm IEP bug is FIXED in pru_stepper.h (volatile
+# pointer approach).  Both compilers now produce correct 32-bit IEP reads.
+# clpru uses CT_IEP.TMR_CNT via the constant table; pru-elf-gcc uses a
+# volatile pointer dereference to 0x0002E00C, both verified by disassembly.
+#
+# Usage:
+#   make bbb-build BBB_IP=192.168.74.171   — rsync + compile on BBB
+#   make bbb-deploy BBB_IP=192.168.74.171  — bbb-build + install + reload PRUs
+
+BBB_USER ?= beagle
+BBB_IP   ?= 192.168.74.171
+BBB_BUILD_DIR ?= /home/beagle/pru-build
+
+# TI paths on the BBB (ti-pru-cgt-v2.3 + ti-pru-software-v6.3)
+BBB_SWPKG  = /usr/lib/ti/pru-software-support-package-v6.3
+BBB_CGTI   = /usr/share/ti/cgt-pru/include
+BBB_CGTLIB = /usr/share/ti/cgt-pru/lib
+BBB_LNK    = $(BBB_BUILD_DIR)/AM335x_PRU.cmd
+
+BBB_CLPRU_FLAGS = \
+    --include_path=$(BBB_CGTI) \
+    --include_path=$(BBB_SWPKG)/include/am335x \
+    --include_path=$(BBB_SWPKG)/include \
+    --include_path=$(BBB_BUILD_DIR)/include \
+    --hardware_mac=on -O2 \
+    -DPRU_SRAM_PHYS_BASE=0x00010000u \
+    -DPRU_FIRMWARE
+
+# Remote deploy ──────────────────────────────────────────────────────────────
 
 # ── Targets ─────────────────────────────────────────────────────────────────
-.PHONY: all clean install deploy toolchain toolchain-info test-spindle test-gpio test-static
+.PHONY: all clean install deploy toolchain toolchain-info test-spindle test-gpio test-static bbb-build bbb-deploy
 
 all: $(OUT_DIR)/$(FW_NAME_0) $(OUT_DIR)/$(FW_NAME_1)
 
@@ -133,6 +160,63 @@ endif
 	    sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state' && \
 	    echo 'PRUs reloaded.'"
 
-# ── Clean ────────────────────────────────────────────────────────────────────
+# ── BBB-native build (clpru) ─────────────────────────────────────────────────
+# Rsyncs the entire src/pru/ tree to the BBB, compiles all firmware binaries
+# using clpru, then copies the resulting ELF files back into $(OUT_DIR).
+
+bbb-build:
+ifeq ($(strip $(BBB_IP)),)
+	$(error BBB_IP must be set, e.g.: make bbb-build BBB_IP=192.168.74.171)
+endif
+	@echo "[BBB] Syncing sources to $(BBB_USER)@$(BBB_IP):$(BBB_BUILD_DIR)/"
+	ssh $(BBB_USER)@$(BBB_IP) "mkdir -p $(BBB_BUILD_DIR)"
+	rsync -a --delete \
+	    --exclude='build/' \
+	    . $(BBB_USER)@$(BBB_IP):$(BBB_BUILD_DIR)/
+	@echo "[BBB] Compiling firmware with clpru..."
+	ssh $(BBB_USER)@$(BBB_IP) " \
+	    set -e ; \
+	    CLPRU=/usr/bin/clpru ; \
+	    CGTLIB=$(BBB_CGTLIB) ; \
+	    FLAGS='$(BBB_CLPRU_FLAGS)' ; \
+	    LNK=$(BBB_LNK) ; \
+	    cd $(BBB_BUILD_DIR) ; \
+	    \$$CLPRU \$$FLAGS -fe mc_obj.out   motor_control/main.c  -z -i\$$CGTLIB -o $(FW_NAME_1) \$$LNK \$$CGTLIB/rtspruv1_le.lib && \
+	    \$$CLPRU \$$FLAGS -fe orch_obj.out orchestrator/main.c   -z -i\$$CGTLIB -o $(FW_NAME_0) \$$LNK \$$CGTLIB/rtspruv1_le.lib && \
+	    \$$CLPRU \$$FLAGS -fe tsp_obj.out  test_spindle/main.c   -z -i\$$CGTLIB -o $(FW_NAME_TEST_SP) \$$LNK \$$CGTLIB/rtspruv1_le.lib && \
+	    echo '[BBB] Compilation OK'"
+	@echo "[BBB] Fetching binaries..."
+	mkdir -p $(OUT_DIR)
+	scp $(BBB_USER)@$(BBB_IP):$(BBB_BUILD_DIR)/$(FW_NAME_0)       $(OUT_DIR)/
+	scp $(BBB_USER)@$(BBB_IP):$(BBB_BUILD_DIR)/$(FW_NAME_1)       $(OUT_DIR)/
+	scp $(BBB_USER)@$(BBB_IP):$(BBB_BUILD_DIR)/$(FW_NAME_TEST_SP) $(OUT_DIR)/
+	@echo "[BBB] Binaries fetched to $(OUT_DIR)/"
+
+bbb-deploy: bbb-build
+	@echo "[BBB] Installing firmware..."
+	ssh $(BBB_USER)@$(BBB_IP) " \
+	    set -e ; \
+	    sudo cp $(BBB_BUILD_DIR)/$(FW_NAME_0) /lib/firmware/ ; \
+	    sudo cp $(BBB_BUILD_DIR)/$(FW_NAME_1) /lib/firmware/ ; \
+	    sudo sh -c 'echo stop  > /sys/class/remoteproc/remoteproc1/state 2>/dev/null; true' ; \
+	    sudo sh -c 'echo stop  > /sys/class/remoteproc/remoteproc2/state 2>/dev/null; true' ; \
+	    sleep 1 ; \
+	    sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc1/state' ; \
+	    sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state' ; \
+	    echo '[BBB] PRUs reloaded.' ; \
+	    cat /sys/class/remoteproc/remoteproc1/state ; \
+	    cat /sys/class/remoteproc/remoteproc2/state"
+
+# ── BBB deploy test-spindle ──────────────────────────────────────────────────
+bbb-deploy-test-spindle: bbb-build
+	ssh $(BBB_USER)@$(BBB_IP) " \
+	    set -e ; \
+	    sudo cp $(BBB_BUILD_DIR)/$(FW_NAME_TEST_SP) /lib/firmware/$(FW_NAME_1) ; \
+	    sudo sh -c 'echo stop  > /sys/class/remoteproc/remoteproc2/state 2>/dev/null; true' ; \
+	    sleep 1 ; \
+	    sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state' ; \
+	    cat /sys/class/remoteproc/remoteproc2/state"
+
+# ── Clean ─────────────────────────────────────────────────────────────────────
 clean:
 	rm -rf $(OUT_DIR)

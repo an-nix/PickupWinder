@@ -1,0 +1,57 @@
+# pickup-winder.service — PickupWinder hardware daemon
+#
+# Starts the C hardware daemon that bridges the Python application
+# with the PRU real-time firmware via /dev/mem (PRU shared RAM).
+#
+# PRU firmware must be loaded before this service starts.
+# remoteproc devices are probed during early boot by the kernel;
+# we depend on sysinit.target to ensure that is complete.
+#
+# Install:
+#   sudo cp pickup-winder.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pickup-winder
+#
+# Manage:
+#   sudo systemctl status   pickup-winder
+#   sudo journalctl -fu     pickup-winder
+#   sudo systemctl restart  pickup-winder
+
+[Unit]
+Description=PickupWinder PRU hardware daemon
+Documentation=https://github.com/antnic/PickupWinder
+# Wait until the remoteproc PRU subsystem is up (firmware loaded by kernel).
+After=sysinit.target
+# Restart if the daemon crashes — important because the daemon holds
+# the /dev/mem mapping and the Python app depends on the socket.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sh -c '\
+    echo "stop" > /sys/class/remoteproc/remoteproc1/state 2>/dev/null || true; \
+    echo "stop" > /sys/class/remoteproc/remoteproc2/state 2>/dev/null || true; \
+    sleep 0.5; \
+    echo "start" > /sys/class/remoteproc/remoteproc1/state; \
+    echo "start" > /sys/class/remoteproc/remoteproc2/state; \
+    sleep 0.5'
+ExecStart=/usr/local/bin/pickup_daemon
+ExecStop=/bin/kill -TERM $MAINPID
+# Remove stale socket on stop/crash so the next start finds a clean state.
+ExecStopPost=/bin/rm -f /run/pickup-winder.sock
+# Restart on any non-clean exit.
+Restart=on-failure
+RestartSec=2s
+# Give the PRU firmware time to initialise before accepting connections.
+TimeoutStartSec=15
+# Run as root (required for /dev/mem + remoteproc sysfs writes).
+User=root
+Group=root
+# Log to journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pickup-winder
+
+[Install]
+WantedBy=multi-user.target

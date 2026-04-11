@@ -21,12 +21,12 @@
 #include <stdint.h>
 #include "../include/pru_regs.h"   /* __R30 */
 
-#define PIN_STEP_A   (1u << 1)   /* P9_29 */
-#define PIN_DIR_A    (1u << 5)   /* P9_27 */
-#define PIN_EN_A     (1u << 7)   /* P9_25 */
-#define PIN_STEP_B   (1u << 2)   /* P9_30 */
-#define PIN_DIR_B    (1u << 0)   /* P9_31 */
-#define PIN_EN_B     (1u << 3)   /* P9_28 */
+#define PIN_STEP_A   (1u << 0)   /* P8_45 PRU1 R30[0] */
+#define PIN_STEP_B   (1u << 1)   /* P8_46 PRU1 R30[1] */
+#define PIN_DIR_A    (1u << 2)   /* P8_43 PRU1 R30[2] */
+#define PIN_DIR_B    (1u << 3)   /* P8_44 PRU1 R30[3] */
+#define PIN_EN_A     (1u << 4)   /* P8_41 PRU1 R30[4] active-low */
+#define PIN_EN_B     (1u << 5)   /* P8_42 PRU1 R30[5] active-low */
 
 #define ALL_PINS  (PIN_STEP_A | PIN_DIR_A | PIN_EN_A | \
                    PIN_STEP_B | PIN_DIR_B | PIN_EN_B)

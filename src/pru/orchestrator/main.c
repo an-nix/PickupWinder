@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include "../include/pru_ipc.h"
 #include "../include/pru_regs.h"  /* register volatile __R31 */
+#include "../include/pru_rsc_table.h"  /* required by remoteproc */
 
 /* ── Shared RAM pointers ─────────────────────────────────────────────────── */
 static volatile host_cmd_t     *host_cmd =
@@ -48,14 +49,21 @@ static volatile motor_telem_t  *telem =
 static volatile pru_status_t   *status =
     (volatile pru_status_t *)  (PRU_SRAM_PHYS_BASE + IPC_PRU_STATUS_OFFSET);
 
+static volatile move_ctrl_t    *move_ctrl =
+    (volatile move_ctrl_t *)   (PRU_SRAM_PHYS_BASE + IPC_MOVE_CTRL_OFFSET);
+
+static volatile step_block_t   *move_blocks =
+    (volatile step_block_t *)  (PRU_SRAM_PHYS_BASE + IPC_STEP_BLOCKS_OFFSET);
+
 /* ── Cadence ─────────────────────────────────────────────────────────────── */
 #define CMD_CHECK_STRIDE    1000u      /* check host cmd every ~1000 loops   */
 #define STATUS_STRIDE       500000u    /* publish status every ~2.5 ms       */
 
 /* ── Endstop inputs (PRU0 R31) ───────────────────────────────────────────── */
-/* P9_28 = conf_mcasp0_ahclkr  MODE6 = pr1_pru0_pru_r31[6]                  */
-/* P9_30 = conf_mcasp0_axr0    MODE6 = pr1_pru0_pru_r31[2]                  */
-#define ES1_BIT  (1u << 6)   /* R31[6]  P9_28  ENDSTOP_1  (active-HIGH)     */
+/* P9_28 = conf_mcasp0_ahclkr  offset 0x19C  MODE6 = pr1_pru0_pru_r31_3     */
+/* P9_30 = conf_mcasp0_fsr     offset 0x198  MODE6 = pr1_pru0_pru_r31_2     */
+/* Both confirmed via pinctrl debugfs: pin 103 / pin 102, value 0x36=MODE6   */
+#define ES1_BIT  (1u << 3)   /* R31[3]  P9_28  ENDSTOP_1  (active-HIGH)     */
 #define ES2_BIT  (1u << 2)   /* R31[2]  P9_30  ENDSTOP_2  (active-HIGH)     */
 
 static uint8_t g_endstop_mask      = 0u;  /* live endstop state (R31)        */
@@ -287,11 +295,15 @@ static void process_host_cmd(void) {
 
     case HOST_CMD_MOVE_TO:
         /* Only lateral axis is supported for move_to. */
-        if (!g_limit_locked[AXIS_LATERAL]) {
+        if (!g_limit_locked[AXIS_LATERAL] && move_ctrl->block_ready && move_ctrl->block_count > 0u) {
+            int32_t delta = host_cmd->move_target - telem->lat_position;
+            uint8_t new_dir = (delta < 0) ? 1u : 0u;
+
             params->lat_target_pos  = host_cmd->move_target;
-            params->lat_start_iv    = host_cmd->move_start_iv;
+            params->lat_start_iv    = move_blocks[0].interval;
             params->lat_cruise_iv   = host_cmd->move_cruise_iv;
-            params->lat_delta_iv    = host_cmd->move_delta_iv;
+            params->lat_delta_iv    = 0u;
+            params->lat_dir         = new_dir;
             /* Store Q6 coordination ratio (0 = coordination disabled).      */
             g_sp_lat_coord          = host_cmd->move_sp_lat_coord;
             /* Set spindle to proportional starting speed immediately.       *
@@ -307,8 +319,10 @@ static void process_host_cmd(void) {
                 params->sp_run      = 1u;
             }
             params->lat_enable      = 1u;
-            /* Arm: PRU1 reads this flag and self-clears it. */
-            params->lat_move_active = 1u;
+            params->lat_run         = 1u;
+            /* Arm: PRU1 reads start_flag and self-clears it. */
+            move_ctrl->done_flag    = 0u;
+            move_ctrl->start_flag   = 1u;
             g_lat_in_move           = 1u;
         }
         ack_cmd(cmd);
@@ -414,9 +428,16 @@ static void publish_status(void) {
 int main(void) {
     /* PRU1 never touches IEP or motor pins. */
 
-    /* Zero shared memory areas owned by PRU1. */
-    *params = (motor_params_t){0};
-    *status = (pru_status_t){0};
+    /* Zero all shared memory areas that PRU0 owns or initialises.
+     * CRITICAL: host_cmd must be zeroed to HOST_CMD_NOP before any command
+     * processing begins.  Leftover non-zero values from a previous boot or
+     * from the daemon writing before the firmware restarted would otherwise
+     * be interpreted as a spurious command (e.g. cmd=0x44 = HALT the PRU). */
+    *host_cmd  = (host_cmd_t){0};      /* zeroes cmd, cmd_ack, all fields     */
+    *params    = (motor_params_t){0};
+    *status    = (pru_status_t){0};
+    *move_ctrl = (move_ctrl_t){0};
+    /* Explicitly set sentinel values after zero. */
     host_cmd->cmd     = HOST_CMD_NOP;
     host_cmd->cmd_ack = HOST_CMD_NOP;
 

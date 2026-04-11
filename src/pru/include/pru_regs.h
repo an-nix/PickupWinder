@@ -5,20 +5,27 @@
 
 /* PRU R30/R31 hardware register aliases.
  *
- * CRITICAL: 'register' is REQUIRED.
+ * Two compiler variants:
  *
- * Without 'register', __asm__("r30") on a global variable only assigns an
- * assembly symbol name to a memory location — writes to __R30 go to RAM
- * and never reach the physical output pins.
+ * pru-elf-gcc (open-source):
+ *   CRITICAL: 'register' + '__asm__("r30")' are BOTH required.
+ *   Without 'register', __asm__("r30") on a global creates a RAM variable
+ *   named r30 — writes never reach the physical pins.
  *
- * With 'register', GCC maps __R30 directly to hardware register r30.
- * Writes to __R30 are emitted as "or r30, r30, IMM" instructions which
- * drive the physical GPIO pins (R30 = PRU direct output register).
+ * clpru (TI):
+ *   Uses 'volatile register unsigned int __R30' WITHOUT __asm__.
+ *   clpru recognises R30/R31 by name natively; __asm__ is not supported.
  *
- * R30 = direct output  → PRU1 motor firmware STEP/DIR/EN pins (P8 header)
- * R31 = direct input   → PRU0 orchestrator endstop pins (P9_28/P9_30)
+ * R30 = direct output  → motor firmware STEP/DIR/EN (P8 header, PRU1)
+ * R31 = direct input   → orchestrator endstop pins  (P9_28/P9_30, PRU0)
  */
+#ifdef __TI_COMPILER_VERSION__
+volatile register unsigned int __R30;
+volatile register unsigned int __R31;
+#else
 register volatile uint32_t __R30 __asm__("r30");
 register volatile uint32_t __R31 __asm__("r31");
+#endif
 
 #endif /* PRU_REGS_H */
+

@@ -20,7 +20,7 @@
 #   build/pru/     — PRU firmware binaries (am335x-pru{0,1}-fw)
 #   build/daemon/  — pickup_daemon binary
 
-.PHONY: all dtbo pru daemon clean install deploy test-spindle test-gpio test-static \
+.PHONY: all dtbo pru daemon docker-daemon clean install deploy docker-deploy test-spindle test-gpio test-static \
         docker-build docker-image docker-image-push
 
 all: dtbo pru daemon
@@ -59,10 +59,15 @@ test-gpio:
 test-static:
 	@echo "=== Building PRU static HIGH test firmware ==="
 	$(MAKE) -C src/pru OUT_DIR=$(CURDIR)/build/pru test-static
-# ── C daemon ─────────────────────────────────────────────────────────────
+# ── C daemon (local cross-compile, requires ARM toolchain) ───────────────────
 daemon:
 	@echo "=== Building daemon ==="
 	$(MAKE) -C src/linux/daemon OUT_DIR=$(CURDIR)/build/daemon
+
+# ── C daemon (always via Docker, no local toolchain needed) ──────────────────
+docker-daemon:
+	@echo "=== Building daemon via Docker cross-compiler ==="
+	@./docker-build.sh -- daemon
 
 # ── Clean ─────────────────────────────────────────────────────────────────
 clean:
@@ -122,23 +127,32 @@ install: all
 	@echo "Done."
 
 # ── Deploy via SSH ────────────────────────────────────────────────────────
-BBB_USER ?= debian
+BBB_USER ?= beagle
 BBB_IP   ?=
 
+# deploy: build everything locally (requires PRU + ARM cross-compilers) then push via SSH.
+# Installs daemon, firmware AND systemd service on the BBB.
 deploy: all
 ifeq ($(strip $(BBB_IP)),)
-	$(error BBB_IP must be set. Example: make deploy BBB_IP=192.168.7.2)
+	$(error BBB_IP must be set. Example: make deploy BBB_IP=192.168.74.171)
 endif
-	@echo "=== Deploying to $(BBB_IP) ==="
+	@echo "=== Deploying to $(BBB_USER)@$(BBB_IP) ==="
 	scp build/pru/am335x-pru0-fw build/pru/am335x-pru1-fw \
 	    build/daemon/pickup_daemon \
+	    src/linux/daemon/pickup-winder.service \
 	    $(BBB_USER)@$(BBB_IP):/tmp/
-	ssh $(BBB_USER)@$(BBB_IP) "\
+	ssh -o BatchMode=yes $(BBB_USER)@$(BBB_IP) " \
 	    sudo cp /tmp/am335x-pru0-fw /tmp/am335x-pru1-fw /lib/firmware/ && \
-	    sudo cp /tmp/pickup_daemon /usr/local/bin/ && \
-	    sudo sh -c 'echo stop > /sys/class/remoteproc/remoteproc1/state 2>/dev/null; true' && \
-	    sudo sh -c 'echo stop > /sys/class/remoteproc/remoteproc2/state 2>/dev/null; true' && \
-	    sleep 1 && \
-	    sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc1/state' && \
-	    sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state' && \
-	    echo 'PRUs reloaded, daemon installed.'"
+	    sudo cp /tmp/pickup_daemon /usr/local/bin/pickup_daemon && \
+	    sudo cp /tmp/pickup-winder.service /etc/systemd/system/ && \
+	    sudo systemctl daemon-reload && \
+	    sudo systemctl enable pickup-winder && \
+	    sudo systemctl restart pickup-winder && \
+	    echo 'Deploy complete — service pickup-winder started.'"
+
+# docker-deploy: build everything via Docker (no local ARM toolchain required) then push via SSH.
+docker-deploy:
+ifeq ($(strip $(BBB_IP)),)
+	$(error BBB_IP must be set. Example: make docker-deploy BBB_IP=192.168.74.171)
+endif
+	@./scripts/deploy.sh -h "$(BBB_IP)" -u "$(BBB_USER)"

@@ -11,12 +11,12 @@
  *
  *   GPIO1 bank : P9_23 (footswitch input, GPIO1[17])
  *
- *   GPIO0 bank : P8_41 (EN_A,   PRU1 R30[7])
- *                P8_43 (DIR_A,  PRU1 R30[5])
- *                P8_45 (STEP_A, PRU1 R30[1])
- *                P8_42 (EN_B,   PRU1 R30[3])
- *                P8_44 (DIR_B,  PRU1 R30[0])
- *                P8_46 (STEP_B, PRU1 R30[2])
+ *   GPIO0 bank : P8_45 (STEP_A, PRU1 R30[0])
+ *                P8_46 (STEP_B, PRU1 R30[1])
+ *                P8_43 (DIR_A,  PRU1 R30[2])
+ *                P8_44 (DIR_B,  PRU1 R30[3])
+ *                P8_41 (EN_A,   PRU1 R30[4], active-low)
+ *                P8_42 (EN_B,   PRU1 R30[5], active-low)
  *
  * Note: bone-pinmux-helper absent sur kernel 6.12 → pinmux attaché via &gpioN.
  * Chaque groupe est attaché au contrôleur GPIO propriétaire des pads.
@@ -47,18 +47,28 @@
     };
 
     /* ── GPIO0 : sorties stepper PRU1 (P8_41..P8_46) ────────────────────
-     * MODE6 = PRU1 R30 direct OUTPUT  (MODE5 = PRU0 R30 output on GPMC pins)
-     * AM335x GPMC pins: MODE6 → pr1_pru1_pru_r30_N (output)
+     * MODE5 = PRU1 R30 direct OUTPUT  (MODE6 = PRU1 R31 INPUT — ne pas confondre)
+     * AM335x GPMC pins: MODE5 → pr1_pru1_pru_r30_N (output)
+     *                   MODE6 → pr1_pru1_pru_r31_N (input)  ← MAUVAIS pour sorties
+     *
+     * Bits R30 réels (confirmés par pinctrl debugfs) :
+     *   P8_45 → R30[0]  STEP_A
+     *   P8_46 → R30[1]  STEP_B
+     *   P8_43 → R30[2]  DIR_A
+     *   P8_44 → R30[3]  DIR_B
+     *   P8_41 → R30[4]  EN_A   (active-low)
+     *   P8_42 → R30[5]  EN_B   (active-low)
+     *
      * EN_A/EN_B : pull-up (active-low, état safe = driver désactivé si PRU OFF)
      * STEP/DIR : pull désactivé (piloté directement par PRU1)           */
     pru_step_pins: pru-step-pins {
         pinctrl-single,pins = <
-            0x0B0 0x10 0x06  /* P8_41 EN_A   (PRU1 R30 output) pull-up, active-low, MODE6=R30 out */
-            0x0A8 0x08 0x06  /* P8_43 DIR_A  (PRU1 R30 output) no pull,             MODE6=R30 out */
-            0x0A0 0x08 0x06  /* P8_45 STEP_A (PRU1 R30 output) no pull,             MODE6=R30 out */
-            0x0B4 0x10 0x06  /* P8_42 EN_B   (PRU1 R30 output) pull-up, active-low, MODE6=R30 out */
-            0x0AC 0x08 0x06  /* P8_44 DIR_B  (PRU1 R30 output) no pull,             MODE6=R30 out */
-            0x0A4 0x08 0x06  /* P8_46 STEP_B (PRU1 R30 output) no pull,             MODE6=R30 out */
+            0x0A0 0x08 0x05  /* P8_45 STEP_A (PRU1 R30[0]) no pull,             MODE5=R30 out */
+            0x0A4 0x08 0x05  /* P8_46 STEP_B (PRU1 R30[1]) no pull,             MODE5=R30 out */
+            0x0A8 0x08 0x05  /* P8_43 DIR_A  (PRU1 R30[2]) no pull,             MODE5=R30 out */
+            0x0AC 0x08 0x05  /* P8_44 DIR_B  (PRU1 R30[3]) no pull,             MODE5=R30 out */
+            0x0B0 0x10 0x05  /* P8_41 EN_A   (PRU1 R30[4]) pull-up, active-low, MODE5=R30 out */
+            0x0B4 0x10 0x05  /* P8_42 EN_B   (PRU1 R30[5]) pull-up, active-low, MODE5=R30 out */
         >;
     };
 };

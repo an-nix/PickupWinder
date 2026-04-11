@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -54,6 +55,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 #include "../../pru/include/pru_ipc.h"
@@ -68,6 +70,8 @@
 /* ── Shared RAM pointers ──────────────────────────────────────────────────── */
 static volatile host_cmd_t     *g_host_cmd  = NULL;
 static volatile pru_status_t   *g_status    = NULL;
+static volatile move_ctrl_t    *g_move_ctrl = NULL;
+static volatile step_block_t   *g_step_blocks = NULL;
 
 static void   *g_mmap_base = NULL;
 static size_t  g_mmap_size = 0;
@@ -86,6 +90,186 @@ static uint8_t  g_last_event_sent = EVENT_NONE;
 /* ── Last spindle IEP interval (for move_to spindle coordination) ────────── */
 static uint32_t g_last_sp_iv = 0u;
 
+#define MAX_MOVE_PLAN_STEPS  24000
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * ARM-side move planner (exact trapezoid physics + secant root solver)
+ *
+ * Why this exists:
+ * - Austin recurrence and linear-delay ramps are approximations.
+ * - Here we solve f(t)=pos(t)-n from the exact trapezoid position equation.
+ * - PRU executes only compressed (interval,count,add) blocks.
+ *
+ * Tuning guide:
+ * - v_start  : choose safely above stall threshold (e.g. 100-500 steps/s).
+ * - v_cruise : desired top speed (bounded by motor torque and driver).
+ * - accel    : ramp aggressiveness (steps/s²). If stalls: lower accel first.
+ * - High v_cruise with low accel increases move duration but reduces stalls.
+ */
+typedef struct {
+    double t_start, t_accel_end, t_cruise_end, t_end;
+    double v_start, v_cruise, accel;
+    int32_t start_pos;
+} Move;
+
+/* Exact position from the trapezoid profile at absolute time t (seconds).
+ * Physical meaning:
+ *   v_start   = initial speed at t_start
+ *   v_cruise  = plateau speed
+ *   accel     = |dv/dt|
+ *   t_accel_end / t_cruise_end / t_end delimit accel/cruise/decel phases.
+ */
+static double move_get_pos(const Move *m, double t)
+{
+    if (t <= m->t_start) return (double)m->start_pos;
+
+    const double t_acc = m->t_accel_end - m->t_start;
+    const double t_cruise = m->t_cruise_end - m->t_accel_end;
+    const double dt = t - m->t_start;
+
+    if (t <= m->t_accel_end) {
+        return (double)m->start_pos + m->v_start * dt + 0.5 * m->accel * dt * dt;
+    }
+
+    const double s_acc = m->v_start * t_acc + 0.5 * m->accel * t_acc * t_acc;
+    if (t <= m->t_cruise_end) {
+        const double tc = dt - t_acc;
+        return (double)m->start_pos + s_acc + m->v_cruise * tc;
+    }
+
+    const double s_cruise = m->v_cruise * t_cruise;
+    const double td = dt - t_acc - t_cruise;
+    return (double)m->start_pos + s_acc + s_cruise
+         + m->v_cruise * td - 0.5 * m->accel * td * td;
+}
+
+/* Secant root solver for f(t)=move_get_pos(m,t)-target.
+ * This solves against the exact physics function (not Austin approximation),
+ * so there is no cumulative recurrence drift at high step rates.
+ */
+static double solve_step_time(const Move *m, int32_t target, double t_est)
+{
+    double t0 = t_est - (1.0 / ((m->v_cruise > 1.0) ? m->v_cruise : 1.0));
+    double t1 = t_est;
+    if (t0 < m->t_start) t0 = m->t_start;
+    if (t1 < m->t_start) t1 = m->t_start;
+    if (t1 > m->t_end)   t1 = m->t_end;
+
+    double f0 = move_get_pos(m, t0) - (double)target;
+    double f1 = move_get_pos(m, t1) - (double)target;
+
+    for (int i = 0; i < 8; i++) {
+        if (fabs(f1) < 0.5) break; /* within half-step */
+        const double den = (f1 - f0);
+        if (fabs(den) < 1e-12) break;
+        double t2 = t1 - f1 * (t1 - t0) / den;
+        if (t2 < m->t_start) t2 = m->t_start;
+        if (t2 > m->t_end)   t2 = m->t_end;
+        t0 = t1;
+        f0 = f1;
+        t1 = t2;
+        f1 = move_get_pos(m, t1) - (double)target;
+    }
+
+    return t1;
+}
+
+/* Compress exact step intervals into StepBlock triplets for PRU.
+ * add may be negative (accel), zero (cruise), or positive (decel).
+ */
+static int compress_and_write(const Move *m, int32_t n_steps,
+                              volatile step_block_t *shram, int max_blocks)
+{
+    static uint32_t ticks[MAX_MOVE_PLAN_STEPS + 1];
+    static uint32_t iv[MAX_MOVE_PLAN_STEPS];
+
+    if (n_steps <= 0 || n_steps > MAX_MOVE_PLAN_STEPS) return -1;
+
+    double t_est = m->t_start + (1.0 / ((m->v_start > 1.0) ? m->v_start : 1.0));
+    ticks[0] = (uint32_t)llround(m->t_start * ((double)PRU_CLOCK_HZ * 0.5));
+
+    for (int32_t i = 0; i < n_steps; i++) {
+        const int32_t target = m->start_pos + (i + 1);
+        const double  t = solve_step_time(m, target, t_est);
+        ticks[i + 1] = (uint32_t)llround(t * ((double)PRU_CLOCK_HZ * 0.5));
+        t_est = t + (1.0 / ((m->v_cruise > 1.0) ? m->v_cruise : 1.0));
+    }
+
+    for (int32_t i = 0; i < n_steps; i++) {
+        uint32_t d = ticks[i + 1] - ticks[i];
+        if (d < 625u) d = 625u;
+        if (d > SP_IV_MAX) d = SP_IV_MAX;
+        iv[i] = d;
+    }
+
+    int bi = 0;
+    int32_t i = 0;
+    while (i < n_steps) {
+        if (bi >= max_blocks) return -1;
+
+        const uint32_t start_iv = iv[i];
+        int32_t add = 0;
+        if (i + 1 < n_steps)
+            add = (int32_t)iv[i + 1] - (int32_t)iv[i];
+        if (add < -32768) add = -32768;
+        if (add >  32767) add =  32767;
+
+        uint32_t count = 1u;
+        int32_t j = i + 1;
+        while (j < n_steps && count < 65535u) {
+            int32_t d = (int32_t)iv[j] - (int32_t)iv[j - 1];
+            if (d < add - 1 || d > add + 1) break;
+            count++;
+            j++;
+        }
+
+        shram[bi].interval = start_iv;
+        shram[bi].count    = (uint16_t)count;
+        shram[bi].add      = (int16_t)add;
+
+        bi++;
+        i = j;
+    }
+
+    return bi;
+}
+
+static int build_move_profile(Move *m, int32_t n_steps,
+                              uint32_t start_hz, uint32_t max_hz,
+                              uint32_t accel_steps)
+{
+    if (!m || n_steps <= 0) return -1;
+
+    if (start_hz == 0u) start_hz = 1u;
+    if (max_hz == 0u) max_hz = start_hz;
+    if (max_hz < start_hz) max_hz = start_hz;
+    if (accel_steps == 0u) accel_steps = 1u;
+
+    const double vs = (double)start_hz;
+    double vc = (double)max_hz;
+    double a = (vc * vc - vs * vs) / (2.0 * (double)accel_steps);
+    if (a < 1.0) a = 1.0;
+
+    double d_acc = (vc * vc - vs * vs) / (2.0 * a);
+    if (2.0 * d_acc > (double)n_steps) {
+        d_acc = 0.5 * (double)n_steps;
+        vc = sqrt(vs * vs + 2.0 * a * d_acc);
+    }
+    const double d_cruise = (double)n_steps - 2.0 * d_acc;
+    const double t_acc = (vc - vs) / a;
+    const double t_cruise = (d_cruise > 0.0 && vc > 0.0) ? (d_cruise / vc) : 0.0;
+
+    m->t_start = 0.0;
+    m->t_accel_end = t_acc;
+    m->t_cruise_end = t_acc + t_cruise;
+    m->t_end = t_acc + t_cruise + t_acc;
+    m->v_start = vs;
+    m->v_cruise = vc;
+    m->accel = a;
+    m->start_pos = 0;
+    return 0;
+}
+
 /* ── Winding mode ───────────────────────────────────────────────────── *
  * WINDING_MODE_FREE    (0, default): no spindle–lateral coordination.       *
  *   set_speed controls spindle directly.                                    *
@@ -100,6 +284,8 @@ static uint32_t g_last_sp_iv = 0u;
 static uint8_t  g_winding_mode = WINDING_MODE_FREE;
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; }
+
+static uint32_t hz_to_interval(uint32_t hz);
 
 /* ════════════════════════════════════════════════════════════════════════════
  * PRU Shared RAM
@@ -125,6 +311,8 @@ static int pru_map_open(const char *devmem) {
     uint8_t *base = (uint8_t *)g_mmap_base + page_off;
     g_host_cmd = (volatile host_cmd_t *)  (base + IPC_HOST_CMD_OFFSET);
     g_status   = (volatile pru_status_t *)(base + IPC_PRU_STATUS_OFFSET);
+    g_move_ctrl = (volatile move_ctrl_t *)(base + IPC_MOVE_CTRL_OFFSET);
+    g_step_blocks = (volatile step_block_t *)(base + IPC_STEP_BLOCKS_OFFSET);
 
     return 0;
 }
@@ -192,24 +380,41 @@ static int send_host_move_to(uint8_t axis, int32_t target_pos,
                               uint32_t start_hz, uint32_t max_hz,
                               uint32_t accel_steps) {
     if (!g_host_cmd) return -1;
+    if (!g_move_ctrl || !g_step_blocks || !g_status) return -1;
 
-    /* Guard: prevent division by zero */
-    if (start_hz == 0u)    start_hz = 1u;
-    if (max_hz   == 0u)    max_hz   = start_hz;
-    if (max_hz   < start_hz) max_hz = start_hz;
-    if (accel_steps == 0u) accel_steps = 1u;
+    int32_t cur_pos = g_status->lat_position;
+    int32_t delta = target_pos - cur_pos;
+    int32_t n_steps = (delta < 0) ? -delta : delta;
 
-    /* Hz → IEP intervals. Min interval = 625 cycles (160 kHz). */
-    uint32_t start_iv  = PRU_CLOCK_HZ / (2u * start_hz);
-    uint32_t cruise_iv = PRU_CLOCK_HZ / (2u * max_hz);
+    if (n_steps == 0) {
+        g_move_ctrl->block_count = 0u;
+        g_move_ctrl->block_ready = 0u;
+        g_move_ctrl->start_flag = 0u;
+        g_move_ctrl->done_flag = 1u;
+        g_move_ctrl->active = 0u;
+        g_move_ctrl->planned_steps = 0u;
+        g_move_ctrl->executed_steps = 0u;
+        return 0;
+    }
+
+    Move mv;
+    if (build_move_profile(&mv, n_steps, start_hz, max_hz, accel_steps) != 0)
+        return -1;
+
+    int nblk = compress_and_write(&mv, n_steps, g_step_blocks, (int)MAX_STEP_BLOCKS);
+    if (nblk <= 0) return -1;
+
+    uint32_t cruise_iv = hz_to_interval(max_hz);
     if (cruise_iv < 625u) cruise_iv = 625u;
-    if (start_iv  < cruise_iv) start_iv = cruise_iv;
 
-    /* delta_iv = interval change per step during ramp (no division in PRU). */
-    uint32_t diff     = start_iv - cruise_iv;
-    uint32_t delta_iv = diff / accel_steps;
-    /* Ensure at least 1 cycle of change if there is a real ramp. */
-    if (delta_iv == 0u && diff > 0u) delta_iv = 1u;
+    g_move_ctrl->block_count = (uint8_t)nblk;
+    g_move_ctrl->planned_steps = (uint32_t)n_steps;
+    g_move_ctrl->executed_steps = 0u;
+    g_move_ctrl->done_flag = 0u;
+    g_move_ctrl->active = 0u;
+    g_move_ctrl->start_flag = 0u;
+    g_move_ctrl->block_ready = 1u;
+    __sync_synchronize();
 
     for (int i = 0; i < 5000; i++) {
         if (g_host_cmd->cmd == HOST_CMD_NOP) break;
@@ -219,9 +424,9 @@ static int send_host_move_to(uint8_t axis, int32_t target_pos,
 
     g_host_cmd->axis           = axis;
     g_host_cmd->move_target    = target_pos;
-    g_host_cmd->move_start_iv  = start_iv;
+    g_host_cmd->move_start_iv  = g_step_blocks[0].interval;
     g_host_cmd->move_cruise_iv = cruise_iv;
-    g_host_cmd->move_delta_iv  = delta_iv;
+    g_host_cmd->move_delta_iv  = 0u;
     /* Q6 spindle-lateral coordination ratio (0 if spindle not yet started). *
      * PRU0 computes: sp_adj = (move_sp_lat_coord * lat_iv) >> 6             *
      * This keeps turns/mm constant during lateral ramps and reversals.      */
@@ -258,6 +463,8 @@ static int create_server_socket(void) {
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("[daemon] bind"); close(fd); return -1;
     }
+    /* Allow non-root clients (Python app) to connect. */
+    chmod(SOCKET_PATH, 0666);
     listen(fd, MAX_CLIENTS);
     return fd;
 }
@@ -286,8 +493,35 @@ static void broadcast(const char *msg) {
  * Command dispatcher
  * ════════════════════════════════════════════════════════════════════════════ */
 
-static void handle_command(int client_fd, const char *line) {
+/* Compact a JSON line in-place: remove spaces after ':' and ','.
+ * This makes HAS() matching work regardless of Python/client formatting.
+ * E.g. {"cmd": "enable", "value": 1} → {"cmd":"enable","value":1}
+ * Only spaces immediately after ':' or ',' and before '"' or digit are removed.
+ */
+static void compact_json(char *s) {
+    char *r = s, *w = s;
+    while (*r) {
+        *w++ = *r;
+        if (*r == ':' || *r == ',') {
+            ++r;
+            /* skip spaces */
+            while (*r == ' ' || *r == '\t') ++r;
+        } else {
+            ++r;
+        }
+    }
+    *w = '\0';
+}
+
+static void handle_command(int client_fd, const char *line_in) {
     char resp[BUF_SZ];
+    /* Work on a mutable copy so we can compact it without modifying the
+     * original buffer (not strictly required here but good practice). */
+    char line_buf[BUF_SZ];
+    strncpy(line_buf, line_in, sizeof(line_buf) - 1);
+    line_buf[sizeof(line_buf) - 1] = '\0';
+    compact_json(line_buf);
+    const char *line = line_buf;
 
 #define HAS(key)  (strstr(line, key) != NULL)
 
@@ -453,6 +687,9 @@ int main(int argc, char **argv) {
         for (int i = g_nclients - 1; i >= 0; i--) {
             if (!(fds[1 + i].revents & POLLIN)) continue;
             ssize_t n = read(g_clients[i], buf, sizeof(buf) - 1);
+            /* Non-blocking socket: EAGAIN/EWOULDBLOCK means no data yet — keep
+             * the client connected and retry next poll cycle. */
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
             if (n <= 0) {
                 close(g_clients[i]);
                 for (int j = i; j < g_nclients - 1; j++)

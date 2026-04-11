@@ -4,14 +4,15 @@
  * Connect a 330 Ω + red LED (anode→pin, cathode→GND) on each pin to
  * verify the BBB is actually driving the pad.
  *
- * Pins tested (PRU0 R30):
+ * Pins tested (PRU R30):
  *
- *   R30[1]  P9_29  STEP_A  (spindle step)
- *   R30[5]  P9_27  DIR_A   (spindle direction)
- *   R30[7]  P9_25  EN_A    (spindle enable — active-low in production)
- *   R30[2]  P9_30  STEP_B  (lateral step)
- *   R30[0]  P9_31  DIR_B   (lateral direction)
- *   R30[3]  P9_28  EN_B    (lateral enable — active-low in production)
+ *   R30[7]  P8_41  EN_A    (spindle enable — active-low in production)
+ *   R30[5]  P8_43  DIR_A   (spindle direction)
+ *   R30[1]  P8_45  STEP_A  (spindle step)
+ *
+ *   R30[3]  P8_42  EN_B    (lateral enable — active-low in production)
+ *   R30[0]  P8_44  DIR_B   (lateral direction)
+ *   R30[2]  P8_46  STEP_B  (lateral step)
  *
  * Expected: all 6 LEDs blink in sync at 0.5 Hz (1 s ON, 1 s OFF).
  * If a LED stays dark → that pad is not driven (pinmux not loaded,
@@ -21,11 +22,15 @@
  *   BBB pin ──[ 330 Ω ]──|▶|── GND (P9_1 or P9_2)
  *   Use red LEDs (Vf ≈ 2.0 V).  Current ≈ 3.9 mA — safe for BBB.
  *
- * To load:
- *   sudo cp am335x-pru0-fw-test-gpio /lib/firmware/am335x-pru0-fw
- *   sudo sh -c 'echo stop  > /sys/class/remoteproc/remoteproc1/state'
+ * To load (PRU1 / P8 pins):
+ *   # copy the test image as the PRU1 firmware (remoteproc2)
+ *   sudo cp am335x-pru0-fw-test-gpio /lib/firmware/am335x-pru1-fw
+ *   sudo sh -c 'echo stop  > /sys/class/remoteproc/remoteproc2/state'
  *   sleep 1
- *   sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc1/state'
+ *   sudo sh -c 'echo start > /sys/class/remoteproc/remoteproc2/state'
+ *
+ * Note: The R30 bit positions are the same as the previous mapping; this
+ * test targets the PRU that drives the P8_41..P8_46 group (PRU1 in our DTS).
  *
  * Build: make test-gpio
  */
@@ -34,13 +39,13 @@
 #include "../include/pru_stepper.h"   /* IEP_INIT, IEP_NOW              */
 #include "../include/pru_regs.h"      /* __R30                          */
 
-/* ── All output pins used by the stepper subsystem ──────────────────────── */
-#define PIN_STEP_A   (1u << 1)   /* P9_29 */
-#define PIN_DIR_A    (1u << 5)   /* P9_27 */
-#define PIN_EN_A     (1u << 7)   /* P9_25 */
-#define PIN_STEP_B   (1u << 2)   /* P9_30 */
-#define PIN_DIR_B    (1u << 0)   /* P9_31 */
-#define PIN_EN_B     (1u << 3)   /* P9_28 */
+/* ── All output pins — PRU1 R30 bits (confirmed from pinctrl debugfs dump) ── */
+#define PIN_STEP_A   (1u << 0)   /* P8_45 PRU1 R30[0] */
+#define PIN_STEP_B   (1u << 1)   /* P8_46 PRU1 R30[1] */
+#define PIN_DIR_A    (1u << 2)   /* P8_43 PRU1 R30[2] */
+#define PIN_DIR_B    (1u << 3)   /* P8_44 PRU1 R30[3] */
+#define PIN_EN_A     (1u << 4)   /* P8_41 PRU1 R30[4] active-low */
+#define PIN_EN_B     (1u << 5)   /* P8_42 PRU1 R30[5] active-low */
 
 #define ALL_PINS  (PIN_STEP_A | PIN_DIR_A | PIN_EN_A | \
                    PIN_STEP_B | PIN_DIR_B | PIN_EN_B)

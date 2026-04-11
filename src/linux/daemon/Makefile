@@ -31,17 +31,20 @@ else
 endif
 
 DAEMON_CFLAGS ?= -O2 -Wall -Wextra -I ../../pru/include
+DAEMON_LDFLAGS ?= -lm
+
+.RECIPEPREFIX := >
 
 .PHONY: all clean
 
 all: $(DAEMON_BIN)
 
 $(DAEMON_BIN): $(DAEMON_SRC)
-	@mkdir -p $(OUT_DIR)
-	@echo "=== Building daemon ==="
-	$(DAEMON_CC) $(DAEMON_CFLAGS) $(DAEMON_SRC) -o $(DAEMON_BIN)
-	@echo "  -> $(DAEMON_BIN)"
+> @mkdir -p $(OUT_DIR)
+> @echo "=== Building daemon ==="
+> @$(DAEMON_CC) $(DAEMON_CFLAGS) $(DAEMON_SRC) -o $(DAEMON_BIN) $(DAEMON_LDFLAGS)
+> @echo "  -> $(DAEMON_BIN)"
 
 clean:
-	rm -rf $(OUT_DIR)
-	@echo "Cleaned daemon build/"
+> rm -rf $(OUT_DIR)
+> @echo "Cleaned daemon build/"

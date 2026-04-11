@@ -1,49 +1,49 @@
 ﻿/* motor_control/main.c — motor firmware (runs on PRU1 at runtime).
  *
- * Architecture layer 1/4.  This firmware runs on PRU1 at runtime
- * (loaded as am335x-pru0-fw by the PRU loader).
+ * Architecture layer 1/4.  Loaded as am335x-pru1-fw → remoteproc2 → PRU1
+ * (4a338000.pru).
  *
- * PRU0 (motor firmware) is a dumb pulse generator. It knows nothing about
- * homing, recipes, synchronization, commands, or endstops. Its sole
- * responsibilities:
- *
- *   1. Read motor_params_t (written by PRU1/orchestrator) every iteration.
+ * PRU1 is a dumb pulse generator. Its sole responsibilities:
+ *   1. Read motor_params_t (written by PRU0/orchestrator) every iteration.
  *   2. Generate STEP/DIR pulses using the IEP hardware counter.
- *   3. Publish motor_telem_t for PRU1 (and host) to read.
+ *   3. Publish motor_telem_t for PRU0 (and host) to read.
  *
- * PRU0 owns and initializes the IEP timer. PRU1 may read IEP but never
- * resets it.
+ * PRU1 owns and initializes the IEP timer. PRU0 reads IEP but never resets it.
  *
- * Pin mapping on PRU1 R30 (active-low enable) — GPMC pins in MODE6:
- *   Motor A (spindle): STEP=R30[1] (P8_45), DIR=R30[5] (P8_43), EN=R30[7] (P8_41)
- *   Motor B (lateral): STEP=R30[2] (P8_46), DIR=R30[0] (P8_44), EN=R30[3] (P8_42)
+ * Pin mapping on PRU1 R30 — LCD data pins in MODE5 (pr1_pru1_pru_r30_N):
+ *   Motor A — lateral (odd P8 pins):
+ *     STEP_A = R30[0]  P8_45  pr1_pru1_pru_r30_0
+ *     DIR_A  = R30[2]  P8_43  pr1_pru1_pru_r30_2
+ *     EN_A   = R30[4]  P8_41  pr1_pru1_pru_r30_4  (active-low)
+ *   Motor B — spindle (even P8 pins):
+ *     STEP_B = R30[1]  P8_46  pr1_pru1_pru_r30_1
+ *     DIR_B  = R30[3]  P8_44  pr1_pru1_pru_r30_3
+ *     EN_B   = R30[5]  P8_42  pr1_pru1_pru_r30_5  (active-low)
  *
  * Endstops are read by PRU0 (orchestrator) via its R31 (P9_28/P9_30).
  * This firmware does NOT read R31 or perform any endstop logic.
+ *
+ * Confirmed via pinctrl debugfs: pad offsets 0x0A0-0x0B4, all MODE5.
  */
 
 #include <stdint.h>
 #include "../include/pru_ipc.h"
 #include "../include/pru_stepper.h"
 #include "../include/pru_regs.h"
+#include "../include/pru_rsc_table.h"  /* required by remoteproc */
 
-/* ── Pin bitmasks ────────────────────────────────────────────────────────── */
-#define SP_STEP_BIT    (1u << 1)   /* P8_45 R30[1] */
-#define SP_DIR_BIT     (1u << 5)   /* P8_43 R30[5] */
-#define SP_EN_BIT      (1u << 7)   /* P8_41 R30[7] active-low */
-
-#define LAT_STEP_BIT   (1u << 2)   /* P8_46 R30[2] */
-#define LAT_DIR_BIT    (1u << 0)   /* P8_44 R30[0] */
-#define LAT_EN_BIT     (1u << 3)   /* P8_42 R30[3] active-low */
+/* ── Pin bitmasks (PRU1 R30, confirmed via pinctrl debugfs) ─────────────── */
+/* Motor A — lateral (odd P8 pins, MODE5, lcd_data[0/2/4]) */
+#define LAT_STEP_BIT   (1u << 0)   /* P8_45 R30[0]  pr1_pru1_pru_r30_0     */
+#define LAT_DIR_BIT    (1u << 2)   /* P8_43 R30[2]  pr1_pru1_pru_r30_2     */
+#define LAT_EN_BIT     (1u << 4)   /* P8_41 R30[4]  pr1_pru1_pru_r30_4  ↓0=EN */
+/* Motor B — spindle (even P8 pins, MODE5, lcd_data[1/3/5]) */
+#define SP_STEP_BIT    (1u << 1)   /* P8_46 R30[1]  pr1_pru1_pru_r30_1     */
+#define SP_DIR_BIT     (1u << 3)   /* P8_44 R30[3]  pr1_pru1_pru_r30_3     */
+#define SP_EN_BIT      (1u << 5)   /* P8_42 R30[5]  pr1_pru1_pru_r30_5  ↓0=EN */
 
 /* ── Telemetry publish cadence ───────────────────────────────────────────── */
 #define TELEM_STRIDE   500000u     /* ~2.5 ms at 200 MHz (400 Hz) */
-
-/* ── Trapezoidal move profile phases ────────────────────────────────────── */
-#define MOVE_IDLE    0u
-#define MOVE_ACCEL   1u
-#define MOVE_CRUISE  2u
-#define MOVE_DECEL   3u
 
 /* ── Shared RAM pointers ─────────────────────────────────────────────────── */
 static volatile motor_params_t *params =
@@ -52,127 +52,90 @@ static volatile motor_params_t *params =
 static volatile motor_telem_t *telem =
     (volatile motor_telem_t *)(PRU_SRAM_PHYS_BASE + IPC_MOTOR_TELEM_OFFSET);
 
+static volatile move_ctrl_t *move_ctrl =
+    (volatile move_ctrl_t *)(PRU_SRAM_PHYS_BASE + IPC_MOVE_CTRL_OFFSET);
+
+static volatile step_block_t *move_blocks =
+    (volatile step_block_t *)(PRU_SRAM_PHYS_BASE + IPC_STEP_BLOCKS_OFFSET);
+
 /* ── Pulse generators ────────────────────────────────────────────────────── */
 static pulse_gen_t spindle = {0};
 static pulse_gen_t lateral = {0};
 
-/* ── Trapezoidal move profile state (lateral axis) ──────────────────────── */
-static uint8_t  g_lat_phase        = MOVE_IDLE;
-static int32_t  g_lat_target       = 0;
-static uint32_t g_lat_start_iv     = 0u;
-static uint32_t g_lat_cruise_iv    = 0u;
-static uint32_t g_lat_delta_iv     = 0u;
-static uint32_t g_lat_accel_steps  = 0u; /* steps taken during accel phase  */
 static uint8_t  g_prev_lat_pin     = 0u; /* for rising-edge detection        */
 
-/* ── Integer abs (no stdlib) ───────────────────────────────────────────── */
-static inline uint32_t u32abs(int32_t v) {
-    return (v < 0) ? (uint32_t)(-v) : (uint32_t)v;
-}
+/* ── StepBlock execution state (lateral axis) ───────────────────────────── */
+static uint8_t  g_lat_exec_active = 0u;
+static uint8_t  g_lat_blk_idx = 0u;
+static uint16_t g_lat_blk_left = 0u;
+static uint32_t g_lat_blk_iv = 0u;
+static int16_t  g_lat_blk_add = 0;
 
-/* ── Arm a new move_to profile ───────────────────────────────────────────── *
- * Called once when params->lat_move_active transitions to 1.               *
- * Reads profile params from motor_params_t, derives direction from sign of  *
- * (target - current_position), enables & runs lateral motor.               */
-static void lat_move_arm(void) {
-    int32_t delta = params->lat_target_pos - lateral.position;
-    if (delta == 0) {
-        telem->lat_move_done    = 1u;
-        params->lat_move_active = 0u;
+static void lat_exec_start(void)
+{
+    if (!move_ctrl->start_flag || !move_ctrl->block_ready)
+        return;
+    if (move_ctrl->block_count == 0u) {
+        move_ctrl->start_flag = 0u;
+        move_ctrl->done_flag  = 1u;
+        move_ctrl->active     = 0u;
+        telem->lat_move_done  = 1u;
         return;
     }
 
-    uint8_t new_dir = (delta < 0) ? 1u : 0u;
+    g_lat_blk_idx    = 0u;
+    g_lat_blk_iv     = move_blocks[0].interval;
+    g_lat_blk_left   = move_blocks[0].count;
+    g_lat_blk_add    = move_blocks[0].add;
+    g_lat_exec_active = 1u;
 
-    /* ── Hot retarget: motor already moving in the same direction. ─────── *
-     * Just update destination + profile constants. Keep current interval   *
-     * to avoid deceleration between consecutive small moves.               */
-    if (g_lat_phase != MOVE_IDLE && new_dir == params->lat_dir) {
-        telem->lat_move_done    = 0u;
-        g_lat_target            = params->lat_target_pos;
-        g_lat_start_iv          = params->lat_start_iv;
-        g_lat_cruise_iv         = params->lat_cruise_iv;
-        g_lat_delta_iv          = params->lat_delta_iv;
-        /* If currently decelerating toward old target: snap back to cruise *
-         * so remaining-distance decel trigger fires for the new target.    */
-        if (g_lat_phase == MOVE_DECEL) {
-            params->lat_interval = g_lat_cruise_iv;
-            g_lat_phase          = MOVE_CRUISE;
-        }
-        params->lat_move_active = 0u;
-        return;
-    }
+    params->lat_interval = g_lat_blk_iv;
+    params->lat_enable   = 1u;
+    params->lat_run      = 1u;
 
-    /* ── Cold start or direction reversal: full re-arm from start speed. ── */
-    telem->lat_move_done    = 0u;
-    g_lat_phase             = MOVE_IDLE;
-    g_lat_target            = params->lat_target_pos;
-    g_lat_start_iv          = params->lat_start_iv;
-    g_lat_cruise_iv         = params->lat_cruise_iv;
-    g_lat_delta_iv          = params->lat_delta_iv;
-    g_lat_accel_steps       = 0u;
-
-    params->lat_dir         = new_dir;
-    params->lat_interval    = g_lat_start_iv;
-    params->lat_enable      = 1u;
-    params->lat_run         = 1u;
-
-    g_lat_phase             = MOVE_ACCEL;
-    params->lat_move_active = 0u;  /* self-clear the arm flag               */
+    move_ctrl->executed_steps = 0u;
+    move_ctrl->active         = 1u;
+    move_ctrl->done_flag      = 0u;
+    move_ctrl->start_flag     = 0u;
+    telem->lat_move_done      = 0u;
 }
 
-/* ── Update profile on each lateral rising edge ─────────────────────────── *
- * No division, no float. Pure addition/subtraction + comparisons.          *
- * Called only when g_lat_phase != MOVE_IDLE and a rising step edge fires.  */
-static void lat_move_on_step(void) {
-    uint32_t remaining = u32abs(g_lat_target - lateral.position);
+/* On each lateral step, update interval with the compressed block add.
+ * This is intentionally the only arithmetic used for profile execution:
+ *   interval += add
+ */
+static void lat_exec_on_step(void)
+{
+    if (!g_lat_exec_active) return;
 
-    switch (g_lat_phase) {
+    if (g_lat_blk_left > 0u) {
+        g_lat_blk_left--;
+        move_ctrl->executed_steps++;
+    }
 
-    case MOVE_ACCEL:
-        g_lat_accel_steps++;
-        /* Decrease interval toward cruise speed. */
-        if (g_lat_delta_iv > 0u &&
-            params->lat_interval > g_lat_cruise_iv + g_lat_delta_iv) {
-            params->lat_interval -= g_lat_delta_iv;
+    {
+        int32_t iv = (int32_t)g_lat_blk_iv + (int32_t)g_lat_blk_add;
+        if (iv < (int32_t)MIN_INTERVAL_CYC) iv = (int32_t)MIN_INTERVAL_CYC;
+        if (iv > (int32_t)MAX_INTERVAL_CYC) iv = (int32_t)MAX_INTERVAL_CYC;
+        g_lat_blk_iv = (uint32_t)iv;
+        params->lat_interval = g_lat_blk_iv;
+    }
+
+    if (g_lat_blk_left == 0u) {
+        g_lat_blk_idx++;
+        if (g_lat_blk_idx < move_ctrl->block_count) {
+            g_lat_blk_iv   = move_blocks[g_lat_blk_idx].interval;
+            g_lat_blk_left = move_blocks[g_lat_blk_idx].count;
+            g_lat_blk_add  = move_blocks[g_lat_blk_idx].add;
+            params->lat_interval = g_lat_blk_iv;
         } else {
-            params->lat_interval = g_lat_cruise_iv;
+            g_lat_exec_active     = 0u;
+            params->lat_run       = 0u;
+            move_ctrl->active     = 0u;
+            move_ctrl->done_flag  = 1u;
+            move_ctrl->block_ready = 0u;
+            telem->lat_move_done  = 1u;
         }
-        /* Transition: remaining <= accel_steps → skip cruise, go to decel. */
-        if (remaining <= g_lat_accel_steps) {
-            g_lat_phase = MOVE_DECEL;
-        } else if (params->lat_interval <= g_lat_cruise_iv) {
-            params->lat_interval = g_lat_cruise_iv;
-            g_lat_phase = MOVE_CRUISE;
-        }
-        break;
-
-    case MOVE_CRUISE:
-        /* Enter decel when distance left equals ramp distance. */
-        if (remaining <= g_lat_accel_steps) {
-            g_lat_phase = MOVE_DECEL;
-        }
-        break;
-
-    case MOVE_DECEL:
-        /* Increase interval back toward start speed. */
-        if (g_lat_delta_iv > 0u) {
-            params->lat_interval += g_lat_delta_iv;
-            if (params->lat_interval >= g_lat_start_iv) {
-                params->lat_interval = g_lat_start_iv;
-            }
-        }
-        /* Stop when target reached. */
-        if (remaining == 0u) {
-            g_lat_phase      = MOVE_IDLE;
-            params->lat_run  = 0u;
-            telem->lat_move_done = 1u;
-        }
-        break;
-
-    default:
-        g_lat_phase = MOVE_IDLE;
-        break;
     }
 }
 
@@ -223,9 +186,9 @@ static void publish_telem(void) {
  * Main loop
  * ════════════════════════════════════════════════════════════════════════════ */
 int main(void) {
-    /* Safe state: STEP/DIR low, drivers disabled (EN high = active-low). */
-    __R30 &= ~(SP_STEP_BIT | SP_DIR_BIT | LAT_STEP_BIT | LAT_DIR_BIT);
-    __R30 |=  (SP_EN_BIT | LAT_EN_BIT);
+    /* Safe state: STEP/DIR low, both drivers disabled (EN active-low → HIGH). */
+    __R30 = 0u;                                    /* all bits low first      */
+    __R30 |= (SP_EN_BIT | LAT_EN_BIT);            /* disable drivers (HIGH)  */
 
     /* PRU0 owns the IEP timer. */
     IEP_INIT();
@@ -238,10 +201,8 @@ int main(void) {
     while (1) {
         uint32_t now = IEP_NOW();
 
-        /* ── 0. Arm move profile if requested ──────────────────────────── */
-        if (params->lat_move_active) {
-            lat_move_arm();
-        }
+        /* ── 0. Arm compressed move execution if requested ─────────────── */
+        lat_exec_start();
 
         /* ── 1. Read motor parameters from PRU1 ─────────────────────────── */
         uint32_t sp_iv   = params->sp_interval;
@@ -270,9 +231,9 @@ int main(void) {
         uint8_t lat_pin = pulse_update(&lateral, lat_iv, lat_dir, lat_run, now);
         if (lat_pin) __R30 |= LAT_STEP_BIT; else __R30 &= ~LAT_STEP_BIT;
 
-        /* ── 5b. Trapezoidal profile step update ────────────────────────── */
-        if (lat_pin && !g_prev_lat_pin && g_lat_phase != MOVE_IDLE) {
-            lat_move_on_step();
+        /* ── 5b. Compressed StepBlock update on each step ──────────────── */
+        if (lat_pin && !g_prev_lat_pin && g_lat_exec_active) {
+            lat_exec_on_step();
         }
         g_prev_lat_pin = lat_pin;
 

@@ -23,7 +23,9 @@
  *   0x0040  motor_params_t        32 B   PRU0 → PRU1
  *   0x0060  motor_telem_t         64 B   PRU1 → PRU0 (+ Host reads)
  *   0x00A0  pru_status_t          64 B   PRU0 → Host
- *   Total used: 224 bytes  (well within 12 KB)
+ *   0x00E0  move_ctrl_t           32 B   ARM/PRU0/PRU1 move handshaking
+ *   0x0100  step_block_t[]       128 B   ARM → PRU1 compressed step blocks
+ *   Total used: 384 bytes  (well within 12 KB)
  *
  * Rules:
  *   - C-compatible only (no C++). Included from PRU C and Linux C.
@@ -53,6 +55,8 @@
 #define IPC_MOTOR_PARAMS_OFFSET   0x0040u
 #define IPC_MOTOR_TELEM_OFFSET    0x0060u
 #define IPC_PRU_STATUS_OFFSET     0x00A0u
+#define IPC_MOVE_CTRL_OFFSET      0x00E0u
+#define IPC_STEP_BLOCKS_OFFSET    0x0100u
 
 /* ── Axis identifiers ────────────────────────────────────────────────────── */
 #define AXIS_SPINDLE   0u
@@ -97,6 +101,9 @@
 /* ── Endstop mask bits (motor_telem_t.endstop_mask) ──────────────────────── */
 #define ENDSTOP1_MASK          (1u << 0)
 #define ENDSTOP2_MASK          (1u << 1)
+
+/* ── Compressed move blocks (ARM planner → PRU executor) ────────────────── */
+#define MAX_STEP_BLOCKS        16u
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Structures
@@ -184,6 +191,31 @@ typedef struct __attribute__((packed, aligned(4))) {
     uint32_t _reserved[8];
 } pru_status_t;                      /* 64 bytes */
 
+/* One compressed sequence of step intervals.
+ * interval: first interval in IEP half-cycles
+ * count:    number of steps in this sequence
+ * add:      interval delta applied after each step
+ *           (negative accel, zero cruise, positive decel)
+ */
+typedef struct __attribute__((packed, aligned(4))) {
+    uint32_t interval;
+    uint16_t count;
+    int16_t  add;
+} step_block_t;                      /* 8 bytes */
+
+/* Shared control flags for one armed lateral move. */
+typedef struct __attribute__((packed, aligned(4))) {
+    uint8_t  block_count;            /* number of valid entries in step_block_t[] */
+    uint8_t  block_ready;            /* ARM set to 1 after writing blocks         */
+    uint8_t  start_flag;             /* PRU0 set to 1 to start PRU1 execution     */
+    uint8_t  done_flag;              /* PRU1 set to 1 when all blocks consumed    */
+    uint8_t  active;                 /* PRU1 set while executing blocks            */
+    uint8_t  _pad0[3];
+    uint32_t planned_steps;          /* informational: host-planned step count    */
+    uint32_t executed_steps;         /* informational: PRU1 executed step count   */
+    uint32_t _reserved[4];
+} move_ctrl_t;                       /* 32 bytes */
+
 /* ── Event types (pru_status_t.event_type) ───────────────────────────────── */
 #define EVENT_NONE            0u
 #define EVENT_ENDSTOP_HIT     1u     /* lateral endstop triggered            */
@@ -201,6 +233,8 @@ _Static_assert(sizeof(host_cmd_t)     == 64, "host_cmd_t size");
 _Static_assert(sizeof(motor_params_t) == 32, "motor_params_t size");
 _Static_assert(sizeof(motor_telem_t)  == 64, "motor_telem_t size");
 _Static_assert(sizeof(pru_status_t)   == 64, "pru_status_t size");
+_Static_assert(sizeof(step_block_t)   == 8,  "step_block_t size");
+_Static_assert(sizeof(move_ctrl_t)    == 32, "move_ctrl_t size");
 #  endif
 #endif
 
