@@ -14,15 +14,17 @@
  *
  *   Python → daemon (commands):
  *     {"cmd":"set_speed","sp_hz":N,"lat_hz":N,"sp_dir":0|1,"lat_dir":0|1}
+ *       Spindle always ramps from current speed → target.  No explicit ramp
+ *       command needed — the daemon computes and deposits ramp segments.
  *     {"cmd":"enable","axis":0|1|255,"value":0|1}
  *     {"cmd":"e_stop"}
  *     {"cmd":"home_start"}
  *     {"cmd":"ack_event"}
  *     {"cmd":"reset_pos","axis":0|1|255}
  *     {"cmd":"set_limits","axis":0|1,"min":<int>,"max":<int>}
- *     {"cmd":"move_to","axis":1,"pos":<int>,"start_hz":N,"max_hz":N,"accel_steps":N}
+ *     {"cmd":"move_to","axis":1,"pos":<int>}
  *     {"cmd":"set_mode","mode":"free"|"winding"}
- *     {"cmd":"ramp_to","sp_hz":N,"start_hz":N,"accel_steps":N,"sp_dir":0|1}
+ *     {"cmd":"set_accel","lat_max_speed":N,"lat_accel":N,"lat_decel":N,"sp_accel":N}
  *
  *   daemon → Python (responses):
  *     {"ok":true}
@@ -36,7 +38,7 @@
  *      "sp":{"steps":N,"speed_hz":N,"faults":N},
  *      "lat":{"steps":N,"pos":N,"speed_hz":N,"faults":N},
  *      "endstop":N}
- *     {"event":"ramp_complete","sp_hz":N}
+ *     {"event":"speed_reached","sp_hz":N}
  *     {"event":"move_complete","pos":N}
  *     {"event":"limit_hit","axis":N,"pos":N}
  *
@@ -90,7 +92,7 @@ static uint8_t  g_event_broadcast = 0u;  /* 1 = current event already broadcast 
 /* ── Last spindle IEP interval (for move_to spindle coordination) ────────── */
 static uint32_t g_last_sp_iv = 0u;
 
-/* ── Last ramp target Hz (for ramp_complete event broadcast) ─────────────── */
+/* ── Last ramp target Hz (for speed_reached event broadcast) ─────────────── */
 static uint32_t g_last_ramp_target_hz = 0u;
 
 #define MAX_MOVE_PLAN_STEPS  24000
@@ -100,7 +102,7 @@ static uint32_t g_last_ramp_target_hz = 0u;
  */
 typedef struct {
     double t_start, t_accel_end, t_cruise_end, t_end;
-    double v_start, v_cruise, accel;
+    double v_start, v_cruise, v_end, accel, decel;
     int32_t start_pos;
 } Move;
 
@@ -120,7 +122,7 @@ static double move_get_pos(const Move *m, double t)
     const double s_cruise = m->v_cruise * t_cruise;
     const double td = dt - t_acc - t_cruise;
     return (double)m->start_pos + s_acc + s_cruise
-         + m->v_cruise * td - 0.5 * m->accel * td * td;
+         + m->v_cruise * td - 0.5 * m->decel * td * td;
 }
 
 static double solve_step_time(const Move *m, int32_t target, double t_est)
@@ -201,36 +203,54 @@ static int compress_and_write(const Move *m, int32_t n_steps,
 }
 
 static int build_move_profile(Move *m, int32_t n_steps,
-                              uint32_t start_hz, uint32_t max_hz,
-                              uint32_t accel_steps)
+                              uint32_t v_start_hz, uint32_t v_max_hz,
+                              uint32_t accel_s2, uint32_t decel_s2)
 {
     if (!m || n_steps <= 0) return -1;
-    if (start_hz == 0u) start_hz = 1u;
-    if (max_hz == 0u) max_hz = start_hz;
-    if (max_hz < start_hz) max_hz = start_hz;
-    if (accel_steps == 0u) accel_steps = 1u;
+    if (v_start_hz == 0u) v_start_hz = 534u;
+    if (v_max_hz   == 0u) v_max_hz   = v_start_hz;
+    if (v_max_hz < v_start_hz) v_max_hz = v_start_hz;
+    if (accel_s2 == 0u) accel_s2 = 1u;
+    if (decel_s2 == 0u) decel_s2 = 1u;
 
-    const double vs = (double)start_hz;
-    double vc = (double)max_hz;
-    double a = (vc * vc - vs * vs) / (2.0 * (double)accel_steps);
-    if (a < 1.0) a = 1.0;
+    const double vs = (double)v_start_hz;
+    const double ve = vs;               /* end speed = start speed */
+    double vc       = (double)v_max_hz;
+    const double a  = (double)accel_s2;
+    const double d  = (double)decel_s2;
 
     double d_acc = (vc * vc - vs * vs) / (2.0 * a);
-    if (2.0 * d_acc > (double)n_steps) {
-        d_acc = 0.5 * (double)n_steps;
-        vc = sqrt(vs * vs + 2.0 * a * d_acc);
+    double d_dec = (vc * vc - ve * ve) / (2.0 * d);
+
+    if (d_acc + d_dec > (double)n_steps) {
+        /* Triangular profile: no cruise phase — solve for peak speed.
+         * v_peak² = vs² + 2·a·d·n / (a + d)  (asymmetric case) */
+        double vpk2 = vs * vs + 2.0 * a * d * (double)n_steps / (a + d);
+        if (vpk2 < vs * vs) vpk2 = vs * vs;
+        vc    = sqrt(vpk2);
+        d_acc = (vc * vc - vs * vs) / (2.0 * a);
+        d_dec = (vc * vc - ve * ve) / (2.0 * d);
+        if (d_acc + d_dec > (double)n_steps) {  /* rounding edge case */
+            d_acc = (double)n_steps * a / (a + d);
+            d_dec = (double)n_steps - d_acc;
+            vc    = sqrt(vs * vs + 2.0 * a * d_acc);
+        }
     }
-    const double d_cruise = (double)n_steps - 2.0 * d_acc;
-    const double t_acc = (vc - vs) / a;
+
+    const double d_cruise = (double)n_steps - d_acc - d_dec;
+    const double t_acc    = (vc - vs) / a;
+    const double t_dec    = (vc - ve) / d;
     const double t_cruise = (d_cruise > 0.0 && vc > 0.0) ? (d_cruise / vc) : 0.0;
 
     m->t_start      = 0.0;
     m->t_accel_end  = t_acc;
     m->t_cruise_end = t_acc + t_cruise;
-    m->t_end        = t_acc + t_cruise + t_acc;
+    m->t_end        = t_acc + t_cruise + t_dec;
     m->v_start      = vs;
     m->v_cruise     = vc;
+    m->v_end        = ve;
     m->accel        = a;
+    m->decel        = d;
     m->start_pos    = 0;
     return 0;
 }
@@ -239,6 +259,12 @@ static int build_move_profile(Move *m, int32_t n_steps,
 #define WINDING_MODE_FREE    0u
 #define WINDING_MODE_WINDING 1u
 static uint8_t g_winding_mode = WINDING_MODE_FREE;
+
+/* ── Per-axis accel/speed configuration (updated by set_accel command) ───── */
+static uint32_t g_lat_max_speed = 4000u;   /* Hz   lateral cruise speed      */
+static uint32_t g_lat_accel     = 10000u;  /* steps/s² lateral acceleration  */
+static uint32_t g_lat_decel     = 10000u;  /* steps/s² lateral deceleration  */
+static uint32_t g_sp_accel      = 30000u; /* steps/s² spindle acceleration  */
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; }
 
@@ -326,26 +352,33 @@ static int send_host_set_limits(uint8_t axis, int32_t limit_min, int32_t limit_m
 }
 
 /* ── Send move_to with ARM-computed exact trapezoid profile ──────────────── */
-static int send_host_move_to(uint8_t axis, int32_t target_pos,
-                              uint32_t start_hz, uint32_t max_hz,
-                              uint32_t accel_steps) {
+static int send_host_move_to(uint8_t axis, int32_t target_pos) {
     if (!g_host_cmd || !g_status) return -1;
 
     int32_t cur_pos = g_status->motor[MOTOR_1].position;
-    int32_t delta = target_pos - cur_pos;
+    int32_t delta   = target_pos - cur_pos;
     int32_t n_steps = (delta < 0) ? -delta : delta;
 
     if (n_steps == 0) return 0;
 
+    /* Derive start speed from current lateral interval_actual. */
+    uint32_t v0_hz = 534u;  /* fallback: min IEP speed ≈ PRU_CLOCK_HZ/(2×SP_IV_MAX) */
+    {
+        uint32_t iv = g_status->motor[MOTOR_1].interval_actual;
+        if (iv > 0u && iv < SP_IV_MAX)
+            v0_hz = PRU_CLOCK_HZ / (2u * iv);
+    }
+
     Move mv;
-    if (build_move_profile(&mv, n_steps, start_hz, max_hz, accel_steps) != 0)
+    if (build_move_profile(&mv, n_steps, v0_hz, g_lat_max_speed,
+                           g_lat_accel, g_lat_decel) != 0)
         return -1;
 
     int nblk = compress_and_write(&mv, n_steps,
                                   g_ramp_segs[MOTOR_1], (int)MAX_RAMP_SEGS);
     if (nblk <= 0) return -1;
 
-    uint32_t cruise_iv = hz_to_interval(max_hz);
+    uint32_t cruise_iv = hz_to_interval(g_lat_max_speed);
     if (cruise_iv < 625u) cruise_iv = 625u;
 
     __sync_synchronize();  /* ARM memory barrier before cmd write */
@@ -377,114 +410,79 @@ static uint32_t hz_to_interval(uint32_t hz) {
 }
 
 /* ── Klipper ramp computation (ARM-side, no PRU involvement) ─────────────── *
- * Handles both accel ramps (start_iv > end_iv, intervals decrease = speed up)
- * and decel ramps (start_iv < end_iv, intervals increase = slow down).       */
+ * Divides the ramp uniformly in VELOCITY space (Δv-uniform): each sub-segment
+ * covers the same Δv = total_Δv / MAX_RAMP_SEGS Hz.
+ *
+ * add=0 is mathematically unavoidable for v > ∛(a × 100 MHz) ≈ 135 RPM with
+ * a=30 000 steps/s².  When add=0, the PRU runs at constant speed for `count`
+ * steps, then PRU0 force-loads the NEXT segment's start_iv at the boundary.
+ * This produces a staircase of 64 small speed steps — each step is:
+ *
+ *   jump_pct = dv / v_current = (total_Δv / 64) / v
+ *
+ * Examples for the test's incremental speed commands:
+ *   32 000→64 000 Hz (300→600 RPM): dv_seg=500 Hz → jump=1.6% at 300 RPM  ✓
+ *   32 000→96 000 Hz (300→900 RPM): dv_seg=1000 Hz → jump=3.1% at 300 RPM ✓
+ *
+ * DO NOT clamp cnt to |gap| to force add=±1: clamping makes the actual
+ * acceleration 9–12× faster than specified (confirmed live: motor stalls).  */
 static void compute_ramp(ramp_seg_t *segs,
                          uint32_t start_iv, uint32_t end_iv,
                          uint32_t accel_s2)
 {
-    int32_t total_delta = (int32_t)end_iv - (int32_t)start_iv;
-    /* accel: total_delta < 0 (intervals shrink), decel: > 0 (intervals grow) */
+    const uint32_t F = PRU_CLOCK_HZ / 2u;   /* 100 MHz */
+    uint32_t i;
 
-    int32_t div_iv = total_delta / (int32_t)MAX_RAMP_SEGS;
-    if (div_iv == 0)
-        div_iv = (total_delta > 0) ? 1 : -1;
+    uint32_t v_s = F / start_iv;   /* Hz at ramp start */
+    uint32_t v_e = F / end_iv;     /* Hz at ramp end   */
 
-    for (uint32_t i = 0u; i < MAX_RAMP_SEGS; i++) {
-        int32_t ivs_s = (int32_t)start_iv + div_iv * (int32_t)i;
-        int32_t ive_s;
-        if (i == MAX_RAMP_SEGS - 1u)
-            ive_s = (int32_t)end_iv;
-        else
-            ive_s = ivs_s + div_iv;
+    int32_t total_dv = (int32_t)v_e - (int32_t)v_s;
+    if (total_dv == 0) {
+        for (i = 0u; i < MAX_RAMP_SEGS; i++) {
+            segs[i].start_iv = start_iv; segs[i].add = 0; segs[i].count = 1u;
+        }
+        return;
+    }
 
-        /* Clamp to valid IEP range */
-        if (ivs_s < 625)    ivs_s = 625;
-        if (ivs_s > 187500) ivs_s = 187500;
-        if (ive_s < 625)    ive_s = 625;
-        if (ive_s > 187500) ive_s = 187500;
+    int32_t dv = total_dv / (int32_t)MAX_RAMP_SEGS;
+    if (dv == 0) dv = (total_dv > 0) ? 1 : -1;
 
-        uint32_t ivs = (uint32_t)ivs_s;
-        uint32_t ive = (uint32_t)ive_s;
+    for (i = 0u; i < MAX_RAMP_SEGS; i++) {
+        /* Velocity bounds for this segment */
+        int32_t vs_i = (int32_t)v_s + dv * (int32_t)i;
+        int32_t ve_i = (i == MAX_RAMP_SEGS - 1u)
+                     ? (int32_t)v_e
+                     : vs_i + dv;
 
-        uint32_t vs = (PRU_CLOCK_HZ / 2u) / ivs;
-        uint32_t ve = (PRU_CLOCK_HZ / 2u) / ive;
+        if (vs_i < 534)    vs_i = 534;
+        if (ve_i < 534)    ve_i = 534;
+        if (vs_i > 160000) vs_i = 160000;
+        if (ve_i > 160000) ve_i = 160000;
 
-        /* |v² - v₀²| / (2a) — absolute value, direction encoded in add sign */
-        uint32_t v_hi = (vs > ve) ? vs : ve;
-        uint32_t v_lo = (vs > ve) ? ve : vs;
-        uint64_t num = (uint64_t)(v_hi + v_lo) * (uint64_t)(v_hi - v_lo);
-        uint32_t cnt = (uint32_t)(num / (2u * (uint64_t)accel_s2));
+        /* IEP intervals — force-loaded at each segment boundary by PRU0 */
+        uint32_t ivs = F / (uint32_t)vs_i;
+        uint32_t ive = F / (uint32_t)ve_i;
+        if (ivs < SP_IV_MIN) ivs = SP_IV_MIN;
+        if (ivs > SP_IV_MAX) ivs = SP_IV_MAX;
+        if (ive < SP_IV_MIN) ive = SP_IV_MIN;
+        if (ive > SP_IV_MAX) ive = SP_IV_MAX;
+
+        /* Kinematic step count: s = (v_hi²-v_lo²)/(2a) */
+        uint32_t v_hi = ((uint32_t)vs_i > (uint32_t)ve_i) ? (uint32_t)vs_i : (uint32_t)ve_i;
+        uint32_t v_lo = ((uint32_t)vs_i > (uint32_t)ve_i) ? (uint32_t)ve_i : (uint32_t)vs_i;
+        uint32_t cnt  = (uint32_t)(((uint64_t)(v_hi + v_lo) * (uint64_t)(v_hi - v_lo))
+                         / (2u * (uint64_t)accel_s2));
         if (cnt < 1u) cnt = 1u;
 
+        /* Per-step delta. When cnt > |gap|, add truncates to 0 — that is
+         * correct: PRU1 holds speed constant for cnt steps, then PRU0
+         * force-loads the next start_iv.  With MAX_RAMP_SEGS=64 the
+         * resulting boundary jump is ≤3% in the normal test range.         */
         int32_t gap = (int32_t)ive - (int32_t)ivs;
-        int32_t add = gap / (int32_t)cnt;
-        if (add == 0 && gap != 0)
-            add = (gap > 0) ? 1 : -1;
-
         segs[i].start_iv = ivs;
         segs[i].count    = cnt;
-        segs[i].add      = add;
+        segs[i].add      = gap / (int32_t)cnt;
     }
-}
-
-/* ── send_host_ramp_to — generic axis ramp command ───────────────────────── */
-static int send_host_ramp_to(uint32_t start_hz, uint32_t target_hz,
-                              uint32_t accel_steps, uint8_t sp_dir)
-{
-    if (!g_host_cmd || !g_ramp_segs[MOTOR_0]) return -1;
-    if (target_hz == 0u) return -1;
-    if (start_hz  == 0u) start_hz = 640u;
-    if (accel_steps < MAX_RAMP_SEGS) accel_steps = MAX_RAMP_SEGS;
-
-    uint32_t start_iv  = hz_to_interval(start_hz);
-    uint32_t cruise_iv = hz_to_interval(target_hz);
-    if (start_iv == cruise_iv) {
-        g_last_sp_iv          = cruise_iv;
-        g_last_ramp_target_hz = target_hz;
-        return send_host_cmd(HOST_CMD_SET_SPEED, AXIS_SPINDLE,
-                             cruise_iv, 0u, sp_dir, 0u, 0u);
-    }
-
-    /* Acceleration magnitude = |v²_high - v²_low| / (2 × accel_steps) */
-    double v_hi = (double)(start_hz > target_hz ? start_hz : target_hz);
-    double v_lo = (double)(start_hz > target_hz ? target_hz : start_hz);
-    double a = (v_hi * v_hi - v_lo * v_lo) / (2.0 * (double)accel_steps);
-    if (a < 1.0) a = 1.0;
-    uint32_t accel_s2 = (uint32_t)a;
-    if (accel_s2 < 1u) accel_s2 = 1u;
-
-    ramp_seg_t local_segs[MAX_RAMP_SEGS];
-    compute_ramp(local_segs, start_iv, cruise_iv, accel_s2);
-
-    for (uint32_t i = 0u; i < MAX_RAMP_SEGS; i++) {
-        g_ramp_segs[MOTOR_0][i].start_iv = local_segs[i].start_iv;
-        g_ramp_segs[MOTOR_0][i].add      = local_segs[i].add;
-        g_ramp_segs[MOTOR_0][i].count    = local_segs[i].count;
-    }
-    __sync_synchronize();
-
-    for (int i = 0; i < 5000; i++) {
-        if (g_host_cmd->cmd == HOST_CMD_NOP) break;
-        usleep(10);
-    }
-    if (g_host_cmd->cmd != HOST_CMD_NOP) return -1;
-
-    g_host_cmd->axis                       = AXIS_SPINDLE;
-    g_host_cmd->motor[MOTOR_0].dir         = sp_dir;
-    g_host_cmd->motor[MOTOR_0].interval_target = cruise_iv;
-    g_host_cmd->seg_count                  = (uint8_t)MAX_RAMP_SEGS;
-    g_host_cmd->cruise_iv                  = cruise_iv;
-    g_host_cmd->cmd_ack                    = HOST_CMD_NOP;
-    g_host_cmd->cmd                        = HOST_CMD_RAMP_TO;
-
-    g_last_sp_iv          = cruise_iv;
-    g_last_ramp_target_hz = target_hz;
-
-    fprintf(stderr,
-        "[daemon] ramp_to: %u→%u Hz (%u→%u iv) accel=%u steps/s² dir=%u\n",
-        start_hz, target_hz, start_iv, cruise_iv, accel_s2, sp_dir);
-    return 0;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -557,6 +555,12 @@ static void handle_command(int client_fd, const char *line_in) {
 
     if (HAS("\"cmd\":\"e_stop\"") || HAS("\"cmd\": \"e_stop\"")) {
         int rc = send_host_cmd(HOST_CMD_ESTOP, AXIS_ALL, 0,0,0,0, 0);
+        if (rc == 0) {
+            /* Motor is now stopped: reset last-commanded interval so the next
+             * set_speed builds a ramp from standstill, not from the previous
+             * target speed (which would skip the acceleration phase).        */
+            g_last_sp_iv = 0u;
+        }
         snprintf(resp, sizeof(resp),
             rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
 
@@ -573,10 +577,75 @@ static void handle_command(int client_fd, const char *line_in) {
 
         uint32_t sp_iv  = hz_to_interval(sp_hz);
         uint32_t lat_iv = hz_to_interval(lat_hz);
+
+        /* Spindle always ramps: compute segments from current → target.
+         * Use g_last_sp_iv (last commanded interval) as start: it tracks the
+         * last target exactly, independent of telem latency (telem is
+         * published every ~2.5 ms and may still show the previous speed).  */
+        int use_ramp = 0;
+        if (sp_iv > 0u && g_ramp_segs[MOTOR_0]) {
+            /* start_iv: last commanded value, or SP_IV_MAX if stopped */
+            uint32_t start_iv = (g_last_sp_iv > 0u && g_last_sp_iv < SP_IV_MAX)
+                                ? g_last_sp_iv : SP_IV_MAX;
+            if (start_iv != sp_iv) {
+                ramp_seg_t local_segs[MAX_RAMP_SEGS];
+                compute_ramp(local_segs, start_iv, sp_iv, g_sp_accel);
+                for (uint32_t i = 0u; i < MAX_RAMP_SEGS; i++)
+                    g_ramp_segs[MOTOR_0][i] = local_segs[i];
+                __sync_synchronize();
+                use_ramp = 1;
+
+                /* Diagnostic: dump computed segments to stderr */
+                fprintf(stderr,
+                    "[daemon] ramp %u→%u Hz  start_iv=%u  end_iv=%u  accel=%u\n",
+                    (PRU_CLOCK_HZ / 2u) / start_iv,
+                    sp_hz, start_iv, sp_iv, g_sp_accel);
+                for (uint32_t i = 0u; i < MAX_RAMP_SEGS; i++) {
+                    fprintf(stderr,
+                        "  seg[%2u] start_iv=%6u  add=%5d  count=%6u\n",
+                        i, local_segs[i].start_iv,
+                        local_segs[i].add, local_segs[i].count);
+                }
+            }
+        }
+
         g_last_sp_iv = sp_iv;
 
-        int rc = send_host_cmd(HOST_CMD_SET_SPEED, AXIS_ALL,
-                               sp_iv, lat_iv, sp_dir, lat_dir, 0);
+        /* Wait for PRU0 to be ready. */
+        for (int i = 0; i < 5000; i++) {
+            if (g_host_cmd->cmd == HOST_CMD_NOP) break;
+            usleep(10);
+        }
+        int rc;
+        if (g_host_cmd->cmd != HOST_CMD_NOP) {
+            rc = -1;
+        } else if (use_ramp) {
+            g_host_cmd->axis                           = AXIS_SPINDLE;
+            g_host_cmd->motor[MOTOR_0].dir             = sp_dir;
+            g_host_cmd->motor[MOTOR_0].interval_target = sp_iv;
+            g_host_cmd->motor[MOTOR_1].dir             = lat_dir;
+            g_host_cmd->motor[MOTOR_1].interval_target = lat_iv;
+            g_host_cmd->seg_count                      = (uint8_t)MAX_RAMP_SEGS;
+            g_host_cmd->cruise_iv                      = sp_iv;
+            g_host_cmd->cmd_ack                        = HOST_CMD_NOP;
+            g_host_cmd->cmd                            = HOST_CMD_SET_SPEED;
+            g_last_ramp_target_hz = sp_hz;
+            rc = 0;
+            fprintf(stderr, "[daemon] set_speed: ramp to %u Hz (iv=%u) dir=%u\n",
+                    sp_hz, sp_iv, sp_dir);
+        } else {
+            /* Already at target speed or stopped — direct write. */
+            g_host_cmd->axis                           = AXIS_ALL;
+            g_host_cmd->motor[MOTOR_0].dir             = sp_dir;
+            g_host_cmd->motor[MOTOR_0].interval_target = sp_iv;
+            g_host_cmd->motor[MOTOR_1].dir             = lat_dir;
+            g_host_cmd->motor[MOTOR_1].interval_target = lat_iv;
+            g_host_cmd->seg_count                      = 0u;
+            g_host_cmd->cruise_iv                      = sp_iv;
+            g_host_cmd->cmd_ack                        = HOST_CMD_NOP;
+            g_host_cmd->cmd                            = HOST_CMD_SET_SPEED;
+            rc = 0;
+        }
         snprintf(resp, sizeof(resp),
             rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
 
@@ -611,19 +680,10 @@ static void handle_command(int client_fd, const char *line_in) {
     } else if (HAS("\"cmd\":\"move_to\"")) {
         uint8_t  axis       = HAS("\"axis\":1") ? AXIS_LATERAL : AXIS_SPINDLE;
         int32_t  target_pos = 0;
-        uint32_t start_hz   = 200u;
-        uint32_t max_hz     = 4000u;
-        uint32_t accel_steps = 300u;
         const char *p;
         p = strstr(line, "\"pos\":");
         if (p) target_pos = (int32_t)strtol(p + 6, NULL, 10);
-        p = strstr(line, "\"start_hz\":");
-        if (p) start_hz = (uint32_t)strtoul(p + 11, NULL, 10);
-        p = strstr(line, "\"max_hz\":");
-        if (p) max_hz = (uint32_t)strtoul(p + 9, NULL, 10);
-        p = strstr(line, "\"accel_steps\":");
-        if (p) accel_steps = (uint32_t)strtoul(p + 14, NULL, 10);
-        int rc = send_host_move_to(axis, target_pos, start_hz, max_hz, accel_steps);
+        int rc = send_host_move_to(axis, target_pos);
         snprintf(resp, sizeof(resp),
             rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
 
@@ -637,29 +697,24 @@ static void handle_command(int client_fd, const char *line_in) {
         }
         snprintf(resp, sizeof(resp), "{\"ok\":true}\n");
 
-    } else if (HAS("\"cmd\":\"ramp_to\"")) {
-        uint32_t sp_hz      = 0u;
-        uint32_t start_hz   = 640u;
-        uint32_t accel_steps = 500u;
-        uint8_t  sp_dir     = 0u;
+    } else if (HAS("\"cmd\":\"set_accel\"")) {
         const char *p;
-        p = strstr(line, "\"sp_hz\":");
-        if (p) sp_hz = (uint32_t)strtoul(p + 8, NULL, 10);
-        p = strstr(line, "\"start_hz\":");
-        if (p) start_hz = (uint32_t)strtoul(p + 11, NULL, 10);
-        p = strstr(line, "\"accel_steps\":");
-        if (p) accel_steps = (uint32_t)strtoul(p + 14, NULL, 10);
-        if (HAS("\"sp_dir\":1")) sp_dir = 1u;
-
-        if (sp_hz == 0u) {
-            snprintf(resp, sizeof(resp),
-                "{\"ok\":false,\"error\":\"sp_hz required\"}\n");
-        } else {
-            int rc = send_host_ramp_to(start_hz, sp_hz, accel_steps, sp_dir);
-            snprintf(resp, sizeof(resp),
-                rc == 0 ? "{\"ok\":true}\n"
-                        : "{\"ok\":false,\"error\":\"busy or invalid params\"}\n");
-        }
+        p = strstr(line, "\"lat_max_speed\":");
+        if (p) g_lat_max_speed = (uint32_t)strtoul(p + 16, NULL, 10);
+        p = strstr(line, "\"lat_accel\":");
+        if (p) g_lat_accel = (uint32_t)strtoul(p + 12, NULL, 10);
+        p = strstr(line, "\"lat_decel\":");
+        if (p) g_lat_decel = (uint32_t)strtoul(p + 12, NULL, 10);
+        p = strstr(line, "\"sp_accel\":");
+        if (p) g_sp_accel = (uint32_t)strtoul(p + 11, NULL, 10);
+        if (g_lat_max_speed < 534u) g_lat_max_speed = 534u;
+        if (g_lat_accel < 1u)       g_lat_accel = 1u;
+        if (g_lat_decel < 1u)       g_lat_decel = 1u;
+        if (g_sp_accel  < 1u)       g_sp_accel  = 1u;
+        fprintf(stderr,
+            "[daemon] set_accel: lat_max=%u lat_a=%u lat_d=%u sp_a=%u\n",
+            g_lat_max_speed, g_lat_accel, g_lat_decel, g_sp_accel);
+        snprintf(resp, sizeof(resp), "{\"ok\":true}\n");
 
     } else if (HAS("\"cmd\":\"ack_event\"")) {
         int rc = send_host_cmd(HOST_CMD_ACK_EVENT, 0, 0,0,0,0, 0);
@@ -777,9 +832,9 @@ int main(int argc, char **argv) {
                         (int)g_status->motor[MOTOR_1].position);
                     broadcast(buf);
                     break;
-                case EVENT_RAMP_COMPLETE:
+                case EVENT_SPEED_REACHED:
                     snprintf(buf, sizeof(buf),
-                        "{\"event\":\"ramp_complete\",\"sp_hz\":%u}\n",
+                        "{\"event\":\"speed_reached\",\"sp_hz\":%u}\n",
                         g_last_ramp_target_hz);
                     broadcast(buf);
                     break;

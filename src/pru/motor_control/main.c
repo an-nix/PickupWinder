@@ -14,7 +14,7 @@
  * PRU1 knows NOTHING about:
  *   - Segment arrays (ramp_seg_t[]) — those are managed by PRU0
  *   - Host commands, homing, coordination — all PRU0's job
- *   - Which operation is in progress (ramp_to vs move_to)
+ *   - Which operation is in progress (set_speed ramp vs move_to)
  *
  * PRU1 owns and initialises the IEP timer.  PRU0 reads IEP but never resets.
  *
@@ -59,12 +59,24 @@ static volatile motor_telem_t *telem =
 static pulse_gen_t spindle = {0};
 static pulse_gen_t lateral = {0};
 
+/* ── Ramp segment arrays (shared RAM, written by ARM daemon) ─────────────── */
+static volatile ramp_seg_t *g_ramp_segs[2];
+
 /* ── Per-axis ramp tracking ──────────────────────────────────────────────── *
- * g_ramping[ax]: 1 while a ramp segment is executing on axis ax.
- * When accel_count reaches 0, PRU1 writes the final interval back to params
- * (to prevent speed jump when pulse_update reads with accel_count==0) and
- * sets seg_done=1 in telem.  PRU0 detects this and loads the next segment.  */
-static uint8_t g_ramping[2] = {0, 0};
+ * PRU1 now self-advances through ramp segments without any PRU0 handshake.
+ *
+ * When ramp_arm > 0 (written by PRU0), PRU1 arms seg[0] from motor_ctl_t
+ * and stores the total segment count.  When each segment completes
+ * (accel_count==0), PRU1 immediately loads the next segment from g_ramp_segs
+ * without waiting for PRU0.  Only after ALL segments complete does PRU1
+ * write the final interval back to params and set seg_done=1 so PRU0 fires
+ * the EVENT_SPEED_REACHED / EVENT_MOVE_COMPLETE event.
+ *
+ * This eliminates the race-prone per-segment ramp_arm/seg_done handshake
+ * that previously caused alternating stalls under certain timing conditions.*/
+static uint8_t g_ramping[2]   = {0, 0};
+static uint8_t g_seg_idx[2]   = {0, 0};
+static uint8_t g_seg_total[2] = {0, 0};
 
 /* ── Apply direction GPIO ────────────────────────────────────────────────── */
 static inline void apply_dir_sp(uint8_t dir) {
@@ -124,6 +136,12 @@ int main(void) {
     /* Zero shared memory area owned by PRU1. */
     *telem = (motor_telem_t){0};
 
+    /* Segment arrays in shared RAM (written by ARM daemon via mmap). */
+    g_ramp_segs[MOTOR_0] =
+        (volatile ramp_seg_t *)(PRU_SRAM_PHYS_BASE + IPC_RAMP_SEGS_0_OFFSET);
+    g_ramp_segs[MOTOR_1] =
+        (volatile ramp_seg_t *)(PRU_SRAM_PHYS_BASE + IPC_RAMP_SEGS_1_OFFSET);
+
     uint32_t loop_cnt = 0u;
 
     while (1) {
@@ -136,22 +154,27 @@ int main(void) {
          * new ramp segments — it never reads the segment arrays directly.   */
 
         if (params->motor[MOTOR_0].ramp_arm) {
+            /* ramp_arm holds total segment count written by PRU0. */
+            g_seg_total[MOTOR_0] = params->motor[MOTOR_0].ramp_arm;
+            g_seg_idx[MOTOR_0]   = 0u;
             pulse_set_ramp(&spindle,
                            params->motor[MOTOR_0].interval,
                            params->motor[MOTOR_0].ramp_add,
                            params->motor[MOTOR_0].ramp_count);
             params->motor[MOTOR_0].ramp_arm = 0u;
-            telem->motor[MOTOR_0].seg_done = 0u;
+            telem->motor[MOTOR_0].seg_done  = 0u;
             g_ramping[MOTOR_0] = 1u;
         }
 
         if (params->motor[MOTOR_1].ramp_arm) {
+            g_seg_total[MOTOR_1] = params->motor[MOTOR_1].ramp_arm;
+            g_seg_idx[MOTOR_1]   = 0u;
             pulse_set_ramp(&lateral,
                            params->motor[MOTOR_1].interval,
                            params->motor[MOTOR_1].ramp_add,
                            params->motor[MOTOR_1].ramp_count);
             params->motor[MOTOR_1].ramp_arm = 0u;
-            telem->motor[MOTOR_1].seg_done = 0u;
+            telem->motor[MOTOR_1].seg_done  = 0u;
             g_ramping[MOTOR_1] = 1u;
         }
 
@@ -176,14 +199,26 @@ int main(void) {
         if (sp_pin) __R30 |= SP_STEP_BIT; else __R30 &= ~SP_STEP_BIT;
 
         /* ── 4b. Spindle ramp segment completion ────────────────────────── *
-         * When accel_count reaches 0, the segment is done.  Write final
-         * interval back to params so pulse_update doesn't jump back to
-         * start_iv (pulse_update reads params when accel_count==0).
-         * Then set seg_done=1 so PRU0 knows to load the next segment.      */
+         * When accel_count reaches 0, the current segment is done.
+         * If more segments remain, load the next one directly from shared RAM
+         * — no PRU0 involvement, no race window between segments.
+         * Only when ALL segments complete: write final interval and signal
+         * PRU0 via seg_done=1 to fire EVENT_SPEED_REACHED.                 */
         if (g_ramping[MOTOR_0] && spindle.accel_count == 0u) {
-            params->motor[MOTOR_0].interval = spindle.interval;
-            telem->motor[MOTOR_0].seg_done = 1u;
-            g_ramping[MOTOR_0] = 0u;
+            g_seg_idx[MOTOR_0]++;
+            if (g_seg_idx[MOTOR_0] < g_seg_total[MOTOR_0]) {
+                /* Load next segment directly from shared RAM. */
+                volatile ramp_seg_t *s = &g_ramp_segs[MOTOR_0][g_seg_idx[MOTOR_0]];
+                pulse_set_ramp(&spindle, s->start_iv, s->add, s->count);
+                /* g_ramping stays 1; do NOT write params->interval here
+                 * (pulse_set_ramp already sets spindle.interval = s->start_iv,
+                 *  so pulse_update with accel_count>0 won't force-load it)  */
+            } else {
+                /* All segments done — signal PRU0 to fire completion event. */
+                params->motor[MOTOR_0].interval = spindle.interval;
+                telem->motor[MOTOR_0].seg_done  = 1u;
+                g_ramping[MOTOR_0] = 0u;
+            }
         }
 
         /* ── 5. Lateral pulse generation ────────────────────────────────── */
@@ -192,9 +227,15 @@ int main(void) {
 
         /* ── 5b. Lateral ramp segment completion ────────────────────────── */
         if (g_ramping[MOTOR_1] && lateral.accel_count == 0u) {
-            params->motor[MOTOR_1].interval = lateral.interval;
-            telem->motor[MOTOR_1].seg_done = 1u;
-            g_ramping[MOTOR_1] = 0u;
+            g_seg_idx[MOTOR_1]++;
+            if (g_seg_idx[MOTOR_1] < g_seg_total[MOTOR_1]) {
+                volatile ramp_seg_t *s = &g_ramp_segs[MOTOR_1][g_seg_idx[MOTOR_1]];
+                pulse_set_ramp(&lateral, s->start_iv, s->add, s->count);
+            } else {
+                params->motor[MOTOR_1].interval = lateral.interval;
+                telem->motor[MOTOR_1].seg_done  = 1u;
+                g_ramping[MOTOR_1] = 0u;
+            }
         }
 
         /* ── 6. Publish telemetry (throttled) ───────────────────────────── */

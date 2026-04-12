@@ -25,8 +25,9 @@
  *
  * Ramp architecture (generic, works for ANY axis):
  *   The ARM (daemon) pre-computes ramp segments as ramp_seg_t[MAX_RAMP_SEGS]
- *   in shared RAM, one array per axis.  The daemon sends HOST_CMD_RAMP_TO or
- *   HOST_CMD_MOVE_TO.  PRU0 (orchestrator) manages segment sequencing:
+ *   in shared RAM, one array per axis.  The daemon sends HOST_CMD_SET_SPEED
+ *   (with seg_count>0) or HOST_CMD_MOVE_TO.  PRU0 (orchestrator) manages
+ *   segment sequencing:
  *     1. Loads segment N into motor_ctl_t.{interval, ramp_add, ramp_count}
  *        and sets ramp_arm=1.
  *     2. PRU1 detects ramp_arm=1, calls pulse_set_ramp(), clears ramp_arm=0.
@@ -48,9 +49,9 @@
  *   0x0040  motor_params_t      32 B   PRU0 → PRU1
  *   0x0060  motor_telem_t       64 B   PRU1 → PRU0 (+ Host reads)
  *   0x00A0  pru_status_t        64 B   PRU0 → Host
- *   0x00E0  ramp_seg_t[16]     192 B   Axis 0 (spindle) ramp segments
- *   0x01A0  ramp_seg_t[16]     192 B   Axis 1 (lateral) ramp/move segments
- *   Total used: 608 bytes  (well within 12 KB)
+ *   0x00E0  ramp_seg_t[64]     768 B   Axis 0 (spindle) ramp segments
+ *   0x03E0  ramp_seg_t[64]     768 B   Axis 1 (lateral) ramp/move segments
+ *   Total used: 1760 bytes  (well within 12 KB)
  *
  * Rules:
  *   - C-compatible only (no C++). Included from PRU C and Linux C.
@@ -80,8 +81,8 @@
 #define IPC_MOTOR_PARAMS_OFFSET   0x0040u
 #define IPC_MOTOR_TELEM_OFFSET    0x0060u
 #define IPC_PRU_STATUS_OFFSET     0x00A0u
-#define IPC_RAMP_SEGS_0_OFFSET    0x00E0u   /* 192 B  ramp_seg_t[16] axis 0 */
-#define IPC_RAMP_SEGS_1_OFFSET    0x01A0u   /* 192 B  ramp_seg_t[16] axis 1 */
+#define IPC_RAMP_SEGS_0_OFFSET    0x00E0u   /* 768 B  ramp_seg_t[64] axis 0 */
+#define IPC_RAMP_SEGS_1_OFFSET    0x03E0u   /* 768 B  ramp_seg_t[64] axis 1 */
 
 /* ── Motor index convention ──────────────────────────────────────────────── */
 #define MOTOR_0   0u   /* spindle (Motor B, even P8 pins) */
@@ -92,15 +93,19 @@
 #define AXIS_LATERAL   1u
 #define AXIS_ALL       0xFFu
 
-/* ── Ramp segments per axis ──────────────────────────────────────────────── */
-#define MAX_RAMP_SEGS  16u
+/* ── Ramp segments per axis ──────────────────────────────────────────────── *
+ * 64 segments gives ≤3.1% boundary jump at 300 RPM, ≤1.6% at 600 RPM.     *
+ * With slow acceleration (30 000 steps/s²), add=0 is unavoidable above     *
+ * ~135 RPM (add≠0 requires a ≥ v³/100 MHz).  64 small force-load steps     *
+ * produce a smooth macroscopic ramp the motor can follow.                  */
+#define MAX_RAMP_SEGS  64u
 
 /* ── Host command opcodes (host_cmd_t.cmd) ───────────────────────────────── *
  * Host writes a command; PRU0 reads and acknowledges by echoing opcode
  * into cmd_ack, then setting cmd=NOP.
  * Host must poll cmd_ack or wait for cmd==NOP before writing next command.  */
 #define HOST_CMD_NOP           0u   /* idle / no pending command             */
-#define HOST_CMD_SET_SPEED     1u   /* set target speed via motor[].interval */
+#define HOST_CMD_SET_SPEED     1u   /* set target speed (ramp if segs loaded)*/
 #define HOST_CMD_ENABLE        2u   /* enable/disable drivers (value_a=1/0)  */
 #define HOST_CMD_ESTOP         3u   /* emergency stop: immediate all-halt    */
 #define HOST_CMD_HOME_START    4u   /* start homing sequence (lateral)       */
@@ -108,7 +113,7 @@
 #define HOST_CMD_RESET_POS     6u   /* reset step counters + position        */
 #define HOST_CMD_SET_LIMITS    7u   /* set axis software limits (min,max)    */
 #define HOST_CMD_MOVE_TO       8u   /* move axis to target position          */
-#define HOST_CMD_RAMP_TO       9u   /* ramp axis to target speed             */
+/* opcode 9 reserved (was RAMP_TO — removed, folded into SET_SPEED)         */
 
 /* ── PRU state flags (pru_status_t.pru1_state) ───────────────────────────── */
 #define PRU1_STATE_IDLE        (1u << 0)
@@ -137,7 +142,7 @@
 #define EVENT_FAULT           3u     /* motor fault detected                 */
 #define EVENT_LIMIT_HIT       4u     /* software limit hit                   */
 #define EVENT_MOVE_COMPLETE   5u     /* move_to profile completed            */
-#define EVENT_RAMP_COMPLETE   6u     /* ramp_to completed                    */
+#define EVENT_SPEED_REACHED   6u     /* set_speed ramp completed             */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Structures — motor abstraction
@@ -205,14 +210,14 @@ typedef struct __attribute__((packed, aligned(4))) {
     uint8_t     cmd;                 /* HOST_CMD_* opcode                    */
     uint8_t     axis;                /* AXIS_SPINDLE / LATERAL / ALL         */
     uint8_t     cmd_ack;             /* PRU0 echoes cmd opcode here on done  */
-    uint8_t     seg_count;           /* RAMP_TO/MOVE_TO: # valid ramp_seg_t  */
+    uint8_t     seg_count;           /* SET_SPEED/MOVE_TO: # valid ramp_seg_t  */
     motor_cmd_t motor[2];            /* per-motor target speed + direction   */
     uint32_t    value_a;             /* general purpose (e.g. enable=1/0)    */
     uint32_t    value_b;             /* general purpose                      */
     int32_t     limit_min;           /* SET_LIMITS: signed limit min (steps) */
     int32_t     limit_max;           /* SET_LIMITS: signed limit max (steps) */
     int32_t     move_target;         /* MOVE_TO: target position (steps)     */
-    uint32_t    cruise_iv;           /* RAMP_TO/MOVE_TO: cruise IEP interval */
+    uint32_t    cruise_iv;           /* SET_SPEED/MOVE_TO: cruise IEP interval  */
     uint32_t    move_sp_lat_coord;   /* MOVE_TO: Q6 spindle coord ratio      */
     uint32_t    _reserved[4];        /* pad to 64 bytes                      */
 } host_cmd_t;                        /* 64 bytes */
@@ -254,7 +259,7 @@ typedef struct __attribute__((packed, aligned(4))) {
 
 /* ── Ramp segment (ARM planner → PRU shared RAM → PRU0 → PRU1) ──────────── *
  *
- * Universal ramp segment used for BOTH ramp_to (speed change) and move_to
+ * Universal ramp segment used for BOTH set_speed (speed change) and move_to
  * (position change).  Replaces the former sp_ramp_seg_t and step_block_t.
  *
  * The ARM fills ramp_seg_t[MAX_RAMP_SEGS] in shared RAM per axis.
@@ -275,7 +280,7 @@ typedef struct __attribute__((packed, aligned(4))) {
     uint32_t start_iv;   /* IEP interval at segment start (force-loaded)     */
     int32_t  add;        /* signed interval delta per step (0 = cruise)      */
     uint32_t count;      /* number of steps in this segment (0 = skip)       */
-} ramp_seg_t;                        /* 12 bytes × 16 = 192 bytes per axis */
+} ramp_seg_t;                        /* 12 bytes × 64 = 768 bytes per axis */
 
 /* ── Compile-time size checks ────────────────────────────────────────────── */
 #ifdef __STDC_VERSION__
@@ -288,8 +293,8 @@ _Static_assert(sizeof(motor_params_t) == 32, "motor_params_t size");
 _Static_assert(sizeof(motor_telem_t)  == 64, "motor_telem_t size");
 _Static_assert(sizeof(pru_status_t)   == 64, "pru_status_t size");
 _Static_assert(sizeof(ramp_seg_t)     == 12, "ramp_seg_t size");
-_Static_assert(MAX_RAMP_SEGS * sizeof(ramp_seg_t) == 192u,
-               "ramp_seg_t[16] size");
+_Static_assert(MAX_RAMP_SEGS * sizeof(ramp_seg_t) == 768u,
+               "ramp_seg_t[64] size");
 #  endif
 #endif
 

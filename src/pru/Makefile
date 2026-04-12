@@ -36,11 +36,16 @@ PRU_INCLUDES += -I$(PRU_SWPKG)/include -I$(PRU_SWPKG)/include/am335x
 endif
 
 # ── Compiler flags ──────────────────────────────────────────────────────────
+# AM335x PRU has 8 KB IRAM and 8 KB DRAM.  The default pru-elf linker script
+# assumes 256 KB for both → stack placed at 0x40000 (unmapped!).  Override
+# via --defsym so the stack lands inside actual DRAM (top of 0x2000 = 8 KB).
 PRU_CFLAGS = -O1 -Wall -Wextra \
              -Wno-volatile-register-var \
              $(PRU_INCLUDES) \
              -DPRU_FIRMWARE \
-             -DPRU_SRAM_PHYS_BASE=0x00010000u
+             -DPRU_SRAM_PHYS_BASE=0x00010000u \
+             -Wl,--defsym,__DMEM_SIZE=0x2000 \
+             -Wl,--defsym,__IMEM_SIZE=0x2000
 
 # ── Outputs ─────────────────────────────────────────────────────────────────
 OUT_DIR   ?= build

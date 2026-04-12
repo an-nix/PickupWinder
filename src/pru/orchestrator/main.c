@@ -6,19 +6,18 @@
  * PRU0 is the brain.  It is the only PRU that communicates with the host
  * (daemon).  Responsibilities:
  *   1. Poll host_cmd_t for new commands from the daemon.
- *   2. Manage ramp segments for BOTH axes (ramp_to + move_to).
+ *   2. Manage ramp segments for BOTH axes (set_speed with ramp + move_to).
  *   3. Homing state machine (lateral endstop approach).
  *   4. Software limits check (lateral position bounds).
  *   5. Spindle-lateral speed coordination (Q6 ratio).
  *   6. Publish pru_status_t for daemon to broadcast.
  *
- * Ramp segment management (generic, per-axis):
- *   The ARM fills ramp_seg_t[MAX_RAMP_SEGS] in shared RAM (one array per
- *   axis) and sends HOST_CMD_RAMP_TO or HOST_CMD_MOVE_TO.  PRU0 loads
- *   segments one-by-one into motor_ctl_t via ramp_arm handshake.  PRU1
- *   executes each segment, then sets seg_done=1.  PRU0 detects this and
- *   loads the next segment.  After the last segment, PRU0 raises the
- *   appropriate event (RAMP_COMPLETE or MOVE_COMPLETE).
+ * Ramp model (unified for set_speed and move_to):
+ *   The daemon always pre-computes ramp_seg_t[MAX_RAMP_SEGS] in shared RAM
+ *   and sets seg_count in the command.  If seg_count==0 the interval is
+ *   applied immediately (e.g. estop, already-at-speed).  If seg_count>0
+ *   PRU0 feeds segments to PRU1 one-by-one via the ramp_arm handshake.
+ *   There is NO separate RAMP_TO opcode — ramping IS set_speed.
  *
  * Rules:
  *   - PRU0 must NEVER call IEP_INIT() — PRU1 owns the IEP.
@@ -50,8 +49,14 @@ static volatile pru_status_t   *status =
 static volatile ramp_seg_t     *g_ramp_segs[2];
 
 /* ── Cadence ─────────────────────────────────────────────────────────────── */
-#define CMD_CHECK_STRIDE    1000u      /* check host cmd every ~1000 loops   */
-#define STATUS_STRIDE       500000u    /* publish status every ~2.5 ms       */
+/* Power-of-2 strides → compiler uses bitwise AND instead of software
+ * division (__pruabi_remu).  PRU has no hardware divider; the modulo
+ * operator on non-power-of-2 values costs hundreds of cycles per call.
+ *
+ *   CMD_CHECK_STRIDE  = 1024  → check host cmd every ~5 µs
+ *   STATUS_STRIDE     = 524288 → publish status every ~2.6 ms           */
+#define CMD_CHECK_STRIDE    1024u
+#define STATUS_STRIDE       524288u
 
 /* ── Endstop inputs (PRU0 R31) ───────────────────────────────────────────── */
 #define ES1_BIT  (1u << 3)   /* R31[3]  P9_28  ENDSTOP_1  (active-HIGH)     */
@@ -68,12 +73,10 @@ static uint8_t  g_limit_locked[2]    = {0, 0};
 
 /* ── Per-axis ramp state ─────────────────────────────────────────────────── */
 #define RAMP_OP_NONE      0u
-#define RAMP_OP_RAMP_TO   1u   /* speed ramp → EVENT_RAMP_COMPLETE          */
+#define RAMP_OP_SET_SPEED 1u   /* speed ramp → EVENT_SPEED_REACHED          */
 #define RAMP_OP_MOVE_TO   2u   /* position move → EVENT_MOVE_COMPLETE       */
 
 static uint8_t  g_ramp_active[2]    = {0, 0};
-static uint8_t  g_ramp_seg_idx[2]   = {0, 0};
-static uint8_t  g_ramp_seg_count[2] = {0, 0};
 static uint8_t  g_ramp_op[2]        = {RAMP_OP_NONE, RAMP_OP_NONE};
 static uint32_t g_ramp_cruise_iv[2] = {0, 0};
 
@@ -115,13 +118,19 @@ static void cancel_ramp(uint8_t ax) {
     params->motor[ax].ramp_count  = 0u;
 }
 
-/* ── Helper: load one ramp segment into motor_ctl_t ──────────────────────── */
-static void load_ramp_seg(uint8_t ax, uint8_t seg_idx) {
-    volatile ramp_seg_t *seg = &g_ramp_segs[ax][seg_idx];
-    params->motor[ax].interval   = seg->start_iv;
-    params->motor[ax].ramp_add   = seg->add;
-    params->motor[ax].ramp_count = seg->count;
-    params->motor[ax].ramp_arm   = 1u;   /* trigger PRU1 */
+/* ── Helper: arm ramp on an axis ───────────────────────────────────────────── *
+ * Writes seg[0] fields (interval, add, count) from shared RAM into
+ * motor_ctl_t, then sets ramp_arm = n_segs (total segment count).
+ *
+ * PRU1 reads ramp_arm as the total count and self-advances through all
+ * segments by reading g_ramp_segs directly.  PRU0 is not involved in any
+ * per-segment handshake — it only waits for the final seg_done=1.          */
+static void arm_ramp(uint8_t ax, uint8_t n_segs) {
+    volatile ramp_seg_t *seg0 = &g_ramp_segs[ax][0];
+    params->motor[ax].interval   = seg0->start_iv;
+    params->motor[ax].ramp_add   = seg0->add;
+    params->motor[ax].ramp_count = seg0->count;
+    params->motor[ax].ramp_arm   = n_segs;   /* triggers PRU1; value = total segs */
 }
 
 /* ── Endstop tick: read R31, safety-stop lateral on assertion ───────────── */
@@ -198,34 +207,75 @@ static void process_host_cmd(void) {
     switch (cmd) {
 
     case HOST_CMD_SET_SPEED: {
-        uint32_t sp_iv  = host_cmd->motor[MOTOR_0].interval_target;
-        uint8_t  sp_dir = host_cmd->motor[MOTOR_0].dir;
+        uint8_t  ax     = host_cmd->axis;   /* AXIS_SPINDLE, AXIS_ALL, etc. */
+        uint8_t  n_segs = host_cmd->seg_count;
 
-        /* Track requested spindle speed; disable coordination. */
-        g_sp_requested_iv = sp_iv;
+        /* Speed command always disables spindle-lateral coordination. */
         g_sp_lat_coord    = 0u;
 
-        /* Cancel any active spindle ramp (set_speed takes direct control). */
-        cancel_ramp(MOTOR_0);
+        /* ── Spindle axis ─────────────────────────────────────────── */
+        if (ax == AXIS_SPINDLE || ax == AXIS_ALL) {
+            uint32_t sp_iv  = host_cmd->motor[MOTOR_0].interval_target;
+            uint8_t  sp_dir = host_cmd->motor[MOTOR_0].dir;
 
-        params->motor[MOTOR_0].interval = sp_iv;
-        params->motor[MOTOR_0].dir      = sp_dir;
-        if (sp_iv > 0u && params->motor[MOTOR_0].enable)
-            params->motor[MOTOR_0].run = 1u;
-        if (sp_iv == 0u)
-            params->motor[MOTOR_0].run = 0u;
+            g_sp_requested_iv = sp_iv;
+            cancel_ramp(MOTOR_0);
+            params->motor[MOTOR_0].dir = sp_dir;
 
-        /* Update lateral only when no move_to is active. */
-        if (!g_lat_in_move) {
+            if (n_segs > 0u) {
+                /* Ramp: segments pre-loaded in shared RAM by daemon.
+                 * If the motor is already running, snap the first segment's
+                 * start_iv to the actual current interval so there is no
+                 * speed jump when cancel_ramp + arm_ramp happens.
+                 *
+                 * We only patch start_iv and set add=0 (coast at cur_iv for
+                 * seg[0].count steps).  The next segment boundary force-loads
+                 * seg[1].start_iv.  This avoids a division on the PRU (no
+                 * hardware divider — calling __pruabi_divi corrupted the
+                 * return address via the unmapped stack before the linker
+                 * memory fix).                                               */
+                uint32_t cur_iv = params->motor[MOTOR_0].interval;
+                if (cur_iv >= SP_IV_MIN && cur_iv <= SP_IV_MAX
+                    && params->motor[MOTOR_0].run) {
+                    volatile ramp_seg_t *seg0 = &g_ramp_segs[MOTOR_0][0];
+                    seg0->start_iv = cur_iv;
+                    seg0->add      = 0;
+                }
+                params->motor[MOTOR_0].enable = 1u;
+                params->motor[MOTOR_0].run    = 1u;
+                g_ramp_cruise_iv[MOTOR_0] = host_cmd->cruise_iv;
+                g_ramp_op[MOTOR_0]        = RAMP_OP_SET_SPEED;
+                g_ramp_active[MOTOR_0]    = 1u;
+                telem->motor[MOTOR_0].seg_done = 0u;
+                arm_ramp(MOTOR_0, n_segs);
+            } else {
+                /* Direct speed change (already at target, or stopped).
+                 * Always re-enable: the daemon may send set_speed right after
+                 * an estop, before the enable command is processed by PRU0. */
+                params->motor[MOTOR_0].interval = sp_iv;
+                if (sp_iv > 0u) {
+                    params->motor[MOTOR_0].enable = 1u;
+                    params->motor[MOTOR_0].run    = 1u;
+                } else {
+                    params->motor[MOTOR_0].run = 0u;
+                }
+            }
+        }
+
+        /* ── Lateral axis (only when no move_to is active) ───────── */
+        if ((ax == AXIS_LATERAL || ax == AXIS_ALL) && !g_lat_in_move) {
             uint32_t lat_iv  = host_cmd->motor[MOTOR_1].interval_target;
             uint8_t  lat_dir = host_cmd->motor[MOTOR_1].dir;
             cancel_ramp(MOTOR_1);
             params->motor[MOTOR_1].interval = lat_iv;
             params->motor[MOTOR_1].dir      = lat_dir;
-            if (lat_iv > 0u && params->motor[MOTOR_1].enable)
-                params->motor[MOTOR_1].run = 1u;
-            if (lat_iv == 0u)
+            /* Always re-enable lateral axis on explicit set_speed command. */
+            if (lat_iv > 0u) {
+                params->motor[MOTOR_1].enable = 1u;
+                params->motor[MOTOR_1].run    = 1u;
+            } else {
                 params->motor[MOTOR_1].run = 0u;
+            }
         }
         ack_cmd(cmd);
         break;
@@ -330,40 +380,11 @@ static void process_host_cmd(void) {
         }
 
         /* Start segment execution on MOTOR_1. */
-        g_ramp_seg_count[MOTOR_1] = n;
-        g_ramp_seg_idx[MOTOR_1]   = 0u;
         g_ramp_op[MOTOR_1]        = RAMP_OP_MOVE_TO;
         g_ramp_active[MOTOR_1]    = 1u;
         g_lat_in_move             = 1u;
         telem->motor[MOTOR_1].seg_done = 0u;
-        load_ramp_seg(MOTOR_1, 0u);
-
-        ack_cmd(cmd);
-        break;
-    }
-
-    case HOST_CMD_RAMP_TO: {
-        /* Generic axis ramp using pre-computed segments from ARM. */
-        uint8_t ax = host_cmd->axis;
-        uint8_t n  = host_cmd->seg_count;
-        if (n == 0u || ax > 1u) { ack_cmd(cmd); break; }
-
-        params->motor[ax].dir    = host_cmd->motor[ax].dir;
-        params->motor[ax].enable = 1u;
-        params->motor[ax].run    = 1u;
-
-        /* Disable spindle-lateral coordination during ramp. */
-        g_sp_lat_coord    = 0u;
-        g_ramp_cruise_iv[ax] = host_cmd->cruise_iv;
-        g_sp_requested_iv = host_cmd->cruise_iv;
-
-        /* Start segment execution. */
-        g_ramp_seg_count[ax] = n;
-        g_ramp_seg_idx[ax]   = 0u;
-        g_ramp_op[ax]        = RAMP_OP_RAMP_TO;
-        g_ramp_active[ax]    = 1u;
-        telem->motor[ax].seg_done = 0u;
-        load_ramp_seg(ax, 0u);
+        arm_ramp(MOTOR_1, n);
 
         ack_cmd(cmd);
         break;
@@ -375,51 +396,35 @@ static void process_host_cmd(void) {
     }
 }
 
-/* ── Ramp segment management tick ────────────────────────────────────────── *
- * For each axis with an active ramp, check if PRU1 has finished the current
- * segment (seg_done=1).  If so, load the next segment or raise the
- * completion event.
- *
- * This is the CORE mechanism that replaces the former sp_ramp_on_step()
- * (spindle-specific) and lat_exec_on_step() (lateral-specific) that lived
- * in PRU1.  Now ALL ramp intelligence is here in the orchestrator.          */
+/* ── Ramp completion tick ─────────────────────────────────────────────────── *
+ * PRU1 now self-advances through all ramp segments without any PRU0 per-
+ * segment handshake.  PRU1 sets seg_done=1 only once ALL segments complete.
+ * PRU0's only job is to detect that final flag and fire the event.          */
 static void ramp_tick(void) {
     uint8_t ax;
     for (ax = 0u; ax < 2u; ax++) {
         if (!g_ramp_active[ax]) continue;
         if (!telem->motor[ax].seg_done) continue;
 
-        /* Segment completed by PRU1.  Advance to next. */
-        g_ramp_seg_idx[ax]++;
+        /* All segments done. */
+        telem->motor[ax].seg_done = 0u;
+        g_ramp_active[ax] = 0u;
+        uint8_t op = g_ramp_op[ax];
+        g_ramp_op[ax] = RAMP_OP_NONE;
 
-        if (g_ramp_seg_idx[ax] < g_ramp_seg_count[ax]) {
-            /* More segments: load next one. */
-            telem->motor[ax].seg_done = 0u;
-            load_ramp_seg(ax, g_ramp_seg_idx[ax]);
-        } else {
-            /* All segments consumed. */
-            telem->motor[ax].seg_done = 0u;
-            g_ramp_active[ax] = 0u;
-            uint8_t op = g_ramp_op[ax];
-            g_ramp_op[ax] = RAMP_OP_NONE;
-
-            if (op == RAMP_OP_MOVE_TO) {
-                /* Position move done: stop the motor. */
-                params->motor[ax].run = 0u;
-                if (ax == MOTOR_1) g_lat_in_move = 0u;
-                /* g_sp_lat_coord intentionally kept: spindle stays at
-                 * proportional speed during the reversal gap. */
-                if (!status->event_pending) {
-                    status->event_type    = EVENT_MOVE_COMPLETE;
-                    status->event_pending = 1u;
-                }
-            } else if (op == RAMP_OP_RAMP_TO) {
-                /* Speed ramp done: motor keeps running at cruise. */
-                params->motor[ax].interval = g_ramp_cruise_iv[ax];
-                if (!status->event_pending) {
-                    status->event_type    = EVENT_RAMP_COMPLETE;
-                    status->event_pending = 1u;
-                }
+        if (op == RAMP_OP_MOVE_TO) {
+            params->motor[ax].run = 0u;
+            if (ax == MOTOR_1) g_lat_in_move = 0u;
+            /* g_sp_lat_coord kept: spindle stays proportional during reversal gap. */
+            if (!status->event_pending) {
+                status->event_type    = EVENT_MOVE_COMPLETE;
+                status->event_pending = 1u;
+            }
+        } else if (op == RAMP_OP_SET_SPEED) {
+            params->motor[ax].interval = g_ramp_cruise_iv[ax];
+            if (!status->event_pending) {
+                status->event_type    = EVENT_SPEED_REACHED;
+                status->event_pending = 1u;
             }
         }
     }
@@ -519,10 +524,12 @@ int main(void) {
     g_ramp_segs[MOTOR_1] =
         (volatile ramp_seg_t *)(PRU_SRAM_PHYS_BASE + IPC_RAMP_SEGS_1_OFFSET);
 
-    uint32_t loop_cnt = 0u;
+    uint32_t cmd_cnt    = 0u;
+    uint32_t status_cnt = 0u;
 
     while (1) {
-        if (loop_cnt % CMD_CHECK_STRIDE == 0u) {
+        if (++cmd_cnt >= CMD_CHECK_STRIDE) {
+            cmd_cnt = 0u;
             process_host_cmd();
             endstop_tick();
             homing_tick();
@@ -531,11 +538,10 @@ int main(void) {
             coord_tick();
         }
 
-        if (loop_cnt % STATUS_STRIDE == 0u) {
+        if (++status_cnt >= STATUS_STRIDE) {
+            status_cnt = 0u;
             publish_status();
         }
-
-        loop_cnt++;
     }
 
     return 0;

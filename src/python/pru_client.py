@@ -13,9 +13,9 @@ Protocol (Option A — continuous shared parameters + autonomous move_to):
     {"cmd":"reset_pos",  "axis":0|1|255}
     {"cmd":"ack_event"}
     {"cmd":"set_limits", "axis":1, "min":<int>, "max":<int>}
-    {"cmd":"move_to",    "axis":1, "pos":<int>,
-                          "start_hz":<uint>, "max_hz":<uint>,
-                          "accel_steps":<uint>}
+    {"cmd":"move_to",    "axis":1, "pos":<int>}
+    {"cmd":"set_accel",  "lat_max_speed":<uint>, "lat_accel":<uint>,
+                          "lat_decel":<uint>, "sp_accel":<uint>}
     {"cmd":"set_mode",   "mode":"free"|"winding"}
 
   Winding modes:
@@ -230,19 +230,15 @@ class PruClient:
         })
         return bool(r.get("ok"))
 
-    async def move_to(self, pos: int, start_hz: int = 200,
-                      max_hz: int = 4000, accel_steps: int = 300) -> bool:
-        """Move the lateral axis to an absolute position with a trapezoidal
-        speed profile.
+    async def move_to(self, pos: int) -> bool:
+        """Move the lateral axis to an absolute position.
 
-        pos:         target position in steps (signed, relative to home=0)
-        start_hz:    step frequency at the start and end of the ramp (slow)
-        max_hz:      cruise step frequency (fast)
-        accel_steps: number of steps for the acceleration / deceleration ramp
+        pos: target position in steps (signed, relative to home=0)
 
-        The daemon converts Hz to IEP intervals and sends HOST_CMD_MOVE_TO.
-        PRU1 executes the profile autonomously — no further Python interaction
-        is needed until the 'move_complete' event is received.
+        The daemon reads the current lateral speed from PRU telemetry and uses
+        the globally configured accel/decel/max_speed (set via set_accel()) to
+        plan and execute the full trapezoidal profile autonomously.  Python
+        never specifies start speed, cruise speed, or step count.
 
         Consecutive same-direction calls while the motor is moving trigger a
         hot retarget: the motor never decelerates between waypoints.
@@ -254,14 +250,27 @@ class PruClient:
         Returns True when the command is acknowledged by the daemon.
         Listen for {'event':'move_complete','pos':<N>} via on_event().
         """
-        r = await self._send({
-            "cmd":         "move_to",
-            "axis":        1,
-            "pos":         pos,
-            "start_hz":    start_hz,
-            "max_hz":      max_hz,
-            "accel_steps": accel_steps,
-        })
+        r = await self._send({"cmd": "move_to", "axis": 1, "pos": pos})
+        return bool(r.get("ok"))
+
+    async def set_accel(self, lat_max_speed: int = 0, lat_accel: int = 0,
+                        lat_decel: int = 0, sp_accel: int = 0) -> bool:
+        """Configure per-axis acceleration and max speed limits.
+
+        All parameters are optional — only non-zero values update the daemon's
+        globals.  Call once at startup or when changing the winding profile.
+
+        lat_max_speed: lateral cruise speed in Hz       (e.g. 4000)
+        lat_accel:     lateral acceleration in steps/s² (e.g. 10000)
+        lat_decel:     lateral deceleration in steps/s² (e.g. 10000)
+        sp_accel:      spindle acceleration  in steps/s² (e.g. 100000)
+        """
+        cmd: dict = {"cmd": "set_accel"}
+        if lat_max_speed: cmd["lat_max_speed"] = lat_max_speed
+        if lat_accel:     cmd["lat_accel"]     = lat_accel
+        if lat_decel:     cmd["lat_decel"]     = lat_decel
+        if sp_accel:      cmd["sp_accel"]      = sp_accel
+        r = await self._send(cmd)
         return bool(r.get("ok"))
 
     async def set_mode(self, mode: str) -> bool:
