@@ -85,7 +85,7 @@
 #endif /* __TI_COMPILER_VERSION__ */
 
 /* ── Timing constants ────────────────────────────────────────────────────── */
-#define MIN_INTERVAL_CYC   625u   /* 160 kHz max → 3.125 µs minimum         */
+#define MIN_INTERVAL_CYC   625u    /* 160 kHz max → half-period 3.125 µs     */
 #define MAX_INTERVAL_CYC   187500u /* ~534 Hz min                            */
 #define DIR_SETUP_CYC       40u   /* 200 ns A4988 dir-setup = 40 IEP cycles */
 
@@ -100,7 +100,7 @@ static inline int timer_before(uint32_t t1, uint32_t t2) {
  *   accel_count: number of accel steps remaining (0 = constant speed)       */
 typedef struct {
     uint32_t next_edge_time;    /* absolute IEP value of next STEP edge      */
-    uint32_t interval;          /* current IEP interval between edges        */
+    uint32_t interval;          /* current IEP half-period (100 MHz / Hz)    */
     uint32_t step_count;        /* physical steps (rising edges) since reset */
     int32_t  position;          /* signed step position (lateral only)       */
     int32_t  accel_add;         /* Klipper: interval delta per step          */
@@ -167,7 +167,6 @@ static inline uint8_t pulse_update(pulse_gen_t *pg,
             /* ── Klipper ramp: interval += add ──────────────────────────── */
             if (pg->accel_count > 0u) {
                 int32_t iv = (int32_t)pg->interval + pg->accel_add;
-                /* Clamp to valid range */
                 if (iv < (int32_t)MIN_INTERVAL_CYC) iv = (int32_t)MIN_INTERVAL_CYC;
                 if (iv > (int32_t)MAX_INTERVAL_CYC) iv = (int32_t)MAX_INTERVAL_CYC;
                 pg->interval = (uint32_t)iv;

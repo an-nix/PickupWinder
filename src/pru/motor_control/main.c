@@ -78,6 +78,14 @@ static uint8_t g_ramping[2]   = {0, 0};
 static uint8_t g_seg_idx[2]   = {0, 0};
 static uint8_t g_seg_total[2] = {0, 0};
 
+/* ── Shadow registers for EN/DIR (prevents spurious GPIO writes) ─────────── *
+ * apply_*() functions called only when value actually changes.
+ * Shadow values initialised to 0xFF (force-write on first loop).           */
+static uint8_t g_sp_en_shadow  = 0xFFu;
+static uint8_t g_lat_en_shadow = 0xFFu;
+static uint8_t g_sp_dir_shadow = 0xFFu;
+static uint8_t g_lat_dir_shadow= 0xFFu;
+
 /* ── Apply direction GPIO ────────────────────────────────────────────────── */
 static inline void apply_dir_sp(uint8_t dir) {
     if (dir) __R30 |= SP_DIR_BIT; else __R30 &= ~SP_DIR_BIT;
@@ -188,15 +196,38 @@ int main(void) {
         uint8_t  sp_run  = params->motor[MOTOR_0].run;
         uint8_t  lat_run = params->motor[MOTOR_1].run;
 
-        /* ── 3. Apply enable + direction outputs ─────────────────────────── */
-        apply_enable_sp(sp_en);
-        apply_enable_lat(lat_en);
-        apply_dir_sp(sp_dir);
-        apply_dir_lat(lat_dir);
+        /* ── 3. Apply enable + direction — only on change (shadow regs) ─── *
+         * Writing __R30 for EN/DIR every loop causes spurious GPIO glitches *
+         * even when the value hasn't changed. Compare against shadow and     *
+         * write only when different → DIR/EN lines are perfectly stable.    */
+        if (sp_en != g_sp_en_shadow) {
+            apply_enable_sp(sp_en);
+            g_sp_en_shadow = sp_en;
+        }
+        if (lat_en != g_lat_en_shadow) {
+            apply_enable_lat(lat_en);
+            g_lat_en_shadow = lat_en;
+        }
+        if (sp_dir != g_sp_dir_shadow) {
+            apply_dir_sp(sp_dir);
+            g_sp_dir_shadow = sp_dir;
+        }
+        if (lat_dir != g_lat_dir_shadow) {
+            apply_dir_lat(lat_dir);
+            g_lat_dir_shadow = lat_dir;
+        }
 
-        /* ── 4. Spindle pulse generation ────────────────────────────────── */
-        uint8_t sp_pin = pulse_update(&spindle, sp_iv, sp_dir, sp_run, now);
-        if (sp_pin) __R30 |= SP_STEP_BIT; else __R30 &= ~SP_STEP_BIT;
+        /* ── 4. Pulse generation — both axes, then single __R30 write ───── *
+         * pulse_update() returns 1 while STEP must be HIGH.  Both axes are  *
+         * polled before any GPIO write so that both STEP transitions happen  *
+         * in one read-modify-write cycle — one instruction on PRU R30.      */
+        uint8_t sp_pin  = pulse_update(&spindle, sp_iv,  sp_dir,  sp_run,  now);
+        uint8_t lat_pin = pulse_update(&lateral, lat_iv, lat_dir, lat_run, now);
+
+        /* Single atomic R30 update for both STEP bits. */
+        __R30 = (__R30 & ~(SP_STEP_BIT | LAT_STEP_BIT))
+              | ((uint32_t)sp_pin  << 1u)
+              | ((uint32_t)lat_pin << 0u);
 
         /* ── 4b. Spindle ramp segment completion ────────────────────────── *
          * When accel_count reaches 0, the current segment is done.
@@ -221,11 +252,7 @@ int main(void) {
             }
         }
 
-        /* ── 5. Lateral pulse generation ────────────────────────────────── */
-        uint8_t lat_pin = pulse_update(&lateral, lat_iv, lat_dir, lat_run, now);
-        if (lat_pin) __R30 |= LAT_STEP_BIT; else __R30 &= ~LAT_STEP_BIT;
-
-        /* ── 5b. Lateral ramp segment completion ────────────────────────── */
+        /* ── 5. Lateral ramp segment completion ─────────────────────────── */
         if (g_ramping[MOTOR_1] && lateral.accel_count == 0u) {
             g_seg_idx[MOTOR_1]++;
             if (g_seg_idx[MOTOR_1] < g_seg_total[MOTOR_1]) {
