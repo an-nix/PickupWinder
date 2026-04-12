@@ -95,7 +95,6 @@ class DaemonClient:
                 pass
             self._sock = None
 
-
 class PruClient:
     """Async client for pickup_daemon (asyncio).
 

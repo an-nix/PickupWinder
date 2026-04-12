@@ -1,24 +1,27 @@
-"""Async PruClient (packaged).
+"""Unified client module: synchronous and asynchronous clients.
 
-Copy of the async client placed in the `pickup` package to keep imports
-consistent for the application entrypoint.
+Contains `DaemonClient` (synchronous JSON-line Unix socket client) and
+`PruClient` (asyncio-based client). Both talk to the same `pickup_daemon`.
+Keeping them together avoids duplication and clarifies that both are just
+front-ends to the daemon (not direct PRU access).
 """
 
-import asyncio
 import json
-from typing import Awaitable, Callable, Optional
+import socket
+import time
+import asyncio
+from typing import Any, Dict, Optional, Awaitable, Callable
 
 SOCKET_PATH = "/run/pickup-winder.sock"
+DEFAULT_TIMEOUT = 2.0
 
-MODE_FREE    = "free"
-MODE_WINDING = "winding"
 
 
 class PruClient:
-    """Async client for pickup_daemon (packaged).
+    """Async client for pickup_daemon (asyncio).
 
-    Minimal copy for completeness; full implementation lives in the top-level
-    `pru_client.py` too.
+    Provides the same commands as the synchronous client but in coroutine
+    form. Useful for UIs or services that need a non-blocking API.
     """
 
     def __init__(self, socket_path: str = SOCKET_PATH):
@@ -42,6 +45,10 @@ class PruClient:
             except Exception:
                 pass
 
+    @property
+    def is_connected(self) -> bool:
+        return self._running and self._writer is not None
+
     def on_event(self, callback: Callable[[dict], Awaitable[None]]):
         self._event_cb = callback
 
@@ -55,6 +62,11 @@ class PruClient:
                 msg = json.loads(line.decode().strip())
                 if "event" in msg and self._event_cb:
                     await self._event_cb(msg)
+            except (asyncio.IncompleteReadError, ConnectionError):
+                self._running = False
+                break
+            except json.JSONDecodeError:
+                continue
             except Exception:
                 break
 
@@ -70,3 +82,16 @@ class PruClient:
                 return {"ok": False, "error": "timeout"}
             except json.JSONDecodeError:
                 return {"ok": False, "error": "bad json response"}
+
+    # Convenience command wrappers (examples)
+    async def set_speed(self, sp_hz: int = 0, lat_hz: int = 0) -> bool:
+        r = await self._send({"cmd": "set_speed", "sp_hz": sp_hz, "lat_hz": lat_hz})
+        return bool(r.get("ok"))
+
+    async def enable(self, sp: bool = False, lat: bool = False) -> bool:
+        r = await self._send({"cmd": "enable", "sp": int(sp), "lat": int(lat)})
+        return bool(r.get("ok"))
+
+    async def emergency_stop(self) -> bool:
+        r = await self._send({"cmd": "e_stop"})
+        return bool(r.get("ok"))

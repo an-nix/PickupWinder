@@ -6,10 +6,7 @@ Copied into the `pickup` subpackage; keeps application imports simple:
 
 from typing import Dict, Optional
 
-try:
-    from .daemon_client import DaemonClient
-except Exception:
-    from pickup.daemon_client import DaemonClient
+from hal import DaemonClient
 
 
 class PickupController:
