@@ -20,6 +20,7 @@
 #   -u USER    SSH user            (default: $BBB_USER or beagle)
 #   -p         Deploy PRU firmware only (skip daemon)
 #   -d         Deploy daemon only (skip PRU firmware)
+#   -y         Skip Python deployment
 #   -s         Deploy service file only (no rebuild)
 #   --no-build Skip Docker build step (use existing build/ artifacts)
 #   --help     Show this help
@@ -54,6 +55,7 @@ BBB_HOST="${BBB_IP:-192.168.74.171}"
 BBB_USER="${BBB_USER:-beagle}"
 DO_PRU=true
 DO_DAEMON=true
+DO_PYTHON=true
 DO_SERVICE=true
 DO_BUILD=true
 
@@ -69,6 +71,7 @@ while [[ $# -gt 0 ]]; do
         -u) shift; BBB_USER="$1"; shift ;;
         -p) DO_DAEMON=false; DO_SERVICE=false; shift ;;
         -d) DO_PRU=false; shift ;;
+        -y) DO_PYTHON=false; shift ;;
         -s) DO_BUILD=false; DO_PRU=false; DO_DAEMON=false; shift ;;
         --no-build) DO_BUILD=false; shift ;;
         --help) usage ;;
@@ -77,14 +80,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-SCP="scp -o BatchMode=yes -o StrictHostKeyChecking=no"
+SCP="scp -r -o BatchMode=yes -o StrictHostKeyChecking=no"
 
 # ── Pre-flight checks ─────────────────────────────────────────────────────────
 echo -e "${B}${C}═══════════════════════════════════════════${X}"
 echo -e "${B}${C}  PickupWinder — Full Deploy              ${X}"
 echo -e "${B}${C}═══════════════════════════════════════════${X}"
 info "Target : ${BBB_USER}@${BBB_HOST}"
-info "Deploy : PRU=${DO_PRU} Daemon=${DO_DAEMON} Service=${DO_SERVICE} Build=${DO_BUILD}"
+info "Deploy : PRU=${DO_PRU} Daemon=${DO_DAEMON} Python=${DO_PYTHON} Service=${DO_SERVICE} Build=${DO_BUILD}"
 echo
 
 # Test SSH connectivity
@@ -106,6 +109,13 @@ if $DO_BUILD; then
             || err "Docker build failed. Check docker-make.log"
         ok "Build complete → ${BUILD}/."
     fi
+
+    if $DO_PYTHON; then
+        info "Validating Python sources..."
+        python3 -m py_compile $(find "$ROOT/src/python" -name '*.py') \
+            || err "Python syntax check failed"
+        ok "Python sources validated"
+    fi
 fi
 
 # ── Verify artifacts ──────────────────────────────────────────────────────────
@@ -122,6 +132,10 @@ if $DO_DAEMON; then
     [[ "$ARCH" == "ARM" ]] \
         || warn "pickup_daemon is not an ARM binary (got: $ARCH) — wrong cross-compiler?"
 fi
+if $DO_PYTHON; then
+    [[ -f "${ROOT}/src/python/__init__.py" ]] \
+        || err "Missing ${ROOT}/src/python/__init__.py — Python source tree not found"
+fi
 
 # ── Step 2: Transfer files ────────────────────────────────────────────────────
 info "Transferring files to ${BBB_HOST}..."
@@ -135,6 +149,9 @@ if $DO_DAEMON; then
 fi
 if $DO_SERVICE; then
     TRANSFER_FILES+=("${ROOT}/src/linux/daemon/pickup-winder.service")
+fi
+if $DO_PYTHON; then
+    TRANSFER_FILES+=("${ROOT}/src/python")
 fi
 
 $SCP "${TRANSFER_FILES[@]}" "${BBB_USER}@${BBB_HOST}:/tmp/" \
@@ -174,6 +191,16 @@ if $DO_SERVICE; then
     sudo cp /tmp/pickup-winder.service /etc/systemd/system/pickup-winder.service
     sudo systemctl daemon-reload
     sudo systemctl enable pickup-winder
+'
+fi
+
+if $DO_PYTHON; then
+    REMOTE_SCRIPT+='
+    echo "[remote] Installing Python sources..."
+    sudo rm -rf /usr/local/lib/pickup-winder/python
+    sudo mkdir -p /usr/local/lib/pickup-winder
+
+    sudo cp -r /tmp/python /usr/local/lib/pickup-winder/
 '
 fi
 
@@ -251,4 +278,5 @@ echo -e "${B}${G}  Deploy complete!                         ${X}"
 echo -e "${B}${G}═══════════════════════════════════════════${X}"
 echo -e "  Service : sudo systemctl status pickup-winder"
 echo -e "  Logs    : sudo journalctl -fu pickup-winder"
+echo -e "  Python  : /usr/local/lib/pickup-winder/python"
 echo -e "  Test    : python3 scripts/test_motor.py --host ${BBB_HOST}"

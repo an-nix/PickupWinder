@@ -1,123 +1,13 @@
-"""pru_client.py — Async Python client for pickup_daemon (Option A architecture).
+"""Compatibility shim — async client moved to `pickup.client` package.
 
-Architecture layer 4 — Python application talks to Layer 3 C daemon
-over a Unix socket using newline-delimited JSON.
-
-Protocol (Option A — continuous shared parameters + autonomous move_to):
-
-  Python → daemon (commands):
-    {"cmd":"set_speed",  "sp_hz":<uint>, "lat_hz":<uint>}
-    {"cmd":"enable",     "axis":0|1|255, "value":0|1}
-    {"cmd":"e_stop"}
-    {"cmd":"home_start"}
-    {"cmd":"reset_pos",  "axis":0|1|255}
-    {"cmd":"ack_event"}
-    {"cmd":"set_limits", "axis":1, "min":<int>, "max":<int>}
-    {"cmd":"move_to",    "axis":1, "pos":<int>}
-    {"cmd":"set_accel",  "lat_max_speed":<uint>, "lat_accel":<uint>,
-                          "lat_decel":<uint>, "sp_accel":<uint>}
-    {"cmd":"set_mode",   "mode":"free"|"winding"}
-
-  Winding modes:
-    free    (default) — axes independent. set_speed controls spindle directly.
-                        move_to positions lateral without spindle sync.
-    winding           — spindle tracks lateral ramps proportionally.
-                        set_speed sets the reference speed; PRU0 adjusts
-                        spindle interval in real-time with lateral via Q6 ratio.
-
-  daemon → Python (responses):
-    {"ok":true}
-    {"ok":false,"error":"<reason>"}
-
-  daemon → Python (async events, unsolicited):
-    {"event":"endstop_hit",  "no":0|1, "nc":0|1}
-    {"event":"endstop_clear","no":0|1, "nc":0|1}
-    {"event":"home_complete"}   # daemon-generated after ENDSTOP_HIT during homing
-    {"event":"fault",         "sp_faults":<N>, "lat_faults":<N>}
-    {"event":"limit_hit",     "axis":<N>, "pos":<N>}
-    {"event":"move_complete", "pos":<N>}
-    {"event":"telem", "pru1_state":<N>,
-     "sp":  {"steps":<N>,"speed_hz":<N>,"faults":<N>},
-     "lat": {"steps":<N>,"pos":<N>,"speed_hz":<N>,"faults":<N>},
-     "endstop":<N>}
-
-Usage:
-    import asyncio
-    from pru_client import PruClient
-
-    async def main():
-        client = PruClient()
-        await client.connect()
-
-        async def on_event(msg):
-            print("event:", msg)
-
-        client.on_event(on_event)
-        asyncio.create_task(client.start_event_listener())
-
-        await client.set_speed(sp_hz=6400, lat_hz=200)
-        await client.enable(sp=True, lat=True)
-        await asyncio.sleep(5)
-        await client.emergency_stop()
-        await client.disconnect()
-
-    asyncio.run(main())
+Import `PruClient` from `pickup.client`. This shim keeps old
+`from pru_client import PruClient` imports working during the
+transition; prefer `from pickup.client import PruClient`.
 """
 
-import asyncio
-import json
-from typing import Awaitable, Callable, Optional
+from pickup.client import PruClient
 
-SOCKET_PATH = "/run/pickup-winder.sock"
-
-# Winding modes for set_mode()
-MODE_FREE    = "free"    # Independent axes; no spindle-lateral sync (default)
-MODE_WINDING = "winding" # Spindle tracks lateral ramps; turns/mm stays constant
-
-
-class PruClient:
-    """Async client for pickup_daemon (Option A — continuous shared params).
-
-    All public methods are coroutines. Events from the daemon are dispatched
-    via the callback registered with on_event().
-    """
-
-    def __init__(self, socket_path: str = SOCKET_PATH):
-        self._path = socket_path
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
-        self._event_cb: Optional[Callable[[dict], Awaitable[None]]] = None
-        self._running = False
-        self._cmd_lock = asyncio.Lock()
-
-    # ── Connection ────────────────────────────────────────────────────────
-
-    async def connect(self):
-        """Open connection to pickup_daemon."""
-        self._reader, self._writer = await asyncio.open_unix_connection(
-            self._path
-        )
-        self._running = True
-        print(f"[PruClient] connected to {self._path}")
-
-    async def disconnect(self):
-        """Close the connection gracefully."""
-        self._running = False
-        if self._writer:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:
-                pass
-        print("[PruClient] disconnected")
-
-    @property
-    def is_connected(self) -> bool:
-        return self._running and self._writer is not None
-
-    # ── Event listener ────────────────────────────────────────────────────
-
-    def on_event(self, callback: Callable[[dict], Awaitable[None]]):
+__all__ = ["PruClient"]
         """Register an async callback for daemon-pushed events.
 
         Events: endstop_hit, endstop_clear, home_complete, fault, telem,

@@ -53,3 +53,5 @@ Thumbs.db
 # Local toolchains and build artefacts created by containerized builds
 /root/x-tools/
 /home/builder/x-tools/
+
+**/.history/
