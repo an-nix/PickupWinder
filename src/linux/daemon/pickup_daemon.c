@@ -265,6 +265,7 @@ static uint32_t g_lat_max_speed = 4000u;   /* Hz   lateral cruise speed      */
 static uint32_t g_lat_accel     = 10000u;  /* steps/s² lateral acceleration  */
 static uint32_t g_lat_decel     = 10000u;  /* steps/s² lateral deceleration  */
 static uint32_t g_sp_accel      = 30000u; /* steps/s² spindle acceleration  */
+static uint32_t g_sp_decel      = 30000u; /* steps/s² spindle deceleration  */
 
 static void sig_handler(int sig) { (void)sig; g_running = 0; }
 
@@ -589,7 +590,11 @@ static void handle_command(int client_fd, const char *line_in) {
                                 ? g_last_sp_iv : SP_IV_MAX;
             if (start_iv != sp_iv) {
                 ramp_seg_t local_segs[MAX_RAMP_SEGS];
-                compute_ramp(local_segs, start_iv, sp_iv, g_sp_accel);
+                /* Choose accel vs decel depending on direction of the ramp.
+                 * start_iv > sp_iv -> increasing speed (acceleration)
+                 * start_iv < sp_iv -> decreasing speed (deceleration) */
+                uint32_t ramp_accel = (start_iv > sp_iv) ? g_sp_accel : g_sp_decel;
+                compute_ramp(local_segs, start_iv, sp_iv, ramp_accel);
                 for (uint32_t i = 0u; i < MAX_RAMP_SEGS; i++)
                     g_ramp_segs[MOTOR_0][i] = local_segs[i];
                 __sync_synchronize();
@@ -599,7 +604,7 @@ static void handle_command(int client_fd, const char *line_in) {
                 fprintf(stderr,
                     "[daemon] ramp %u→%u Hz  start_iv=%u  end_iv=%u  accel=%u\n",
                     (PRU_CLOCK_HZ / 2u) / start_iv,
-                    sp_hz, start_iv, sp_iv, g_sp_accel);
+                    sp_hz, start_iv, sp_iv, ramp_accel);
                 for (uint32_t i = 0u; i < MAX_RAMP_SEGS; i++) {
                     fprintf(stderr,
                         "  seg[%2u] start_iv=%6u  add=%5d  count=%6u\n",
@@ -707,13 +712,16 @@ static void handle_command(int client_fd, const char *line_in) {
         if (p) g_lat_decel = (uint32_t)strtoul(p + 12, NULL, 10);
         p = strstr(line, "\"sp_accel\":");
         if (p) g_sp_accel = (uint32_t)strtoul(p + 11, NULL, 10);
+        p = strstr(line, "\"sp_decel\":");
+        if (p) g_sp_decel = (uint32_t)strtoul(p + 11, NULL, 10);
         if (g_lat_max_speed < 534u) g_lat_max_speed = 534u;
         if (g_lat_accel < 1u)       g_lat_accel = 1u;
         if (g_lat_decel < 1u)       g_lat_decel = 1u;
         if (g_sp_accel  < 1u)       g_sp_accel  = 1u;
+        if (g_sp_decel  < 1u)       g_sp_decel  = 1u;
         fprintf(stderr,
-            "[daemon] set_accel: lat_max=%u lat_a=%u lat_d=%u sp_a=%u\n",
-            g_lat_max_speed, g_lat_accel, g_lat_decel, g_sp_accel);
+            "[daemon] set_accel: lat_max=%u lat_a=%u lat_d=%u sp_a=%u sp_d=%u\n",
+            g_lat_max_speed, g_lat_accel, g_lat_decel, g_sp_accel, g_sp_decel);
         snprintf(resp, sizeof(resp), "{\"ok\":true}\n");
 
     } else if (HAS("\"cmd\":\"ack_event\"")) {

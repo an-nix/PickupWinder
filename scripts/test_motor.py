@@ -45,21 +45,61 @@ DEFAULT_HOST   = "192.168.74.171"
 DEFAULT_USER   = "beagle"
 SOCKET_PATH    = "/run/pickup-winder.sock"
 
-# Spindle test profile  (constant-speed steps, no ramp)
+# Spindle accel/decel defaults (steps/s²)
+# Conversion: rpm/s = steps_s2 * 60 / 6400  (steps_per_rev=6400)
+#   30 000  →  281 rpm/s  →  0→1500 RPM in 5.3 s   (conservative)
+#   75 000  →  703 rpm/s  →  0→1500 RPM in 2.1 s
+#  150 000  → 1406 rpm/s  →  0→1500 RPM in 1.1 s   (aggressive)
+#  200 000  → 1875 rpm/s  →  0→1500 RPM in 0.8 s   (max NEMA17 safe approx.)
+SP_ACCEL = 1250000   # steps/s²  — spindle acceleration (editable or via --sp-accel)
+SP_DECEL = 75000   # steps/s²  — spindle deceleration (editable or via --sp-decel)
+
+# Spindle test profile — explicit sweep 100 → 2000 RPM (step 100)
 # Hz = steps/s = RPM * steps_per_rev / 60  (steps_per_rev=6400)
-# Cap at 300 RPM until higher-speed behaviour is validated.
 SPINDLE_TESTS = [
-    # (name,                      sp_hz,   direction, duration_s)
-    ("Slow   CW  ~60 RPM",         6400,   0,          3.0),
-    ("Mid    CW  ~120 RPM",       12800,   0,          3.0),
-    ("Fast   CW  ~180 RPM",       19200,   0,          3.0),
-    ("       CW  ~240 RPM",       25600,   0,          3.0),
-    ("       CW  ~300 RPM",       32000,   0,          4.0),
-    ("       CCW ~300 RPM",       32000,   1,          4.0),
-    ("       CCW ~240 RPM",       25600,   1,          3.0),
-    ("Fast   CCW ~180 RPM",       19200,   1,          3.0),
-    ("Mid    CCW ~120 RPM",       12800,   1,          3.0),
-    ("Slow   CCW ~60 RPM",         6400,   1,          3.0),
+    # CW 100..2000 RPM
+    #("Sweep CW  100 RPM",   10666, 0, 1.0),
+    #("Sweep CW  200 RPM",   21333, 0, 1.0),
+    #("Sweep CW  300 RPM",   32000, 0, 1.0),
+    #("Sweep CW  400 RPM",   42666, 0, 1.0),
+    #("Sweep CW  500 RPM",   53333, 0, 1.0),
+    #("Sweep CW  600 RPM",   64000, 0, 60.0),
+    #("Sweep CW  700 RPM",   74666, 0, 1.0),
+    ("Sweep CW  800 RPM",   85333, 0, 10.0),
+    #("Sweep CW  900 RPM",   96000, 0, 1.0),
+    #("Sweep CW 1000 RPM",  106666, 0, 20.0),
+    #("Sweep CW 1100 RPM",  117333, 0, 1.0),
+    #("Sweep CW 1200 RPM",  128000, 0, 1.0),
+    #("Sweep CW 1300 RPM",  138666, 0, 1.0),
+    #("Sweep CW 1400 RPM",  149333, 0, 5.0),
+    #("Sweep CW 1500 RPM",  160000, 0, 5.0),
+    #("Sweep CW 1600 RPM",  170666, 0, 1.0),
+    #("Sweep CW 1700 RPM",  181333, 0, 1.0),
+    #("Sweep CW 1800 RPM",  192000, 0, 5.0),
+    #("Sweep CW 1900 RPM",  202666, 0, 1.0),
+    #("Sweep CW 2000 RPM",  213333, 0, 1.0),
+
+    # CCW 100..2000 RPM
+    #("Sweep CCW  100 RPM",  10666, 1, 1.0),
+    #("Sweep CCW  200 RPM",  21333, 1, 1.0),
+    #("Sweep CCW  300 RPM",  32000, 1, 1.0),
+    #("Sweep CCW  400 RPM",  42666, 1, 1.0),
+    #("Sweep CCW  500 RPM",  53333, 1, 1.0),
+    #("Sweep CCW  600 RPM",  64000, 1, 1.0),
+    #("Sweep CCW  700 RPM",  74666, 1, 1.0),
+    #("Sweep CCW  800 RPM",  85333, 1, 1.0),
+    #("Sweep CCW  900 RPM",  96000, 1, 1.0),
+    #("Sweep CCW 1000 RPM", 106666, 1, 1.0),
+    #("Sweep CCW 1100 RPM", 117333, 1, 1.0),
+    #("Sweep CCW 1200 RPM", 128000, 1, 1.0),
+    #("Sweep CCW 1300 RPM", 138666, 1, 1.0),
+    #("Sweep CCW 1400 RPM", 149333, 1, 1.0),
+    #("Sweep CCW 1500 RPM", 160000, 1, 1.0),
+    #("Sweep CCW 1600 RPM", 170666, 1, 1.0),
+    #("Sweep CCW 1700 RPM", 181333, 1, 1.0),
+    #("Sweep CCW 1800 RPM", 192000, 1, 1.0),
+    #("Sweep CCW 1900 RPM", 202666, 1, 1.0),
+    #("Sweep CCW 2000 RPM", 213333, 1, 1.0),
 ]
 
 # Lateral test profile (requires homed axis)
@@ -185,6 +225,31 @@ class DaemonClient:
         self._sock.settimeout(2.0)
         return results
 
+    def wait_speed_reached(self, timeout: float = 15.0) -> bool:
+        """Drain telem until speed_reached event (ramp complete). Returns True if received."""
+        self._sock.settimeout(0.1)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                chunk = self._sock.recv(4096).decode(errors="replace")
+                self._buf += chunk
+            except socket.timeout:
+                pass
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("event") == "speed_reached":
+                    self._sock.settimeout(2.0)
+                    return True
+        self._sock.settimeout(2.0)
+        return False
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -206,6 +271,20 @@ def steps_to_rpm(delta_steps: int, duration_s: float, steps_per_rev: int = 6400)
         return 0.0
     return (delta_steps / steps_per_rev) / duration_s * 60.0
 
+def decel_stop(client: DaemonClient, sp_dir: int) -> None:
+    """Ramp spindle down to ~50 RPM then cut. Avoids violent high-speed stop."""
+    # Use SP_DECEL for the deceleration ramp, then restore SP_ACCEL afterwards.
+    client.send({"cmd": "set_accel", "sp_decel": SP_DECEL})
+    # Ramp to ~50 RPM (5000 Hz) in same direction
+    client.send({"cmd": "set_speed", "sp_hz": 5000, "sp_dir": sp_dir})
+    client.wait_speed_reached(timeout=5.0)
+    # Safe to cut now
+    client.send({"cmd": "e_stop"})
+    time.sleep(0.2)
+    # Restore test accel
+    client.send({"cmd": "set_accel", "sp_accel": SP_ACCEL})
+    client.send({"cmd": "ack_event"})
+
 
 # ── Test suites ───────────────────────────────────────────────────────────────
 
@@ -223,14 +302,15 @@ def test_spindle(client: DaemonClient) -> bool:
     r = client.send({"cmd": "ack_event"})
     all_ok &= check(r, "ack_event (clear any pending)")
 
-    # Conservative spindle acceleration: 30000 steps/s² ≈ 281 RPM/s
-    # → 0 to 1500 RPM in ~5.3 s.  Increase once motor behaviour is validated.
-    r = client.send({"cmd": "set_accel", "sp_accel": 30000})
-    all_ok &= check(r, "set_accel (sp_accel=30000 steps/s²)")
+    sp_ramp_time = 160000 / SP_ACCEL if SP_ACCEL else 0   # 0→1500 RPM approx
+    r = client.send({"cmd": "set_accel", "sp_accel": SP_ACCEL, "sp_decel": SP_DECEL})
+    all_ok &= check(r, f"set_accel  sp_accel={SP_ACCEL} steps/s²  "
+                       f"({SP_ACCEL*60/6400:.0f} rpm/s  0→1500 in {sp_ramp_time:.1f}s)  "
+                       f"sp_decel={SP_DECEL} steps/s²")
 
     print()
-    print(f"  {'Test':<28} {'Target Hz':>10} {'Dir':>5} {'Steps':>8} {'RPM meas':>10} {'Status':>8}")
-    print(f"  {'-'*28} {'-'*10} {'-'*5} {'-'*8} {'-'*10} {'-'*8}")
+    print(f"  {'Test':<28} {'Target Hz':>10} {'Dir':>5} {'Steps':>8} {'Tours':>7} {'RPM meas':>10} {'Status':>8}")
+    print(f"  {'-'*28} {'-'*10} {'-'*5} {'-'*8} {'-'*7} {'-'*10} {'-'*8}")
 
     prev_dir = None
     for name, sp_hz, sp_dir, duration in SPINDLE_TESTS:
@@ -239,9 +319,7 @@ def test_spindle(client: DaemonClient) -> bool:
         # (set_speed with same Hz but different dir produces use_ramp=0
         #  → instant direction switch at full speed → guaranteed stall)
         if prev_dir is not None and sp_dir != prev_dir:
-            r = client.send({"cmd": "e_stop"})
-            check(r, "e_stop (direction change)")
-            time.sleep(0.8)   # let motor coast to stop
+            decel_stop(client, prev_dir)          # rampe jusqu'à ~50 RPM puis coupe
             r = client.send({"cmd": "enable", "value": 1})
             check(r, "re-enable after direction change")
             client.send({"cmd": "ack_event"})
@@ -258,31 +336,38 @@ def test_spindle(client: DaemonClient) -> bool:
             all_ok = False
             continue
 
-        # Collect telemetry for the cruise phase
+        # Attendre la fin de la rampe avant de mesurer (exclut la phase d'accél)
+        if not client.wait_speed_reached(timeout=15.0):
+            print(f"  {CY}⚠  speed_reached timeout — mesure quand même{CX}")
+
+        # Mesure pendant la phase croisière seulement
         t0 = time.monotonic()
         telem = client.read_telem(duration)
         elapsed = time.monotonic() - t0
 
-        # Acknowledge ramp-complete event so PRU event queue stays clean
+        # Acquitter l'event PRU
         client.send({"cmd": "ack_event"})
 
-        # Compute delta steps from first to last telem
+        # Calcul delta steps, tours et RPM
         if len(telem) >= 2:
             steps0 = telem[0].get("sp", {}).get("steps", 0)
             steps1 = telem[-1].get("sp", {}).get("steps", 0)
             delta  = abs(steps1 - steps0)
+            tours  = delta / 6400.0
             rpm    = steps_to_rpm(delta, elapsed)
             status = f"{CG}OK{CX}" if delta > 0 else f"{CR}STALL{CX}"
         else:
-            delta, rpm, status = 0, 0.0, f"{CR}NO TELEM{CX}"
+            delta, tours, rpm, status = 0, 0.0, 0.0, f"{CR}NO TELEM{CX}"
             all_ok = False
 
         dir_str = "CW" if sp_dir == 0 else "CCW"
-        print(f"  {name:<28} {sp_hz:>10}  {dir_str:>5} {delta:>8} {rpm:>9.1f}  {status}")
+        print(f"  {name:<28} {sp_hz:>10}  {dir_str:>5} {delta:>8} {tours:>7.2f} {rpm:>9.1f}  {status}")
 
-    # Stop
-    r = client.send({"cmd": "e_stop"})
-    check(r, "e_stop")
+    # Arrêt progressif (décélération douce)
+    if prev_dir is not None:
+        decel_stop(client, prev_dir)
+    else:
+        client.send({"cmd": "e_stop"})
 
     return all_ok
 
@@ -394,6 +479,10 @@ def parse_args():
     p.add_argument("--lateral-only", action="store_true",   help="Lateral tests only")
     p.add_argument("--no-home",      action="store_true",   help="Skip lateral homing")
     p.add_argument("-v", "--verbose", action="store_true",  help="Print all telemetry")
+    p.add_argument("--sp-accel",     type=int, default=0,
+                   help=f"Spindle acceleration steps/s² (default: {SP_ACCEL})")
+    p.add_argument("--sp-decel",     type=int, default=0,
+                   help=f"Spindle deceleration steps/s² (default: {SP_DECEL})")
     return p.parse_args()
 
 
@@ -422,6 +511,11 @@ def main():
         tunnel = subprocess.Popen(ssh_cmd)
         time.sleep(1.5)  # let tunnel establish
         sock_path = local_sock
+
+    # Apply CLI overrides to module-level constants
+    global SP_ACCEL, SP_DECEL
+    if args.sp_accel: SP_ACCEL = args.sp_accel
+    if args.sp_decel: SP_DECEL = args.sp_decel
 
     client = DaemonClient(socket_path=sock_path, verbose=args.verbose)
 

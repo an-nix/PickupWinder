@@ -254,7 +254,7 @@ class PruClient:
         return bool(r.get("ok"))
 
     async def set_accel(self, lat_max_speed: int = 0, lat_accel: int = 0,
-                        lat_decel: int = 0, sp_accel: int = 0) -> bool:
+                        lat_decel: int = 0, sp_accel: int = 0, sp_decel: int = 0) -> bool:
         """Configure per-axis acceleration and max speed limits.
 
         All parameters are optional — only non-zero values update the daemon's
@@ -270,6 +270,7 @@ class PruClient:
         if lat_accel:     cmd["lat_accel"]     = lat_accel
         if lat_decel:     cmd["lat_decel"]     = lat_decel
         if sp_accel:      cmd["sp_accel"]      = sp_accel
+        if sp_decel:      cmd["sp_decel"]      = sp_decel
         r = await self._send(cmd)
         return bool(r.get("ok"))
 
