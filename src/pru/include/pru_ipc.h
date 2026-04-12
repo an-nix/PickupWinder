@@ -3,27 +3,35 @@
  * Option A architecture — continuous shared-parameter motor control:
  *
  *   Host (daemon) writes commands + target speeds into shared RAM.
- *   PRU0 (orchestrator) reads host commands, owns homing/sync logic,
+ *   PRU0 (orchestrator) reads host commands, owns sync logic,
  *     manages ramp segment sequences, writes motor_params for PRU1.
+ *     PRU0 also reads R31 endstop pins and forwards raw pin state to
+ *     pru_status_t — it does NOT interpret endstop state or stop motors.
+ *     All endstop/homing decisions belong on the host daemon.
  *   PRU1 (motor driver) reads motor_params, generates STEP/DIR pulses
- *     via IEP, reports telemetry including ramp segment completion.
+ *     via IEP.  PRU1 is a pure constant-time pulse generator: it executes
+ *     one ramp_arm segment at a time, writes accel_count to telem every
+ *     loop iteration so PRU0 can detect segment completion, and busy-waits
+ *     for a fixed LOOP_CYCLES_TARGET to guarantee deterministic timing.
  *
  * Communication flow:
  *   Host → PRU0:  host_cmd_t      (commands: set_speed, enable, estop, …)
  *   PRU0 → PRU1:  motor_params_t  (intervals, directions, enable, ramp segs)
- *   PRU1 → PRU0:  motor_telem_t   (step counts, positions, seg_done flags)
+ *   PRU1 → PRU0:  motor_telem_t   (step counts, positions, accel_count)
  *   PRU0 → Host:  pru_status_t    (aggregated status for daemon broadcast)
  *
  * Motor abstraction:
- *   motor_t     — universal per-motor struct (24 B). Contains both control
+ *   motor_t     — universal per-motor struct (28 B). Contains both control
  *                 and telemetry fields.  Used in motor_telem_t, pru_status_t.
+ *                 Includes accel_count so PRU0 can detect segment completion
+ *                 by watching this field reach 0.
  *   motor_cmd_t — per-motor command fields in host_cmd_t (8 B).
  *   motor_ctl_t — per-motor control in motor_params_t (16 B).
  *                 Includes ramp fields (ramp_arm, ramp_add, ramp_count) so
  *                 that acceleration is a generic, per-axis capability.
  *   Index convention: MOTOR_0 = 0 (spindle), MOTOR_1 = 1 (lateral).
  *
- * Ramp architecture (generic, works for ANY axis):
+ * Ramp architecture (PRU0 advances segments, PRU1 is constant-time):
  *   The ARM (daemon) pre-computes ramp segments as ramp_seg_t[MAX_RAMP_SEGS]
  *   in shared RAM, one array per axis.  The daemon sends HOST_CMD_SET_SPEED
  *   (with seg_count>0) or HOST_CMD_MOVE_TO.  PRU0 (orchestrator) manages
@@ -32,13 +40,14 @@
  *        and sets ramp_arm=1.
  *     2. PRU1 detects ramp_arm=1, calls pulse_set_ramp(), clears ramp_arm=0.
  *     3. PRU1 executes "interval += add" per step (Klipper inner loop).
- *     4. When accel_count reaches 0, PRU1 sets telem.motor[ax].seg_done=1.
- *     5. PRU0 detects seg_done=1, loads segment N+1 (back to step 1).
- *     6. After last segment: PRU0 raises EVENT_RAMP_COMPLETE or
+ *        PRU1 writes accel_count to telem every loop (constant-time).
+ *     4. When accel_count reaches 0, PRU0 detects it and loads segment N+1
+ *        (back to step 1).  PRU1 does NOT read segment arrays.
+ *     5. After last segment: PRU0 raises EVENT_SPEED_REACHED or
  *        EVENT_MOVE_COMPLETE depending on the operation type.
  *
- *   This keeps PRU1 as a dumb pulse generator: it knows nothing about
- *   segment arrays, homing, or host commands.  All intelligence is in PRU0.
+ *   This keeps PRU1 as a dumb, constant-time pulse generator: it knows
+ *   nothing about segment arrays, homing, or host commands.
  *
  * Memory: PRU Shared RAM — 12 KB (AM335x)
  *   PRU local base : 0x00010000
@@ -137,12 +146,13 @@
 
 /* ── Event types (pru_status_t.event_type) ───────────────────────────────── */
 #define EVENT_NONE            0u
-#define EVENT_ENDSTOP_HIT     1u     /* lateral endstop triggered            */
-#define EVENT_HOME_COMPLETE   2u     /* homing sequence finished             */
+#define EVENT_ENDSTOP_HIT     1u     /* endstop pin asserted (host decides)  */
+#define EVENT_HOME_COMPLETE   2u     /* homing complete (raised by host)     */
 #define EVENT_FAULT           3u     /* motor fault detected                 */
 #define EVENT_LIMIT_HIT       4u     /* software limit hit                   */
 #define EVENT_MOVE_COMPLETE   5u     /* move_to profile completed            */
 #define EVENT_SPEED_REACHED   6u     /* set_speed ramp completed             */
+#define EVENT_ENDSTOP_CLEAR   7u     /* endstop returned to inactive state   */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Structures — motor abstraction
@@ -152,23 +162,30 @@
  * Contains both control echo and telemetry fields.  Used in motor_telem_t
  * and pru_status_t where the full field set is needed.
  *
- * seg_done: handshake flag for ramp segment completion.
- *   PRU1 sets to 1 when the current ramp segment finishes (accel_count==0).
- *   PRU0 clears to 0 when loading the next segment via ramp_arm.
- *   When no ramp is active, seg_done is 0.                                 */
+ * accel_count: mirrors pulse_gen_t.accel_count (written by PRU1 every loop).
+ *   PRU0 watches this field to detect ramp segment completion without any
+ *   seg_done handshake flag — when accel_count reaches 0 while g_ramping[ax]
+ *   is set, the segment is done and PRU0 loads the next one.
+ *
+ * seg_done: retained for backwards compatibility but no longer used by PRU0
+ *   for segment advance; PRU1 no longer writes it.                          *
+ *
+ * SIZE CHANGED: 24 B → 28 B (added accel_count uint32_t, removed _pad[2]).  */
 typedef struct __attribute__((packed, aligned(4))) {
     uint32_t interval;          /* IEP cycles between STEP edges             */
     uint8_t  dir;               /* direction: 0=fwd, 1=rev                   */
     uint8_t  enable;            /* driver enable: 0=disabled, 1=enabled      */
     uint8_t  run;               /* 1=generate pulses, 0=idle                 */
-    uint8_t  seg_done;          /* 1=ramp segment completed (PRU1→PRU0)      */
+    uint8_t  seg_done;          /* retained; PRU1 no longer writes this      */
     uint32_t step_count;        /* steps since last reset                    */
     int32_t  position;          /* signed position in steps                  */
-    uint32_t interval_actual;   /* current measured IEP interval             */
+    uint32_t interval_actual;   /* current IEP interval (written each loop)  */
+    uint32_t accel_count;       /* mirrors pulse_gen_t.accel_count (PRU1→PRU0)
+                                   PRU0 watches: ==0 means segment complete  */
     uint8_t  state;             /* MOTOR_STATE_* flags                       */
     uint8_t  faults;            /* FAULT_* flags                             */
-    uint8_t  _pad[2];           /* pad to 24 bytes                           */
-} motor_t;                      /* 24 bytes */
+    uint8_t  _pad[2];           /* pad to 28 bytes                           */
+} motor_t;                      /* 28 bytes  — SIZE CHANGED from 24 */
 
 /* ── motor_cmd_t — per-motor command fields in host_cmd_t ────────────────── */
 typedef struct __attribute__((packed, aligned(4))) {
@@ -235,27 +252,57 @@ typedef struct __attribute__((packed, aligned(4))) {
 } motor_params_t;                    /* 32 bytes */
 
 /* ── PRU1 → PRU0 motor telemetry (64 bytes) ──────────────────────────────── *
- * PRU1 updates at ~400 Hz (every TELEM_STRIDE iterations).
- * PRU0 and Host read this data.                                             */
+ * PRU1 updates every main-loop iteration (no TELEM_STRIDE throttle).
+ * PRU0 and Host read this data.
+ *
+ * Layout: motor[2]=56B + endstop_mask(1)+_pad[3] + seq(4) = 64B.
+ * _reserved removed to accommodate the larger motor_t (28B each).          */
 typedef struct __attribute__((packed, aligned(4))) {
-    motor_t  motor[2];               /* 48 B — per-motor telemetry           */
+    motor_t  motor[2];               /* 56 B — per-motor telemetry (28B each)*/
     uint8_t  endstop_mask;           /* bit0=ES1, bit1=ES2 (live reading)    */
     uint8_t  _pad[3];
-    uint32_t seq;                    /* monotone counter (wraps)             */
-    uint32_t _reserved[2];           /* reserved                             */
+    uint32_t seq;                    /* monotone counter (wraps), every loop */
 } motor_telem_t;                     /* 64 bytes */
 
-/* ── PRU0 → Host aggregated status (64 bytes) ────────────────────────────── *
- * PRU0 updates at its main loop cadence. Daemon reads and broadcasts.       */
+/* ── status_motor_t — per-motor status subset for pru_status_t ────────────── *
+ * Identical to motor_t except accel_count is omitted — the host daemon does  *
+ * not need to observe accel_count; that field is only used by PRU0.          *
+ * Keeping this struct at 24 bytes preserves the pru_status_t at 64 bytes.   */
 typedef struct __attribute__((packed, aligned(4))) {
-    uint32_t seq;                    /* monotone counter (wraps)             */
-    uint8_t  pru1_state;             /* PRU1_STATE_* flags                   */
-    uint8_t  event_pending;          /* 1 = event waiting for host ack       */
-    uint8_t  event_type;             /* EVENT_* type code                    */
-    uint8_t  endstop_mask;           /* copied from motor_telem              */
-    motor_t  motor[2];               /* 48 B — per-motor status (from telem) */
-    uint32_t _reserved[2];           /* reserved                             */
-} pru_status_t;                      /* 64 bytes */
+    uint32_t interval;          /* IEP cycles between STEP edges             */
+    uint8_t  dir;               /* direction: 0=fwd, 1=rev                   */
+    uint8_t  enable;            /* driver enable: 0=disabled, 1=enabled      */
+    uint8_t  run;               /* 1=generate pulses, 0=idle                 */
+    uint8_t  _pad0;
+    uint32_t step_count;        /* steps since last reset                    */
+    int32_t  position;          /* signed position in steps                  */
+    uint32_t interval_actual;   /* current IEP interval                      */
+    uint8_t  state;             /* MOTOR_STATE_* flags                       */
+    uint8_t  faults;            /* FAULT_* flags                             */
+    uint8_t  _pad[2];
+} status_motor_t;               /* 24 bytes */
+
+/* ── PRU0 → Host aggregated status (64 bytes) ────────────────────────────── *
+ * PRU0 updates at its main loop cadence. Daemon reads and broadcasts.
+ *
+ * Layout: seq(4) + {pru1_state,event_pending,event_type,endstop_mask}(4)
+ *       + {endstop_pin_no,endstop_pin_nc,_status_pad[2]}(4)
+ *       + status_motor[2](48) + _reserved[1](4) = 64B.
+ *
+ * endstop_pin_no/nc: raw R31 pin values forwarded by PRU0 every loop.
+ *   PRU0 does NOT interpret these — the host daemon decides action.        */
+typedef struct __attribute__((packed, aligned(4))) {
+    uint32_t       seq;                  /* monotone counter (wraps)         */
+    uint8_t        pru1_state;           /* PRU1_STATE_* flags               */
+    uint8_t        event_pending;        /* 1 = event waiting for host ack   */
+    uint8_t        event_type;           /* EVENT_* type code                */
+    uint8_t        endstop_mask;         /* bit0=ES1,bit1=ES2 (aggregated)   */
+    uint8_t        endstop_pin_no;       /* raw R31 NO pin value (0 or 1)    */
+    uint8_t        endstop_pin_nc;       /* raw R31 NC pin value (0 or 1)    */
+    uint8_t        _status_pad[2];       /* alignment pad                    */
+    status_motor_t motor[2];             /* 48 B — per-motor status          */
+    uint32_t       _reserved[1];         /* pad to 64 bytes                  */
+} pru_status_t;                          /* 64 bytes */
 
 /* ── Ramp segment (ARM planner → PRU shared RAM → PRU0 → PRU1) ──────────── *
  *
@@ -285,12 +332,16 @@ typedef struct __attribute__((packed, aligned(4))) {
 /* ── Compile-time size checks ────────────────────────────────────────────── */
 #ifdef __STDC_VERSION__
 #  if __STDC_VERSION__ >= 201112L
-_Static_assert(sizeof(motor_t)        == 24, "motor_t size");
+/* motor_t: SIZE CHANGED 24→28 (added accel_count uint32_t, removed _pad[2]) */
+_Static_assert(sizeof(motor_t)        == 28, "motor_t size");
+_Static_assert(sizeof(status_motor_t) == 24, "status_motor_t size");
 _Static_assert(sizeof(motor_cmd_t)    == 8,  "motor_cmd_t size");
 _Static_assert(sizeof(motor_ctl_t)    == 16, "motor_ctl_t size");
 _Static_assert(sizeof(host_cmd_t)     == 64, "host_cmd_t size");
 _Static_assert(sizeof(motor_params_t) == 32, "motor_params_t size");
+/* motor_telem_t: motor[2]=56B, endstop_mask+_pad[3]+seq = 8B → 64B total  */
 _Static_assert(sizeof(motor_telem_t)  == 64, "motor_telem_t size");
+/* pru_status_t: 4+4+4+48+4 = 64B (uses status_motor_t[2], not motor_t[2]) */
 _Static_assert(sizeof(pru_status_t)   == 64, "pru_status_t size");
 _Static_assert(sizeof(ramp_seg_t)     == 12, "ramp_seg_t size");
 _Static_assert(MAX_RAMP_SEGS * sizeof(ramp_seg_t) == 768u,

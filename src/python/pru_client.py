@@ -30,8 +30,9 @@ Protocol (Option A — continuous shared parameters + autonomous move_to):
     {"ok":false,"error":"<reason>"}
 
   daemon → Python (async events, unsolicited):
-    {"event":"endstop_hit"}
-    {"event":"home_complete"}
+    {"event":"endstop_hit",  "no":0|1, "nc":0|1}
+    {"event":"endstop_clear","no":0|1, "nc":0|1}
+    {"event":"home_complete"}   # daemon-generated after ENDSTOP_HIT during homing
     {"event":"fault",         "sp_faults":<N>, "lat_faults":<N>}
     {"event":"limit_hit",     "axis":<N>, "pos":<N>}
     {"event":"move_complete", "pos":<N>}
@@ -119,7 +120,8 @@ class PruClient:
     def on_event(self, callback: Callable[[dict], Awaitable[None]]):
         """Register an async callback for daemon-pushed events.
 
-        Events: endstop_hit, fault, telem.
+        Events: endstop_hit, endstop_clear, home_complete, fault, telem,
+                speed_reached, move_complete, limit_hit.
         """
         self._event_cb = callback
 
@@ -199,7 +201,16 @@ class PruClient:
         return bool(r.get("ok"))
 
     async def home_start(self) -> bool:
-        """Start lateral homing sequence (PRU1 orchestrates)."""
+        """Start lateral homing sequence.
+
+        The daemon drives the lateral motor at a fixed approach speed toward
+        the home sensor.  When the endstop triggers (EVENT_ENDSTOP_HIT), the
+        daemon stops the motor, resets the position counter to 0, and broadcasts
+        {'event':'home_complete'}.  All FSM logic is in the daemon — not the PRU.
+
+        Returns True when the daemon has acknowledged and started the approach.
+        Listen for {'event':'home_complete'} via on_event() for completion.
+        """
         r = await self._send({"cmd": "home_start"})
         return bool(r.get("ok"))
 

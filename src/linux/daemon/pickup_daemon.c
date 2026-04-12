@@ -31,13 +31,14 @@
  *     {"ok":false,"error":"<reason>"}
  *
  *   daemon → Python (async events):
- *     {"event":"endstop_hit"}
- *     {"event":"home_complete"}
+ *     {"event":"endstop_hit","no":0|1,"nc":0|1}
+ *     {"event":"endstop_clear","no":0|1,"nc":0|1}
+ *     {"event":"home_complete"}           (daemon-generated, after ENDSTOP_HIT during homing)
  *     {"event":"fault","sp_faults":N,"lat_faults":N}
  *     {"event":"telem","pru1_state":N,
  *      "sp":{"steps":N,"speed_hz":N,"faults":N},
  *      "lat":{"steps":N,"pos":N,"speed_hz":N,"faults":N},
- *      "endstop":N}
+ *      "endstop":N,"es_no":0|1,"es_nc":0|1}
  *     {"event":"speed_reached","sp_hz":N}
  *     {"event":"move_complete","pos":N}
  *     {"event":"limit_hit","axis":N,"pos":N}
@@ -96,6 +97,15 @@ static uint32_t g_last_sp_iv = 0u;
 static uint32_t g_last_ramp_target_hz = 0u;
 
 #define MAX_MOVE_PLAN_STEPS  24000
+
+/* ── Homing approach parameters (moved from PRU0 orchestrator) ───────────── */
+#define HOMING_INTERVAL  16276u   /* ~2 mm/s at 3072 steps/mm               */
+#define HOMING_DIR       1u       /* approach direction toward home sensor   */
+
+/* ── Homing FSM state (moved from PRU0, now owned by daemon) ─────────────── *
+ * Daemon starts lateral at HOMING_INTERVAL and monitors EVENT_ENDSTOP_HIT.  *
+ * On hit: stop + reset_pos + ack + broadcast home_complete.                */
+static uint8_t g_homing_active = 0u;
 
 /* ──────────────────────────────────────────────────────────────────────────
  * ARM-side move planner (exact trapezoid physics + secant root solver)
@@ -560,8 +570,7 @@ static void handle_command(int client_fd, const char *line_in) {
             /* Motor is now stopped: reset last-commanded interval so the next
              * set_speed builds a ramp from standstill, not from the previous
              * target speed (which would skip the acceleration phase).        */
-            g_last_sp_iv = 0u;
-        }
+            g_last_sp_iv = 0u;            g_homing_active = 0u;   /* cancel homing sequence if active      */        }
         snprintf(resp, sizeof(resp),
             rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
 
@@ -664,7 +673,20 @@ static void handle_command(int client_fd, const char *line_in) {
             rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
 
     } else if (HAS("\"cmd\":\"home_start\"")) {
-        int rc = send_host_cmd(HOST_CMD_HOME_START, AXIS_LATERAL, 0,0,0,0, 0);
+        int rc;
+        if (g_homing_active) {
+            rc = -1;  /* already homing */
+        } else {
+            /* Daemon provides approach interval and direction to PRU0.         *
+             * PRU0 starts lateral motor; daemon monitors EVENT_ENDSTOP_HIT.   */
+            rc = send_host_cmd(HOST_CMD_HOME_START, AXIS_LATERAL,
+                               0, HOMING_INTERVAL, 0, HOMING_DIR, 0);
+            if (rc == 0) {
+                g_homing_active = 1u;
+                fprintf(stderr, "[daemon] home_start: approaching iv=%u dir=%u\n",
+                        HOMING_INTERVAL, HOMING_DIR);
+            }
+        }
         snprintf(resp, sizeof(resp),
             rc == 0 ? "{\"ok\":true}\n" : "{\"ok\":false,\"error\":\"busy\"}\n");
 
@@ -822,10 +844,35 @@ int main(int argc, char **argv) {
                 g_event_broadcast = 1u;
                 switch (g_status->event_type) {
                 case EVENT_ENDSTOP_HIT:
-                    broadcast("{\"event\":\"endstop_hit\"}\n");
+                    if (g_homing_active) {
+                        /* Endstop triggered during homing sequence.             *
+                         * Stop motor, reset position, ack PRU event, then       *
+                         * broadcast home_complete to Python clients.            */
+                        if (send_host_cmd(HOST_CMD_ESTOP, AXIS_ALL, 0,0,0,0, 0) == 0)
+                            g_last_sp_iv = 0u;
+                        send_host_cmd(HOST_CMD_RESET_POS, AXIS_ALL, 0,0,0,0, 0);
+                        send_host_cmd(HOST_CMD_ACK_EVENT,  0,        0,0,0,0, 0);
+                        g_event_broadcast = 0u;   /* event already acked        */
+                        g_homing_active   = 0u;
+                        broadcast("{\"event\":\"home_complete\"}\n");
+                        fprintf(stderr, "[daemon] home_complete\n");
+                    } else {
+                        snprintf(buf, sizeof(buf),
+                            "{\"event\":\"endstop_hit\",\"no\":%u,\"nc\":%u}\n",
+                            g_status->endstop_pin_no, g_status->endstop_pin_nc);
+                        broadcast(buf);
+                    }
                     break;
                 case EVENT_HOME_COMPLETE:
+                    /* PRU0 no longer raises EVENT_HOME_COMPLETE — homing FSM   *
+                     * moved to daemon.  Case kept for forward compatibility.   */
                     broadcast("{\"event\":\"home_complete\"}\n");
+                    break;
+                case EVENT_ENDSTOP_CLEAR:
+                    snprintf(buf, sizeof(buf),
+                        "{\"event\":\"endstop_clear\",\"no\":%u,\"nc\":%u}\n",
+                        g_status->endstop_pin_no, g_status->endstop_pin_nc);
+                    broadcast(buf);
                     break;
                 case EVENT_LIMIT_HIT:
                     snprintf(buf, sizeof(buf),
@@ -875,14 +922,15 @@ int main(int argc, char **argv) {
                     "{\"event\":\"telem\",\"pru1_state\":%u,"
                     "\"sp\":{\"steps\":%u,\"speed_hz\":%u,\"faults\":%u},"
                     "\"lat\":{\"steps\":%u,\"pos\":%d,\"speed_hz\":%u,\"faults\":%u},"
-                    "\"endstop\":%u}\n",
+                    "\"endstop\":%u,\"es_no\":%u,\"es_nc\":%u}\n",
                     g_status->pru1_state,
                     g_status->motor[MOTOR_0].step_count, sp_hz,
                     g_status->motor[MOTOR_0].faults,
                     g_status->motor[MOTOR_1].step_count,
                     (int)g_status->motor[MOTOR_1].position,
                     lat_hz, g_status->motor[MOTOR_1].faults,
-                    g_status->endstop_mask);
+                    g_status->endstop_mask,
+                    g_status->endstop_pin_no, g_status->endstop_pin_nc);
                 broadcast(buf);
             }
         }

@@ -1,18 +1,28 @@
-﻿/* motor_control/main.c — PRU1 motor firmware (dumb pulse generator).
+﻿/* motor_control/main.c — PRU1 motor firmware (constant-time pulse generator).
  *
  * Architecture layer 1/4.  Loaded as am335x-pru1-fw → remoteproc2 → PRU1
  * (4a338000.pru).
  *
- * PRU1 is a DUMB pulse generator.  Its sole responsibilities:
+ * PRU1 is a PURE CONSTANT-TIME pulse generator.  Every main-loop iteration
+ * takes exactly LOOP_CYCLES_TARGET IEP cycles (busy-wait padded).
+ *
+ * Responsibilities:
  *   1. Read motor_ctl_t from motor_params_t (written by PRU0).
- *   2. Detect ramp_arm=1 → arm pulse_set_ramp(), clear ramp_arm=0.
- *   3. Generate STEP/DIR pulses using the IEP hardware counter.
- *   4. When a ramp segment completes (accel_count==0): write final interval
- *      back to params (prevents speed jump), set seg_done=1 in telem.
- *   5. Publish motor_telem_t for PRU0 (and host) to read.
+ *   2. Detect ramp_arm=1 → arm pulse_set_ramp() for ONE segment, clear
+ *      ramp_arm=0.  Segment advance is entirely PRU0's job.
+ *   3. Generate STEP/DIR/EN pulses via IEP hardware counter.
+ *   4. Write all telemetry fields (incl. accel_count) inline every iteration.
+ *      No TELEM_STRIDE, no gating — telemetry is always current.
+ *   5. Busy-wait to LOOP_CYCLES_TARGET so loop duration is deterministic.
+ *
+ * Removed from PRU1 (moved to PRU0):
+ *   - g_ramp_segs[], g_seg_idx[], g_seg_total[], g_ramping[] — moved to PRU0
+ *   - Segment auto-advance logic (blocks 4b and 5) — moved to PRU0
+ *   - publish_telem(), TELEM_STRIDE, loop_cnt — replaced by inline writes
+ *   - seg_done write logic — PRU0 now detects completion via accel_count==0
  *
  * PRU1 knows NOTHING about:
- *   - Segment arrays (ramp_seg_t[]) — those are managed by PRU0
+ *   - Segment arrays (ramp_seg_t[]) — managed by PRU0
  *   - Host commands, homing, coordination — all PRU0's job
  *   - Which operation is in progress (set_speed ramp vs move_to)
  *
@@ -45,10 +55,13 @@
 #define LAT_EN_BIT     (1u << 4)   /* P8_41 R30[4]  MOTOR_1 lateral en (↓)  */
 #define SP_EN_BIT      (1u << 5)   /* P8_42 R30[5]  MOTOR_0 spindle en (↓)  */
 
-/* ── Telemetry publish cadence ───────────────────────────────────────────── */
-#define TELEM_STRIDE   4000000u    /* ~20 ms at 200 MHz (≈50 Hz); larger value
-                                    * reduces rhythmic STEP-stream jitter at
-                                    * high speed — see FIX 1 (noise fix).   */
+/* ── Loop timing — constant iteration target ─────────────────────────────── *
+ * Busy-wait at end of each loop ensures every iteration takes exactly        *
+ * LOOP_CYCLES_TARGET IEP cycles → zero rhythmic timing perturbation.        *
+ *   LOOP_CYCLES_TARGET = 650                                                 *
+ *   Max STEP frequency  = 200 MHz / (2 × 650) ≈ 153 kHz                    *
+ *   ≈ 1440 RPM at 32× microstepping — covers the full operating range.     */
+#define LOOP_CYCLES_TARGET  650u
 
 /* ── Shared RAM pointers ─────────────────────────────────────────────────── */
 static volatile motor_params_t *params =
@@ -61,39 +74,11 @@ static volatile motor_telem_t *telem =
 static pulse_gen_t spindle = {0};
 static pulse_gen_t lateral = {0};
 
-/* ── Ramp segment arrays (shared RAM, written by ARM daemon) ─────────────── */
-static volatile ramp_seg_t *g_ramp_segs[2];
-
-/* ── Per-axis ramp tracking ──────────────────────────────────────────────── *
- * PRU1 now self-advances through ramp segments without any PRU0 handshake.
- *
- * When ramp_arm > 0 (written by PRU0), PRU1 arms seg[0] from motor_ctl_t
- * and stores the total segment count.  When each segment completes
- * (accel_count==0), PRU1 immediately loads the next segment from g_ramp_segs
- * without waiting for PRU0.  Only after ALL segments complete does PRU1
- * write the final interval back to params and set seg_done=1 so PRU0 fires
- * the EVENT_SPEED_REACHED / EVENT_MOVE_COMPLETE event.
- *
- * This eliminates the race-prone per-segment ramp_arm/seg_done handshake
- * that previously caused alternating stalls under certain timing conditions.*/
-static uint8_t g_ramping[2]   = {0, 0};
-static uint8_t g_seg_idx[2]   = {0, 0};
-static uint8_t g_seg_total[2] = {0, 0};
-
-/* ── Shadow registers for EN/DIR (prevents spurious GPIO writes) ─────────── *
- * apply_*() functions called only when value actually changes.
+/* ── Shadow registers for EN (prevents spurious GPIO writes on EN) ───────── *
+ * EN is active-low and must only change when the enable state changes.
  * Shadow values initialised to 0xFF (force-write on first loop).           */
 static uint8_t g_sp_en_shadow  = 0xFFu;
 static uint8_t g_lat_en_shadow = 0xFFu;
-static uint8_t g_sp_dir_shadow = 0xFFu;
-static uint8_t g_lat_dir_shadow= 0xFFu;
-
-/* ── Apply direction GPIO ────────────────────────────────────────────────── *
- * DIR bits are NOT written here anymore — they are merged into the unified  *
- * STEP+DIR atomic __R30 write at step 4 below (FIX 3).  These functions    *
- * remain as no-ops so the shadow-update call sites compile without changes. */
-static inline void apply_dir_sp(uint8_t dir)  { (void)dir; }
-static inline void apply_dir_lat(uint8_t dir) { (void)dir; }
 
 /* ── Apply enable GPIO (active-low) ─────────────────────────────────────── */
 static inline void apply_enable_sp(uint8_t en) {
@@ -101,34 +86,6 @@ static inline void apply_enable_sp(uint8_t en) {
 }
 static inline void apply_enable_lat(uint8_t en) {
     if (en) __R30 &= ~LAT_EN_BIT; else __R30 |= LAT_EN_BIT;
-}
-
-/* ── Publish telemetry ───────────────────────────────────────────────────── */
-static void publish_telem(void) {
-    /* Spindle (MOTOR_0) */
-    telem->motor[MOTOR_0].step_count      = spindle.step_count;
-    telem->motor[MOTOR_0].position        = spindle.position;
-    telem->motor[MOTOR_0].interval_actual = spindle.interval;
-
-    uint8_t sp_st = MOTOR_STATE_IDLE;
-    if (spindle.running) sp_st = MOTOR_STATE_RUNNING;
-    if (!(__R30 & SP_EN_BIT)) sp_st |= MOTOR_STATE_ENABLED;
-    telem->motor[MOTOR_0].state = sp_st;
-
-    /* Lateral (MOTOR_1) */
-    telem->motor[MOTOR_1].step_count      = lateral.step_count;
-    telem->motor[MOTOR_1].position        = lateral.position;
-    telem->motor[MOTOR_1].interval_actual = lateral.interval;
-
-    uint8_t lat_st = MOTOR_STATE_IDLE;
-    if (lateral.running) lat_st = MOTOR_STATE_RUNNING;
-    if (!(__R30 & LAT_EN_BIT)) lat_st |= MOTOR_STATE_ENABLED;
-    telem->motor[MOTOR_1].state = lat_st;
-
-    /* Endstop mask: 0 — endstops are owned by PRU0 (orchestrator) */
-    telem->endstop_mask = 0u;
-    /* seg_done flags are written directly by the ramp completion code */
-    telem->seq++;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -145,49 +102,11 @@ int main(void) {
     /* Zero shared memory area owned by PRU1. */
     *telem = (motor_telem_t){0};
 
-    /* Segment arrays in shared RAM (written by ARM daemon via mmap). */
-    g_ramp_segs[MOTOR_0] =
-        (volatile ramp_seg_t *)(PRU_SRAM_PHYS_BASE + IPC_RAMP_SEGS_0_OFFSET);
-    g_ramp_segs[MOTOR_1] =
-        (volatile ramp_seg_t *)(PRU_SRAM_PHYS_BASE + IPC_RAMP_SEGS_1_OFFSET);
-
-    uint32_t loop_cnt = 0u;
-
     while (1) {
-        uint32_t now = IEP_NOW();
+        /* ── a. Capture loop start time for busy-wait pad ───────────────── */
+        uint32_t t_start = IEP_NOW();
 
-        /* ── 1. Check ramp arm for each axis ────────────────────────────── *
-         * PRU0 loads a segment by writing {interval, ramp_add, ramp_count}
-         * and setting ramp_arm=1.  We arm the pulse generator and clear
-         * ramp_arm to acknowledge.  This is the ONLY way PRU1 learns about
-         * new ramp segments — it never reads the segment arrays directly.   */
-
-        if (params->motor[MOTOR_0].ramp_arm) {
-            /* ramp_arm holds total segment count written by PRU0. */
-            g_seg_total[MOTOR_0] = params->motor[MOTOR_0].ramp_arm;
-            g_seg_idx[MOTOR_0]   = 0u;
-            pulse_set_ramp(&spindle,
-                           params->motor[MOTOR_0].interval,
-                           params->motor[MOTOR_0].ramp_add,
-                           params->motor[MOTOR_0].ramp_count);
-            params->motor[MOTOR_0].ramp_arm = 0u;
-            telem->motor[MOTOR_0].seg_done  = 0u;
-            g_ramping[MOTOR_0] = 1u;
-        }
-
-        if (params->motor[MOTOR_1].ramp_arm) {
-            g_seg_total[MOTOR_1] = params->motor[MOTOR_1].ramp_arm;
-            g_seg_idx[MOTOR_1]   = 0u;
-            pulse_set_ramp(&lateral,
-                           params->motor[MOTOR_1].interval,
-                           params->motor[MOTOR_1].ramp_add,
-                           params->motor[MOTOR_1].ramp_count);
-            params->motor[MOTOR_1].ramp_arm = 0u;
-            telem->motor[MOTOR_1].seg_done  = 0u;
-            g_ramping[MOTOR_1] = 1u;
-        }
-
-        /* ── 2. Read motor parameters from PRU0 ─────────────────────────── */
+        /* ── b. Read motor parameters from PRU0 ────────────────────────── */
         uint32_t sp_iv   = params->motor[MOTOR_0].interval;
         uint32_t lat_iv  = params->motor[MOTOR_1].interval;
         uint8_t  sp_dir  = params->motor[MOTOR_0].dir;
@@ -197,10 +116,28 @@ int main(void) {
         uint8_t  sp_run  = params->motor[MOTOR_0].run;
         uint8_t  lat_run = params->motor[MOTOR_1].run;
 
-        /* ── 3. Apply enable + direction — only on change (shadow regs) ─── *
-         * Writing __R30 for EN/DIR every loop causes spurious GPIO glitches *
-         * even when the value hasn't changed. Compare against shadow and     *
-         * write only when different → DIR/EN lines are perfectly stable.    */
+        /* ── c. Ramp arm detection (ONE segment, PRU0 owns advance) ─────── *
+         * PRU0 writes {interval, ramp_add, ramp_count, ramp_arm=1} for each *
+         * segment in sequence.  PRU1 arms the pulse generator and clears    *
+         * ramp_arm=0.  PRU0 detects segment completion via accel_count==0   *
+         * in telem (no seg_done flag needed).                               *
+         * Segment arrays (ramp_seg_t[]) are owned by PRU0 — moved to PRU0. */
+        if (params->motor[MOTOR_0].ramp_arm) {
+            pulse_set_ramp(&spindle,
+                           params->motor[MOTOR_0].interval,
+                           params->motor[MOTOR_0].ramp_add,
+                           params->motor[MOTOR_0].ramp_count);
+            params->motor[MOTOR_0].ramp_arm = 0u;  /* acknowledge to PRU0 */
+        }
+        if (params->motor[MOTOR_1].ramp_arm) {
+            pulse_set_ramp(&lateral,
+                           params->motor[MOTOR_1].interval,
+                           params->motor[MOTOR_1].ramp_add,
+                           params->motor[MOTOR_1].ramp_count);
+            params->motor[MOTOR_1].ramp_arm = 0u;  /* acknowledge to PRU0 */
+        }
+
+        /* ── EN: only on change (shadow register prevents GPIO glitches) ── */
         if (sp_en != g_sp_en_shadow) {
             apply_enable_sp(sp_en);
             g_sp_en_shadow = sp_en;
@@ -209,24 +146,15 @@ int main(void) {
             apply_enable_lat(lat_en);
             g_lat_en_shadow = lat_en;
         }
-        if (sp_dir != g_sp_dir_shadow) {
-            apply_dir_sp(sp_dir);
-            g_sp_dir_shadow = sp_dir;
-        }
-        if (lat_dir != g_lat_dir_shadow) {
-            apply_dir_lat(lat_dir);
-            g_lat_dir_shadow = lat_dir;
-        }
 
-        /* ── 4. Pulse generation — both axes, then single __R30 write ───── *
-         * pulse_update() returns 1 while STEP must be HIGH.  Both axes are  *
-         * polled before any GPIO write so that both STEP transitions happen  *
-         * in one read-modify-write cycle — one instruction on PRU R30.      */
+        /* ── d. Pulse generation ────────────────────────────────────────── */
+        uint32_t now = IEP_NOW();
         uint8_t sp_pin  = pulse_update(&spindle, sp_iv,  sp_dir,  sp_run,  now);
         uint8_t lat_pin = pulse_update(&lateral, lat_iv, lat_dir, lat_run, now);
 
-        /* One atomic R30 update for STEP + DIR bits — DIR glitches on the
-         * same iteration as a STEP edge are impossible (FIX 3).           */
+        /* ── e. Single atomic __R30 write for STEP + DIR ────────────────── *
+         * DIR and STEP written in one instruction — no 1-cycle DIR/STEP     *
+         * glitch possible.  EN bits preserved by the masked clear.         */
         uint32_t r30 = __R30;
         r30 &= ~(SP_STEP_BIT | LAT_STEP_BIT | SP_DIR_BIT | LAT_DIR_BIT);
         r30 |= ((uint32_t)sp_pin  << 1u);   /* SP_STEP_BIT  = R30[1] */
@@ -235,53 +163,48 @@ int main(void) {
         r30 |= ((uint32_t)lat_dir << 2u);   /* LAT_DIR_BIT  = R30[2] */
         __R30 = r30;
 
-        /* ── 4b. Spindle ramp segment completion ────────────────────────── *
-         * When accel_count reaches 0, the current segment is done.
-         * If more segments remain, load the next one directly from shared RAM
-         * — no PRU0 involvement, no race window between segments.
-         * Only when ALL segments complete: write final interval and signal
-         * PRU0 via seg_done=1 to fire EVENT_SPEED_REACHED.                 */
-        if (g_ramping[MOTOR_0] && spindle.accel_count == 0u) {
-            g_seg_idx[MOTOR_0]++;
-            if (g_seg_idx[MOTOR_0] < g_seg_total[MOTOR_0]) {
-                /* Load next segment directly from shared RAM. */
-                volatile ramp_seg_t *s = &g_ramp_segs[MOTOR_0][g_seg_idx[MOTOR_0]];
-                pulse_set_ramp(&spindle, s->start_iv, s->add, s->count);
-                /* g_ramping stays 1; do NOT write params->interval here
-                 * (pulse_set_ramp already sets spindle.interval = s->start_iv,
-                 *  so pulse_update with accel_count>0 won't force-load it)  */
-            } else {
-                /* All segments done — signal PRU0 to fire completion event. */
-                params->motor[MOTOR_0].interval = spindle.interval;
-                telem->motor[MOTOR_0].seg_done  = 1u;
-                g_ramping[MOTOR_0] = 0u;
-            }
+        /* ── f. Inline telemetry write — every iteration, no throttle ───── *
+         * All telem fields written unconditionally.  accel_count is the key *
+         * field: PRU0 polls it to detect segment completion without any     *
+         * seg_done handshake.  publish_telem() and TELEM_STRIDE removed.   */
+
+        /* Spindle (MOTOR_0) */
+        telem->motor[MOTOR_0].step_count      = spindle.step_count;
+        telem->motor[MOTOR_0].position        = spindle.position;
+        telem->motor[MOTOR_0].interval_actual = spindle.interval;
+        telem->motor[MOTOR_0].accel_count     = spindle.accel_count; /* PRU0 watches */
+        {
+            uint8_t sp_st = MOTOR_STATE_IDLE;
+            if (spindle.running)        sp_st  = MOTOR_STATE_RUNNING;
+            if (!(__R30 & SP_EN_BIT))   sp_st |= MOTOR_STATE_ENABLED;
+            telem->motor[MOTOR_0].state = sp_st;
         }
 
-        /* ── 5. Lateral ramp segment completion ─────────────────────────── */
-        if (g_ramping[MOTOR_1] && lateral.accel_count == 0u) {
-            g_seg_idx[MOTOR_1]++;
-            if (g_seg_idx[MOTOR_1] < g_seg_total[MOTOR_1]) {
-                volatile ramp_seg_t *s = &g_ramp_segs[MOTOR_1][g_seg_idx[MOTOR_1]];
-                pulse_set_ramp(&lateral, s->start_iv, s->add, s->count);
-            } else {
-                params->motor[MOTOR_1].interval = lateral.interval;
-                telem->motor[MOTOR_1].seg_done  = 1u;
-                g_ramping[MOTOR_1] = 0u;
-            }
+        /* Lateral (MOTOR_1) */
+        telem->motor[MOTOR_1].step_count      = lateral.step_count;
+        telem->motor[MOTOR_1].position        = lateral.position;
+        telem->motor[MOTOR_1].interval_actual = lateral.interval;
+        telem->motor[MOTOR_1].accel_count     = lateral.accel_count; /* PRU0 watches */
+        {
+            uint8_t lat_st = MOTOR_STATE_IDLE;
+            if (lateral.running)        lat_st  = MOTOR_STATE_RUNNING;
+            if (!(__R30 & LAT_EN_BIT))  lat_st |= MOTOR_STATE_ENABLED;
+            telem->motor[MOTOR_1].state = lat_st;
         }
 
-        /* ── 6. Publish telemetry (throttled + speed-gated) ─────────────── *
-         * At high speed the ~50-80 cycle SBBO burst in publish_telem()      *
-         * perturbs STEP timing rhythmically at STEP_freq/TELEM_STRIDE       *
-         * (≈200 Hz audible grinding).  Suppress when any axis is above      *
-         * ~830 RPM (interval ≤ 1500 cycles = 133 kHz).  FIX 1.             */
-        if (++loop_cnt >= TELEM_STRIDE) {
-            loop_cnt = 0u;
-            if (spindle.interval > 1500u && lateral.interval > 1500u)
-                publish_telem();
-        }
+        /* Endstop mask: read by PRU0; we write 0 (endstops owned by PRU0). */
+        telem->endstop_mask = 0u;
+
+        /* ── g. Sequence counter (every iteration) ───────────────────────── */
+        telem->seq++;
+
+        /* ── h. Busy-wait pad — constant loop duration ───────────────────── *
+         * Spin until LOOP_CYCLES_TARGET cycles have elapsed since t_start.  *
+         * Guarantees every iteration is exactly LOOP_CYCLES_TARGET cycles   *
+         * long → no rhythmic timing perturbation on STEP output.           */
+        while ((uint32_t)(IEP_NOW() - t_start) < LOOP_CYCLES_TARGET) {}
     }
 
     return 0;
 }
+

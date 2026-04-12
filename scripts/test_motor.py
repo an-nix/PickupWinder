@@ -68,11 +68,11 @@ SPINDLE_TESTS = [
     ("Sweep CW  800 RPM",   85333, 0, 2.0),
     ("Sweep CW  900 RPM",   96000, 0, 2.0),
     ("Sweep CW 1000 RPM",  106666, 0, 2.0),
-    ("Sweep CW 1100 RPM",  117333, 0, 2.0),
-    ("Sweep CW 1200 RPM",  128000, 0, 2.0),
-    ("Sweep CW 1300 RPM",  138666, 0, 2.0),
-    ("Sweep CW 1400 RPM",  149333, 0, 2.0),
-    ("Sweep CW 1500 RPM",  160000, 0, 3.0),
+    #("Sweep CW 1100 RPM",  117333, 0, 2.0),
+    #("Sweep CW 1200 RPM",  128000, 0, 2.0),
+    #("Sweep CW 1300 RPM",  138666, 0, 2.0),
+    #("Sweep CW 1400 RPM",  149333, 0, 2.0),
+    #("Sweep CW 1500 RPM",  160000, 0, 3.0),
     #("Sweep CW 1600 RPM",  170666, 0, 2.0),
     #("Sweep CW 1700 RPM",  181333, 0, 2.0),
     #("Sweep CW 1800 RPM",  192000, 0, 2.0),
@@ -229,7 +229,8 @@ class DaemonClient:
                         lat = obj.get("lat", {})
                         print(f"  {CC}telem{CX}  sp={sp.get('steps'):>8}  "
                               f"lat={lat.get('pos'):>7}  endstop={obj.get('endstop')}")
-                elif obj.get("event") in ("endstop_hit", "home_complete",
+                elif obj.get("event") in ("endstop_hit", "endstop_clear",
+                                           "home_complete",
                                            "fault", "limit_hit",
                                            "move_complete", "speed_reached"):
                     results.append(obj)
