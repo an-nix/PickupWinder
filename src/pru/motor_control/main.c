@@ -46,7 +46,9 @@
 #define SP_EN_BIT      (1u << 5)   /* P8_42 R30[5]  MOTOR_0 spindle en (↓)  */
 
 /* ── Telemetry publish cadence ───────────────────────────────────────────── */
-#define TELEM_STRIDE   500000u     /* ~2.5 ms at 200 MHz (≈400 Hz)          */
+#define TELEM_STRIDE   4000000u    /* ~20 ms at 200 MHz (≈50 Hz); larger value
+                                    * reduces rhythmic STEP-stream jitter at
+                                    * high speed — see FIX 1 (noise fix).   */
 
 /* ── Shared RAM pointers ─────────────────────────────────────────────────── */
 static volatile motor_params_t *params =
@@ -86,13 +88,12 @@ static uint8_t g_lat_en_shadow = 0xFFu;
 static uint8_t g_sp_dir_shadow = 0xFFu;
 static uint8_t g_lat_dir_shadow= 0xFFu;
 
-/* ── Apply direction GPIO ────────────────────────────────────────────────── */
-static inline void apply_dir_sp(uint8_t dir) {
-    if (dir) __R30 |= SP_DIR_BIT; else __R30 &= ~SP_DIR_BIT;
-}
-static inline void apply_dir_lat(uint8_t dir) {
-    if (dir) __R30 |= LAT_DIR_BIT; else __R30 &= ~LAT_DIR_BIT;
-}
+/* ── Apply direction GPIO ────────────────────────────────────────────────── *
+ * DIR bits are NOT written here anymore — they are merged into the unified  *
+ * STEP+DIR atomic __R30 write at step 4 below (FIX 3).  These functions    *
+ * remain as no-ops so the shadow-update call sites compile without changes. */
+static inline void apply_dir_sp(uint8_t dir)  { (void)dir; }
+static inline void apply_dir_lat(uint8_t dir) { (void)dir; }
 
 /* ── Apply enable GPIO (active-low) ─────────────────────────────────────── */
 static inline void apply_enable_sp(uint8_t en) {
@@ -224,10 +225,15 @@ int main(void) {
         uint8_t sp_pin  = pulse_update(&spindle, sp_iv,  sp_dir,  sp_run,  now);
         uint8_t lat_pin = pulse_update(&lateral, lat_iv, lat_dir, lat_run, now);
 
-        /* Single atomic R30 update for both STEP bits. */
-        __R30 = (__R30 & ~(SP_STEP_BIT | LAT_STEP_BIT))
-              | ((uint32_t)sp_pin  << 1u)
-              | ((uint32_t)lat_pin << 0u);
+        /* One atomic R30 update for STEP + DIR bits — DIR glitches on the
+         * same iteration as a STEP edge are impossible (FIX 3).           */
+        uint32_t r30 = __R30;
+        r30 &= ~(SP_STEP_BIT | LAT_STEP_BIT | SP_DIR_BIT | LAT_DIR_BIT);
+        r30 |= ((uint32_t)sp_pin  << 1u);   /* SP_STEP_BIT  = R30[1] */
+        r30 |= ((uint32_t)lat_pin << 0u);   /* LAT_STEP_BIT = R30[0] */
+        r30 |= ((uint32_t)sp_dir  << 3u);   /* SP_DIR_BIT   = R30[3] */
+        r30 |= ((uint32_t)lat_dir << 2u);   /* LAT_DIR_BIT  = R30[2] */
+        __R30 = r30;
 
         /* ── 4b. Spindle ramp segment completion ────────────────────────── *
          * When accel_count reaches 0, the current segment is done.
@@ -265,10 +271,15 @@ int main(void) {
             }
         }
 
-        /* ── 6. Publish telemetry (throttled) ───────────────────────────── */
+        /* ── 6. Publish telemetry (throttled + speed-gated) ─────────────── *
+         * At high speed the ~50-80 cycle SBBO burst in publish_telem()      *
+         * perturbs STEP timing rhythmically at STEP_freq/TELEM_STRIDE       *
+         * (≈200 Hz audible grinding).  Suppress when any axis is above      *
+         * ~830 RPM (interval ≤ 1500 cycles = 133 kHz).  FIX 1.             */
         if (++loop_cnt >= TELEM_STRIDE) {
             loop_cnt = 0u;
-            publish_telem();
+            if (spindle.interval > 1500u && lateral.interval > 1500u)
+                publish_telem();
         }
     }
 

@@ -175,6 +175,12 @@ static inline uint8_t pulse_update(pulse_gen_t *pg,
         }
 
         pg->next_edge_time += pg->interval;
+        /* Resync: if main-loop latency (e.g. publish_telem()) delayed this
+         * edge past its deadline, next_edge_time may still be behind 'now'.
+         * Re-anchor to prevent back-to-back step bursts on the following
+         * iterations — audible as a crack or grinding spike (FIX 2).      */
+        if (timer_before(pg->next_edge_time, now))
+            pg->next_edge_time = now + pg->interval;
     }
 
     return pg->step_pin_state;
