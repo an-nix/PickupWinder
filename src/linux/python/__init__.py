@@ -3,7 +3,7 @@
 Export canonical names from the `pickup` subpackage.
 """
 
-from pickup.client import DaemonClient, PruClient
-from pickup.pickup_controller import PickupController
+from hal import DaemonClient, PruClient
+from pickup import PickupController
 
 __all__ = ["DaemonClient", "PickupController", "PruClient"]

@@ -87,6 +87,58 @@ class DaemonClient:
         line, self._buf = self._buf.split("\n", 1)
         return json.loads(line.strip())
 
+    def poll_events(self, timeout: float = 0.0) -> list[dict]:
+        """Drain all pending events from the daemon.
+
+        timeout=0.0 (default) is near-non-blocking (2 ms socket poll).
+        Returns a list of dicts that have an ``"event"`` key.
+        """
+        events: list[dict] = []
+        if self._sock is None:
+            return events
+
+        # First: parse anything already buffered in memory (no I/O)
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if "event" in obj:
+                    events.append(obj)
+            except json.JSONDecodeError:
+                pass
+
+        # Then: try to read more data from the socket with a short timeout
+        old_timeout = self._sock.gettimeout()
+        self._sock.settimeout(max(0.002, timeout) if timeout > 0 else 0.002)
+        try:
+            while True:
+                try:
+                    chunk = self._sock.recv(4096)
+                    if not chunk:
+                        break
+                    self._buf += chunk.decode(errors="replace")
+                    while "\n" in self._buf:
+                        line, self._buf = self._buf.split("\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if "event" in obj:
+                                events.append(obj)
+                        except json.JSONDecodeError:
+                            pass
+                except socket.timeout:
+                    break
+                except OSError:
+                    break
+        finally:
+            self._sock.settimeout(old_timeout)
+        return events
+
     def close(self) -> None:
         if self._sock is not None:
             try:
@@ -94,6 +146,7 @@ class DaemonClient:
             except OSError:
                 pass
             self._sock = None
+
 
 class PruClient:
     """Async client for pickup_daemon (asyncio).

@@ -16,15 +16,21 @@ class PickupController:
         self._client = client
 
     def enable(self, sp: bool = False, lat: bool = False) -> bool:
+        """Enable or disable stepper drivers.
+
+        sp=False, lat=False  → disable all axes (safe default).
+        sp=True,  lat=True   → enable both axes.
+        sp=True,  lat=False  → enable spindle only.
+        sp=False, lat=True   → enable lateral only.
+        """
         if sp and lat:
-            axis = 0xFF
+            axis, value = 0xFF, 1   # both on
         elif sp:
-            axis = 0
+            axis, value = 0,    1   # spindle on
         elif lat:
-            axis = 1
+            axis, value = 1,    1   # lateral on
         else:
-            axis = 0xFF
-        value = 1 if (sp or lat) else 0
+            axis, value = 0xFF, 0   # all off
         return bool(self._client.send({
             "cmd": "enable",
             "axis": axis,

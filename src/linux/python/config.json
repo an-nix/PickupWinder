@@ -1,0 +1,29 @@
+{
+  "socket_path": "/run/pickup-winder.sock",
+  "recipe_path": "/usr/local/lib/pickup-winder/recipe.json",
+  "tick_hz": 100,
+  "approach_turns": 50,
+  "approach_hz_floor": 3200,
+  "rodage_dist_mm": 10.0,
+  "rodage_passes": 10,
+  "pot_run_threshold": 0.001,
+
+  "hardware": {
+    "lat_steps_per_mm":    3072,
+    "lat_traverse_max_mm": 20.0,
+    "lat_home_hz":         2000,
+    "lat_traverse_hz":     15000,
+    "lat_rodage_hz":       5000,
+    "lat_accel":           100000,
+    "sp_steps_per_rev":    6400,
+    "sp_hz_min":           1067,
+    "sp_hz_max":           160000
+  },
+
+  "bobbin_presets": [
+    {"name": "Strat",      "total_mm": 17.0, "flange_bot_mm": 1.5, "flange_top_mm": 1.5, "wire_mm": 0.071},
+    {"name": "Telecaster", "total_mm": 18.5, "flange_bot_mm": 1.5, "flange_top_mm": 1.5, "wire_mm": 0.071},
+    {"name": "P90",        "total_mm": 30.0, "flange_bot_mm": 2.0, "flange_top_mm": 2.0, "wire_mm": 0.071},
+    {"name": "Humbucker",  "total_mm": 38.0, "flange_bot_mm": 2.0, "flange_top_mm": 2.0, "wire_mm": 0.064}
+  ]
+}

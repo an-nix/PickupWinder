@@ -20,7 +20,7 @@
 #   -u USER    SSH user            (default: $BBB_USER or beagle)
 #   -p         Deploy PRU firmware only (skip daemon)
 #   -d         Deploy daemon only (skip PRU firmware)
-#   -y         Skip Python deployment
+#   -y         Deploy Python only
 #   -s         Deploy service file only (no rebuild)
 #   --no-build Skip Docker build step (use existing build/ artifacts)
 #   --help     Show this help
@@ -71,7 +71,7 @@ while [[ $# -gt 0 ]]; do
         -u) shift; BBB_USER="$1"; shift ;;
         -p) DO_DAEMON=false; DO_SERVICE=false; shift ;;
         -d) DO_PRU=false; shift ;;
-        -y) DO_PYTHON=false; shift ;;
+        -y) DO_PRU=false; DO_DAEMON=false; DO_SERVICE=false; DO_BUILD=false; DO_PYTHON=true; shift ;;
         -s) DO_BUILD=false; DO_PRU=false; DO_DAEMON=false; shift ;;
         --no-build) DO_BUILD=false; shift ;;
         --help) usage ;;
@@ -112,7 +112,7 @@ if $DO_BUILD; then
 
     if $DO_PYTHON; then
         info "Validating Python sources..."
-        python3 -m py_compile $(find "$ROOT/src/python" -name '*.py') \
+        python3 -m py_compile $(find "$ROOT/src/linux/python/pickup" -name '*.py') "$ROOT/src/linux/python/pickup_test.py" \
             || err "Python syntax check failed"
         ok "Python sources validated"
     fi
@@ -125,16 +125,10 @@ if $DO_PRU; then
     [[ -f "${BUILD}/pru/am335x-pru1-fw" ]] \
         || err "Missing ${BUILD}/pru/am335x-pru1-fw — run build first"
 fi
-if $DO_DAEMON; then
-    [[ -f "${BUILD}/daemon/pickup_daemon" ]] \
-        || err "Missing ${BUILD}/daemon/pickup_daemon — run build first"
-    ARCH=$(file "${BUILD}/daemon/pickup_daemon" | grep -o 'ARM\|x86')
-    [[ "$ARCH" == "ARM" ]] \
-        || warn "pickup_daemon is not an ARM binary (got: $ARCH) — wrong cross-compiler?"
-fi
+# Check for canonical pickup package and test script
 if $DO_PYTHON; then
-    [[ -f "${ROOT}/src/python/__init__.py" ]] \
-        || err "Missing ${ROOT}/src/python/__init__.py — Python source tree not found"
+    [[ -f "${ROOT}/src/linux/python/__init__.py" ]] \
+        || err "Missing ${ROOT}/src/linux/python/__init__.py — python package root not found"
 fi
 
 # ── Step 2: Transfer files ────────────────────────────────────────────────────
@@ -150,13 +144,21 @@ fi
 if $DO_SERVICE; then
     TRANSFER_FILES+=("${ROOT}/src/linux/daemon/pickup-winder.service")
 fi
-if $DO_PYTHON; then
-    TRANSFER_FILES+=("${ROOT}/src/python")
+
+# Transfer non-Python artifacts (PRU/daemon/service)
+if [[ ${#TRANSFER_FILES[@]} -gt 0 ]]; then
+    $SCP "${TRANSFER_FILES[@]}" "${BBB_USER}@${BBB_HOST}:/tmp/" \
+        || err "SCP transfer failed"
+    ok "Artifacts transferred"
 fi
 
-$SCP "${TRANSFER_FILES[@]}" "${BBB_USER}@${BBB_HOST}:/tmp/" \
-    || err "SCP transfer failed"
-ok "Transfer complete"
+# Transfer Python sources from canonical directory
+if $DO_PYTHON; then
+    info "Copying python sources (src/linux/python) to /tmp/python on BBB..."
+    $SCP "${ROOT}/src/linux/python" "${BBB_USER}@${BBB_HOST}:/tmp" \
+        || err "SCP python transfer failed"
+    ok "Python sources copied"
+fi
 
 # ── Step 3: Install on BBB ───────────────────────────────────────────────────
 info "Installing on ${BBB_HOST}..."
@@ -194,13 +196,14 @@ if $DO_SERVICE; then
 '
 fi
 
+
+# Install pickup package and pickup_test.py to canonical location
 if $DO_PYTHON; then
     REMOTE_SCRIPT+='
     echo "[remote] Installing Python sources..."
     sudo rm -rf /usr/local/lib/pickup-winder/python
-    sudo mkdir -p /usr/local/lib/pickup-winder
-
-    sudo cp -r /tmp/python /usr/local/lib/pickup-winder/
+    sudo mkdir -p /usr/local/lib/pickup-winder/python
+    sudo cp -a /tmp/python/. /usr/local/lib/pickup-winder/python/
 '
 fi
 
