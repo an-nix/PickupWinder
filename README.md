@@ -1,289 +1,150 @@
-# PickupWinder — BeagleBone Black PRU winding controller
+# PickupWinder — RPi + ESP32 Real-time Winding Controller
 
-Automated/assisted guitar pickup coil winding on the BeagleBone Black (AM335x).
-Real-time stepper control via PRU, with Linux daemon + Python application layer.
+Automated/assisted guitar pickup coil winding.
+Real-time stepper control on the **ESP32** (dual-core, FreeRTOS, **ESP-IDF** framework),
+commanded by a **Raspberry Pi** Python application over SPI.
 
-## Architecture — Option A (Continuous Shared Parameters)
-
-4-layer stack. **No move rings.** Host writes target speeds; PRU0 orchestrates;
-PRU1 generates pulses from continuous parameters.
+## Architecture
 
 ```
-Layer 4  Python application   (pickup_test.py, pru_client.py)
-         │ Unix socket /run/pickup-winder.sock
-Layer 3  C hardware daemon    (pickup_daemon)
-         │ /dev/mem mmap
-Layer 2  PRU0 orchestration   (host_cmd → motor_params, homing FSM)
-         │ PRU Shared RAM
-Layer 1  PRU1 motor control   (pulse_gen_t, STEP/DIR/EN, endstops)
+Raspberry Pi (Python / asyncio)
+  CoilWinder · TensionController · WebUI
+       │ SPI 4 MHz (8-byte CmdFrame → / ← 44-byte StatusFrame)
+ESP32 (ESP-IDF, FreeRTOS, 240 MHz)
+  Core 0 (pri  5): sensor_task  — HX711 poll, ADC pot, PCNT encoder, tension setpoint
+  Core 0 (pri 10): spi_task     — receives commands, sends StatusFrame
+  Core 1 (pri 24): stepper_task — 3 hardware timers, endstop poll, axis dispatch
+  HX711 load cells              — non-blocking ~80 Hz, values forwarded to Pi
+  Potentiometer (ADC1)          — speed control knob on GPIO 36
+  Quadrature encoder (PCNT)     — manual axis control on GPIO 0/15 (strap pins)
 ```
 
-**Communication flow** (224 bytes shared RAM):
-```
-Host ──host_cmd_t──→ PRU0 ──motor_params_t──→ PRU1
-                     PRU0 ←──motor_telem_t── PRU1
-Host ←─pru_status_t─ PRU0
-```
-
-See `doc/beaglebone_architecture.md` and `.github/copilot-instructions.md`
-for the full architecture rationale.
+Full architecture details: [doc/architecture.md](doc/architecture.md)
 
 ## Hardware
 
-- **Board**: BeagleBone Black (AM335x Cortex-A8 + 2× PRU)
-- **Steppers**: Two A4988/DRV8825 drivers — spindle + lateral traverse
-- **Microstepping**: 32 µstep (6400 steps/rev spindle, 3072 steps/mm lateral)
-- **Encoders**: eQEP1 (P8.33, P8.35)
-- **Endstops**: Dual-contact on PRU0 R31 (P9_28=R31[6], P9_30=R31[2], pull-up)
-- **Footswitch**: P9.23 (GPIO)
+- **ESP32** DevKit (38-pin) — stepper controller, sensor acquisition, SPI link to Pi
+- **Raspberry Pi** (3B+ or 4) — application host, WebSocket UI, PID and TMC2209 UART
+- **Steppers**: 3× A4988/DRV8825 (Bobbin + Lateral + Tensioner), 32 µstep
+- **Home sensor**: 2-contact reed/optical (NO + NC), lateral axis
+- **Load cells**: 2× HX711 — read by ESP32, forwarded to Pi for PID
+- **Potentiometer**: 10 kΩ on GPIO 36 (ADC1_CH0) — speed control
+- **Encoder**: quadrature on GPIO 1/3 (PCNT) — manual axis control
+- **TMC2209 UART**: handled by the Raspberry Pi, not the ESP32
 
-## Canonical Pin Mapping
+## Pin Assignments (ESP32)
 
-### PRU1 motor outputs
+| Signal             | GPIO | Notes                                            |
+|--------------------|------|--------------------------------------------------|
+| Bobbin STEP        | 26   |                                                  |
+| Bobbin DIR         | 27   |                                                  |
+| Bobbin EN          | 14   | Active LOW                                       |
+| Lateral STEP       | 32   |                                                  |
+| Lateral DIR        | 33   |                                                  |
+| Lateral EN         | 25   | Active LOW                                       |
+| Lateral HOME NO    | 21   | Normally-open contact (pull-up, LOW at home)     |
+| Lateral HOME NC    | 22   | Normally-closed contact (pull-up, HIGH at home)  |
+| Tensioner STEP     | 16   |                                                  |
+| Tensioner DIR      | 17   |                                                  |
+| Tensioner EN       | 4    | Active LOW                                       |
+| Tensioner endstop  | —    | No dedicated endstop                             |
+| SPI MOSI           | 23   | From RPi GPIO 10                                 |
+| SPI MISO           | 19   | To RPi GPIO 9                                    |
+| SPI SCLK           | 18   | From RPi GPIO 11                                 |
+| SPI CS             | 5    | From RPi GPIO 8                                  |
+| HX711 tension SCK  | 13   | Load cell #0 (forwarded to Pi)                   |
+| HX711 tension DOUT | 34   | Input-only                                       |
+| HX711 aux SCK      | 12   | Load cell #1 (forwarded to Pi)                   |
+| HX711 aux DOUT     | 39   | Input-only (VN)                                  |
+| Potentiometer      | 36   | ADC1_CH0 (VP), input-only, 12-bit, 32-sample MA  |
+| Encoder manual A   | 0    | PCNT — strap pin (ensure safe state at boot)      |
+| Encoder manual B   | 15   | PCNT — strap pin (ensure safe state at boot)      |
 
-| Header pin | PRU bit   | Function | Notes |
-|------------|-----------|----------|-------|
-| P8_41      | R30\[7\]  | EN_A     | Spindle enable (active-low) |
-| P8_43      | R30\[5\]  | DIR_A    | Spindle direction |
-| P8_45      | R30\[1\]  | STEP_A   | Spindle step |
-| P8_42      | R30\[3\]  | EN_B     | Lateral enable (active-low) |
-| P8_44      | R30\[0\]  | DIR_B    | Lateral direction |
-| P8_46      | R30\[2\]  | STEP_B   | Lateral step |
+> ⚠️ GPIO 12 must be LOW at boot — HX711 SCK is LOW at idle ✓.
+> GPIO 23 was `HOME_PIN_NO` in the old `resources/esp32/Config.h`.
+> It is now SPI MOSI — the home sensor NO contact has moved to GPIO 21.
+> The old POT_PIN (GPIO 34) from `Config.h` is now HX711[0] DOUT.
+> The potentiometer has moved to GPIO 36 (VP, ADC1_CH0, input-only).
+> GPIO0/15 are used for the manual encoder. These are strapping pins on
+> many ESP32 modules — avoid driving the encoder during reset/flash or add
+> pull resistors to guarantee a safe boot level.
 
-### PRU0 endstop inputs
+> Note: UART for TMC2209 is handled by the Raspberry Pi, not the ESP32.
 
-| Header pin | PRU bit   | Function   |
-|------------|-----------|------------|
-| P9_28      | R31\[6\]  | ENDSTOP_1  |
-| P9_30      | R31\[2\]  | ENDSTOP_2  |
+## Build & Flash
 
-### Other IO
+### ESP32 (PlatformIO — ESP-IDF framework)
 
-| Pin    | Function      |
-|--------|---------------|
-| P8_33  | eQEP1 A       |
-| P8_35  | eQEP1 B       |
-| P8_11  | Encoder1 A    |
-| P8_12  | Encoder1 B    |
-| P9_12  | HX711 SCK     |
-| P9_14  | HX711 DOUT    |
-| P9_23  | Footswitch    |
+```bash
+cd esp32/
+pio run -t upload              # build + flash over USB
+pio device monitor -b 115200  # serial monitor (if console is re-enabled)
+```
+
+> The firmware uses `framework = espidf`. Entry point is `app_main()`, not `setup()/loop()`.
+> `sdkconfig.defaults` overrides are applied automatically by PlatformIO on first build.
+
+### RPi Python
+
+```bash
+cd rpi/
+pip install -r requirements.txt
+python3 -m pytest tests/ -v              # run unit tests (no hardware)
+python3 main.py --preset strat --dry-run # dry-run with mock ESP32
+python3 main.py --preset strat           # real hardware
+```
+
+## SPI Protocol Summary
+
+- **Command frame**: 8 bytes (opcode + axis + uint32 data + flags + CRC-8/MAXIM)
+- **Status frame**: 44 bytes (3× axis state + HX711 readings + pot_raw + encoder_manual)
+- **Speed unit**: Hz (step frequency). 6400 steps/rev → 6400 Hz = 60 RPM.
+
+## Tension Control
+
+HX711 readings are acquired by the ESP32 sensor_task and forwarded to the Raspberry Pi via SPI.
+The Pi performs the PID loop at ~80 Hz and sends back a tension setpoint to the ESP32.
+
+```python
+await controller.set_tension(setpoint_dg=500)  # 50 g
+status = await controller.get_status()
+print(f"Tension: {status.tension_raw[0] / 10:.1f} g")
+print(f"Pot: {status.pot_raw}")          # 0–4095
+print(f"Encoder: {status.encoder_manual}")  # signed int16 delta
+```
 
 ## Directory Structure
 
 ```
-src/
-  pru/                          PRU firmware (pru-unknown-elf-gcc)
-    include/                    pru_ipc.h, pru_stepper.h, pru_regs.h
-    motor_control/          motor firmware (runs on PRU1)
-    orchestrator/           orchestrator firmware (runs on PRU0)
-    Makefile
-  linux/
-    daemon/                     pickup_daemon.c (Layer 3)
-  python/
-    pickup_test.py              Test sketch (9 functions)
-    pru_client.py               Async socket client
-  dts/                          Device-tree overlays
-build/                          Build outputs (dtbo, pru, daemon)
-doc/                            Architecture documentation
-resources/                      Reference material (ESP32, eQEP, Klipper)
-test/                           Unit tests (planned)
-Makefile                        Root build orchestrator
+esp32/          ESP32 PlatformIO firmware (C++17, ESP-IDF + FreeRTOS)
+  src/
+    encoder.h/.cpp    PCNT quadrature decoder (GPIO 1/3)
+    pot.h/.cpp        ADC1 potentiometer driver (GPIO 36)
+    sensor_task.h/.cpp  Core 0 sensor acquisition task
+    hx711.h/.cpp      HX711 bitbang driver (no PID)
+    axis.h/.cpp       Per-axis step ISR, trapezoidal ramp
+    stepper_engine.h/.cpp  3-axis engine, Core 1 task
+    spi_slave.h/.cpp  SPI slave DMA driver, Core 0 task
+    endstop.h/.cpp    2-contact endstop + homing
+    protocol.h        CmdFrame / StatusFrame / CRC-8
+    main.cpp          Pin config, app_main()
+  sdkconfig.defaults  SDK config overrides (console=none, 240 MHz, 1 kHz tick)
+rpi/            RPi Python application (asyncio)
+  hal/          SPI transport, protocol, axis config
+  machine/      CoilWinder, TensionController, homing
+  tests/        32 unit tests (pytest, no hardware needed)
+doc/            Architecture documentation
+resources/      Reference code (do not modify)
+  esp32/        Old standalone ESP32 project (original pinout reference)
+  klipper/      Klipper stepper acceleration reference
+  fastaccelstepper/  FastAccelStepper reference
 ```
 
-## Build
+## Motor Constants
 
-### Prerequisites
-
-- `pru-unknown-elf-gcc` (crosstool-NG) for PRU firmware
-- ARM cross-compiler for daemon on x86 hosts (e.g. `arm-linux-gnueabihf-gcc`)
-- `dtc` for device-tree overlays
-
-### Compiler usage
-
-- PRU firmware: built with `pru-unknown-elf-gcc` from crosstool-NG, typically found in `~/x-tools/*/bin/pru-elf-gcc` or `~/x-tools/*/bin/pru-gcc`.
-- Host daemon: on x86 hosts, `make daemon` automatically searches for an ARM cross-compiler in `PATH` or in `$(HOME)/x-tools/*/bin`.
-  - supported toolchain names include `arm-linux-gnueabihf-gcc`, `arm-cortex_a8-linux-gnueabihf-gcc`, `armv7l-linux-gnueabihf-gcc`, or equivalent ARM GNU toolchains.
-  - if none is found, the build fails and prompts you to install an ARM cross-toolchain.
-- On an ARM host, the normal native `gcc` is used for `pickup_daemon`.
-
-### Cross compilation
-
-When building on an x86 host, `make daemon` will automatically search for an ARM cross-compiler in your `PATH` and in `$(HOME)/x-tools/*/bin`.
-If none is found, the build prints a clear error and you must either install an ARM cross-toolchain or build the daemon directly on the BeagleBone.
-
-If you already have a cross-toolchain in `~/x-tools`, no extra flags are required.
-
-### Build everything
-
-```bash
-make all
-```
-
-Outputs:
-- `build/dtbo/*.dtbo` — DT overlays
-- `build/pru/am335x-pru0-fw` — PRU0 firmware
-- `build/pru/am335x-pru1-fw` — PRU1 firmware
-- `build/daemon/pickup_daemon` — C daemon
-
-### Build individual targets
-
-```bash
-make dtbo        # DT overlays only
-make pru         # PRU firmware only
-make daemon      # Daemon only
-make clean       # Remove all build outputs
-```
-
-### Deploy to BeagleBone
-
-```bash
-make deploy BBB_IP=192.168.x.x         # Full deploy via SSH
-make -C src/pru deploy BBB_IP=...      # PRU firmware only
-```
-
-## Socket Protocol
-
-The daemon listens on `/run/pickup-winder.sock` (Unix domain, newline-delimited JSON).
-
-**Commands** (Python → daemon):
-| Command       | Fields                              | Description |
-|---------------|-------------------------------------|-------------|
-| `set_speed`   | `sp_hz`, `lat_hz`, `sp_dir`, `lat_dir` | Set spindle speed (Hz). `lat_hz` activates continuous lateral (avoid during winding) |
-| `enable`      | `axis`, `value`                     | Enable/disable drivers |
-| `set_mode`    | `mode`                              | Set winding mode: `"free"` (default) or `"winding"` (spindle–lateral sync) |
-| `set_limits`  | `axis`, `min`, `max`                | Set software position limits (steps, signed) |
-| `move_to`     | `axis`, `pos`, `start_hz`, `max_hz`, `accel_steps` | Move lateral to absolute position with trapezoidal profile |
-| `e_stop`      |                                     | Emergency stop |
-| `home_start`  |                                     | Start lateral homing |
-| `reset_pos`   | `axis`                              | Reset step counters |
-| `ack_event`   |                                     | Acknowledge event and release locks |
-
-### Command payloads and rate
-
-- Each command is a single JSON object on its own line (newline-delimited JSON).
-- The daemon rejects a new command if the previous host command is still pending for more than ~50 ms. Returns `{"ok":false,"error":"busy"}`.
-- **Spindle** speed ramps: send progressive `set_speed` at ~**10 ms cadence**.
-- **Lateral axis**: use `move_to` — the motor stops at the target autonomously. `lat_hz` in `set_speed` is for continuous lateral modes only.
-
-### Winding modes
-
-```json
-{"cmd":"set_mode","mode":"free"}
-{"cmd":"set_mode","mode":"winding"}
-```
-
-Mode is a **daemon-only** concept — no IPC command is sent to the PRU. It controls
-whether each `move_to` includes a spindle-coordination ratio.
-
-| Mode | `set_speed` | `move_to` | Spindle follow lateral? |
-|------|-------------|-----------|-------------------------|
-| `free` *(default)* | direct spindle control | position target, no sync | ❌ |
-| `winding` | records reference speed | position target + Q6 coord ratio sent | ✅ |
-
-**`free`** — axes independent. Use for testing, homing, manual positioning.  
-**`winding`** — call `set_speed()` first to set the reference spindle speed, then
-`move_to()` activates coordination. The spindle slows/accelerates in real-time
-with every lateral ramp, including deceleration and reversal gaps. Coordination
-is automatically disabled by any subsequent `set_speed()` call.
-
-### move_to — autonomous trapezoidal profile
-
-```json
-{"cmd":"move_to","axis":1,"pos":3072,"start_hz":200,"max_hz":4000,"accel_steps":300}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `pos` | int | Absolute target position in steps (signed, 0 = home) |
-| `start_hz` | uint | Step frequency at ramp start/end (slow, e.g. 200) |
-| `max_hz` | uint | Cruise step frequency (fast, e.g. 4000–16000) |
-| `accel_steps` | uint | Steps for accel and decel (≥ 1) |
-
-The daemon converts Hz → IEP intervals (integer only) and sends `HOST_CMD_MOVE_TO`.
-PRU1 executes the profile autonomously and stops exactly at `pos`. On completion, PRU0 fires `EVENT_MOVE_COMPLETE` and the daemon broadcasts:
-
-```json
-{"event":"move_complete","pos":3072}
-```
-
-Call `ack_event` after receiving `move_complete`.
-
-**Hot retarget** — consecutive same-direction moves without stopping:
-
-If a new `move_to` arrives while the lateral is already moving in the **same direction** (ACCEL or CRUISE phase), PRU1 simply updates its destination without resetting the speed to `start_hz`. The motor keeps running at cruise speed and decelerates only when approaching the new target. This enables seamless winding traversals made of many small steps:
-
-```python
-# Winding traversal: stream small moves; motor never stops between them
-for waypoint in traverse_waypoints:
-    await client.move_to(pos=waypoint, start_hz=500, max_hz=8000, accel_steps=100)
-    # No need to wait for move_complete between waypoints
-```
-
-For **direction reversals** (e.g. at the coil edge), Python must wait for `move_complete` before sending the reverse move — the motor decelerates to a full stop then re-accelerates in the new direction.
-
-**Spindle-lateral speed coordination:**
-
-The daemon includes a Q6 ratio `move_sp_lat_coord = (sp_iv × 64) / lat_cruise_iv` in each `move_to`. PRU0's `coord_tick()` reads `params->lat_interval` and adjusts the spindle proportionally every `CMD_CHECK_STRIDE` iterations (≈ 5 µs), so turns/mm stays constant during lateral ramps:
-
-```
-sp_adj = (sp_lat_coord × lat_iv) >> 6
-```
-
-Coordination is **activated** by `move_to` and **deactivated** by `set_speed` (Python re-takes direct spindle control). It persists across `move_complete` during the reversal gap so the spindle stays slow while the lateral is momentarily stopped.
-
-**Safety layering for lateral:**
-1. PRU1 stops exactly at target (primary — no host timing dependency).
-2. Software limits (`set_limits`) halt the axis if position leaves the configured range (secondary).
-3. Hardware endstops (P9\_28, P9\_30) cut the lateral immediately (hardware failsafe).
-
-Additional commands:
-- `{"cmd":"set_limits","axis":1,"min":-10000,"max":10000}` — install soft limits.  If exceeded, PRU0 latches the axis and fires `limit_hit`. Send `ack_event` to release.
-- `{"cmd":"set_speed","sp_hz":8000,"sp_dir":0}` — spindle speed change (10 ms ramp cadence).
-- `axis` can be `0` (spindle), `1` (lateral), or `255` (all).
-
-**Events** (daemon → Python):
-| Event           | Fields               | Description |
-|-----------------|----------------------|-------------|
-| `endstop_hit`   |                      | Lateral endstop triggered |
-| `home_complete` |                      | Homing sequence finished |
-| `fault`         | `sp_faults`, `lat_faults` | Motor fault detected |
-| `limit_hit`     | `axis`, `pos`        | Software position limit exceeded |
-| `move_complete` | `pos`                | Autonomous move_to finished; motor stopped at target |
-| `telem`         | `pru1_state`, `sp`, `lat`, `endstop` | Periodic telemetry (100 ms) |
-
-## Testing
-
-```bash
-# Run all tests (requires daemon running on BBB)
-python3 src/python/pickup_test.py
-
-# Run specific test
-python3 src/python/pickup_test.py --test test_set_speed
-
-# List available tests
-python3 src/python/pickup_test.py --list
-```
-
-## Notes
-
-- The active BeagleBone port is the current target; ESP32/PlatformIO content
-  in `resources/esp32/` is legacy reference only.
-- PRU0 is the orchestrator (homing, limits, move_to arming, spindle coordination); PRU1 drives
-  the steppers (IEP owner, STEP/DIR/EN, trapezoidal profile + hot retarget execution).
-- Spindle speed ramps are managed host-side via `set_speed` at ~10 ms cadence.
-- Lateral moves use `move_to` — PRU1 executes the profile autonomously; Python
-  only needs to send one command and wait for `move_complete`.
-- Consecutive same-direction `move_to` commands trigger hot retarget — the lateral
-  motor never decelerates between waypoints. Direction reversal requires waiting for
-  `move_complete` first.
-- Spindle speed is automatically coordinated with lateral ramps via Q6 ratio
-  (`move_sp_lat_coord`) so turns/mm stays constant. Deactivated by `set_speed`.
-
-## References
-
-- `doc/beaglebone_architecture.md` — architecture and pinmux rationale
-- `.github/copilot-instructions.md` — coding guidelines and conventions
-- `src/pru/README.md` — PRU firmware overview
-- `src/pru/PRU_DEPLOY.md` — deployment scripts and runtime checks
-- `src/dts/README.md` — overlay build/deploy instructions
+| Parameter          | Value                                     |
+|--------------------|-------------------------------------------|
+| Spindle steps/rev  | 6400 (200 full × 32 µstep)               |
+| Lateral steps/mm   | 3072 (96 full × 32 µstep, M6 1 mm pitch) |
+| Speed range        | 100 – 160 000 Hz (~0.9 – 1500 RPM)       |
+| ESP32 timer clock  | 40 MHz (APB/2, 25 ns resolution)          |

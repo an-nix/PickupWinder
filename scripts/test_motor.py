@@ -51,7 +51,7 @@ SOCKET_PATH    = "/run/pickup-winder.sock"
 #   75 000  →  703 rpm/s  →  0→1500 RPM in 2.1 s
 #  150 000  → 1406 rpm/s  →  0→1500 RPM in 1.1 s   (aggressive)
 #  200 000  → 1875 rpm/s  →  0→1500 RPM in 0.8 s   (max NEMA17 safe approx.)
-SP_ACCEL = 75000   # steps/s²  — spindle acceleration (editable or via --sp-accel)
+SP_ACCEL = 30000   # steps/s²  — spindle acceleration (editable or via --sp-accel)
 SP_DECEL = 75000   # steps/s²  — spindle deceleration (editable or via --sp-decel)
 
 # Spindle test profile — explicit sweep 100 → 2000 RPM (step 100)
@@ -68,11 +68,11 @@ SPINDLE_TESTS = [
     ("Sweep CW  800 RPM",   85333, 0, 2.0),
     ("Sweep CW  900 RPM",   96000, 0, 2.0),
     ("Sweep CW 1000 RPM",  106666, 0, 2.0),
-    #("Sweep CW 1100 RPM",  117333, 0, 2.0),
-    #("Sweep CW 1200 RPM",  128000, 0, 2.0),
-    #("Sweep CW 1300 RPM",  138666, 0, 2.0),
-    #("Sweep CW 1400 RPM",  149333, 0, 2.0),
-    #("Sweep CW 1500 RPM",  160000, 0, 3.0),
+    ("Sweep CW 1100 RPM",  117333, 0, 2.0),
+    ("Sweep CW 1200 RPM",  128000, 0, 2.0),
+    ("Sweep CW 1300 RPM",  138666, 0, 2.0),
+    ("Sweep CW 1400 RPM",  149333, 0, 2.0),
+    ("Sweep CW 1500 RPM",  160000, 0, 3.0),
     #("Sweep CW 1600 RPM",  170666, 0, 2.0),
     #("Sweep CW 1700 RPM",  181333, 0, 2.0),
     #("Sweep CW 1800 RPM",  192000, 0, 2.0),

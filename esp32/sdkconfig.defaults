@@ -1,0 +1,33 @@
+# PickupWinder ESP32 — ESP-IDF SDK configuration defaults
+#
+# These values override the IDF defaults at configure time.
+# Rebuild fully after changing (pio run --target clean && pio run).
+
+# ── FreeRTOS ─────────────────────────────────────────────────────────────────
+# 1 kHz tick = 1 ms precision for stepper polling and sensor task.
+CONFIG_FREERTOS_HZ=1000
+
+# ── CPU ──────────────────────────────────────────────────────────────────────
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# 0=none 1=error 2=warn 3=info 4=debug 5=verbose
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+
+# ── Console UART ──────────────────────────────────────────────────────────────
+# GPIO 1 (UART0 TX) and GPIO 3 (UART0 RX) are used for the manual axis encoder.
+# Disable the UART0 console to free those pins for PCNT quadrature input.
+#
+# To restore serial console for debugging (e.g. without encoder connected):
+#   1. Comment out the two CONFIG_ESP_CONSOLE_* lines below.
+#   2. Run: pio run --target clean && pio run
+# Note: If you use GPIO1/3 for an external encoder while the serial console
+# is enabled, avoid turning the encoder during flashing — external inputs
+# with internal pull-ups are usually safe, but spinning the encoder during
+# flash can interfere with serial bootloader behavior.
+# To disable the UART0 console (free GPIO1/3 for other uses), uncomment:
+# CONFIG_ESP_CONSOLE_UART_NONE=y
+
+# ── Flash ─────────────────────────────────────────────────────────────────────
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

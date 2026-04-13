@@ -1,683 +1,689 @@
-# Copilot Instructions — PickupWinder (BeagleBone Black)
+# Copilot Instructions — PickupWinder (RPi + ESP32)
 
-> Branch `beagle` — migration to BeagleBone Black (AM335x) + PRU.
-> ESP32 sources in `resources/esp32/` (reference only).
+> Platform: Raspberry Pi (Python application) + ESP32 (real-time stepper controller).
+> ESP32 firmware uses **ESP-IDF framework** (not Arduino). Entry point is `app_main()`.
+> Old BeagleBone Black sources are in `resources/esp32/` (reference only — do not modify).
 
 ---
 
 ## 1. Project Identity & Goals
 
 - **Purpose**: Automated/assisted guitar pickup coil winding — precise lateral
-  guide traversal, real-time speed control, recipe persistence.
-- **Hardware**: BeagleBone Black (AM335x), two A4988/DRV8825 stepper drivers
-  (spindle + lateral), rotary encoder, analog potentiometer, footswitch,
-  dual-contact home sensor, WebSocket UI.
-- **Core constraint**: Firmware pilots physical motors under wire tension.
+  traversal, real-time speed control, wire tension control, recipe persistence.
+- **Hardware**: ESP32 (dual-core FreeRTOS, ESP-IDF), three A4988/DRV8825 stepper drivers
+  (bobbin + lateral + tensioner), two HX711 load cells, 2-contact home sensor,
+  potentiometer on GPIO 36, quadrature encoder on GPIO 1/3, SPI link to Raspberry Pi.
+- **Core constraint**: Firmware drives physical motors under wire tension.
   Correctness and determinism always outweigh elegance.
 
 ---
 
-## 2. Architecture Overview — Option A (Continuous Shared Parameters)
+## 2. Architecture Overview
 
-4-layer architecture. **No move rings.** Host writes target speeds;
-PRU0 orchestrates; PRU1 generates pulses from continuous parameters.
-
-```
-┌───────────────────────────────────────────────────────────────────┐
-│  Layer 4 — Python application (asyncio, runs on ARM Linux)        │
-│  PruClient · pickup_test.py · (future: WinderApp, WebUI, ...)     │
-│  Sends JSON commands to daemon, receives telem + events           │
-│                      │ Unix socket /run/pickup-winder.sock        │
-├──────────────────────▼────────────────────────────────────────────┤
-│  Layer 3 — C hardware daemon  (pickup_daemon, runs on ARM Linux)  │
-│  Maps PRU Shared RAM via /dev/mem                                 │
-│  Writes host_cmd_t   (commands: set_speed, enable, estop, home)   │
-│  Reads pru_status_t  (aggregated status from PRU0)                │
-│  Polls at 10 ms, broadcasts telem + events to Python              │
-│  ONLY talks to PRU0 — never accesses motor_params or motor_telem  │
-│                      │ /dev/mem mmap (PRU Shared RAM 0x4A310000)  │
-├──────────────────────▼────────────────────────────────────────────┤
-│  Layer 2 — PRU0 orchestration  (200 MHz, 5 ns/cycle)              │
-│  Reads host_cmd_t from daemon (via shared RAM)                    │
-│  Owns homing state machine (IDLE→APPROACH→HIT)                    │
-│  Writes motor_params_t (intervals, dirs, enable, run flags)       │
-│  Reads motor_telem_t from PRU1                                    │
-│  Publishes pru_status_t (aggregated status for daemon)            │
-│  Detects events (endstop, home_complete, fault) → sets event flags│
-│  NO motor pin ownership. NO STEP/DIR/EN control.                  │
-│                      │ PRU Shared RAM (host_cmd / motor_params)   │
-├──────────────────────▼────────────────────────────────────────────┤
-│  Layer 1 — PRU1 motor control  (200 MHz, IEP owner)               │
-│  Reads motor_params_t from PRU0 continuously                      │
-│  IEP-based pulse generation: pulse_gen_t per axis                 │
-│  STEP/DIR/EN GPIO for spindle + lateral                           │
-│  Reads R31 endstops → unconditional lateral safety stop           │
-│  Publishes motor_telem_t (step counts, positions, faults, endstop)│
-│  DUMB motor driver — no homing logic, no host commands            │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-**Communication flow** (total shared RAM: 224 bytes):
-```
-Host ──host_cmd_t──→ PRU0 ──motor_params_t──→ PRU1
-                     PRU0 ←──motor_telem_t── PRU1
-Host ←─pru_status_t─ PRU0
-```
-
-Key files per layer:
-- Layer 1: `src/pru/motor_control/main.c`
-- Layer 2: `src/pru/orchestrator/main.c`
-- Layer 3: `src/linux/daemon/pickup_daemon.c`
-- Layer 4: `src/python/pickup_test.py`, `src/python/pru_client.py`
-
-Full architecture: see `doc/beaglebone_architecture.md`.
-
-### 2.1 PRU Firmware
-
-| File                                   | Responsibility |
-|----------------------------------------|----------------|
-| `pru/include/pru_ipc.h`               | IPC shared memory layout: host_cmd_t, motor_params_t, motor_telem_t, pru_status_t; HOST_CMD_* opcodes; fault/state/event flags |
-| `pru/include/pru_stepper.h`           | IEP timer macros; pulse_gen_t continuous engine with Klipper-style acceleration (`interval += add` per step); pulse_update() / pulse_set_ramp() / pulse_stop() |
-| `pru/include/pru_regs.h`              | R30/R31 register aliases for STEP/DIR/EN/ENDSTOP pins |
-| `pru/motor_control/main.c`       | Motor firmware (PRU1 at runtime): IEP owner, dual-axis pulse generation, trapezoidal move_to profile FSM, motor_telem_t publisher |
-| `pru/orchestrator/main.c`        | Orchestrator firmware (PRU0 at runtime): host_cmd_t processor, homing FSM, software limits, move_to arming, R31 endstop reading, motor_params_t writer, pru_status_t publisher |
-
-### 2.2 Layer 3 — C Daemon (`pickup_daemon`)
-
-| File                                          | Responsibility |
-|-----------------------------------------------|----------------|
-| `src/linux/daemon/pickup_daemon.c`            | C hardware daemon: mmap PRU shared RAM, write host_cmd_t, read pru_status_t, Unix socket server |
-
-Socket path: `/run/pickup-winder.sock`
-Protocol: newline-delimited JSON.
-
-Commands from Python:
-- `set_speed` — set spindle Hz (and optionally lateral Hz for continuous mode)
-- `enable` — enable/disable stepper drivers
-- `e_stop` — immediate all-axis stop
-- `home_start` — start lateral homing sequence
-- `set_mode` — set winding mode: `"free"` (default, no sync) or `"winding"` (spindle tracks lateral). Daemon-only, no IPC sent to PRU.
-- `set_limits` — configure axis software position limits (steps)
-- `move_to` — move lateral to absolute position with trapezoidal profile
-- `ack_event` — acknowledge pending event and release limit locks
-- `reset_pos` — reset step counters and positions
-
-Events to Python: `endstop_hit`, `home_complete`, `fault`, `limit_hit`, `move_complete`, `telem`
-
-### 2.3 Layer 4 — Python Application
-
-| Module               | File(s)                              | Responsibility |
-|----------------------|--------------------------------------|----------------|
-| `PruClient`          | `src/python/pru_client.py`           | Async socket client for pickup_daemon; JSON command/event protocol |
-| `pickup_test.py`     | `src/python/pickup_test.py`          | Test sketch: DaemonClient class + 11 test functions for validating the full stack |
-
-> Python must NOT access /dev/mem directly. All PRU interaction goes through
-> `PruClient` → Unix socket → `pickup_daemon`.
-
-### 2.4 Key Header (C layer)
-
-| Header                        | Content |
-|-------------------------------|---------|
-| `pru/include/pru_ipc.h`      | `host_cmd_t` (64B), `motor_params_t` (32B), `motor_telem_t` (64B), `pru_status_t` (64B); HOST_CMD_* opcodes; MOTOR_STATE_*, FAULT_*, EVENT_* flags |
-| `pru/include/pru_stepper.h`  | `pulse_gen_t` (continuous IEP engine with Klipper-style acceleration: `interval += add` per step), `pulse_update()`, `pulse_set_ramp()`, `IEP_NOW()`, `IEP_INIT()` |
-| `pru/include/pru_regs.h`     | R30/R31 hardware register aliases — **`register volatile` is mandatory**; without `register` writes go to RAM, not pins |
-
-### 2.5 IPC Shared RAM Layout
+Two-processor architecture: Raspberry Pi (Python) ↔ ESP32 (C++/FreeRTOS/ESP-IDF) over SPI.
 
 ```
-Offset   Size    Struct              Direction       Description
-0x0000   64 B    host_cmd_t          Host → PRU0     Commands (set_speed, enable, estop, home, set_limits, move_to, ...)
-0x0040   32 B    motor_params_t      PRU0 → PRU1     Motor intervals, dirs, enable/run flags, move_to profile params
-0x0060   64 B    motor_telem_t       PRU1 → PRU0     Step counts, positions, faults, endstop mask, lat_move_done
-0x00A0   64 B    pru_status_t        PRU0 → Host     Aggregated status for daemon broadcast
-Total:  224 bytes (well within 12 KB PRU shared RAM)
+┌──────────────────────────────────────────────────────────────────────┐
+│  Python application  (asyncio, Raspberry Pi)                         │
+│  main.py · CoilWinder · TensionController · WebUI                   │
+│                      │ spidev SPI0, 4 MHz                            │
+│              rpi/hal/esp32_controller.py                             │
+│           CmdFrame (8 B) → / ← StatusFrame (44 B)                   │
+├──────────────────────────────────────────────────────────────────────┤
+│  ESP32  (240 MHz, FreeRTOS/ESP-IDF, dual-core)                       │
+│                                                                      │
+│  Core 0 (priority  5): sensor_task                                  │
+│    HX711 non-blocking poll every 1 ms (~80 Hz actual)               │
+│    ADC1 potentiometer every 20 ms (~50 Hz)                          │
+│    PCNT quadrature encoder every 1 ms                               │
+│    Writes SensorState g_sensor under portMUX spinlock               │
+│                                                                      │
+│  Core 0 (priority 10): spi_task                                     │
+│    Receives CmdFrame → CmdQueue → Core 1                            │
+│    Sends StatusFrame (reads g_sensor under spinlock)                │
+│                                                                      │
+│  Core 1 (priority 24): stepper_task                                 │
+│    Dispatches CmdQueue → Axis commands                              │
+│    Polls endstops every 1 ms (non-blocking)                         │
+│    Hardware timers → STEP ISRs (jitter < 1 µs)                      │
+│      Timer 0/0 → Axis 0 (Bobbin)                                    │
+│      Timer 0/1 → Axis 1 (Lateral)                                   │
+│      Timer 1/0 → Axis 2 (Tensioner)                                 │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.6 HAL Contract — Strict Separation of Concerns
-
-The C daemon is the **sole Hardware Abstraction Layer** between the physical
-world (PRU, /dev/mem, registers) and the application world (Python, recipes,
-UI). This separation is intentional and must be maintained.
-
-**Why the boundary exists:**
-
-The hardware world is unstable by nature:
-- PRU shared RAM layout (`pru_ipc.h` offsets) may change with firmware updates.
-- Stepper driver replacement (A4988 → TMC2209 UART) changes the low-level protocol.
-- PRU firmware opcode changes, struct sizes, flag bits — all hardware details.
-
-The application world is unstable by nature:
-- New winding recipes, patterns, geometry parameters.
-- UI changes, new WebSocket events, REST endpoints.
-- Session arbitration rules, turn counting, target logic.
-
-**The contract between them is intentionally small and stable:**
-
-```
-Commands (Python → C):  set_speed / enable / e_stop / home_start / set_mode / set_limits / move_to / ack_event / reset_pos
-Events   (C → Python):  endstop_hit / home_complete / fault / limit_hit / move_complete / telem
-```
-
-This contract exposes **no hardware detail**: no memory addresses, no register
-values, no PRU opcodes. Python does not know and must never know what
-`motor_params_t`, `IEP_NOW()`, or `pulse_gen_t` are.
-
-**Discipline rules (enforced in code review):**
-
-In the C daemon — never let application logic leak in:
-```c
-/* ❌ wrong: application logic in C */
-if (step_count >= recipe_target) { send_event("target_reached"); }
-
-/* ✅ correct: raw hardware fact only */
-send_event("telem", step_count, position, faults);
-/* Python decides whether target_reached based on telem */
-```
-
-In Python — never reference hardware concepts:
-```python
-# ❌ wrong: hardware detail leaking into Python
-motor_params.sp_interval = 31250
-
-# ✅ correct: socket contract only
-await client.set_speed(sp_hz=6400)
-await client.move_to(pos=3072, start_hz=200, max_hz=4000, accel_steps=300)
-```
-
-**Consequence:** If the hardware changes (new PRU firmware, new stepper driver,
-new board revision), only `pickup_daemon.c` changes — Python is untouched.
-If the application logic changes (new recipe type, new UI feature), only Python
-changes — the C daemon is untouched.
-
-### 2.7 Option A with autonomous move_to (lateral) + hot retarget + spindle coordination
-
-This project uses the **continuous shared-parameter** model (Option A) for the spindle, and an **autonomous trapezoidal move_to** for the lateral axis:
-
-- **Spindle**: Python sends progressive `set_speed` commands at ~10 ms cadence for ramps. No host timing risk since the spindle position is irrelevant.
-- **Lateral**: Python sends a `move_to` command. PRU1 executes the trapezoidal profile (accel → cruise → decel) and stops exactly at the target without any further host interaction. Python receives a `move_complete` event on arrival.
-
-**Hot retarget** — consecutive same-direction moves form a seamless stream:
-
-If a new `move_to` arrives while PRU1 is in ACCEL or CRUISE phase and the direction matches, PRU1 just updates `g_lat_target` without resetting `params->lat_interval` to `start_iv`. The motor never decelerates between waypoints. If in DECEL phase with same direction, the interval is snapped back to `lat_cruise_iv` (CRUISE resumed). For direction changes, a full re-arm occurs (motor decelerates to stop, then re-accelerates).
-
-**Spindle-lateral speed coordination** (PRU0 `coord_tick()`):
-
-- The daemon computes `move_sp_lat_coord = (sp_iv × 64) / lat_cruise_iv` (Q6 ratio) for each `move_to`.
-- PRU0 applies `sp_adj = (sp_lat_coord × params->lat_interval) >> 6` every `CMD_CHECK_STRIDE` iterations (≈5 µs). No division in PRU.
-- Coordination stays **active after `move_complete`** so the spindle stays at the proportional start speed during the reversal gap (waiting for the reverse `move_to`).
-- Coordination is **disabled by `set_speed`** (Python re-takes direct control) and by safety events (endstop, limit).
-- `SP_IV_MIN = 625` (160 kHz) / `SP_IV_MAX = 187500` (~534 Hz) bound the coordinated interval.
-
-Why this choice for lateral:
-- **No overshoot possible**: PRU1 owns position at step resolution. Motor STOPS at target regardless of Python scheduler jitter.
-- **No streaming required for single moves**: One command per move, not 50+ `set_speed` messages.
-- **Hot retarget for traversals**: Python can stream rapid waypoints — the motor maintains cruise speed.
-- **Consistent winding density**: Spindle tracks lateral speed during ramps, keeping turns/mm constant.
-- **Safety by design**: Even if Python crashes mid-move, the motor decelerates to its target and stops.
-
-### 2.8 Acceleration Model — Klipper-style multi-segment `interval += add`
-
-Both spindle and lateral axes use the same acceleration model inspired by
-Klipper's `stepper.c` (`resources/klipper/stepper.c`).
-
-**Core principle:** On each rising STEP edge, the PRU executes:
-```c
-interval += add;
-count--;
-// when count == 0 → load next segment (stepper_load_next)
-```
-
-**CRITICAL: a single {interval, add, count} segment does NOT produce constant
-acceleration over a wide speed range.** Since `v = clock / interval`, the
-relationship is hyperbolic. A constant `add` gives:
-- At iv=93000 (10 RPM): subtracting 14 → Δv ≈ 0.015% per step
-- At iv=625 (1500 RPM): subtracting 14 → Δv ≈ 2.2% per step
-
-The acceleration is ~150× faster at high speed. A single segment spends
-forever at low speed then shoots through high speed → motor stalls.
-
-**Solution (identical to Klipper):** break each ramp into **N_SEG=16
-sub-segments**, each covering an equal velocity sub-range. Each segment has
-its own `{start_iv, add, count}`. The interval is **force-loaded** at each
-segment boundary (= Klipper's `stepper_load_next()` loading `m->interval`).
-
-**Segment computation** (done by host/orchestrator BEFORE the step loop):
-```
-for each segment i in [0, N_SEG):
-    vs = v_start + i × Δv_seg          # segment start velocity
-    ve = v_start + (i+1) × Δv_seg      # segment end velocity
-    start_iv = 100M / vs               # force-loaded at segment start
-    end_iv   = 100M / ve
-    count    = (vs + ve) × (ve - vs) / (2 × accel)   # kinematic s=(v²-v₀²)/2a
-    add      = (end_iv - start_iv) / count            # truncated toward zero
-```
-
-**Execution** (Klipper inner loop + stepper_load_next):
-```c
-for (seg = 0; seg < N_SEG; seg++) {
-    iv = segs[seg].start_iv;           // force-load (stepper_load_next)
-    for (s = 0; s < segs[seg].count; s++) {
-        one_step(iv);
-        iv += segs[seg].add;           // interval += add
-    }
-}
-```
-
-**Trapezoidal profile** = accel segments (forward) + cruise + decel segments
-(same segments in reverse order with negated add).
-
-**API (`pru_stepper.h`):**
-```c
-pulse_set_ramp(pg, start_iv, add, count);  // arm a ramp segment
-// pg->accel_count > 0 while ramp is active
-// pg->accel_count == 0 → ramp complete, constant speed
-```
-
-When `accel_count == 0` (no ramp active), `pulse_update()` accepts external
-`new_interval` changes immediately (backward compatible with constant-speed
-mode).
-
-**Why Klipper over FastAccelStepper:**
-- FastAccelStepper uses `ticks = f/sqrt(2·a·s)` via a ~300-line log₂
-  fixed-point library. Too complex for PRU's 8 KB instruction RAM.
-- Klipper: one add per step, 5 lines of code in the ISR, host does all math.
-- Both are reference implementations in `resources/`.
-
-**Accuracy note:** Each sub-segment's linear approximation has a bounded
-error confined within the segment (force-load at boundaries prevents
-accumulation). With N_SEG=16 and a 150:1 speed range, each segment covers
-about 10:1 velocity ratio — sufficient for smooth stepper operation.
+Key files:
+- `esp32/src/main.cpp` — pin config, `app_main()`
+- `esp32/sdkconfig.defaults` — SDK overrides (console=none, 240 MHz, 1 kHz tick)
+- `esp32/src/protocol.h` — CmdFrame / StatusFrame / CRC-8/MAXIM
+- `esp32/src/axis.h/.cpp` — per-axis step ISR, trapezoidal ramp
+- `esp32/src/stepper_engine.h/.cpp` — 3-axis engine, command dispatch
+- `esp32/src/spi_slave.h/.cpp` — SPI slave driver, Core 0 task (pri 10)
+- `esp32/src/endstop.h/.cpp` — 2-contact endstop ISR + homing
+- `esp32/src/hx711.h/.cpp` — HX711 bitbang driver (no PID — Pi handles PID)
+- `esp32/src/encoder.h/.cpp` — PCNT quadrature decoder (GPIO 1/3)
+- `esp32/src/pot.h/.cpp` — ADC1 potentiometer driver (GPIO 36)
+- `esp32/src/sensor_task.h/.cpp` — Core 0 sensor acquisition task (pri 5)
+- `rpi/hal/protocol.py` — Python mirror of protocol.h
+- `rpi/hal/esp32_controller.py` — async command/event interface
+- `rpi/machine/coil_winder.py` — WindingState machine
 
 ---
 
-## 3. Hard Rules (Must-follow)
+## 3. SPI Protocol
 
-### 3.1 PRU Safety
+Full-duplex, SPI Mode 0, 4 MHz. Each transfer sends **CmdFrame (8 bytes)** and
+receives **StatusFrame (44 bytes)** simultaneously.
 
-- **NEVER** use dynamic memory, floats, or OS calls in PRU firmware.
-- **NEVER** use division in the inner PRU step loop (intervals pre-computed host-side).
-- The PRU step loop polls `IEP_NOW()` continuously — no `__delay_cycles` anywhere.
-- Emergency stop (`HOST_CMD_ESTOP`) clears all STEP outputs and stops all axes immediately.
-- PRU0 owns and initializes the IEP timer; PRU1 reads only — never resets it.
-- All motor-related real-time code must target **PRU0**.
-- PRU1 is reserved for orchestration, supervision, and host communication.
-- PRU0 is a DUMB motor driver — it has no knowledge of commands, homing, or host protocol.
-- All PRU shared memory accesses must use `volatile` pointers.
-- Shared memory structs must be `__attribute__((packed, aligned(4)))`.
-
-### 3.1.1 Canonical pin layout (MUST NOT change implicitly)
-
-Motor pins run through **PRU1** (`4a338000.pru` = `remoteproc2`), not PRU0.
-R30 bit assignments confirmed via `pinctrl-single/pins` debugfs dump on the
-target. All P8 MCASP0 pins are in **MODE5** (`pr1_pru1_pru_r30_N`, output).
-
-Motor A — Group A (odd P8 pins):
-- `P8_45` → `STEP_A` (`PRU1 R30[0]`)
-- `P8_43` → `DIR_A`  (`PRU1 R30[2]`)
-- `P8_41` → `EN_A`   (`PRU1 R30[4]`, active-low)
-
-Motor B — Group B (even P8 pins) — **spindle câblé ici**:
-- `P8_46` → `STEP_B` (`PRU1 R30[1]`)
-- `P8_44` → `DIR_B`  (`PRU1 R30[3]`)
-- `P8_42` → `EN_B`   (`PRU1 R30[5]`, active-low)
-
-Endstops (PRU0 inputs — read by PRU0 orchestrateur via R31):
-- `P9_28` → `ENDSTOP_1` (`PRU0 R31[3]`, pull-up, active-HIGH)
-- `P9_30` → `ENDSTOP_2` (`PRU0 R31[2]`, pull-up, active-HIGH)
-
-Additional board IO:
-- Encoder1: `P8_11` (A), `P8_12` (B)
-- Encoder2: `P8_33` (A), `P8_35` (B)
-- HX711: `P9_12` (SCK), `P9_14` (DOUT)
-- Footswitch: `P9_23`
-
-Rules:
-- Do not remap these pins unless the user explicitly requests it.
-- Any PRU pin change must update firmware + DTS + documentation in one commit.
-
-### 3.2 Linux Daemon Safety
-
-- **NEVER** use heap allocation in the hot control loop or telemetry path.
-  All runtime buffers are stack-local with bounded sizes or static.
-- Control loop tick: <= 10 ms. Log timing warnings if exceeded.
-- Daemon communicates ONLY with PRU1 (reads pru_status_t, writes host_cmd_t).
-  It never accesses motor_params_t or motor_telem_t directly.
-
-### 3.3 IPC Protocol
-
-- Host writes commands to `host_cmd_t.cmd` and waits for PRU1 to acknowledge
-  by echoing the opcode in `host_cmd_t.cmd_ack`, then setting `cmd = HOST_CMD_NOP`.
-- Host must not write a new command before the previous one is acknowledged.
-- Daemon reads `pru_status_t` at control loop cadence (<= 10 ms).
-- `pru_ipc.h` is C-compatible: included from both PRU C and Linux C.
-
-### 3.4 Socket Protocol
-
-- Socket path: `/run/pickup-winder.sock` (Unix domain, SOCK_STREAM).
-- All messages: newline-delimited compact JSON.
-- Commands: `set_speed`, `enable`, `e_stop`, `home_start`, `ack_event`, `reset_pos`.
-- Responses: `{"ok":true}` or `{"ok":false,"error":"..."}`.
-- Events: `endstop_hit`, `home_complete`, `fault`, `telem`.
-- Speed is specified in Hz (daemon converts Hz → IEP intervals).
-
-### 3.5 Recipe & Persistence
-
-- Recipe format version: `PICKUP_RECIPE_FORMAT_VERSION` (future, in Python).
-- Float fields clamped after parsing.
-- Storage: JSON files on BBB eMMC.
-
-### 3.6 Sensor Safety
-
-- Home sensor: NO=LOW + NC=HIGH → home. NO=HIGH + NC=HIGH → FAULT.
-- Endstops on PRU0 R31 (P9_28/P9_30): unconditional lateral safety stop when any endstop asserts.
-- PRU1 homing FSM reads endstop state from motor_telem_t.endstop_mask.
-
-### 3.7 Build
-
-- PRU: `pru-unknown-elf-gcc` (crosstool-NG). Makefile: `src/pru/Makefile`.
-- Daemon: `gcc` (ARM native or cross). Build via root `Makefile`.
-- DTS overlays: `dtc` compiler. Build via root `Makefile`.
-- Root Makefile: `make all` builds dtbo + pru + daemon. Outputs in `build/`.
-- Unit tests: (planned) native x86-64 host, gtest. Tests in `test/`.
-- CI: `.github/workflows/beaglebone-build.yml`.
-
-### 3.8 Logging
-
-- Daemon uses `fprintf(stderr, ...)` for diagnostics.
-- High-frequency logs gated by verbosity flags.
-- Never log credentials, recipe blobs, or raw shared memory dumps in production.
-
----
-
-## 4. Domain Knowledge
-
-### 4.1 Winding State Machine (future — Python layer)
+### CmdFrame layout
 
 ```
-IDLE --(start)--> PAUSED (positioning)
-                    |
-                    +--(positioned+pot/resume)--> WINDING
-                    |                               |
-                    |                         (pot=0)--> PAUSED
-                    |                  (turns>=target)--> TARGET_REACHED
-                    |                               |
-                    +----------(stop)---------------> IDLE
+Byte  Field   Description
+0     cmd     CmdOpcode (uint8)
+1     axis    AxisId: 0=Bobbin, 1=Lateral, 2=Tensioner, 0xFF=ALL
+2..5  data    uint32_t little-endian payload
+6     flags   CmdFlags bitfield
+7     crc8    CRC-8/MAXIM over bytes 0..6
 ```
 
-### 4.2 Session Arbitration (future — Python layer)
+### StatusFrame layout (44 bytes)
 
-- Sources: Pot (analog), IHM (WebSocket/UART), Footswitch.
-- IDLE: only IHM can produce a Start intent.
-- Pot-lock: when another source takes control while pot > 0, pot locked until it returns to 0.
-- Pot → RunMode::Pot (proportional). UI/Footswitch → RunMode::Max.
+```
+Byte   Field              Description
+0      global_flags       StatusFlags bitfield
+1      event_type         EventType
+2      event_axis         Axis that raised the event
+3      endstop_mask       Bit per axis (bit 0 = axis 0)
+4..7   uptime_ms          uint32_t LE
+8..15  axis[0]            AxisStatus — Bobbin  (position i32, hz u16, flags u8, pad)
+16..23 axis[1]            AxisStatus — Lateral
+24..31 axis[2]            AxisStatus — Tensioner
+32..33 tension_raw[0]     HX711 #0 in 0.1 g (int16_t LE)
+34..35 tension_raw[1]     HX711 #1 in 0.1 g (int16_t LE)
+36..37 tension_setpoint   Active PID setpoint in 0.1 g (int16_t LE)
+38..39 pot_raw            ADC1 potentiometer 0–4095 (int16_t LE)
+40..41 encoder_manual     PCNT quadrature delta, signed (int16_t LE)
+42..43 reserved           0x00 0x00
+```
 
-### 4.3 Lateral Traverse Synchronization
+### Command opcodes
 
-- Lateral speed: `effWidthMm × windingHz / (tpp × STEPS_PER_REV)`.
-- Scaled by pattern `speedScale` (0.55-1.60).
-- Compensation applied **host-side**: Python adjusts speeds via `set_speed` each tick.
-- Speed changes take effect immediately (no move ring flush needed).
-
-### 4.4 Winding Patterns (future — Python layer)
-
-- **STRAIGHT**: constant traverse.
-- **SCATTER**: per-layer random TPP + speed jitter.
-- **HUMAN**: smooth Perlin-like noise on traverse and speed.
-- All patterns deterministic per `seed`.
-
-### 4.5 Hardware Constants
-
-| Parameter         | Value           | Notes |
-|-------------------|-----------------|-------|
-| Spindle steps/rev | 6400            | 200-step × 32 µstep |
-| Speed range       | ~1067 – 160000 Hz | ~10 – 1500 RPM |
-| Lateral steps/mm  | 3072            | 96-step × 32 µstep, M6 1mm pitch |
-| PRU clock         | 200 MHz         | 5 ns/cycle, 1 cycle/instruction |
-| IEP interval min  | 1250            | = 200 MHz / 160000 Hz |
-| IEP interval max  | 187500          | = 200 MHz / 1067 Hz |
-
----
-
-## 5. Code Style Conventions
-
-- **Language**: C for daemon and PRU. Python for application layer.
-- **Naming**: PascalCase classes/enums, camelCase methods/members, _prefix private, UPPER_SNAKE macros.
-- **Fixed buffers**: `char buf[N]` + `snprintf(buf, sizeof(buf), ...)`. Never `sprintf`.
-- **PRU integers only**: speeds in Hz (uint32_t), positions in steps (int32_t). No floats.
-- **Comments**: French acceptable in log messages. English for code comments.
-- **Include order**: matching .h first, then system headers, then project headers.
+| Opcode      | Value | Data              |
+|-------------|-------|-------------------|
+| NOP         | 0x00  | —                 |
+| SET_SPEED   | 0x01  | Hz (uint32)       |
+| MOVE_ABS    | 0x02  | steps (int32)     |
+| MOVE_REL    | 0x03  | steps (int32)     |
+| STOP        | 0x04  | —                 |
+| ESTOP       | 0x05  | —                 |
+| ENABLE      | 0x06  | 1=on, 0=off       |
+| HOME        | 0x07  | —                 |
+| SET_ACCEL   | 0x08  | steps/s² (uint32) |
+| GET_STATUS  | 0x09  | —                 |
+| SET_MODE    | 0x0A  | 0=free, 1=winding |
+| RESET_POS   | 0x0B  | —                 |
+| SET_LIMITS  | 0x0C  | limit (int32)     |
+| ACK_EVENT   | 0x0D  | —                 |
+| SET_TENSION | 0x0E  | 0.1g setpoint     |
+| TARE_HX711  | 0x0F  | axis=sensor index |
 
 ---
 
-## 6. Testing & Validation
+## 4. Pin Assignments (ESP32 — MUST NOT change implicitly)
 
-- `src/python/pickup_test.py`: 9 test functions exercising the full stack
-  (enable, estop, set_speed, speed_change, direction, home, reset_pos, telem, ack_event).
-- Future unit tests: `test/test_<suite>/test_main.cpp` (gtest, host-compilable).
-- Add/update test when adding a command or changing validation.
+### Stepper axes
+
+| Axis            | STEP | DIR | EN  | Notes                  |
+|-----------------|------|-----|-----|------------------------|
+| 0 — Bobbin      | 26   | 27  | 14  | No endstop             |
+| 1 — Lateral     | 32   | 33  | 25  | 2-contact home sensor  |
+| 2 — Tensioner   | 16   | 17  | 4   | No dedicated endstop   |
+
+EN pins: active LOW (driver ON when GPIO = LOW).
+
+### Lateral home sensor (2-contact)
+
+Both pins configured as input with pull-up (`gpio_config()`, `GPIO_PULLUP_ONLY`):
+
+| Contact | GPIO | Away       | At home    | Fault      |
+|---------|------|------------|------------|------------|
+| NO      | 21   | HIGH (open)| LOW (closed)| LOW       |
+| NC      | 22   | LOW (closed)| HIGH (open)| LOW       |
+
+Valid home: NO=LOW AND NC=HIGH.
+Fault (disconnected): NO=LOW AND NC=LOW.
+
+> ⚠️ Old `Config.h` had `HOME_PIN_NO = 23`. GPIO 23 is now SPI MOSI.
+> The NO contact was moved to **GPIO 21**.
+
+### SPI (VSPI / SPI3)
+
+| Signal | GPIO |
+|--------|------|
+| MOSI   | 23   |
+| MISO   | 19   |
+| SCLK   | 18   |
+| CS     | 5    |
+
+### HX711 load cells
+
+| Sensor     | SCK    | DOUT   | Notes                                    |
+|------------|--------|--------|------------------------------------------|
+| Tension[0] | GPIO 13| GPIO 34| Read by ESP32 and forwarded to RPi       |
+| Aux[1]     | GPIO 12| GPIO 39| Read by ESP32 and forwarded to RPi       |
+
+GPIO 12: strapping pin — must be LOW at boot. HX711 SCK idle = LOW ✓.
+GPIO 34, 39: input-only (no OUTPUT capability). DOUT only ever needs to be read.
+
+### Potentiometer & Encoder
+
+| Function       | GPIO | Notes                                                     |
+|----------------|------|-----------------------------------------------------------|
+| Potentiometer  | 36   | ADC1_CH0 (VP), input-only, 12-bit, 32-sample MA ~50 Hz   |
+| Encoder A      | 1    | PCNT_UNIT_0 — UART0 TX, freed by CONFIG_ESP_CONSOLE_UART_NONE |
+| Encoder B      | 3    | PCNT_UNIT_0 — UART0 RX, freed by CONFIG_ESP_CONSOLE_UART_NONE |
+
+> Old `Config.h` `POT_PIN = 34` is occupied by HX711[0] DOUT. Pot moved to GPIO 36.
+> Old encoder pins (GPIO 18/19) are now SPI SCLK/MISO.
+> GPIO 1/3 freed by `CONFIG_ESP_CONSOLE_UART_NONE=y` in `esp32/sdkconfig.defaults`.
+
+> Note: UART for TMC2209 is handled by the Raspberry Pi, not the ESP32.
+
+### Other
+
+| Signal | GPIO | Notes                          |
+|--------|------|--------------------------------|
+| —      | —    | No dedicated E-STOP pin used   |
+
+Any pin change **must** update `esp32/src/main.cpp` + `doc/architecture.md` + this file.
 
 ---
 
-## 7. Common Pitfalls
+## 5. Hard Rules
+
+### 5.1 ESP32 Firmware
+
+- **Framework is ESP-IDF**, not Arduino. Use `app_main()`, not `setup()/loop()`.
+  Never use Arduino HAL functions (`digitalWrite`, `digitalRead`, `millis`, `pinMode`, etc.).
+  Use ESP-IDF equivalents: `gpio_set_level()`, `gpio_get_level()`, `esp_timer_get_time()`, `gpio_config()`.
+- **NEVER** call `vTaskDelay()` or blocking I/O from a timer ISR.
+- All timer ISRs must be `IRAM_ATTR` and declared as free functions with `void(*)(void*)` signature.
+- `IRAM_ATTR` placement: on the function signature line in the `.cpp` file, not on the declaration in the header.
+- The `SensorState g_sensor` is protected by a `portMUX_TYPE` spinlock.
+  The `StatusFrame` in `g_engine.status_` is also protected by a spinlock.
+  Always use `portENTER_CRITICAL / portEXIT_CRITICAL` for access across tasks.
+- `volatile` required on all shared-state fields in `Axis` that are written by the ISR
+  and read by the stepper task or SPI task.
+- `AxisPins.endstop_no` / `endstop_nc` — set to -1 when not used.
+  Never assume a pin is valid without checking `>= 0`.
+- HX711 reads are **non-blocking**: check `gpio_get_level(DOUT) == 0` first.
+  Never spin-wait for DOUT in sensor_task tight loop.
+- GPIO 12 must not be driven HIGH at boot.
+- For GPIO >= 32, use `GPIO.out1_w1ts.val` / `GPIO.out1_w1tc.val` for fast bit-bang.
+  `GPIO.out_w1ts` only affects GPIO 0–31.
+
+### 5.2 Python Application
+
+- Python **never** touches SPI or GPIO directly.
+  All hardware access goes through `EspController` → SPI → ESP32.
+- No hardware constants (GPIO numbers, step counts, intervals) in Python
+  application code (`machine/`). Hardware constants live in `hal/axis.py`
+  or `config/machine_config.yaml`.
+- `EspController` is the only Python class that knows about `CmdOpcode` / `StatusFrame`.
+  `CoilWinder` only sees `set_speed()`, `move_to()`, `home()`, etc.
+
+### 5.3 Protocol
+
+- CRC-8/MAXIM over bytes 0..6 of each CmdFrame. Drop silently on mismatch.
+- **Status frame size = 44 bytes.** Python and C must stay in sync.
+- All multi-byte fields: little-endian on both sides (LE native on Xtensa and ARM).
+
+---
+
+## 6. Acceleration Model (Klipper-style)
+
+```
+for each segment i in [0, N_SEG=16):
+    interval = start_iv[i]      ← force-loaded
+    for s in range(count[i]):
+        step()
+        interval += add[i]
+```
+
+Segments are pre-computed by `Axis::build_simple_ramp()` on the ESP32.
+A single `{start_iv, add, count}` segment cannot cover a wide speed range —
+linear `add` means constant ΔHz per step but ΔHz/Hz is non-constant. Use N_SEG=16+.
+
+---
+
+## 7. HX711 & Sensor Architecture
+
+- **sensor_task** (Core 0, priority 5) owns all sensor acquisition.
+  It calls `hx711_tick()`, `pot_read()`, and `encoder_get_and_clear_delta()`.
+- HX711 tick fires every 1 ms but only reads when `gpio_get_level(DOUT) == 0` (data ready, ~80 Hz).
+- Potentiometer: `pot_read()` every 20 ms, 32-sample moving average, ~50 Hz.
+- Encoder: PCNT hardware (4X quadrature), `encoder_get_and_clear_delta()` every 1 ms.
+- **No PID on the ESP32.** Tension PID runs on the Raspberry Pi.
+  The Pi sends back a setpoint via `SET_TENSION`; the ESP32 stores it in `g_sensor.tension_setpoint`.
+- Output unit: 0.1 g (decigrams). Range: ±3276.7 g in int16_t.
+- `hx711_tare()` is blocking — call only during machine idle via `sensor_request_tare()`.
+
+---
+
+## 8. Common Pitfalls
 
 | Pitfall | Why it matters |
 |---------|----------------|
-| Float or division in PRU loop | PRU has no FPU; crashes or extreme slowdown |
-| OS call in PRU firmware | PRU has no OS; link error or crash |
-| Missing `volatile` on shared RAM pointer | Compiler may cache stale value |
-| `sprintf()` without size | Buffer overflow |
-| Missing PRU0 endstop safety stop | Wire break if lateral runs past limit |
-| Writing motor_params from daemon | Violates layering: daemon → PRU1 only |
-| Hz=0 in set_speed without interval check | Division by zero in daemon Hz→interval conversion |
-| Daemon writing new cmd before PRU1 ack | Race condition: previous command lost |
-| 2-cell `pinctrl-single,pins` on kernel 6.12 | `#pinctrl-cells=<2>` expects 3-cell format; only first pin applied |
-| `fragment@ {}` syntax in `/plugin/` DTS | Unreliable on 6.12; use direct `&node {}` syntax |
-| `bone-pinmux-helper` on kernel 6.12 | Not compiled; node stuck at `waiting_for_supplier` |
-| Wrong pad offset for GPIO input pin | Derive from pinctrl debugfs dump, not from pad name |
-| `__R30`/`__R31` declared without `register` keyword | `volatile uint32_t __R30 __asm__("r30")` without `register` creates a RAM variable named `r30` — writes never reach the physical pins. PRU appears to run (step counts increment in RAM) but no GPIO changes. **Always use `register volatile uint32_t __R30 __asm__("r30")`** — see `pru/include/pru_regs.h`. |
-| MODE6 on PRU0 output pins instead of MODE5 | On AM335x MCASP0 pins used by PRU0: MODE5 = `pr1_pru0_pru_r30_N` (output), MODE6 = `pr1_pru0_pru_r31_N` (input). Using MODE6 on STEP/DIR/EN pins in the DTS silently configures them as inputs — `__R30` writes are correct but the pads never drive. Verify with `cat /sys/kernel/debug/pinctrl/.../pins`: must show `pru 0 out`, not `pru 0 in`. |
-| Blocking `write()` in daemon `broadcast()` | Single-threaded daemon with blocking `write()` on client fds: one slow/stuck `socat` client freezes the entire event loop (no commands, no telem, SIGINT ignored). Fix: `fcntl(cfd, F_SETFL, O_NONBLOCK)` on accept + tolerate `EAGAIN` in `broadcast()`. |
-| Linear-interval ramp (interval -= constant) | Produces exponential RPM curve: too slow at low speeds, instant jump at high speeds. Motor stalls at high RPM. **Use Klipper `interval += add` with multi-segment ramp instead.** |
-| Single-segment ramp over wide speed range | A single `{interval, add, count}` covering e.g. 10→1500 RPM has ~150:1 speed ratio. `add` is constant but velocity change per step is hyperbolic — acceleration is 150× faster at high speed vs low speed. Motor spends forever at low RPM then shoots through high RPM → stall. **Always use N_SEG=16+ sub-segments with force-loaded `start_iv` at each boundary.** See `compute_accel_ramp()` in test_spindle and section 2.8. |
-| Overwriting interval during active ramp | When `accel_count > 0`, `pulse_update()` ignores external `new_interval`. Wait for `accel_count == 0` or call `pulse_set_ramp()` to override. |
-| Shared RAM garbage at PRU boot | The PRU shared RAM retains its content between soft reboots (remoteproc stop/start without power cycle). A residual non-NOP `cmd` byte in `host_cmd_t` is processed as a spurious command before the daemon sends anything → PRU stuck in unexpected state (PC loops at one address, step counters never advance). **Always zero `*host_cmd = (host_cmd_t){0}` as the very first thing in `orchestrator/main()`**. |
-| JSON spaces in Python → "unknown cmd" | `json.dumps()` produces `{"cmd": "enable"}` (space after `:`). If the daemon matches with `strstr(line, "\"cmd\":\"enable\"")` (no space), every command returns "unknown cmd". **Fix: `compact_json()` normalises the input in-place before dispatch** (already in `pickup_daemon.c`). |
-| Unix socket permissions 755 after `sudo` daemon | When `pickup_daemon` is launched with `sudo`, the socket file is created as root:root with mode 755. Non-root Python clients get `EACCES` on `connect()`. **Fix: `chmod(SOCKET_PATH, 0666)` immediately after `bind()`** (already in `create_server_socket()`). |
-| `read()` EAGAIN closes client socket | Client sockets are set `O_NONBLOCK` so `broadcast()` never blocks. If `read()` returns -1 with EAGAIN (no data yet, race with poll), `n <= 0` would close the socket. **Always guard: `if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;`** before the `n <= 0` close path. |
-| remoteproc1/remoteproc2 naming confusion | On Debian 12 BBB, `remoteproc1` maps to `4a334000.pru` = **PRU0** (orchestrator) and `remoteproc2` maps to `4a338000.pru` = **PRU1** (motor). The index in sysfs is NOT the PRU number. Confirm with `cat /sys/class/remoteproc/remoteproc1/name`. |
-| PRU IRAM not writable via `/dev/mem` | Writes to PRU IRAM via `/dev/mem` mmap are silently dropped by the kernel even when the PRU is stopped. The ONLY way to load PRU code is `echo start > /sys/class/remoteproc/remoteproc*/state` which triggers the remoteproc driver to load `/lib/firmware/am335x-pru*-fw`. Direct memory manipulation of IRAM is futile. |
-| pru-elf default linker script 256K memory | The default `pruelf.x` linker script assumes `__DMEM_SIZE=256K` and `__IMEM_SIZE=256K`. AM335x PRU has only **8 KB each**. Stack is placed at `_stack_top = ORIGIN(dmem) + LENGTH(dmem)` → 0x40000 → **unmapped memory**. Function calls that save/restore the return address via the software stack (e.g. `__pruabi_divi`, `__pruabi_remu`) silently lose the return address → PRU jumps to garbage address → **HALT**. Symptom: PRU0 `status.seq` resets and stops incrementing after the first function that uses the stack for `ra` save/restore. **Fix: always pass `-Wl,--defsym,__DMEM_SIZE=0x2000 -Wl,--defsym,__IMEM_SIZE=0x2000` in PRU CFLAGS.** |
-| `%` modulo operator in PRU code | PRU has no hardware divider. The `%` operator on non-power-of-2 values compiles to `__pruabi_remu` → hundreds of cycles per call. **Use increment+compare (`if (++cnt >= STRIDE) { cnt = 0; ... }`) instead of `loop_cnt % STRIDE == 0`.** |
+| Using Arduino API (digitalWrite, millis, etc.) | Framework is ESP-IDF — Arduino symbols are undefined |
+| `IRAM_ATTR` on declaration not definition | ISR placed in flash → cache miss → hard fault under load |
+| Timer ISR not a free function | `timer_isr_register()` expects `void(*)(void*)`, rejects member pointers |
+| Missing `volatile` on ISR-written fields | Compiler caches stale value in register |
+| Blocking in HX711 tick | `gpio_get_level(DOUT)` before reading; never spin-wait in the sensor loop |
+| GPIO 12 HIGH at boot | Causes ESP32 flash voltage issue on some modules |
+| GPIO 34-39 used as output | Input-only — any `gpio_set_level()` silently ignored |
+| GPIO >= 32 with `out_w1ts` | Must use `out1_w1ts.val` for GPIO 32–39 in fast ISR code |
+| EndStop NC check skipped | Single-pin mode masks sensor faults; NO=LOW AND NC=LOW = wiring break |
+| STATUS_FRAME_SIZE mismatch | Python/C must both be **44 bytes**; assert in both languages |
+| portMUX not used on g_sensor or StatusFrame | sensor_task and stepper_task run on different cores simultaneously |
+| HX711 scale = 0 | Division by zero in `raw_to_dg()` — always validate before calibrating |
+| Encoder on GPIO 1/3 without sdkconfig | UART0 drives those pins by default; `CONFIG_ESP_CONSOLE_UART_NONE=y` required |
 
 ---
 
-## 8. Quick Reference: Adding a New Feature
+## 9. Quick Reference: Adding a New Feature
 
-1. **New daemon command**: add `HOST_CMD_*` in `pru_ipc.h`, handle in PRU1
-   `process_host_cmd()`, add JSON command parsing in `pickup_daemon.c`,
-   add `PruClient` method, add test in `pickup_test.py`.
-2. **New event type**: add `EVENT_*` in `pru_ipc.h`, detect in PRU1 and set
-   `event_pending`/`event_type`, handle in daemon event broadcast, handle
-   in Python `on_event` callback.
-3. **New motor parameter**: add field to `motor_params_t`, set in PRU1, read
-   in PRU0. Update daemon if host needs to control it.
-4. **New telemetry field**: add to `motor_telem_t`, publish in PRU0, copy to
-   `pru_status_t` in PRU1, add to daemon telem JSON.
-
----
-
-## 9. File Organization
-
-```
-.github/                        <- CI + copilot instructions
-src/
-  pru/                          <- PRU firmware (active)
-    include/                    <- pru_ipc.h, pru_stepper.h, pru_regs.h
-    motor_control/          <- motor firmware (runs on PRU1 at runtime)
-    orchestrator/           <- orchestrator firmware (runs on PRU0 at runtime)
-    Makefile                    <- PRU cross-compile (pru-unknown-elf-gcc)
-  linux/
-    daemon/                     <- pickup_daemon.c (Layer 3)
-  python/                       <- Python application (Layer 4)
-    pickup_test.py              <- Test sketch (9 functions)
-    pru_client.py               <- Async socket client for daemon
-  dts/                          <- Device-tree overlays
-build/                          <- Build outputs
-  dtbo/                         <- Compiled DT overlays
-  pru/                          <- PRU firmware binaries
-  daemon/                       <- Daemon binary
-doc/                            <- Architecture docs
-resources/                      <- Reference material (ESP32, eQEP, Klipper, FastAccelStepper)
-test/                           <- Unit tests (gtest, planned)
-Makefile                        <- Root build orchestrator
-```
-
-Do not modify `resources/`.
-Do not create new source files without clear domain justification.
+1. **New command opcode**: add to `CmdOpcode` enum in `protocol.h` and `protocol.py`,
+   handle in `stepper_engine.cpp::dispatch_command()`,
+   add method to `EspController`, add test in `rpi/tests/`.
+2. **New status field**: extend `StatusFrame` in `protocol.h` (must stay packed,
+   update `STATUS_FRAME_SIZE` and `static_assert`), decode in `protocol.py`,
+   update `MockSpiTransport._build_status()`, update tests.
+3. **New axis feature**: add to `Axis` class, update `StatusFlags` if needed,
+   expose via `StepperEngine`, wire into `EspController`.
+4. **New sensor**: add acquisition to `sensor_task.cpp`, store in `SensorState g_sensor`,
+   expose in `StatusFrame` extension bytes, decode in `protocol.py`.
 
 ---
 
-## 10. Device Tree Overlay Authoring (BBB / kernel 6.12)
-
-### 10.1 pinctrl-single,pins format — CRITICAL
-
-The AM335x pinmux node on Debian 12 / kernel 6.12 declares **`#pinctrl-cells = <2>`**.
-This switches `pinctrl-single,pins` to **3-cell format per pin**:
+## 10. File Organization
 
 ```
-<pad_offset   config_flags   mux_mode>
+.github/                    CI + copilot instructions
+esp32/                      ESP32 PlatformIO project (C++17, ESP-IDF)
+  sdkconfig.defaults        SDK overrides (console=none, 240 MHz, 1 kHz tick)
+  src/
+    protocol.h              CmdFrame, StatusFrame (44 B), CRC-8/MAXIM
+    command_queue.h         SPSC ring buffer (16 slots)
+    axis.h / axis.cpp       Per-axis state, step ISR, Klipper-style ramp
+    stepper_engine.h/.cpp   3-axis engine, FreeRTOS Core 1 task (pri 24)
+    spi_slave.h/.cpp        SPI slave DMA driver, Core 0 task (pri 10)
+    endstop.h/.cpp          2-contact ISR + homing
+    hx711.h/.cpp            HX711 bitbang driver (no PID)
+    encoder.h/.cpp          PCNT quadrature decoder (GPIO 1/3)
+    pot.h/.cpp              ADC1 potentiometer driver (GPIO 36)
+    sensor_task.h/.cpp      Core 0 sensor acquisition task (pri 5)
+    main.cpp                Pin config, app_main()
+  platformio.ini
+rpi/                        Raspberry Pi Python application
+  hal/
+    protocol.py             Python mirror of protocol.h (STATUS_FRAME_SIZE=44)
+    spi_transport.py        spidev wrapper, thread-safe
+    axis.py                 AxisConfig, unit conversions
+    esp32_controller.py     Async ESP32Controller
+  machine/
+    coil_winder.py          WindingState FSM, CoilWinder
+    tensioner.py            TensionController (SET_TENSION command)
+    homing.py               home_axis(), home_all()
+  config/
+    machine_config.yaml     Hardware constants + bobbin presets
+  tests/                    pytest (32 tests, no hardware required)
+  main.py                   asyncio CLI entry point
+doc/                        Architecture docs
+  architecture.md           Full design reference
+resources/                  Reference code (DO NOT MODIFY)
+  esp32/                    Old standalone ESP32 project (original pinout)
+  klipper/                  Klipper stepper.c reference
+  fastaccelstepper/         FastAccelStepper reference
 ```
-
-The driver writes `config_flags | mux_mode` to the pad register at
-`pinmux_base + pad_offset`.
-
-> ⚠️ **Using the old 2-cell format `<offset value>` silently applies only the
-> first pin.** The second pin's offset is misinterpreted as a config value and
-> skipped.
-
-### 10.2 Pad register config_flags bits (AM335x)
-
-| Bit | Name | 0 | 1 |
-|-----|------|---|---|
-| 6 | SLEWCTRL | fast | slow |
-| 5 | RXACTIVE | input disabled | input enabled |
-| 4 | PUTYPESEL | pull-down | pull-up |
-| 3 | PUDEN | pull **enabled** | pull disabled |
-| 2:0 | MUXMODE | — | 0–7 function select |
-
-Common `config_flags` values:
-
-| Value | Binary | Meaning | Typical use |
-|-------|--------|---------|-------------|
-| `0x30` | `00110000` | fast, rx-EN, pull-UP, pull-EN | digital input with pull-up (encoder, eQEP) |
-| `0x10` | `00010000` | fast, rx-OFF, pull-UP, pull-EN | GPIO output with pull-up |
-| `0x00` | `00000000` | fast, rx-OFF, pull-DOWN, pull-EN | GPIO output, pull-down |
-| `0x08` | `00001000` | fast, rx-OFF, pull-DISABLED | PRU output (STEP/DIR/EN — no pull load) |
-| `0x20` | `00100000` | fast, rx-EN, pull-DOWN, pull-EN | input with pull-down |
-
-### 10.3 Known pad offsets (confirmed in this project)
-
-| BBB Pin | Pad name | Offset | Function at MODE | Config | Final reg |
-|---------|----------|--------|------------------|--------|-----------|
-| P8_35 | conf_mcasp0_ahclkr | `0x0D0` | MODE4 = EQEP1A_in | `0x30 0x04` | `0x34` |
-| P8_33 | conf_mcasp0_fsr    | `0x0D4` | MODE4 = EQEP1B_in | `0x30 0x04` | `0x34` |
-
-### 10.4 Minimal working overlay template
-
-```dts
-/dts-v1/;
-/plugin/;
-
-&am33xx_pinmux {
-    my_pins: my_pins {
-        pinctrl-single,pins = <
-            /* offset  config  mux  -- final = config | mux */
-            0x0D0  0x30  0x04   /* P8_35: input, pull-up, MODE4 */
-            0x0D4  0x30  0x04   /* P8_33: input, pull-up, MODE4 */
-        >;
-    };
-};
-
-&my_device {
-    pinctrl-names = "default";
-    pinctrl-0 = <&my_pins>;
-    status = "okay";
-};
-```
-
-Build:  `dtc -O dtb -o MY-OVERLAY-00A0.dtbo -b 0 -@ overlay.dts`
-
-### 10.5 Overlay-specific pitfalls
-
-| Pitfall | Effect |
-|---------|--------|
-| 2-cell format on kernel 6.12 | Only first pin applied; rest silently skipped |
-| `fragment@ {}` syntax inside `/plugin/` | Unreliable on kernel 6.12; use direct `&node {}` |
-| `bone-pinmux-helper` on kernel 6.12 | Not compiled; node stuck at `waiting_for_supplier` |
-| Missing `-@` flag in `dtc` command | Overlay symbols not emitted; references unresolved |
-| Wrong pad offset from pin name | Always derive from pinctrl debugfs dump |
-
-### 10.6 How to find the correct pad offset
-
-Never guess from pad name or generic AM335x docs.
-
-1. Read pinctrl debugfs dump on the target:
-   ```bash
-   cat /sys/kernel/debug/pinctrl/44e10800.pinmux-pinctrl-single/pins
-   ```
-2. Identify pin by GPIO label (e.g. P9_23 = GPIO1[17] → look for `gpio-32-63 #17`).
-3. Compute: `offset = register_address - 0x44e10800`.
-
-Confirmed values:
-
-| BBB Pin | GPIO | Register | Offset DTS |
-|---------|------|----------|------------|
-| P9_23 | GPIO1[17] | `44e10844` | `0x044` |
-| P8_33 | GPIO0[11] | `44e108d4` | `0x0D4` |
-| P8_35 | GPIO0[8]  | `44e108d0` | `0x0D0` |
 
 ---
 
-## 11. BeagleBone eQEP (Kernel 6.6+)
+## 11. Hardware Constants
 
-- eQEP1 device: `48302180.counter` (modern `ti-eqep-cnt` driver, counter framework).
-- Pins: P8.33 + P8.35 in MODE4 (3-cell overlay format).
-- sysfs: `/sys/bus/counter/devices/counterX/`.
-
-Runtime configuration (critical):
-```bash
-echo 4294967295 | sudo tee .../count0/ceiling
-echo 'quadrature x4' | sudo tee .../count0/function
-echo 1 | sudo tee .../count0/enable
-```
-
-Common failures: `ceiling=0` → stays at zero; `function` wrong → no counting;
-2-cell pinmux → only first pin applied.
+| Parameter           | Value              | Notes                              |
+|---------------------|--------------------|------------------------------------|
+| Spindle steps/rev   | 6400               | 200 full × 32 µstep                |
+| Lateral steps/mm    | 3072               | 96 full × 32 µstep, M6 1 mm pitch  |
+| Speed range (Hz)    | 100 – 160 000      | ~0.9 – 1500 RPM at 6400 steps/rev  |
+| ESP32 timer clock   | 40 MHz             | APB 80 MHz / prescaler 2           |
+| Timer resolution    | 25 ns              | 1 tick = 25 ns                     |
+| HX711 sample rate   | ~80 Hz             | At VCC ≥ 4.8 V (RATE pin = HIGH)   |
+| HX711 output unit   | 0.1 g (decigram)   | int16_t, range ±3276.7 g           |
+| Potentiometer range | 0 – 4095           | 12-bit ADC1_CH0, 32-sample MA      |
+| Encoder interface   | PCNT_UNIT_0, 4X    | GPIO 1 (A) / GPIO 3 (B)            |
 
 ---
-### PRU / ARM responsibility split — stepper motor step generation
 
-Platform: BeagleBone Black, Debian 12, kernel 6.12, remoteproc + rpmsg.
-PRU0 = orchestration (remoteproc0). PRU1 = motor control (remoteproc1).
+## 1. Project Identity & Goals
 
-**Step generation architecture (Klipper-style):**
+- **Purpose**: Automated/assisted guitar pickup coil winding — precise lateral
+  traversal, real-time speed control, wire tension control, recipe persistence.
+- **Hardware**: ESP32 (dual-core FreeRTOS), three A4988/DRV8825 stepper drivers
+  (bobbin + lateral + tensioner), two HX711 load cells, 2-contact home sensor,
+  SPI link to Raspberry Pi.
+- **Core constraint**: Firmware drives physical motors under wire tension.
+  Correctness and determinism always outweigh elegance.
 
-- The ARM computes all step timing before each move using an iterative solver
-  (secant method) applied to the exact physics equations of the trapezoid
-  profile. Never generate code that computes step times or ramp tables inside
-  any PRU.
+---
 
-- Step times are compressed into (interval, count, add) blocks on the ARM and
-  written to PRUSS shared RAM. A full trapezoidal move fits in 3 blocks.
+## 2. Architecture Overview
 
-- PRU1 executes a trivial loop: wait `interval` cycles, toggle GPIO,
-  interval += add. This is the only arithmetic allowed on PRU1.
+Two-processor architecture: Raspberry Pi (Python) ↔ ESP32 (C++/FreeRTOS) over SPI.
 
-- PRU0 relays commands and flags between ARM and PRU1. No motion logic.
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Python application  (asyncio, Raspberry Pi)                         │
+│  main.py · CoilWinder · TensionController · WebUI                   │
+│                      │ spidev SPI0, 4 MHz                            │
+│              rpi/hal/esp32_controller.py                             │
+│           CmdFrame (8 B) → / ← StatusFrame (40 B)                   │
+├──────────────────────────────────────────────────────────────────────┤
+│  ESP32  (240 MHz, FreeRTOS, dual-core)                               │
+│                                                                      │
+│  Core 0 (priority 10): spi_slave task                               │
+│    Receives CmdFrame → CmdQueue → Core 1                            │
+│    Sends StatusFrame built from g_engine.get_status()               │
+│                                                                      │
+│  Core 1 (priority 24): stepper_task                                 │
+│    Dispatches CmdQueue → Axis commands                              │
+│    Polls endstops + HX711 every 1 ms (non-blocking)                 │
+│    Samples encoders + HX711 and forwards values to Pi               │
+│    Hardware timers → STEP ISRs (jitter < 1 µs)                      │
+│      Timer 0/0 → Axis 0 (Bobbin)                                    │
+│      Timer 0/1 → Axis 1 (Lateral)                                   │
+│      Timer 1/0 → Axis 2 (Tensioner)                                 │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
-- Never use Austin (1995) recurrence or any delay-table approach: they
-  accumulate rounding errors at high step rates and waste shared memory.
+Key files:
+- `esp32/src/main.cpp` — pin config, FreeRTOS startup
+- `esp32/src/protocol.h` — CmdFrame / StatusFrame / CRC-8/MAXIM
+- `esp32/src/axis.h/.cpp` — per-axis step ISR, trapezoidal ramp
+- `esp32/src/stepper_engine.h/.cpp` — 3-axis engine, command dispatch
+- `esp32/src/spi_slave.h/.cpp` — SPI slave driver, Core 0 task
+- `esp32/src/endstop.h/.cpp` — 2-contact endstop ISR + homing
+- `esp32/src/hx711.h/.cpp` — HX711 driver + tension PI controller
+- `rpi/hal/protocol.py` — Python mirror of protocol.h
+- `rpi/hal/esp32_controller.py` — async command/event interface
+- `rpi/machine/coil_winder.py` — WindingState machine
 
-**Reason:** the PRU has no hardware divider, 8 KB program memory, and no
-debugger. All computation belongs on the ARM where it can be tested, logged,
-and tuned without reflashing firmware.
+---
+
+## 3. SPI Protocol
+
+Full-duplex, SPI Mode 0, 4 MHz. Each transfer sends **CmdFrame (8 bytes)** and
+receives **StatusFrame (40 bytes)** simultaneously.
+
+### CmdFrame layout
+
+```
+Byte  Field   Description
+0     cmd     CmdOpcode (uint8)
+1     axis    AxisId: 0=Bobbin, 1=Lateral, 2=Tensioner, 0xFF=ALL
+2..5  data    uint32_t little-endian payload
+6     flags   CmdFlags bitfield
+7     crc8    CRC-8/MAXIM over bytes 0..6
+```
+
+### StatusFrame layout (40 bytes)
+
+```
+Byte   Field              Description
+0      global_flags       StatusFlags bitfield
+1      event_type         EventType
+2      event_axis         Axis that raised the event
+3      endstop_mask       Bit per axis (bit 0 = axis 0)
+4..7   uptime_ms          uint32_t LE
+8..15  axis[0]            AxisStatus — Bobbin  (position i32, hz u16, flags u8, pad)
+16..23 axis[1]            AxisStatus — Lateral
+24..31 axis[2]            AxisStatus — Tensioner
+32..33 tension_raw[0]     HX711 #0 in 0.1 g (int16_t LE)
+34..35 tension_raw[1]     HX711 #1 in 0.1 g (int16_t LE)
+36..37 tension_setpoint   Active PID setpoint in 0.1 g (int16_t LE)
+38..39 reserved           0x00 0x00
+```
+
+### Command opcodes
+
+| Opcode      | Value | Data              |
+|-------------|-------|-------------------|
+| NOP         | 0x00  | —                 |
+| SET_SPEED   | 0x01  | Hz (uint32)       |
+| MOVE_ABS    | 0x02  | steps (int32)     |
+| MOVE_REL    | 0x03  | steps (int32)     |
+| STOP        | 0x04  | —                 |
+| ESTOP       | 0x05  | —                 |
+| ENABLE      | 0x06  | 1=on, 0=off       |
+| HOME        | 0x07  | —                 |
+| SET_ACCEL   | 0x08  | steps/s² (uint32) |
+| GET_STATUS  | 0x09  | —                 |
+| SET_MODE    | 0x0A  | 0=free, 1=winding |
+| RESET_POS   | 0x0B  | —                 |
+| SET_LIMITS  | 0x0C  | limit (int32)     |
+| ACK_EVENT   | 0x0D  | —                 |
+| SET_TENSION | 0x0E  | 0.1g setpoint     |
+| TARE_HX711  | 0x0F  | axis=sensor index |
+
+---
+
+## 4. Pin Assignments (ESP32 — MUST NOT change implicitly)
+
+### Stepper axes
+
+| Axis            | STEP | DIR | EN  | Notes                  |
+|-----------------|------|-----|-----|------------------------|
+| 0 — Bobbin      | 26   | 27  | 14  | No endstop             |
+| 1 — Lateral     | 32   | 33  | 25  | 2-contact home sensor  |
+| 2 — Tensioner   | 16   | 17  | 4   | Safety endstop GPIO 35 |
+
+EN pins: active LOW (driver ON when GPIO = LOW).
+
+### Lateral home sensor (2-contact)
+
+Both pins `INPUT_PULLUP`. The sensor wiring matches `resources/esp32/Config.h`:
+
+| Contact | GPIO | Away       | At home    | Fault      |
+|---------|------|------------|------------|------------|
+| NO      | 21   | HIGH (open)| LOW (closed)| LOW       |
+| NC      | 22   | LOW (closed)| HIGH (open)| LOW       |
+
+Valid home: NO=LOW AND NC=HIGH.
+Fault (disconnected): NO=LOW AND NC=LOW.
+
+> ⚠️ Old `Config.h` had `HOME_PIN_NO = 23`. GPIO 23 is now SPI MOSI.
+> The NO contact was moved to **GPIO 21**.
+
+### SPI (VSPI / SPI3)
+
+| Signal | GPIO |
+|--------|------|
+| MOSI   | 23   |
+| MISO   | 19   |
+| SCLK   | 18   |
+| CS     | 5    |
+
+### HX711 load cells
+
+| Sensor     | SCK    | DOUT   | Notes                                    |
+|------------|--------|--------|------------------------------------------|
+| Tension[0] | GPIO 13| GPIO 34| Read by ESP32 and forwarded to RPi       |
+| Aux[1]     | GPIO 12| GPIO 39| Read by ESP32 and forwarded to RPi       |
+
+GPIO 12: strapping pin — must be LOW at boot. HX711 SCK idle = LOW ✓.
+GPIO 34, 39: input-only (no OUTPUT capability). DOUT only ever needs to be read.
+
+### Encoders
+
+| Function     | GPIO | Notes                                   |
+|--------------|------|-----------------------------------------|
+| Manual axis A| 36   | Input-only encoder input                 |
+| Manual axis B| 37   | Input-only encoder input                 |
+| UI encoder A | 1    | UART0 TX pin — use only if USB serial is unused |
+| UI encoder B | 3    | UART0 RX pin — use only if USB serial is unused |
+
+> Note: UART for TMC2209 is handled by the Raspberry Pi, not the ESP32.
+
+### Other
+
+| Signal | GPIO | Notes                          |
+|--------|------|--------------------------------|
+| —      | —    | No dedicated E-STOP pin used   |
+
+Any pin change **must** update `esp32/src/main.cpp` + `doc/architecture.md` + this file.
+
+---
+
+## 5. Hard Rules
+
+### 5.1 ESP32 Firmware
+
+- **NEVER** call `vTaskDelay()` or blocking I/O from a timer ISR.
+- All timer ISRs must be `IRAM_ATTR` and declared as free functions with `void(*)(void*)` signature.
+- `IRAM_ATTR` placement: on the function signature line in the `.cpp` file, not on the declaration in the header.
+- The `StatusFrame` in `g_engine.status_` is protected by a `portMUX_TYPE` spinlock.
+  Always use `portENTER_CRITICAL / portEXIT_CRITICAL` for access across tasks.
+- `volatile` required on all shared-state fields in `Axis` that are written by the ISR
+  and read by the stepper task or SPI task.
+- `AxisPins.endstop_no` / `endstop_nc` — set to -1 when not used.
+  Never assume a pin is valid without checking `>= 0`.
+- HX711 reads are **non-blocking**: check `digitalRead(DOUT) == LOW` first.
+  Never spin-wait for DOUT in a timer ISR or the stepper task tight loop.
+- GPIO 12 must not be driven HIGH at boot.
+
+### 5.2 Python Application
+
+- Python **never** touches SPI or GPIO directly.
+  All hardware access goes through `EspController` → SPI → ESP32.
+- No hardware constants (GPIO numbers, step counts, intervals) in Python
+  application code (`machine/`). Hardware constants live in `hal/axis.py`
+  or `config/machine_config.yaml`.
+- `EspController` is the only Python class that knows about `CmdOpcode` / `StatusFrame`.
+  `CoilWinder` only sees `set_speed()`, `move_to()`, `home()`, etc.
+
+### 5.3 Protocol
+
+- CRC-8/MAXIM over bytes 0..6 of each CmdFrame. Drop silently on mismatch.
+- Status frame size = 40 bytes. Python and C must stay in sync.
+- All multi-byte fields: little-endian on both sides (LE native on Xtensa and ARM).
+
+---
+
+## 6. Acceleration Model (Klipper-style)
+
+```
+for each segment i in [0, N_SEG=16):
+    interval = start_iv[i]      ← force-loaded
+    for s in range(count[i]):
+        step()
+        interval += add[i]
+```
+
+Segments are pre-computed by `Axis::build_simple_ramp()` on the ESP32.
+A single `{start_iv, add, count}` segment cannot cover a wide speed range —
+linear `add` means constant ΔHz per step but ΔHz/Hz is non-constant. Use N_SEG=16+.
+
+---
+
+## 7. HX711 Tension PID
+
+- Runs in Core 1 (stepper task), called from `hx711_tick()` every 1 ms.
+- Only fires when new data is ready (DOUT=LOW). Data rate ≈ 80 Hz.
+- Sensor [0] → PI controller → tensioner axis speed.
+- Sensor [1] → value stored in `g_hx711.reading_dg[1]`, forwarded in StatusFrame.
+- Output unit: 0.1 g (decigrams). Range: ±3276.7 g in int16_t.
+- `hx711_tare()` is blocking — call only during machine idle.
+
+---
+
+## 8. Common Pitfalls
+
+| Pitfall | Why it matters |
+|---------|----------------|
+| `IRAM_ATTR` on declaration not definition | ISR placed in flash → cache miss → hard fault under load |
+| Timer ISR not a free function | `timer_isr_register()` expects `void(*)(void*)`, rejects member pointers |
+| Missing `volatile` on ISR-written fields | Compiler caches stale value in register |
+| Blocking in HX711 tick | `digitalRead(DOUT)` before reading; never spin-wait in the stepper loop |
+| GPIO 12 HIGH at boot | Causes ESP32 flash voltage issue on some modules |
+| GPIO 34-39 used as output | Input-only — any `digitalWrite()` silently ignored |
+| EndStop NC check skipped | Single-pin mode masks sensor faults; NO=LOW AND NC=LOW = wiring break |
+| STATUS_FRAME_SIZE mismatch | Python/C must both be 40 bytes; assert in both languages |
+| portMUX not used on StatusFrame | SPI task and stepper task run on different cores simultaneously |
+| HX711 scale = 0 | Division by zero in `raw_to_dg()` — always validate before calibrating |
+
+---
+
+## 9. Quick Reference: Adding a New Feature
+
+1. **New command opcode**: add to `CmdOpcode` enum in `protocol.h` and `protocol.py`,
+   handle in `stepper_engine.cpp::dispatch_command()`,
+   add method to `EspController`, add test in `rpi/tests/`.
+2. **New status field**: extend `StatusFrame` in `protocol.h` (must stay packed,
+   update `STATUS_FRAME_SIZE`, update `static_assert`), decode in `protocol.py`,
+   update `MockSpiTransport._build_status()`, update tests.
+3. **New axis feature**: add to `Axis` class, update `StatusFlags` if needed,
+   expose via `StepperEngine`, wire into `EspController`.
+4. **New sensor**: if it drives a motor, integrate in `stepper_engine.cpp::run()`.
+   If data-only, store in `StatusFrame` extension bytes.
+
+---
+
+## 10. File Organization
+
+```
+.github/                    CI + copilot instructions
+esp32/                      ESP32 PlatformIO project (C++17, Arduino + ESP-IDF)
+  src/
+    protocol.h              CmdFrame, StatusFrame, CRC-8/MAXIM
+    command_queue.h         SPSC ring buffer (16 slots)
+    axis.h / axis.cpp       Per-axis state, step ISR, Klipper-style ramp
+    stepper_engine.h/.cpp   3-axis engine, FreeRTOS Core 1 task
+    spi_slave.h/.cpp        SPI slave DMA driver, Core 0 task
+    endstop.h/.cpp          2-contact ISR + homing
+    hx711.h/.cpp            HX711 bitbang driver + PI tension controller
+    main.cpp                Pin config, setup(), loop()
+  platformio.ini
+rpi/                        Raspberry Pi Python application
+  hal/
+    protocol.py             Python mirror of protocol.h
+    spi_transport.py        spidev wrapper, thread-safe
+    axis.py                 AxisConfig, unit conversions
+    esp32_controller.py     Async ESP32Controller
+  machine/
+    coil_winder.py          WindingState FSM, CoilWinder
+    tensioner.py            TensionController (SET_TENSION command)
+    homing.py               home_axis(), home_all()
+  config/
+    machine_config.yaml     Hardware constants + bobbin presets
+  tests/                    pytest (40 tests, no hardware required)
+  main.py                   asyncio CLI entry point
+doc/                        Architecture docs
+  architecture.md           Full design reference
+resources/                  Reference code (DO NOT MODIFY)
+  esp32/                    Old standalone ESP32 project (original pinout)
+  klipper/                  Klipper stepper.c reference
+  fastaccelstepper/         FastAccelStepper reference
+```
+
+---
+
+## 11. Hardware Constants
+
+| Parameter           | Value              | Notes                              |
+|---------------------|--------------------|------------------------------------|
+| Spindle steps/rev   | 6400               | 200 full × 32 µstep                |
+| Lateral steps/mm    | 3072               | 96 full × 32 µstep, M6 1 mm pitch  |
+| Speed range (Hz)    | 100 – 160 000      | ~0.9 – 1500 RPM at 6400 steps/rev  |
+| ESP32 timer clock   | 40 MHz             | APB 80 MHz / prescaler 2           |
+| Timer resolution    | 25 ns              | 1 tick = 25 ns                     |
+| HX711 sample rate   | ~80 Hz             | At VCC ≥ 4.8 V (RATE pin = HIGH)   |
+| HX711 output unit   | 0.1 g (decigram)   | int16_t, range ±3276.7 g           |
