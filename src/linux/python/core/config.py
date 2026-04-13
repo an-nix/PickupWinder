@@ -21,7 +21,6 @@ from hal.hardware_definition import HardWareDefinition
 
 _log = logging.getLogger(__name__)
 
-CONFIG_PATH = "/usr/local/lib/pickup-winder/config.json"
 
 
 # ── Application parameters ─────────────────────────────────────────────────────
@@ -60,7 +59,7 @@ class AppConfig:
 
 # ── JSON load / save ───────────────────────────────────────────────────────────
 
-def load_config(path: str = CONFIG_PATH) -> AppConfig:
+def load_config(path: str ) -> AppConfig:
     """Load AppConfig from *path*.  Missing keys fall back to Python defaults.
 
     Never raises: on any error the function logs a warning and returns a
@@ -105,7 +104,7 @@ def load_config(path: str = CONFIG_PATH) -> AppConfig:
     return cfg
 
 
-def save_config(cfg: AppConfig, path: str = CONFIG_PATH) -> bool:
+def save_config(cfg: AppConfig, path: str) -> bool:
     """Persist AppConfig to JSON.  Returns True on success."""
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)

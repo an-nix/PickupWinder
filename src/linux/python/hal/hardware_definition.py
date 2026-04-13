@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 @dataclass
@@ -14,9 +14,9 @@ class MotorDefinition:
 
 @dataclass
 class HardWareDefinition:
-    spindle: MotorDefinition = MotorDefinition(name="spindle")
-    lateral: MotorDefinition = MotorDefinition(name="lateral")
-    tensionner: MotorDefinition = MotorDefinition(name="tensionner")
+    spindle: MotorDefinition = field(default_factory=lambda: MotorDefinition(name="spindle"))
+    lateral: MotorDefinition = field(default_factory=lambda: MotorDefinition(name="lateral"))
+    tensionner: MotorDefinition = field(default_factory=lambda: MotorDefinition(name="tensionner"))
 
     # Lateral axis convenience fields (kept for compatibility with existing
     # config JSON keys). These mirror values available under `lateral`.

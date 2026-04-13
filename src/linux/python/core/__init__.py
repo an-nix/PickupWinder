@@ -1,6 +1,6 @@
 from .axis import Axis, LATERAL, SPINDLE
 from .command_router import CommandRouter
-from .config import AppConfig, CONFIG_PATH, load_config, save_config
+from .config import AppConfig, load_config, save_config
 from .geometry import BOBBIN_PRESETS, WireGauge, WindingGeometry
 from .lateral_controller import LatState, LateralController
 from .pattern_planner import WindingPatternPlanner
@@ -26,7 +26,7 @@ __all__ = [
 	"Axis",
 	"BOBBIN_PRESETS",
 	"CommandRouter",
-	"CONFIG_PATH",
+
 	"ControlIntent",
 	"InputSource",
 	"LATERAL",
