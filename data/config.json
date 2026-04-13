@@ -20,10 +20,5 @@
     "sp_hz_max":           160000
   },
 
-  "bobbin_presets": [
-    {"name": "Strat",      "total_mm": 17.0, "flange_bot_mm": 1.5, "flange_top_mm": 1.5, "wire_mm": 0.071},
-    {"name": "Telecaster", "total_mm": 18.5, "flange_bot_mm": 1.5, "flange_top_mm": 1.5, "wire_mm": 0.071},
-    {"name": "P90",        "total_mm": 30.0, "flange_bot_mm": 2.0, "flange_top_mm": 2.0, "wire_mm": 0.071},
-    {"name": "Humbucker",  "total_mm": 38.0, "flange_bot_mm": 2.0, "flange_top_mm": 2.0, "wire_mm": 0.064}
-  ]
+  
 }

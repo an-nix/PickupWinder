@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from math import floor
+import json
+import os
 
 
 # ── Wire gauge constants (insulated diameter, mm) ─────────────────────────────
@@ -125,3 +127,25 @@ class WindingGeometry:
             return False
         frac = ratio - floor(ratio)
         return frac <= tolerance or frac >= (1.0 - tolerance)
+
+
+def load_presets(path: str | None = None) -> list | None:
+    """Load bobbin presets from a JSON file.
+
+    If *path* is None, the function looks for `data/presets.json` at the
+    repository root (four levels above this module). Returns a list of
+    preset dicts on success, or None if the file is missing or invalid.
+    """
+    if path is None:
+        # core/ -> python/ -> linux/ -> src/ -> repo root
+        path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', 'data', 'presets.json'))
+    try:
+        with open(path, 'r') as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            return data
+        return None
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None

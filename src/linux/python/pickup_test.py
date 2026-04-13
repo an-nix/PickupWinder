@@ -24,8 +24,7 @@ import os
 # Import from the packaged `pickup` library. The deploy step should install
 # the `pickup/` subpackage next to this script so `import pickup.*` works.
 try:
-    from hal import DaemonClient
-    from pickup.pickup_controller import PickupController
+    from hal import DaemonClient, PickupController
 except Exception as e:
     print(f"[IMPORT ERROR] failed to import pickup package: {e}", file=sys.stderr)
     raise

@@ -15,7 +15,7 @@ import logging
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Optional
 
-from .geometry import BOBBIN_PRESETS, WindingGeometry
+from .geometry import BOBBIN_PRESETS, WindingGeometry, load_presets
 from .lateral_controller import LatState, LateralController
 from .pattern_planner import WindingPatternPlanner
 from .recipe import WindingRecipe
@@ -54,7 +54,8 @@ class WinderApp:
         self._lat_max_mm:      float = hw.lat_traverse_max_mm
         self._approach_turns:  int   = cfg.approach_turns
         self._approach_hz_floor: int = cfg.approach_hz_floor
-        self._cfg_presets:     list  = cfg.bobbin_presets  # may be empty
+        # Load external presets if present; fall back to built-in BOBBIN_PRESETS
+        self._cfg_presets:     list | None = load_presets()
 
         self._controller = controller
         self._lateral = LateralController(controller, cfg)

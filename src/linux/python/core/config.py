@@ -17,32 +17,11 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from hal.hardware_definition import HardWareDefinition
 
 _log = logging.getLogger(__name__)
 
 CONFIG_PATH = "/usr/local/lib/pickup-winder/config.json"
-
-
-# ── Hardware constants ─────────────────────────────────────────────────────────
-
-@dataclass
-class HardwareConfig:
-    """Physical constants — must match the stepper hardware and lead-screw
-    mechanics.  Change these when swapping motors, drivers, or the traversal
-    lead screw."""
-
-    # ── Lateral axis ──────────────────────────────────────────────────────────
-    lat_steps_per_mm: int = 3072       # 96-step motor × 32 µstep, M6 1 mm pitch
-    lat_traverse_max_mm: float = 20.0  # Hard software travel limit (mm)
-    lat_home_hz: int = 2000            # Homing approach speed (steps/s)
-    lat_traverse_hz: int = 15000       # Positioning / jog speed (steps/s)
-    lat_rodage_hz: int = 5000          # Break-in (rodage) traversal speed (steps/s)
-    lat_accel: int = 100_000           # Lateral acceleration (steps/s²)
-
-    # ── Spindle axis ──────────────────────────────────────────────────────────
-    sp_steps_per_rev: int = 6400       # 200-step motor × 32 µstep
-    sp_hz_min: int = 1067              # ≈ 10 RPM
-    sp_hz_max: int = 160_000           # ≈ 1500 RPM
 
 
 # ── Application parameters ─────────────────────────────────────────────────────
@@ -59,8 +38,8 @@ class AppConfig:
     socket_path: str = "/run/pickup-winder.sock"
     recipe_path: str = "/usr/local/lib/pickup-winder/recipe.json"
 
-    # Hardware
-    hw: HardwareConfig = field(default_factory=HardwareConfig)
+    # Hardware (model defined in HAL)
+    hw: HardWareDefinition = field(default_factory=HardWareDefinition)
 
     # Main loop
     tick_hz: int = 100                 # Target ticks per second (10 ms period)
@@ -76,9 +55,7 @@ class AppConfig:
     # Pot input dead-zone
     pot_run_threshold: float = 0.001   # Below this → motor is stopped
 
-    # Bobbin presets — empty list means "use built-in defaults from geometry.py"
-    # Each entry must have: name, total_mm, flange_bot_mm, flange_top_mm, wire_mm
-    bobbin_presets: list = field(default_factory=list)
+    # (Bobbin presets moved out of AppConfig — see core.geometry.BOBBIN_PRESETS)
 
 
 # ── JSON load / save ───────────────────────────────────────────────────────────
@@ -121,9 +98,8 @@ def load_config(path: str = CONFIG_PATH) -> AppConfig:
     cfg.rodage_passes     = int  (data.get("rodage_passes",     cfg.rodage_passes))
     cfg.pot_run_threshold = float(data.get("pot_run_threshold", cfg.pot_run_threshold))
 
-    raw_presets = data.get("bobbin_presets", [])
-    if isinstance(raw_presets, list) and raw_presets:
-        cfg.bobbin_presets = raw_presets
+    # Bobbin presets removed from AppConfig — geometry presets live in
+    # `core.geometry.BOBBIN_PRESETS` or a separate presets file managed by the user.
 
     _log.info("Config loaded from %s", path)
     return cfg
@@ -155,8 +131,8 @@ def save_config(cfg: AppConfig, path: str = CONFIG_PATH) -> bool:
                 "sp_hz_max":           hw.sp_hz_max,
             },
         }
-        if cfg.bobbin_presets:
-            data["bobbin_presets"] = cfg.bobbin_presets
+        # Presets intentionally omitted from saved config. Use
+        # core.geometry.BOBBIN_PRESETS or a separate presets file.
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
             json.dump(data, fh, indent=2)

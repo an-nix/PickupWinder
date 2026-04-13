@@ -1,12 +1,12 @@
-"""High-level PickupWinder controller (packaged).
+"""High-level PickupWinder controller (HAL wrapper).
 
-Copied into the `pickup` subpackage; keeps application imports simple:
-`from pickup.pickup_controller import PickupController`.
+This module provides `PickupController` inside the `hal` package so
+application code can import it as `from hal import PickupController`.
 """
 
 from typing import Dict, Optional
 
-from hal import DaemonClient
+from .daemon_client import DaemonClient
 
 
 class PickupController:

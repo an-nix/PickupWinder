@@ -31,8 +31,7 @@ from core import (
     load_config,
     CONFIG_PATH,
 )
-from hal import DaemonClient
-from pickup import PickupController
+from hal import DaemonClient, PickupController
 
 logging.basicConfig(
     level=logging.INFO,
