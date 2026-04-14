@@ -13,6 +13,18 @@ build/
 __pycache__/
 **/__pycache__/
 
+# ESP-IDF / PlatformIO build artifacts
+sdkconfig
+sdkconfig.*
+CMakeCache.txt
+CMakeFiles/
+project_description.json
+compile_commands.json
+*.elf
+*.bin
+*.map
+*.csv
+
 # Device Tree blobs (compiled overlays)
 *.dtbo
 test/test_eqep/*.dtbo

@@ -333,6 +333,13 @@ IRAM_ATTR uint32_t Axis::step_isr() {
 
     // STEP LOW (pulse width guaranteed by timer interval >> STEP_PULSE_US)
     if (pins_.step >= 0) gpio_fast_clr(pins_.step);
+    // STEP LOW (pulse width guaranteed by timer interval >> STEP_PULSE_US)
+    if (pins_.step >= 0) gpio_fast_clr(pins_.step);
+
+    // return next interval for re-arming timer
+    return interval_;
+}
+
 // ── Endstop ─────────────────────────────────────────────────────────────────
 
 void Axis::update_endstop() {

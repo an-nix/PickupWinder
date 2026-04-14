@@ -8,6 +8,7 @@
 #include "stepper_engine.h"
 #include "sensor_task.h"
 #include <driver/timer.h>
+#include <soc/timer_group_struct.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 
