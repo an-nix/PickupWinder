@@ -10,7 +10,7 @@ The ESP32 firmware uses the **ESP-IDF framework** (not Arduino). Entry point is 
 │  Raspberry Pi — Python application (asyncio)                 │
 │  main.py  ·  CoilWinder  ·  TensionController  ·  WebUI     │
 │                    │ spidev (SPI0)                            │
-│           rpi/hal/esp32_controller.py                        │
+│           src/rpi/hal/esp32_controller.py                        │
 │              8-byte CmdFrame → / ← 44-byte StatusFrame       │
 ├──────────────────────────────────────────────────────────────┤
 │  ESP32 — dual-core, 240 MHz, FreeRTOS (ESP-IDF)              │
@@ -44,7 +44,7 @@ The ESP32 firmware uses the **ESP-IDF framework** (not Arduino). Entry point is 
 | spi_task      | 0    | 10       | 4 KB  | SPI slave DMA, CmdFrame RX / StatusFrame TX |
 | stepper_task  | 1    | 24       | 8 KB  | Axis dispatch, endstop poll, ISR timer scheduling |
 
-### sdkconfig Overrides (`esp32/sdkconfig.defaults`)
+### sdkconfig Overrides (`src/esp32/sdkconfig.defaults`)
 
 | Key                                    | Value | Reason                                      |
 |----------------------------------------|-------|---------------------------------------------|
@@ -270,7 +270,7 @@ Speed range: 100 Hz (~ 0.9 RPM) to 160 000 Hz (~ 1500 RPM) at 6400 steps/rev.
 ## File Structure
 
 ```
-esp32/                        ← ESP32 firmware (PlatformIO, ESP-IDF framework)
+src/esp32/                    ← ESP32 firmware (PlatformIO, ESP-IDF framework)
   sdkconfig.defaults          ← SDK overrides (console=none, 240 MHz, 1 kHz tick)
   src/
     protocol.h                ← CmdFrame / StatusFrame definitions + CRC-8
@@ -286,7 +286,7 @@ esp32/                        ← ESP32 firmware (PlatformIO, ESP-IDF framework)
     main.cpp                  ← Pin config, app_main()
   platformio.ini
 
-rpi/                          ← RPi Python application
+src/rpi/                       ← RPi Python application
   hal/
     protocol.py               ← Python mirror of protocol.h
     spi_transport.py          ← Thread-safe spidev wrapper

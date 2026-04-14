@@ -53,20 +53,20 @@ Two-processor architecture: Raspberry Pi (Python) ↔ ESP32 (C++/FreeRTOS/ESP-ID
 ```
 
 Key files:
-- `esp32/src/main.cpp` — pin config, `app_main()`
-- `esp32/sdkconfig.defaults` — SDK overrides (console=none, 240 MHz, 1 kHz tick)
-- `esp32/src/protocol.h` — CmdFrame / StatusFrame / CRC-8/MAXIM
-- `esp32/src/axis.h/.cpp` — per-axis step ISR, trapezoidal ramp
-- `esp32/src/stepper_engine.h/.cpp` — 3-axis engine, command dispatch
-- `esp32/src/spi_slave.h/.cpp` — SPI slave driver, Core 0 task (pri 10)
-- `esp32/src/endstop.h/.cpp` — 2-contact endstop ISR + homing
-- `esp32/src/hx711.h/.cpp` — HX711 bitbang driver (no PID — Pi handles PID)
-- `esp32/src/encoder.h/.cpp` — PCNT quadrature decoder (GPIO 1/3)
-- `esp32/src/pot.h/.cpp` — ADC1 potentiometer driver (GPIO 36)
-- `esp32/src/sensor_task.h/.cpp` — Core 0 sensor acquisition task (pri 5)
-- `rpi/hal/protocol.py` — Python mirror of protocol.h
-- `rpi/hal/esp32_controller.py` — async command/event interface
-- `rpi/machine/coil_winder.py` — WindingState machine
+- `src/esp32/src/main.cpp` — pin config, `app_main()`
+- `src/esp32/sdkconfig.defaults` — SDK overrides (console=none, 240 MHz, 1 kHz tick)
+- `src/esp32/src/protocol.h` — CmdFrame / StatusFrame / CRC-8/MAXIM
+- `src/esp32/src/axis.h/.cpp` — per-axis step ISR, trapezoidal ramp
+- `src/esp32/src/stepper_engine.h/.cpp` — 3-axis engine, command dispatch
+- `src/esp32/src/spi_slave.h/.cpp` — SPI slave driver, Core 0 task (pri 10)
+- `src/esp32/src/endstop.h/.cpp` — 2-contact endstop ISR + homing
+- `src/esp32/src/hx711.h/.cpp` — HX711 bitbang driver (no PID — Pi handles PID)
+- `src/esp32/src/encoder.h/.cpp` — PCNT quadrature decoder (GPIO 0/15)
+- `src/esp32/src/pot.h/.cpp` — ADC1 potentiometer driver (GPIO 36)
+- `src/esp32/src/sensor_task.h/.cpp` — Core 0 sensor acquisition task (pri 5)
+- `src/rpi/hal/protocol.py` — Python mirror of protocol.h
+- `src/rpi/hal/esp32_controller.py` — async command/event interface
+- `src/rpi/machine/coil_winder.py` — WindingState machine
 
 ---
 
@@ -185,7 +185,9 @@ GPIO 34, 39: input-only (no OUTPUT capability). DOUT only ever needs to be read.
 
 > Old `Config.h` `POT_PIN = 34` is occupied by HX711[0] DOUT. Pot moved to GPIO 36.
 > Old encoder pins (GPIO 18/19) are now SPI SCLK/MISO.
-> GPIO 1/3 freed by `CONFIG_ESP_CONSOLE_UART_NONE=y` in `esp32/sdkconfig.defaults`.
+> GPIO0/15 are used for the manual encoder. These are strapping pins on
+> many ESP32 modules — avoid driving the encoder during reset/flash or add
+> pull resistors to guarantee a safe boot level.
 
 > Note: UART for TMC2209 is handled by the Raspberry Pi, not the ESP32.
 
@@ -195,7 +197,7 @@ GPIO 34, 39: input-only (no OUTPUT capability). DOUT only ever needs to be read.
 |--------|------|--------------------------------|
 | —      | —    | No dedicated E-STOP pin used   |
 
-Any pin change **must** update `esp32/src/main.cpp` + `doc/architecture.md` + this file.
+Any pin change **must** update `src/esp32/src/main.cpp` + `doc/architecture.md` + this file.
 
 ---
 
@@ -641,7 +643,8 @@ linear `add` means constant ΔHz per step but ΔHz/Hz is non-constant. Use N_SEG
 
 ```
 .github/                    CI + copilot instructions
-esp32/                      ESP32 PlatformIO project (C++17, Arduino + ESP-IDF)
+src/esp32/                  ESP32 PlatformIO project (C++17, ESP-IDF)
+  sdkconfig.defaults        SDK overrides (console=none, 240 MHz, 1 kHz tick)
   src/
     protocol.h              CmdFrame, StatusFrame, CRC-8/MAXIM
     command_queue.h         SPSC ring buffer (16 slots)
@@ -649,10 +652,13 @@ esp32/                      ESP32 PlatformIO project (C++17, Arduino + ESP-IDF)
     stepper_engine.h/.cpp   3-axis engine, FreeRTOS Core 1 task
     spi_slave.h/.cpp        SPI slave DMA driver, Core 0 task
     endstop.h/.cpp          2-contact ISR + homing
-    hx711.h/.cpp            HX711 bitbang driver + PI tension controller
-    main.cpp                Pin config, setup(), loop()
+    hx711.h/.cpp            HX711 bitbang driver (no PID)
+    encoder.h/.cpp          PCNT quadrature decoder (GPIO 0/15)
+    pot.h/.cpp              ADC1 potentiometer driver (GPIO 36)
+    sensor_task.h/.cpp      Core 0 sensor acquisition task (pri 5)
+    main.cpp                Pin config, app_main()
   platformio.ini
-rpi/                        Raspberry Pi Python application
+src/rpi/                    Raspberry Pi Python application
   hal/
     protocol.py             Python mirror of protocol.h
     spi_transport.py        spidev wrapper, thread-safe
@@ -664,7 +670,7 @@ rpi/                        Raspberry Pi Python application
     homing.py               home_axis(), home_all()
   config/
     machine_config.yaml     Hardware constants + bobbin presets
-  tests/                    pytest (40 tests, no hardware required)
+  tests/                    pytest (32 tests, no hardware required)
   main.py                   asyncio CLI entry point
 doc/                        Architecture docs
   architecture.md           Full design reference

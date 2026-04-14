@@ -29,7 +29,7 @@ Full architecture details: [doc/architecture.md](doc/architecture.md)
 - **Home sensor**: 2-contact reed/optical (NO + NC), lateral axis
 - **Load cells**: 2× HX711 — read by ESP32, forwarded to Pi for PID
 - **Potentiometer**: 10 kΩ on GPIO 36 (ADC1_CH0) — speed control
-- **Encoder**: quadrature on GPIO 1/3 (PCNT) — manual axis control
+- **Encoder**: quadrature on GPIO 0/15 (PCNT) — manual axis control
 - **TMC2209 UART**: handled by the Raspberry Pi, not the ESP32
 
 ## Pin Assignments (ESP32)
@@ -76,7 +76,7 @@ Full architecture details: [doc/architecture.md](doc/architecture.md)
 ### ESP32 (PlatformIO — ESP-IDF framework)
 
 ```bash
-cd esp32/
+cd src/esp32/
 pio run -t upload              # build + flash over USB
 pio device monitor -b 115200  # serial monitor (if console is re-enabled)
 ```
@@ -87,7 +87,7 @@ pio device monitor -b 115200  # serial monitor (if console is re-enabled)
 ### RPi Python
 
 ```bash
-cd rpi/
+cd src/rpi/
 pip install -r requirements.txt
 python3 -m pytest tests/ -v              # run unit tests (no hardware)
 python3 main.py --preset strat --dry-run # dry-run with mock ESP32
@@ -116,9 +116,9 @@ print(f"Encoder: {status.encoder_manual}")  # signed int16 delta
 ## Directory Structure
 
 ```
-esp32/          ESP32 PlatformIO firmware (C++17, ESP-IDF + FreeRTOS)
+src/esp32/          ESP32 PlatformIO firmware (C++17, ESP-IDF + FreeRTOS)
   src/
-    encoder.h/.cpp    PCNT quadrature decoder (GPIO 1/3)
+    encoder.h/.cpp    PCNT quadrature decoder (GPIO 0/15)
     pot.h/.cpp        ADC1 potentiometer driver (GPIO 36)
     sensor_task.h/.cpp  Core 0 sensor acquisition task
     hx711.h/.cpp      HX711 bitbang driver (no PID)
@@ -129,7 +129,7 @@ esp32/          ESP32 PlatformIO firmware (C++17, ESP-IDF + FreeRTOS)
     protocol.h        CmdFrame / StatusFrame / CRC-8
     main.cpp          Pin config, app_main()
   sdkconfig.defaults  SDK config overrides (console=none, 240 MHz, 1 kHz tick)
-rpi/            RPi Python application (asyncio)
+src/rpi/        RPi Python application (asyncio)
   hal/          SPI transport, protocol, axis config
   machine/      CoilWinder, TensionController, homing
   tests/        32 unit tests (pytest, no hardware needed)
