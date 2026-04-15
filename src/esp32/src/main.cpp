@@ -77,12 +77,11 @@ extern "C" void app_main(void) {
     uint32_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
 
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  PickupWinder ESP32 Stepper Controller");
+    ESP_LOGI(TAG, "  ESP32 Controller");
     ESP_LOGI(TAG, "  3-axis, SPI slave, FreeRTOS dual-core");
     ESP_LOGI(TAG, "  Framework: ESP-IDF");
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "CPU cores: %d  Free heap: %lu bytes",
-             chip.cores, (unsigned long)free_heap);
+    ESP_LOGI(TAG, "CPU cores: %d  Free heap: %lu bytes", chip.cores, (unsigned long)free_heap);
 
     // 1. Initialize stepper engine (axes + hardware timers)
     ESP_LOGI(TAG, "Initializing stepper engine...");
@@ -92,10 +91,6 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Initializing endstop ISRs...");
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     endstop_init(AXIS_PINS, NUM_AXES);
-
-    // 3. Initialize sensor hardware (HX711 + pot + encoder)
-    ESP_LOGI(TAG, "Initializing sensor hardware...");
-    sensor_task_init();
 
     // 4. Initialize SPI slave
     ESP_LOGI(TAG, "Initializing SPI slave...");
@@ -109,10 +104,8 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Starting SPI slave task on Core 0...");
     spi_slave_start(g_cmd_queue);
 
-    // 7. Start sensor acquisition task on Core 0
-    ESP_LOGI(TAG, "Starting sensor task on Core 0...");
-    sensor_task_start();
 
+    
     ESP_LOGI(TAG, "Startup complete — waiting for SPI commands from RPi");
 
     // Periodic status log (every 5 seconds) — replaces Arduino loop().
