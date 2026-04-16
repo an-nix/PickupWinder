@@ -1,78 +1,70 @@
 /**
  * @file comm_interface.h
- * @brief Host communication interface — UART stub (Klipper-ready).
+ * @brief SPI slave transport for host → ESP32 motion messages.
  *
- * In production this module receives comm_packet_t frames serialised by the
- * Linux host over UART (or SPI), deserialises them, routes each block to the
- * appropriate StepperQueue, and sends flow-control ACKs back to the host.
+ * The communication layer is intentionally separated from the stepper runtime:
  *
- * This is currently a STUB implementation:
- *   • The UART receive path is present but does nothing useful until a real
- *     frame parser is wired in.
- *   • The ACK path logs to the console instead of writing to UART TX.
+ * - `messages.h` defines all wire-level structures and result codes
+ * - `CommInterface` owns the SPI slave task and DMA buffers
+ * - handler methods translate validated messages into queue/driver operations
  *
- * ── Packet framing ─────────────────────────────────────────────────────────
- *   Each packet on the wire is:
- *     [SYNC 0xAA] [LENGTH u16-LE] [comm_packet_t payload] [CRC8]
- *
- *   The stub skips the framing layer.  Wire a real byte-stream parser here
- *   when integrating with the Linux host.
- *
- * ── Flow-control ACK ───────────────────────────────────────────────────────
- *   The ACK frame sent to the host is:
- *     [0xAC] [motor_id u8] [free_slots u8]
- *
- *   The host throttles injection when free_slots < FLOW_CONTROL_THRESHOLD.
+ * This structure keeps the code maintainable when adding new commands:
+ * define a new payload in `messages.h`, then add one handler here.
  */
 
 #pragma once
 
+#include <driver/gpio.h>
 #include <esp_err.h>
-#include "step_types.h"
+
+#include "messages.h"
 #include "stepper_queue.h"
 
-// Maximum number of motors supported by this interface
-#define COMM_MAX_MOTORS 2
+struct SpiBusPins {
+    gpio_num_t mosi;
+    gpio_num_t miso;
+    gpio_num_t sclk;
+    gpio_num_t cs;
+};
 
 class CommInterface {
 public:
     /**
-     * @brief Construct the CommInterface.
+     * @brief Construct the SPI communication interface.
      *
-     * @param queues   Array of StepperQueue pointers, indexed by motor_id.
-     * @param n_motors Number of entries in @p queues (≤ COMM_MAX_MOTORS).
+     * @param queues   Stepper queues indexed by axis id.
+     * @param n_motors Number of valid queues.
      */
     CommInterface(StepperQueue* queues[], uint8_t n_motors);
 
     /**
-     * @brief Initialise the UART peripheral and launch the RX task.
-     *
-     * @param uart_num  UART port number (e.g., UART_NUM_1).
-     * @param tx_gpio   GPIO for UART TX (to host).
-     * @param rx_gpio   GPIO for UART RX (from host).
-     * @param baud_rate Baud rate (e.g., 921600).
+     * @brief Initialize the ESP32 SPI slave and start the communication task.
      */
-    esp_err_t init(int uart_num, int tx_gpio, int rx_gpio, int baud_rate);
-
-    /**
-     * @brief Inject a comm_packet_t directly (bypasses UART — for testing).
-     *
-     * Routes the packet to the appropriate queue and sends a flow-control ACK
-     * if the free-slot count drops below FLOW_CONTROL_THRESHOLD.
-     *
-     * @return ESP_OK, ESP_ERR_INVALID_ARG (bad motor_id), or ESP_ERR_TIMEOUT
-     *         (target queue full).
-     */
-    esp_err_t injectPacket(const comm_packet_t& pkt);
+    esp_err_t init(const SpiBusPins& pins);
 
 private:
-    StepperQueue* queues_[COMM_MAX_MOTORS];
-    uint8_t       n_motors_;
-    int           uart_num_ {-1};
+    StepperQueue*   queues_[SPI_MAX_AXES];
+    uint8_t         n_motors_;
+    SpiBusPins      pins_ {};
 
-    /** Send a flow-control ACK to the host for the given motor. */
-    void sendFlowAck(uint8_t motor_id, uint32_t free_slots);
+    uint16_t        last_rx_sequence_ {0};
+    uint8_t         last_rx_type_ {static_cast<uint8_t>(SpiMessageType::NOP)};
+    uint8_t         last_result_ {static_cast<uint8_t>(SpiMessageResult::OK)};
 
-    /** UART RX task — listens for incoming comm_packet_t frames. */
-    static void rxTask(void* arg);
+    /** Build the status payload for the next SPI response frame. */
+    void buildStatusFrame(uint8_t* out_frame) const;
+
+    /** Parse and execute one validated request frame. */
+    esp_err_t handleFrame(const SpiMessageHeader& header, const uint8_t* payload);
+
+    esp_err_t handleEnableAxis(const EnableAxisPayload& payload);
+    esp_err_t handleEmergencyStop(const EmergencyStopPayload& payload);
+    esp_err_t handleStopAxis(const EmergencyStopPayload& payload);
+    esp_err_t handleDisableAll();
+    esp_err_t handleResetStats();
+    esp_err_t handleStepBlock(const StepBlockPayload& payload);
+    esp_err_t handleSegmentBlock(const SegmentBlockPayload& payload);
+
+    /** Core 0 SPI slave task. */
+    static void spiTask(void* arg);
 };

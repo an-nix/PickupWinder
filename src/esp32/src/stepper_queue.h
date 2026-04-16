@@ -1,23 +1,14 @@
 /**
  * @file stepper_queue.h
- * @brief Per-motor FreeRTOS queue + executor task for step_block_t.
+ * @brief Per-motor FreeRTOS queue + executor task for motion blocks.
  *
- * StepperQueue decouples the communication layer (producer) from the RMT
- * driver (consumer).  The executor task runs on Core 1 at priority 24 to
- * guarantee real-time execution of motor commands without interference from
- * Core 0 (Wi-Fi, UART, web server, etc.).
+ * The host now sends compressed motion segments rather than only explicit
+ * per-step blocks. `StepperQueue` remains the boundary between transport and
+ * execution:
  *
- * ── Flow control ───────────────────────────────────────────────────────────
- *   available() returns the number of free slots remaining in the FreeRTOS
- *   queue.  The communication layer should send an ACK / backpressure signal
- *   to the host when available() < FLOW_CONTROL_THRESHOLD (= 4).
- *
- * ── Underrun handling ──────────────────────────────────────────────────────
- *   The executor blocks on xQueueReceive() when the block queue is empty and
- *   blocks on an ISR task notification when the driver's software ring is
- *   full. There is no CPU-side spin loop. If the producer still cannot keep
- *   up, the encoder emits one LOW-level pause chunk and ends the transaction,
- *   matching the FastAccelStepper IDF5 behavior.
+ * - Core 0 / SPI task enqueues `motion_block_t`
+ * - Core 1 / executor task expands segments into `step_block_t`
+ * - `StepperDriver` streams the concrete steps via RMT
  */
 
 #pragma once
@@ -56,8 +47,20 @@ public:
      * @param timeout_ms  Maximum wait time in ms (0 = non-blocking).
      * @return ESP_OK on success, ESP_ERR_TIMEOUT if the queue was full.
      */
+    esp_err_t enqueueMotionBlock(const motion_block_t& block,
+                                 uint32_t timeout_ms = portMAX_DELAY);
+
+    esp_err_t enqueueStepBlock(const step_block_t& block,
+                               uint32_t timeout_ms = portMAX_DELAY);
+
+    esp_err_t enqueueSegmentBlock(const segment_block_t& block,
+                                  uint32_t timeout_ms = portMAX_DELAY);
+
+    /** @brief Legacy compatibility wrapper for old explicit-step producers. */
     esp_err_t enqueueBlock(const step_block_t& block,
-                           uint32_t timeout_ms = portMAX_DELAY);
+                           uint32_t timeout_ms = portMAX_DELAY) {
+        return enqueueStepBlock(block, timeout_ms);
+    }
 
     /**
      * @brief Number of free slots remaining in the block queue.
@@ -70,6 +73,12 @@ public:
     /** @brief Return the motor id (0 or 1). */
     uint8_t motorId() const { return motor_id_; }
 
+    /** @brief Access the bound driver (for status / enable / estop handling). */
+    StepperDriver& driver() { return driver_; }
+
+    /** @brief Const access to the bound driver. */
+    const StepperDriver& driver() const { return driver_; }
+
 private:
     StepperDriver& driver_;
     uint8_t        motor_id_;
@@ -77,12 +86,16 @@ private:
     QueueHandle_t  queue_  {nullptr};
     TaskHandle_t   task_   {nullptr};
 
+    static esp_err_t maybeStartDriver(StepperDriver& driver, bool force_start);
+    static esp_err_t pushExpandedBlock(StepperDriver& driver, const step_block_t& block);
+    static esp_err_t executeSegmentBlock(StepperDriver& driver, const segment_block_t& block);
+
     /**
      * @brief Executor task body.
      *
-    * Pinned to Core 1, priority 24. Dequeues step_block_t and calls
-    * driver_.pushBlock(). Drains the whole block queue when woken so the
-    * software ring stays as full as possible.
+    * Pinned to Core 1, priority 24. Dequeues `motion_block_t`, expands any
+    * compressed segments into `step_block_t`, and keeps the software ring as
+    * full as possible before starting / restarting the RMT stream.
      */
     static void executorTask(void* arg);
 };

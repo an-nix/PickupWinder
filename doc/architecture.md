@@ -5,19 +5,26 @@
 Two-processor architecture: a Raspberry Pi (Python application + HAL) and an ESP32 (real-time stepper controller).
 The ESP32 firmware uses the **ESP-IDF framework** (not Arduino). Entry point is `app_main()`.
 
-> Current pulse-output path: host transport → `StepperQueue` block queue →
-> `StepperDriver` software ring → RMT `simple_encoder` callback → STEP GPIO.
-> The queue/RMT hand-off is intentionally aligned with the ESP32 IDF5 backend
-> of FastAccelStepper: task-side blocking backpressure, ISR-side chunk refill,
-> and clean transaction stop on starvation.
+Current pulse-output path:
+
+`segment planner (RPi)` → `SPI SEGMENT_BLOCK` → `StepperQueue (motion_block_t)`
+→ `segment expansion on ESP32` → `StepperDriver ring` → `RMT simple_encoder`
+→ STEP GPIO
+
+The queue/RMT hand-off stays aligned with the ESP32 IDF5 FastAccelStepper model:
+task-side blocking backpressure, ISR-side chunk refill, stop-on-starvation.
+
+Protocol definitions are in:
+
+- `src/esp32/src/messages.h`
+- `src/rpi/messages.py`
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  Raspberry Pi — Python application (asyncio)                 │
-│  main.py  ·  CoilWinder  ·  TensionController  ·  WebUI     │
-│                    │ spidev (SPI0)                            │
-│           src/rpi/hal/esp32_controller.py                        │
-│              8-byte CmdFrame → / ← 44-byte StatusFrame       │
+│  demo_spi.py / streamer.py / ramp.py                         │
+│                    │ spidev (SPI0, 4 MHz)                    │
+│      512-byte fixed SPI frames (CRC16, sequence, type)       │
 ├──────────────────────────────────────────────────────────────┤
 │  ESP32 — dual-core, 240 MHz, FreeRTOS (ESP-IDF)              │
 │                                                              │
@@ -28,17 +35,13 @@ The ESP32 firmware uses the **ESP-IDF framework** (not Arduino). Entry point is 
 │    Writes SensorState g_sensor under spinlock                │
 │                                                              │
 │  Core 0 (priority 10): spi_task                              │
-│    Receives CmdFrame, pushes to CmdQueue, sends StatusFrame  │
+│    Receives/validates SPI frames, enqueues motion blocks     │
+│    Sends status payload (queue/ring/underrun/last_result)    │
 │                                                              │
-│  Core 1 (priority 24): stepper_task                          │
-│    Dispatches commands → Axis objects                        │
-│    Polls endstops every 1 ms                                 │
-│    Reads g_sensor under spinlock → fills StatusFrame         │
-│    Hardware timers → STEP pulse ISRs (jitter < 1 µs)         │
-│                                                              │
-│    Axis 0 (Bobbin):    Timer Group 0 / Timer 0              │
-│    Axis 1 (Lateral):   Timer Group 0 / Timer 1              │
-│    Axis 2 (Tensioner): Timer Group 1 / Timer 0              │
+│  Core 1 (priority 24): stepper executor task                 │
+│    Dequeues motion blocks, expands segments to step blocks   │
+│    Fills driver software ring and controls stream start      │
+│    RMT callback emits deterministic STEP waveforms           │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -47,14 +50,14 @@ The ESP32 firmware uses the **ESP-IDF framework** (not Arduino). Entry point is 
 | Task          | Core | Priority | Stack | Responsibility                          |
 |---------------|------|----------|-------|-----------------------------------------|
 | sensor_task   | 0    | 5        | 4 KB  | HX711, ADC pot, PCNT encoder            |
-| spi_task      | 0    | 10       | 4 KB  | SPI slave DMA, CmdFrame RX / StatusFrame TX |
-| stepper_task  | 1    | 24       | 8 KB  | Axis dispatch, endstop poll, ISR timer scheduling |
+| spi_task      | 0    | 10       | 4 KB  | SPI frame RX/TX, CRC16 validation, dispatch |
+| stepper_task  | 1    | 24       | 8 KB  | Motion-block execution, segment expansion, RMT feed |
 
 ### sdkconfig Overrides (`src/esp32/sdkconfig.defaults`)
 
 | Key                                    | Value | Reason                                      |
 |----------------------------------------|-------|---------------------------------------------|
-| `CONFIG_ESP_CONSOLE_UART_NONE`         | y     | Frees GPIO 1/3 for the quadrature encoder   |
+| `CONFIG_ESP_CONSOLE_UART_NONE`         | y     | Frees UART console (encoder uses GPIO 0/15) |
 | `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240`  | y     | Full speed for ISR timing                   |
 | `CONFIG_FREERTOS_HZ`                   | 1000  | 1 ms FreeRTOS tick resolution               |
 
@@ -62,66 +65,35 @@ The ESP32 firmware uses the **ESP-IDF framework** (not Arduino). Entry point is 
 
 ## SPI Protocol
 
-Full-duplex, SPI Mode 0, 4 MHz clock.  Every RPi→ESP32 transfer sends one `CmdFrame` (8 bytes) and simultaneously receives one `StatusFrame` (44 bytes).
+Full-duplex, SPI Mode 0, 4 MHz. Every transfer exchanges one fixed-size
+512-byte frame.
 
-### CmdFrame (8 bytes, RPi → ESP32)
+Frame format:
 
-| Byte | Field  | Description                          |
-|------|--------|--------------------------------------|
-| 0    | cmd    | `CmdOpcode` (see below)              |
-| 1    | axis   | `AxisId` (0=Bobbin, 1=Lateral, 2=Tensioner, 0xFF=ALL) |
-| 2–5  | data   | uint32_t payload, little-endian      |
-| 6    | flags  | `CmdFlags` bitfield                  |
-| 7    | crc8   | CRC-8/MAXIM over bytes 0–6           |
+- 12-byte header: `magic`, `version`, `msg_type`, `sequence`,
+  `payload_length`, `flags`, `crc16`
+- payload: message-specific packed struct
+- CRC16-CCITT over header+payload bytes
 
-### StatusFrame (44 bytes, ESP32 → RPi)
+Primary motion command:
 
-| Bytes | Field             | Description                              |
-|-------|-------------------|------------------------------------------|
-| 0     | global_flags      | `StatusFlags` bitfield                   |
-| 1     | event_type        | `EventType`                              |
-| 2     | event_axis        | Axis that generated the event            |
-| 3     | endstop_mask      | Bit per axis (bit 0 = axis 0, etc.)      |
-| 4–7   | uptime_ms         | Milliseconds since boot (uint32_t)       |
-| 8–15  | axis[0]           | `AxisStatus` — Bobbin                    |
-| 16–23 | axis[1]           | `AxisStatus` — Lateral                   |
-| 24–31 | axis[2]           | `AxisStatus` — Tensioner                 |
-| 32–33 | tension_raw[0]    | HX711 #0 (tension) in 0.1 g (int16_t)   |
-| 34–35 | tension_raw[1]    | HX711 #1 (auxiliary) in 0.1 g (int16_t) |
-| 36–37 | tension_setpoint  | Active PID setpoint in 0.1 g (int16_t)  |
-| 38–39 | pot_raw           | ADC1 potentiometer value 0–4095 (int16_t)|
-| 40–41 | encoder_manual    | PCNT quadrature delta (int16_t, signed)  |
-| 42–43 | reserved          | 0x00 0x00                                |
+- `SEGMENT_BLOCK` (`src/esp32/src/messages.h::SegmentBlockPayload`)
+  - contains up to `SEGMENT_BLOCK_SIZE` arithmetic motion segments
+  - each segment encodes: `step_count`, `start_ticks`, `add_ticks`, `dir`
+  - ESP32 expands segments locally into concrete step intervals
 
-### AxisStatus (8 bytes)
+Legacy/debug command:
 
-| Bytes | Field      | Description                              |
-|-------|------------|------------------------------------------|
-| 0–3   | position   | Step counter (int32_t, signed)           |
-| 4–5   | current_hz | Step frequency (uint16_t, 0 = stopped)   |
-| 6     | flags      | `StatusFlags` per-axis bitfield          |
-| 7     | _pad       | 0                                        |
+- `STEP_BLOCK` (explicit per-step intervals)
 
-### Command Opcodes
+Status response (`StatusPayload`) includes:
 
-| Opcode      | Value | Data field               | Description                        |
-|-------------|-------|--------------------------|------------------------------------|
-| NOP         | 0x00  | —                        | No operation                       |
-| SET_SPEED   | 0x01  | uint32 Hz                | Set constant speed for axis        |
-| MOVE_ABS    | 0x02  | int32 steps              | Absolute move                      |
-| MOVE_REL    | 0x03  | int32 steps              | Relative move                      |
-| STOP        | 0x04  | —                        | Controlled deceleration            |
-| ESTOP       | 0x05  | —                        | Immediate all-axis halt            |
-| ENABLE      | 0x06  | uint32 (1=en, 0=dis)     | Enable/disable stepper drivers     |
-| HOME        | 0x07  | —                        | Start homing sequence              |
-| SET_ACCEL   | 0x08  | uint32 steps/s²          | Set axis acceleration              |
-| GET_STATUS  | 0x09  | —                        | Request status (same as NOP)       |
-| SET_MODE    | 0x0A  | uint32 (0=free, 1=wind)  | Set winding sync mode              |
-| RESET_POS   | 0x0B  | —                        | Reset position counter to 0        |
-| SET_LIMITS  | 0x0C  | int32 limit value        | Set software position limit        |
-| ACK_EVENT   | 0x0D  | —                        | Acknowledge pending event          |
-| SET_TENSION | 0x0E  | uint16 setpoint (0.1 g)  | Set tension PID target (0=disable) |
-| TARE_HX711  | 0x0F  | axis=sensor index (0/1)  | Zero a load cell                   |
+- uptime
+- queue free slots per axis
+- ring free slots per axis
+- underrun counters per axis
+- last RX sequence/type/result
+- enabled and running masks
 
 ---
 
@@ -195,7 +167,8 @@ GPIO 34 and 39 are input-only (5V tolerant), ideal for DOUT.
 
 All sensor acquisition is owned by **sensor_task** (Core 0, priority 5).
 It writes to the shared `SensorState g_sensor` struct under a `portMUX_TYPE` spinlock.
-The stepper_task (Core 1) reads from `g_sensor` under the same spinlock when building the `StatusFrame`.
+The communication task reads the shared state under the same spinlock when
+building `StatusPayload`.
 
 ```
 sensor_task (Core 0):
@@ -205,7 +178,7 @@ sensor_task (Core 0):
 
 g_sensor (shared, spinlock protected):
   tension_dg[2]      — latest HX711 readings in 0.1 g
-  tension_setpoint   — setpoint forwarded from Pi via SET_TENSION
+  tension_setpoint   — optional host-provided setpoint value
   pot_raw            — 0–4095 filtered ADC value
   encoder_manual     — signed int16 PCNT delta since last read
 ```
@@ -222,8 +195,7 @@ The read is **non-blocking**: sensor_task polls `gpio_get_level(DOUT)` each ms
 and reads 24 bits in ~50 µs only when data is ready. **No busy-wait.**
 
 The Raspberry Pi performs the PID loop using the streamed HX711 readings.
-The ESP32 forwards `tension_raw[0]` and `tension_raw[1]` to the Pi, and the Pi
-sends back a setpoint with `SET_TENSION`.
+The ESP32 forwards sensor values to the Pi in `StatusPayload`.
 
 A simple PI loop on the Pi looks like:
 
@@ -238,19 +210,16 @@ else:
     set_tensioner_speed(abs(output), direction=sign(output))
 ```
 
-The RPi sets the setpoint with `SET_TENSION` (0 = disable PID). Current reading
-is returned in `StatusFrame.tension_raw[0]` every SPI cycle.
+Current readings are returned in `StatusPayload` on each SPI cycle.
 
 ---
 
 ## Homing Sequence (Lateral Axis)
 
-1. RPi sends `HOME` command (axis = LATERAL).
-2. ESP32 sets lateral axis direction = reverse, speed = 2000 Hz.
-3. Stepper task polls `update_endstop()` every 1 ms.
-4. When NO=LOW AND NC=HIGH (valid home): axis stops, event `HOME_COMPLETE` raised.
-5. When NO=LOW AND NC=LOW (fault): axis stops, event `FAULT` raised.
-6. RPi receives `HOME_COMPLETE` event and resets lateral position to 0.
+Lateral homing uses the 2-contact sensor logic (NO=LOW and NC=HIGH = valid home).
+The current transport layer is motion-centric (`SEGMENT_BLOCK`/`STEP_BLOCK`).
+Any host-side homing strategy must preserve this contact validation and avoid
+single-contact shortcuts.
 
 ---
 
@@ -278,28 +247,29 @@ deterministic RMT timing.
 
 ## Acceleration Model (Klipper-style)
 
-Both axes use a multi-segment trapezoidal ramp:
+Host-side planner emits arithmetic segments:
 
 ```
-for each segment i in [0, N_SEG=16):
-    interval  = start_iv[i]      ← force-loaded at segment boundary
-    for step in range(count[i]):
-        step()
-        interval += add[i]
+for each segment:
+  ticks = start_ticks
+  for step in range(step_count):
+    emit_step(ticks)
+    ticks += add_ticks
 ```
 
-Segments are pre-computed by `Axis::build_simple_ramp()` on the ESP32
-using floating-point arithmetic (240 MHz, FPU available on ESP32).
+The host sends those segments via `SEGMENT_BLOCK`; ESP32 expands them to
+`step_block_t` and streams through RMT.
 
-Speed range: 100 Hz (~ 0.9 RPM) to 160 000 Hz (~ 1500 RPM) at 6400 steps/rev.
+This decouples link bandwidth from step frequency and avoids the old
+`one transport entry per step` bottleneck.
 
 ---
 
 ## Winding Kinematics  (host side — `src/rpi/machine/winding_kinematics.py`)
 
 All winding geometry computation runs on the Raspberry Pi host, not on the ESP32.
-The ESP32 receives only `SET_SPEED` commands via SPI; it has no knowledge of wire
-diameter, bobbin width, or leadscrew pitch.
+The ESP32 receives only compressed motion segments and has no knowledge of
+wire geometry.
 
 ### Frequency Ratio
 
@@ -356,18 +326,16 @@ where PACK = 1.0 (fixed/custom) or 0.86603 (orthocyclic).
 
 ### Velocity Segment
 
-`generate_layer()` returns a list of `VelocitySegment` objects with a trapezoidal
-speed profile (ramp-up → cruise → ramp-down) at 1 ms resolution.
-The host sends each segment as a pair of `SET_SPEED` commands (axis 0 + axis 1)
-before the segment's `duration_ticks` milliseconds elapse.
+`src/rpi/ramp.py::SegmentBlockGenerator` creates segment blocks where each
+segment is an arithmetic run (`step_count`, `start_ticks`, `add_ticks`, dir).
+`src/rpi/streamer.py` sends those blocks via `SEGMENT_BLOCK`.
 
 | Field          | Description                                  |
 |----------------|----------------------------------------------|
-| step_hz[0]     | Bobbin axis frequency (Hz)                   |
-| step_hz[1]     | Lateral axis frequency (Hz, = hz_bob × R)    |
-| duration_ticks | Duration in 1 ms ticks                       |
-| dir_mask       | bit0=bobbin dir, bit1=lateral dir (0=fwd)    |
-| flags          | LAST(0x01), LAYER_END(0x02)                  |
+| step_count     | Number of steps in segment                    |
+| start_ticks    | First step interval in RMT ticks              |
+| add_ticks      | Delta applied after each emitted step         |
+| direction      | Segment direction                              |
 
 ---
 
@@ -375,42 +343,24 @@ before the segment's `duration_ticks` milliseconds elapse.
 
 ```
 src/esp32/                    ← ESP32 firmware (PlatformIO, ESP-IDF framework)
-  sdkconfig.defaults          ← SDK overrides (console=none, 240 MHz, 1 kHz tick)
   src/
-    protocol.h                ← CmdFrame / StatusFrame definitions + CRC-8/MAXIM
-    command_queue.h           ← Lock-free SPSC ring buffer (CmdFrame, Core 0→1)
-    axis.h / axis.cpp         ← Per-axis state, step ISR, Klipper-style ramp
-    stepper_engine.h/.cpp     ← 3-axis engine, FreeRTOS Core 1 task (pri 24)
-    spi_slave.h/.cpp          ← SPI slave DMA driver, Core 0 task (pri 10)
-    endstop.h/.cpp            ← 2-contact endstop ISR + homing
-    hx711.h/.cpp              ← HX711 bitbang driver (no PID — Pi handles PID)
-    encoder.h/.cpp            ← PCNT quadrature decoder (GPIO 0/15)
-    pot.h/.cpp                ← ADC1 potentiometer driver (GPIO 36)
-    sensor_task.h/.cpp        ← Core 0 sensor acquisition task (pri 5)
-    main.cpp                  ← Pin config, app_main(), task startup
+    messages.h                ← Fixed SPI frame protocol (CRC16, payloads)
+    comm_interface.*          ← SPI slave task + message dispatch
+    step_types.h              ← Step/segment core types and constants
+    stepper_queue.*           ← Motion queue + segment expansion executor
+    stepper_driver.*          ← RMT streaming + software ring
+    main.cpp                  ← Pin config, task startup
   platformio.ini
 
 src/rpi/                       ← RPi Python application
-  hal/
-    protocol.py               ← Python mirror of protocol.h (STATUS_FRAME_SIZE=44)
-    spi_transport.py          ← Thread-safe spidev wrapper
-    axis.py                   ← Axis config, unit conversions
-    esp32_controller.py       ← Async ESP32 command/event interface
-  machine/
-    coil_winder.py            ← WindingState machine, CoilWinder
-    tensioner.py              ← Tension control (uses SET_TENSION)
-    homing.py                 ← Homing sequence helpers
-    winding_kinematics.py     ← Layer geometry + trapezoidal segment generation
-  config/
-    machine_config.yaml       ← Hardware constants + bobbin presets
-  tests/                      ← pytest (97 tests, host-runnable, no hardware)
-  main.py                     ← asyncio CLI entry point
+  messages.py                 ← Python mirror of `messages.h`
+  ramp.py                     ← Segment planner / generators
+  spi_transport.py            ← SPI frame transport helper
+  streamer.py                 ← Segment block streaming and backpressure
+  demo_spi.py                 ← Segment-streaming demo CLI
 
 doc/                          ← Architecture documentation
-migration/                    ← Source of truth used during migration (read-only)
-  esp32/                      ← Original per-module files copied into src/esp32/src/
 resources/                    ← External reference material (do not modify)
-  esp32/                      ← Old standalone ESP32 project (reference pinout)
-  klipper/                    ← Klipper stepper.c reference
-  fastaccelstepper/           ← FastAccelStepper reference
+  esp32/                      ← Old standalone ESP32 project (reference only)
+  FastAccelStepper/           ← behavioral reference for queue/RMT model
 ```

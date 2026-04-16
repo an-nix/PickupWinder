@@ -89,6 +89,12 @@ extern "C" {
 /** Number of step commands per block. */
 #define STEP_BLOCK_SIZE         64
 
+/** Number of compressed motion segments per transport block. */
+#define SEGMENT_BLOCK_SIZE      60
+
+/** Buffered step target before starting/restarting the RMT stream. */
+#define STEP_STREAM_START_FILL  512U
+
 /**
  * Depth of the FreeRTOS step-block queue (per motor).
  * Provides ~(STEPPER_QUEUE_DEPTH × STEP_BLOCK_SIZE) steps of look-ahead.
@@ -133,6 +139,54 @@ typedef struct {
     step_cmd_t steps[STEP_BLOCK_SIZE]; /**< Pre-timed step commands              */
     uint32_t   count;                  /**< Number of valid entries in steps[]   */
 } step_block_t;
+
+/**
+ * @brief A compressed motion segment.
+ *
+ * Represents `step_count` successive steps where the interval evolves as:
+ *
+ *   ticks[n] = start_ticks + n * add_ticks
+ *
+ * This is the same basic representation used by Klipper-style trapezoid
+ * segments: the host sends a compact arithmetic description, the MCU expands
+ * it locally into concrete step timings.
+ */
+typedef struct {
+    uint16_t step_count;   /**< Number of steps encoded by the segment          */
+    uint16_t start_ticks;  /**< Interval for the first step in RMT ticks        */
+    int16_t  add_ticks;    /**< Delta applied after each emitted step           */
+    uint8_t  direction;    /**< true = forward / CW, false = reverse / CCW      */
+    uint8_t  reserved;     /**< Padding / future flags                          */
+} motion_segment_t;
+
+/**
+ * @brief A transport block of compressed motion segments.
+ */
+typedef struct {
+    motion_segment_t segments[SEGMENT_BLOCK_SIZE];
+    uint32_t         count;   /**< Number of valid segments[] entries             */
+} segment_block_t;
+
+typedef enum {
+    MOTION_BLOCK_KIND_STEP = 0,
+    MOTION_BLOCK_KIND_SEGMENT = 1,
+} motion_block_kind_t;
+
+/**
+ * @brief Queue item exchanged between the comm task and the executor task.
+ *
+ * The comm task can enqueue either legacy per-step blocks or compressed
+ * segment blocks. The executor expands segment blocks into `step_block_t`
+ * chunks locally before feeding the driver ring.
+ */
+typedef struct {
+    uint8_t kind;
+    uint8_t reserved[3];
+    union {
+        step_block_t    step;
+        segment_block_t segment;
+    } payload;
+} motion_block_t;
 
 /**
  * @brief Ring buffer entry consumed by the RMT encoder callback (ISR context).

@@ -63,6 +63,9 @@ public:
     /** @brief De-assert EN pin (driver IC off, coils de-energised). */
     void disable();
 
+    /** @brief True if the driver output is currently enabled. */
+    bool isEnabled() const { return enabled_; }
+
     /**
      * @brief Immediate stop: flush the RMT TX queue and reset ring buffer.
      *
@@ -94,6 +97,22 @@ public:
     /** @brief Return the motor id supplied at construction (0 or 1). */
     uint8_t motorId() const { return motor_id_; }
 
+    /**
+     * @brief Start (or restart) RMT streaming.
+     *
+     * Must be called by the executor task after draining all available step
+     * blocks into the ring buffer so that the ring is maximally full before
+     * the RMT hardware starts consuming entries.  Safe to call from task
+     * context only.
+     */
+    esp_err_t startStream();
+
+    /** @brief Approximate number of free slots remaining in the software ring. */
+    uint32_t ringFreeSlots() const { return ringFree(); }
+
+    /** @brief True while an RMT transaction is currently active. */
+    bool isStreaming() const { return rmt_running_; }
+
     // ─── Ring buffer (SPSC: task writes, ISR reads) ────────────────────────
     // Public because the C encoder callback needs direct access in ISR context.
 
@@ -124,9 +143,7 @@ private:
 
     volatile bool         rmt_running_ {false};
     bool                  last_dir_    {true};
-
-    /** @brief Start (or restart) RMT streaming from the ring buffer. */
-    esp_err_t startStream();
+    bool                  enabled_     {false};
 
     /** @brief Number of free slots in the ring buffer. */
     uint32_t ringFree() const {

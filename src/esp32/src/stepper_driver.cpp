@@ -78,6 +78,11 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         return PART_SIZE;
     }
 
+    // Data is available after underrun — clear the stop flag so we can continue
+    // encoding. This handles the case where the ring was empty, we emitted a
+    // pause, and now new data has arrived before on_trans_done_isr fires.
+    drv->rmt_stopped_ = false;
+
     // Peek at next entry — check for direction change
     ring_entry_t* entry = &drv->ring_[rd & STEP_RING_MASK];
     if (entry->toggle_dir) {
@@ -249,11 +254,13 @@ esp_err_t StepperDriver::init()
 void StepperDriver::enable()
 {
     gpio_set_level(en_pin_, 0);
+    enabled_ = true;
 }
 
 void StepperDriver::disable()
 {
     gpio_set_level(en_pin_, 1);
+    enabled_ = false;
 }
 
 void StepperDriver::emergencyStop()
@@ -360,12 +367,12 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block)
         ring_write_ = wr + 1;
     }
 
-    // Start the stream if it's not already running.  Once started, the
-    // encoder callback keeps it alive with pause symbols when the ring empties.
-    if (!rmt_running_) {
-        return startStream();
-    }
-
+    // NOTE: startStream() is NOT called here.
+    //
+    // The executor task (stepper_queue.cpp) calls startStream() explicitly after
+    // draining all available FreeRTOS queue blocks into the ring. This maximises
+    // ring fill before the RMT starts, which is critical at high step rates where
+    // a single 64-step block lasts less than one SPI round-trip.
     return ESP_OK;
 }
 

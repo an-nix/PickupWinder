@@ -5,9 +5,7 @@
  * Architecture overview
  * ─────────────────────
  *   Core 0  (APP CPU)
- *     • comm_rx task  (pri 10) : UART frame parser → StepperQueue
- *     • demo_gen task (pri  8) : local profile generator (remove in production)
- *     • demo_log task (pri  5) : frequency logger every 100 ms
+ *     • comm_spi task (pri 10) : SPI slave message parser → StepperQueue
  *
  *   Core 1  (PRO CPU)
  *     • stepper_0     (pri 24) : executor for motor A  (RMT channel 0)
@@ -23,11 +21,11 @@
  *   Motor A (Bobbin / axis 0)  : STEP=GPIO26  DIR=GPIO27  EN=GPIO14
  *   Motor B (Lateral / axis 1) : STEP=GPIO32  DIR=GPIO33  EN=GPIO25
  *
- *   UART host link             : TX=GPIO17    RX=GPIO16   Baud=921600
+ *   SPI host link              : MOSI=GPIO23  MISO=GPIO19
+ *                                SCLK=GPIO18  CS=GPIO5
  *
- * To disable the local demo and use the real UART host:
- *   Comment out the demo_local_start() call below.
- *   The CommInterface will automatically start the UART RX task.
+ * The Raspberry Pi demo lives in `src/rpi/` and streams fixed-size SPI
+ * message frames to this firmware.
  */
 
 #include <freertos/FreeRTOS.h>
@@ -39,7 +37,6 @@
 #include "stepper_driver.h"
 #include "stepper_queue.h"
 #include "comm_interface.h"
-#include "demo_local.h"
 
 static const char* TAG = "main";
 
@@ -57,11 +54,11 @@ static constexpr gpio_num_t STEP_B = GPIO_NUM_32;
 static constexpr gpio_num_t DIR_B  = GPIO_NUM_33;
 static constexpr gpio_num_t EN_B   = GPIO_NUM_25;
 
-// UART host link (stub — not used when demo_local is active)
-static constexpr int UART_NUM   = 1;
-static constexpr int UART_TX    = 17;
-static constexpr int UART_RX    = 16;
-static constexpr int UART_BAUD  = 921600;
+// SPI host link
+static constexpr gpio_num_t SPI_MOSI = GPIO_NUM_23;
+static constexpr gpio_num_t SPI_MISO = GPIO_NUM_19;
+static constexpr gpio_num_t SPI_SCLK = GPIO_NUM_18;
+static constexpr gpio_num_t SPI_CS   = GPIO_NUM_5;
 
 // ---------------------------------------------------------------------------
 // Global instances — static storage, constructed once
@@ -104,22 +101,8 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(queue_a.init());
     ESP_ERROR_CHECK(queue_b.init());
 
-    // ── 4. Start communication interface (UART RX + flow control) ──────────
-    //
-    // Pass UART_NUM = -1 to skip UART initialisation when using demo_local.
-    // Uncomment the real init() call when the Linux host is connected:
-    //
-    //   ESP_ERROR_CHECK(comm.init(UART_NUM, UART_TX, UART_RX, UART_BAUD));
-    //
-    (void)comm; // suppress unused-variable warning in demo mode
-
-    // ── 5. Start local demo (remove in production) ──────────────────────────
-    //
-    // ╔══════════════════════════════════════════════════════════════════════╗
-    // ║  DEMO MODE ACTIVE.  Remove demo_local_start() and uncomment         ║
-    // ║  comm.init() above when using the real Raspberry Pi host.           ║
-    // ╚══════════════════════════════════════════════════════════════════════╝
-    ESP_ERROR_CHECK(demo_local_start(&queue_a, &queue_b));
+    // ── 4. Start SPI communication interface (Core 0, priority 10) ────────
+    ESP_ERROR_CHECK(comm.init({SPI_MOSI, SPI_MISO, SPI_SCLK, SPI_CS}));
 
     // app_main may return — FreeRTOS scheduler continues running the tasks.
     ESP_LOGI(TAG, "Scheduler running — app_main exiting.");
