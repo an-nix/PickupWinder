@@ -1,14 +1,14 @@
 /* spi_slave.h — Core 0 SPI slave driver.
  *
  * Interrupt-driven SPI slave using ESP-IDF spi_slave driver.
- * Receives CmdFrame (8 bytes) from RPi master, sends StatusFrame (32 bytes).
+ * Receives CmdFrame (8 bytes) from RPi master, sends StatusFrame (44 bytes).
  *
  * The SPI transaction is full-duplex: while the master clocks in a command,
  * the slave simultaneously clocks out the last status frame.
  *
  * Flow:
- *   1. Master sends 8-byte CmdFrame + 24 bytes padding (total 32 bytes)
- *   2. Slave sends 32-byte StatusFrame simultaneously
+ *   1. Master sends 8-byte CmdFrame padded to STATUS_FRAME_SIZE (44 bytes total)
+ *   2. Slave simultaneously sends the 44-byte StatusFrame
  *   3. On transaction complete, the CmdFrame is validated (CRC) and pushed
  *      to the CmdQueue for Core 1.
  *   4. The StatusFrame is refreshed from StepperEngine.

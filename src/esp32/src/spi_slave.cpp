@@ -1,11 +1,20 @@
 /* spi_slave.cpp — Core 0 SPI slave implementation.
  *
  * Uses ESP-IDF spi_slave driver (interrupt-driven, DMA-capable).
- * Full-duplex 32-byte transactions.
+ * Full-duplex transactions of STATUS_FRAME_SIZE (44) bytes.
+ *
+ * Transaction flow (per SPI cycle, ~44 bytes × 8 bits / 4 MHz ≈ 88 µs):
+ *   1. g_rmt_engine.get_status() — snapshot StatusFrame under spinlock
+ *   2. spi_slave_transmit()   — wait for master to drive CS+CLK
+ *   3. CRC validation          — drop frame on mismatch (silently)
+ *   4. cmd_queue.push()        — hand CmdFrame to Core 1 stepper task
+ *
+ * DMA buffers must be in DRAM and word-aligned (WORD_ALIGNED_ATTR).
+ * STATUS_FRAME_SIZE = 44 bytes (protocol.h).
  */
 
 #include "spi_slave.h"
-#include "stepper_engine.h"
+#include "rmt_stepper.h"
 #include <driver/spi_slave.h>
 #include <esp_log.h>
 #include <cstring>
@@ -28,7 +37,7 @@ static void spi_task(void* param) {
 
     for (;;) {
         // Prepare status frame for next transaction
-        StatusFrame sf = g_engine.get_status();
+        StatusFrame sf = g_rmt_engine.get_status();
         memcpy(tx_buf, &sf, sizeof(StatusFrame));
 
         // Setup transaction
@@ -44,7 +53,7 @@ static void spi_task(void* param) {
             continue;
         }
 
-        stats.tx_frames++;
+        stats.tx_frames = stats.tx_frames + 1;
 
         // Extract CmdFrame from first 8 bytes of rx_buf
         CmdFrame frame;
@@ -52,7 +61,7 @@ static void spi_task(void* param) {
 
         // Validate CRC
         if (!cmd_frame_check_crc(frame)) {
-            stats.rx_crc_errors++;
+            stats.rx_crc_errors = stats.rx_crc_errors + 1;
             continue;
         }
 
@@ -61,11 +70,11 @@ static void spi_task(void* param) {
             continue;
         }
 
-        stats.rx_frames++;
+        stats.rx_frames = stats.rx_frames + 1;
 
         // Push to command queue for Core 1
         if (!cmd_queue->push(frame)) {
-            stats.rx_queue_full++;
+            stats.rx_queue_full = stats.rx_queue_full + 1;
             ESP_LOGW(TAG, "Command queue full — frame dropped");
         }
     }

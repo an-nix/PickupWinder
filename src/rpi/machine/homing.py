@@ -16,7 +16,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 
-from ..hal import ESP32Controller, AxisId, EventType
+from hal import ESP32Controller, AxisId, EventType
 
 logger = logging.getLogger(__name__)
 

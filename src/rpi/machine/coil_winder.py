@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional, Callable, Awaitable
 
-from ..hal import ESP32Controller, AxisId, EventType, MachineStatus
+from hal import ESP32Controller, AxisId, EventType, MachineStatus
 
 logger = logging.getLogger(__name__)
 

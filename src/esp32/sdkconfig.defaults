@@ -17,3 +17,22 @@ CONFIG_LOG_DEFAULT_LEVEL=3
 
 # ── Flash ─────────────────────────────────────────────────────────────────────
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# ── RMT legacy driver ────────────────────────────────────────────────────────
+# We use the legacy RMT API (driver/rmt.h) for direct RMTMEM access.
+# Suppress the #warning that would otherwise appear on every build.
+CONFIG_RMT_SUPPRESS_DEPRECATE_WARN=y
+
+# ── PCNT legacy driver ─────────────────────────────────────────────────────
+# encoder.cpp uses driver/pcnt.h (legacy PCNT API).
+CONFIG_PCNT_SUPPRESS_DEPRECATE_WARN=y
+
+# ── ADC legacy driver ──────────────────────────────────────────────────────
+# pot.cpp uses driver/adc.h (legacy ADC1 API).
+CONFIG_ADC_SUPPRESS_DEPRECATE_WARN=y
+
+# ── mbedTLS certificate bundle ────────────────────────────────────────────────
+# The pickup winder does not use TLS/HTTPS.  Disabling the certificate bundle
+# avoids running gen_crt_bundle.py (requires the 'cryptography' Python package)
+# and shrinks the firmware significantly.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n

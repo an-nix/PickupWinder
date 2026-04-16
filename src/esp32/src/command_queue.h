@@ -1,10 +1,24 @@
 /* command_queue.h — Lock-free SPSC ring buffer for Core 0 → Core 1.
  *
- * Single-Producer (Core 0 / SPI ISR) → Single-Consumer (Core 1 / stepper).
- * Wait-free: push and pop never block.
- * Cache-line padding not needed on ESP32 (no L2, Xtensa cores share SRAM).
+ * Single-Producer (Core 0 / SPI task) → Single-Consumer (Core 1 / stepper task).
+ * Wait-free: push() and pop() never block or spin.
  *
- * Uses acquire/release atomics for correct visibility across cores.
+ * Memory ordering:
+ *   head_ is owned by the producer (Core 0 SPI task).
+ *   tail_ is owned by the consumer (Core 1 stepper task).
+ *   Stores use release ordering; loads use acquire ordering, ensuring the
+ *   written CmdFrame is visible to the consumer before head_ is advanced.
+ *
+ * Cache-line padding is not needed on ESP32 (no L2 cache, shared SRAM).
+ *
+ * Typical usage:
+ *   // Core 0 — SPI task:
+ *   CmdFrame f = parse_received_bytes(rx_buf);
+ *   if (!g_cmd_queue.push(f)) { drop_frame(); }
+ *
+ *   // Core 1 — stepper task:
+ *   CmdFrame f;
+ *   while (g_cmd_queue.pop(f)) { dispatch_command(f); }
  */
 
 #pragma once

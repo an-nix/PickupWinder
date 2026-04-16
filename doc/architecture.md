@@ -267,28 +267,104 @@ Speed range: 100 Hz (~ 0.9 RPM) to 160 000 Hz (~ 1500 RPM) at 6400 steps/rev.
 
 ---
 
+## Winding Kinematics  (host side — `src/rpi/machine/winding_kinematics.py`)
+
+All winding geometry computation runs on the Raspberry Pi host, not on the ESP32.
+The ESP32 receives only `SET_SPEED` commands via SPI; it has no knowledge of wire
+diameter, bobbin width, or leadscrew pitch.
+
+### Frequency Ratio
+
+The bobbin and lateral axes may have **different** motor specifications.  For every
+bobbin revolution the lateral axis must advance exactly one pitch:
+
+$$R = \frac{\text{pitch\_mm}}{\text{p\_lead\_mm}} \times \frac{\text{lateral\_ppr}}{\text{bobbin\_ppr}}$$
+
+$$\text{hz\_lateral} = \text{hz\_bobbin} \times R \quad \text{clamped to } [1, \text{HZ\_MAX}]$$
+
+When both axes share the same ppr (lateral_ppr = bobbin_ppr) the fraction cancels
+and the formula reduces to the simpler `R = pitch / p_lead`.
+
+**Numerical example** (equal motors: 200 full × 32 µstep = 6400 ppr each;
+wire d=0.3 mm, leadscrew p_lead=2 mm/rev):
+
+| Parameter        | Value          |
+|------------------|----------------|
+| R                | 0.15           |
+| hz\_bobbin       | 160 000 Hz     |
+| hz\_lateral      | 24 000 Hz      |
+| turns per layer  | 100            |
+| layer duration   | 4 s            |
+| lateral travel   | 30 mm ✓        |
+
+### WindingGeometry fields
+
+```python
+@dataclass
+class WindingGeometry:
+    wire_diameter_mm:      float
+    bobbin_width_mm:       float
+    traverse_pitch_mm:     float   # leadscrew mm/rev
+    mandrel_diameter_mm:   float   # D0 — runtime, never hardcoded
+    bobbin_steps_per_rev:  int = 200
+    bobbin_microsteps:     int = 32
+    lateral_steps_per_rev: int = 200   # may differ from bobbin motor
+    lateral_microsteps:    int = 32
+```
+
+### Winding Modes
+
+| Mode            | Pitch per turn     | Radial advance per layer     |
+|-----------------|--------------------|------------------------------|
+| FIXED_PITCH     | d_wire             | d_wire                       |
+| ORTHOCYCLIC     | d_wire             | d_wire × sin(60°) = 0.866 d  |
+| CUSTOM_PITCH    | user-supplied (mm) | d_wire (or custom)           |
+
+### Layer Diameter
+
+$$D(n) = D_0 + d_\text{wire} \times (1 + 2n \times \text{PACK})$$
+
+where PACK = 1.0 (fixed/custom) or 0.86603 (orthocyclic).
+
+### Velocity Segment
+
+`generate_layer()` returns a list of `VelocitySegment` objects with a trapezoidal
+speed profile (ramp-up → cruise → ramp-down) at 1 ms resolution.
+The host sends each segment as a pair of `SET_SPEED` commands (axis 0 + axis 1)
+before the segment's `duration_ticks` milliseconds elapse.
+
+| Field          | Description                                  |
+|----------------|----------------------------------------------|
+| step_hz[0]     | Bobbin axis frequency (Hz)                   |
+| step_hz[1]     | Lateral axis frequency (Hz, = hz_bob × R)    |
+| duration_ticks | Duration in 1 ms ticks                       |
+| dir_mask       | bit0=bobbin dir, bit1=lateral dir (0=fwd)    |
+| flags          | LAST(0x01), LAYER_END(0x02)                  |
+
+---
+
 ## File Structure
 
 ```
 src/esp32/                    ← ESP32 firmware (PlatformIO, ESP-IDF framework)
   sdkconfig.defaults          ← SDK overrides (console=none, 240 MHz, 1 kHz tick)
   src/
-    protocol.h                ← CmdFrame / StatusFrame definitions + CRC-8
-    command_queue.h           ← Lock-free SPSC ring buffer (CmdFrame)
-    axis.h / axis.cpp         ← Per-axis state, step ISR, trapezoidal ramp
-    stepper_engine.h/.cpp     ← 3-axis engine, FreeRTOS Core 1 task
+    protocol.h                ← CmdFrame / StatusFrame definitions + CRC-8/MAXIM
+    command_queue.h           ← Lock-free SPSC ring buffer (CmdFrame, Core 0→1)
+    axis.h / axis.cpp         ← Per-axis state, step ISR, Klipper-style ramp
+    stepper_engine.h/.cpp     ← 3-axis engine, FreeRTOS Core 1 task (pri 24)
     spi_slave.h/.cpp          ← SPI slave DMA driver, Core 0 task (pri 10)
     endstop.h/.cpp            ← 2-contact endstop ISR + homing
     hx711.h/.cpp              ← HX711 bitbang driver (no PID — Pi handles PID)
     encoder.h/.cpp            ← PCNT quadrature decoder (GPIO 0/15)
     pot.h/.cpp                ← ADC1 potentiometer driver (GPIO 36)
     sensor_task.h/.cpp        ← Core 0 sensor acquisition task (pri 5)
-    main.cpp                  ← Pin config, app_main()
+    main.cpp                  ← Pin config, app_main(), task startup
   platformio.ini
 
 src/rpi/                       ← RPi Python application
   hal/
-    protocol.py               ← Python mirror of protocol.h
+    protocol.py               ← Python mirror of protocol.h (STATUS_FRAME_SIZE=44)
     spi_transport.py          ← Thread-safe spidev wrapper
     axis.py                   ← Axis config, unit conversions
     esp32_controller.py       ← Async ESP32 command/event interface
@@ -296,13 +372,16 @@ src/rpi/                       ← RPi Python application
     coil_winder.py            ← WindingState machine, CoilWinder
     tensioner.py              ← Tension control (uses SET_TENSION)
     homing.py                 ← Homing sequence helpers
+    winding_kinematics.py     ← Layer geometry + trapezoidal segment generation
   config/
     machine_config.yaml       ← Hardware constants + bobbin presets
-  tests/                      ← pytest (32 tests, host-runnable, no hardware)
+  tests/                      ← pytest (97 tests, host-runnable, no hardware)
   main.py                     ← asyncio CLI entry point
 
 doc/                          ← Architecture documentation
-resources/                    ← Reference material (do not modify)
+migration/                    ← Source of truth used during migration (read-only)
+  esp32/                      ← Original per-module files copied into src/esp32/src/
+resources/                    ← External reference material (do not modify)
   esp32/                      ← Old standalone ESP32 project (reference pinout)
   klipper/                    ← Klipper stepper.c reference
   fastaccelstepper/           ← FastAccelStepper reference

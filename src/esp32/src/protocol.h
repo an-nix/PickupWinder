@@ -4,7 +4,21 @@
  * All multi-byte fields are little-endian (native on both ARM & Xtensa).
  *
  * Command frame (RPi → ESP32):  8 bytes
- * Status  frame (ESP32 → RPi): 32 bytes
+ * Status  frame (ESP32 → RPi): 44 bytes
+ *
+ * Wire format:
+ *   Every SPI transfer is STATUS_FRAME_SIZE (44) bytes long.
+ *   The RPi writes CMD_FRAME_SIZE (8) bytes of command followed by
+ *   STATUS_FRAME_SIZE - CMD_FRAME_SIZE (36) bytes of padding (zeroes).
+ *   The ESP32 clocks out a 44-byte StatusFrame simultaneously.
+ *
+ * CRC:
+ *   CRC-8/MAXIM (Dallas/iButton) over bytes 0..6 of each CmdFrame.
+ *   Polynomial 0x31, init 0x00.  Frames with mismatched CRC are dropped.
+ *
+ * Endianness:
+ *   All multi-byte integers are little-endian.  Both ARM (Raspberry Pi)
+ *   and Xtensa LX6 (ESP32) are natively little-endian, so no byte-swap.
  */
 
 #pragma once
@@ -130,7 +144,7 @@ struct __attribute__((packed)) AxisStatus {
 
 static_assert(sizeof(AxisStatus) == 8, "AxisStatus must be 8 bytes");
 
-// ── Status frame (40 bytes, ESP32 → RPi) ────────────────────────────────────
+// ── Status frame (44 bytes, ESP32 → RPi) ────────────────────────────────────
 //
 //   Byte   Field
 //   ─────────────────────────────────────

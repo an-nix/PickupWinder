@@ -43,17 +43,22 @@
 
 #include "protocol.h"
 #include "command_queue.h"
-#include "axis.h"
-#include "stepper_engine.h"
 #include "spi_slave.h"
+
+#include "rmt_stepper.h"
 #include "endstop.h"
 #include "sensor_task.h"
 
 static const char* TAG = "main";
 
+// Forward declare ISR counters for debug
+extern uint32_t isr_count;
+extern uint32_t thr_count;
+extern uint32_t end_count;
+
 // ── Pin configuration ─────────────────────────────────────────────────────────
 
-static constexpr AxisPins AXIS_PINS[NUM_AXES] = {
+static constexpr AxisPins AXIS_PINS[RMT_NUM_AXES] = {
     // Axis 0 — Bobbin rotation
     { .step = 26, .dir = 27, .enable = 14, .endstop_no = -1, .endstop_nc = -1 },
     // Axis 1 — Lateral carriage (2-contact home sensor)
@@ -83,45 +88,64 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "CPU cores: %d  Free heap: %lu bytes", chip.cores, (unsigned long)free_heap);
 
-    // 1. Initialize stepper engine (axes + hardware timers)
-    ESP_LOGI(TAG, "Initializing stepper engine...");
-    g_engine.init(AXIS_PINS);
+    // 1. Initialize RMT stepper engine (axes + RMT channels)
+    ESP_LOGI(TAG, "Initializing RMT stepper engine...");
+    g_rmt_engine.init(AXIS_PINS);
 
-    // 2. Initialize endstop GPIO interrupts
+    // 2. Initialize sensor hardware (HX711, pot, encoder)
+    ESP_LOGI(TAG, "Initializing sensor hardware...");
+    sensor_task_init();
+
+    // 3. Initialize endstop GPIO interrupts
     ESP_LOGI(TAG, "Initializing endstop ISRs...");
     gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-    endstop_init(AXIS_PINS, NUM_AXES);
+    endstop_init(AXIS_PINS, RMT_NUM_AXES);
 
-    // 4. Initialize SPI slave
+    // 4. Initialize SPI slave peripheral
     ESP_LOGI(TAG, "Initializing SPI slave...");
     spi_slave_init(SPI_PINS);
 
     // 5. Start stepper task on Core 1
-    ESP_LOGI(TAG, "Starting stepper task on Core 1...");
-    g_engine.start(g_cmd_queue);
+    ESP_LOGI(TAG, "Starting RMT stepper task on Core 1...");
+    g_rmt_engine.start(g_cmd_queue);
 
     // 6. Start SPI slave task on Core 0
     ESP_LOGI(TAG, "Starting SPI slave task on Core 0...");
     spi_slave_start(g_cmd_queue);
 
+    // 7. Start sensor acquisition task on Core 0 (lower priority uthan SPI)
+    ESP_LOGI(TAG, "Starting sensor task on Core 0...");
+    sensor_task_start();
 
-    
     ESP_LOGI(TAG, "Startup complete — waiting for SPI commands from RPi");
 
     // Periodic status log (every 5 seconds) — replaces Arduino loop().
+    uint32_t last_isr_count = 0, last_thr_count = 0, last_end_count = 0;
+    
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(5000));
 
-        StatusFrame sf = g_engine.get_status();
+        StatusFrame sf = g_rmt_engine.get_status();
         SpiStats    ss = spi_get_stats();
 
+        // Calculate ISR event rates over last 5 seconds
+        uint32_t isr_delta = isr_count - last_isr_count;
+        uint32_t thr_delta = thr_count - last_thr_count;
+        uint32_t end_delta = end_count - last_end_count;
+        last_isr_count = isr_count;
+        last_thr_count = thr_count;
+        last_end_count = end_count;
+
         ESP_LOGI(TAG,
-                 "uptime=%lus  SPI rx=%lu err=%lu  "
+                 "uptime=%lus  SPI rx=%lu err=%lu  ISR_total=%lu(+%lu) THR=%lu(+%lu) END=%lu(+%lu)  "
                  "ax0=%ldpos/%uHz  ax1=%ldpos/%uHz  ax2=%ldpos/%uHz  "
                  "pot=%d  enc=%d",
                  (unsigned long)(sf.uptime_ms / 1000),
                  (unsigned long)ss.rx_frames,
                  (unsigned long)ss.rx_crc_errors,
+                 (unsigned long)isr_count, (unsigned long)isr_delta,
+                 (unsigned long)thr_count, (unsigned long)thr_delta,
+                 (unsigned long)end_count, (unsigned long)end_delta,
                  (long)sf.axis[0].position, sf.axis[0].current_hz,
                  (long)sf.axis[1].position, sf.axis[1].current_hz,
                  (long)sf.axis[2].position, sf.axis[2].current_hz,
