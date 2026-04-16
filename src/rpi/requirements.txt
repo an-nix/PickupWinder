@@ -1,9 +1,0 @@
-# PickupWinder RPi — Python dependencies
-#
-# Core (required on target RPi):
-spidev>=3.6          # SPI master driver
-pyyaml>=6.0          # YAML config loading
-
-# Development / testing (optional):
-pytest>=7.0
-pytest-asyncio>=0.21

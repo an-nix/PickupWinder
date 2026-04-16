@@ -5,6 +5,12 @@
 Two-processor architecture: a Raspberry Pi (Python application + HAL) and an ESP32 (real-time stepper controller).
 The ESP32 firmware uses the **ESP-IDF framework** (not Arduino). Entry point is `app_main()`.
 
+> Current pulse-output path: host transport → `StepperQueue` block queue →
+> `StepperDriver` software ring → RMT `simple_encoder` callback → STEP GPIO.
+> The queue/RMT hand-off is intentionally aligned with the ESP32 IDF5 backend
+> of FastAccelStepper: task-side blocking backpressure, ISR-side chunk refill,
+> and clean transaction stop on starvation.
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  Raspberry Pi — Python application (asyncio)                 │
@@ -247,6 +253,28 @@ is returned in `StatusFrame.tension_raw[0]` every SPI cycle.
 6. RPi receives `HOME_COMPLETE` event and resets lateral position to 0.
 
 ---
+
+## RMT Queue / Streaming Model
+
+The current ESP32 step-output layer is split into two buffers:
+
+1. `StepperQueue` stores coarse `step_block_t` packets received from the host.
+2. `StepperDriver` expands those packets into a software ring of
+  `ring_entry_t`, consumed directly by the RMT `simple_encoder` callback.
+
+At the RMT boundary, the behavior is deliberately matched to
+`resources/FastAccelStepper` on ESP32 IDF5:
+
+- one `rmt_transmit()` per continuous run,
+- `simple_encoder` refill in `PART_SIZE` chunks,
+- `trans_queue_depth = 1`,
+- explicit LOW-level pause chunk before DIR toggles when needed,
+- one LOW-level pause chunk plus stop on queue starvation,
+- no task-side busy-spin while waiting for ring space.
+
+The executor task blocks on a task notification from the encoder ISR whenever
+the software ring is full. This keeps CPU 1 watchdog-safe while preserving
+deterministic RMT timing.
 
 ## Acceleration Model (Klipper-style)
 

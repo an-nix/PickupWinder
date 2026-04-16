@@ -1,137 +1,126 @@
-/* main.cpp — ESP32 PickupWinder stepper controller entry point (Arduino/ESP-IDF hybrid).
+/**
+ * @file main.cpp
+ * @brief ESP32 Klipper-style stepper executor — entry point.
  *
- * Framework: Arduino via initArduino() + app_main().
+ * Architecture overview
+ * ─────────────────────
+ *   Core 0  (APP CPU)
+ *     • comm_rx task  (pri 10) : UART frame parser → StepperQueue
+ *     • demo_gen task (pri  8) : local profile generator (remove in production)
+ *     • demo_log task (pri  5) : frequency logger every 100 ms
  *
- * Architecture:
- *   Core 0: spi_task    (priority 10) — SPI slave, CmdFrame/StatusFrame
- *   Core 0: sensor_task (priority  5) — HX711 poll, pot ADC, encoder read
- *   Core 1: stepper_task(priority 24) — motor control, endstop poll, timers
+ *   Core 1  (PRO CPU)
+ *     • stepper_0     (pri 24) : executor for motor A  (RMT channel 0)
+ *     • stepper_1     (pri 24) : executor for motor B  (RMT channel 1)
  *
- * Pin assignments:
+ *   RMT hardware
+ *     • Channel 0 → STEP_A_GPIO  (2 MHz, 64-symbol block, trans_queue=1)
+ *     • Channel 1 → STEP_B_GPIO  (2 MHz, 64-symbol block, trans_queue=1)
+ *     • One balanced 50/50 HIGH/LOW RMT symbol per commanded step
  *
- *   Axis 0 (Bobbin):     STEP=GPIO26,  DIR=GPIO27,  EN=GPIO14
- *   Axis 1 (Lateral):    STEP=GPIO32,  DIR=GPIO33,  EN=GPIO25,
- *                        HOME NO=GPIO21, HOME NC=GPIO22 (2-contact, pull-up)
- *   Axis 2 (Tensioner):  STEP=GPIO16,  DIR=GPIO17,  EN=GPIO4,
- *                        ENDSTOP=GPIO35
- *   SPI:                 MOSI=GPIO23,  MISO=GPIO19,  SCLK=GPIO18, CS=GPIO5
- *   HX711 tension:       SCK=GPIO13,   DOUT=GPIO34 (input-only)
- *   HX711 auxiliary:     SCK=GPIO12,   DOUT=GPIO39 (input-only)
- *   Potentiometer:       GPIO36 (ADC1_CH0, VP, input-only)
- *   Manual encoder A:    GPIO0  (strap pin)
- *   Manual encoder B:    GPIO15 (strap pin)
+ * Pin assignments
+ * ───────────────
+ *   Motor A (Bobbin / axis 0)  : STEP=GPIO26  DIR=GPIO27  EN=GPIO14
+ *   Motor B (Lateral / axis 1) : STEP=GPIO32  DIR=GPIO33  EN=GPIO25
  *
- * Note: GPIO0 et GPIO15 sont des strapping pins. S'assurer que l'encodeur
- *       est au repos au boot ou ajouter des résistances de pull pour forcer
- *       des niveaux de boot sûrs.
+ *   UART host link             : TX=GPIO17    RX=GPIO16   Baud=921600
  *
- * NOTE: GPIO23 (ancien HOME_PIN_NO) est maintenant SPI MOSI.
- *       Le contact NO du capteur home a été déplacé sur GPIO21.
+ * To disable the local demo and use the real UART host:
+ *   Comment out the demo_local_start() call below.
+ *   The CommInterface will automatically start the UART RX task.
  */
 
-#include <Arduino.h>
-#include <esp_chip_info.h>
-#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_log.h>
 #include <driver/gpio.h>
 
-#include "protocol.h"
-#include "command_queue.h"
-#include "spi_slave.h"
-
-#include "stepper_engine.h"
-#include "endstop.h"
-#include "sensor_task.h"
+#include "step_types.h"
+#include "stepper_driver.h"
+#include "stepper_queue.h"
+#include "comm_interface.h"
+#include "demo_local.h"
 
 static const char* TAG = "main";
 
-// Forward declare ISR counters for debug
-extern uint32_t isr_count;
-extern uint32_t thr_count;
-extern uint32_t end_count;
+// ---------------------------------------------------------------------------
+// Pin definitions — adjust to your board wiring
+// ---------------------------------------------------------------------------
 
+// Motor A — Bobbin axis
+static constexpr gpio_num_t STEP_A = GPIO_NUM_26;
+static constexpr gpio_num_t DIR_A  = GPIO_NUM_27;
+static constexpr gpio_num_t EN_A   = GPIO_NUM_14;
 
+// Motor B — Lateral axis
+static constexpr gpio_num_t STEP_B = GPIO_NUM_32;
+static constexpr gpio_num_t DIR_B  = GPIO_NUM_33;
+static constexpr gpio_num_t EN_B   = GPIO_NUM_25;
 
-// ── Global command queue (Core 0 → Core 1) ────────────────────────────────────
-static CmdQueue g_cmd_queue;
+// UART host link (stub — not used when demo_local is active)
+static constexpr int UART_NUM   = 1;
+static constexpr int UART_TX    = 17;
+static constexpr int UART_RX    = 16;
+static constexpr int UART_BAUD  = 921600;
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Global instances — static storage, constructed once
+// ---------------------------------------------------------------------------
 
-extern "C" void app_main(void) {
-    initArduino();
+static StepperDriver motor_a(STEP_A, DIR_A, EN_A, 0);
+static StepperDriver motor_b(STEP_B, DIR_B, EN_B, 1);
 
-    esp_chip_info_t chip;
-    esp_chip_info(&chip);
-    uint32_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+static StepperQueue  queue_a(motor_a, 0);
+static StepperQueue  queue_b(motor_b, 1);
 
-    Serial.begin(115200);
+static StepperQueue* queues[2] = {&queue_a, &queue_b};
+static CommInterface comm(queues, 2);
 
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  ESP32 Controller");
-    ESP_LOGI(TAG, "  3-axis, SPI slave, FreeRTOS dual-core");
-    ESP_LOGI(TAG, "  Framework: Arduino/ESP-IDF hybrid");
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "CPU cores: %d  Free heap: %lu bytes", chip.cores, (unsigned long)free_heap);
+// ---------------------------------------------------------------------------
+// app_main
+// ---------------------------------------------------------------------------
 
-    // 1. Initialiser le stepper engine (FastAccelStepper)
-    ESP_LOGI(TAG, "Initializing FastAccelStepper engine...");
-    g_stepper_engine.init(AXIS_PINS);
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "PickupWinder — Klipper-style RMT stepper executor");
+    ESP_LOGI(TAG, "RMT resolution : %lu Hz  (%lu ns/tick)",
+             (unsigned long)RMT_STEP_RESOLUTION_HZ,
+             (unsigned long)(1000000000UL / RMT_STEP_RESOLUTION_HZ));
+    ESP_LOGI(TAG, "Max step rate  : ~166 kHz  (interval_min = %u ticks = %lu µs)",
+             RMT_STEP_MIN_TICKS,
+             (unsigned long)(RMT_STEP_MIN_TICKS * 1000000UL / RMT_STEP_RESOLUTION_HZ));
+    ESP_LOGI(TAG, "Block size     : %d steps   Queue depth : %d blocks",
+             STEP_BLOCK_SIZE, STEPPER_QUEUE_DEPTH);
 
-    // 2. Initialiser le hardware capteurs (HX711, pot, encodeur)
-    ESP_LOGI(TAG, "Initializing sensor hardware...");
-    sensor_task_init();
+    // ── 1. Initialise RMT drivers ───────────────────────────────────────────
+    ESP_ERROR_CHECK(motor_a.init());
+    ESP_ERROR_CHECK(motor_b.init());
 
-    // 3. Initialiser les interruptions GPIO des endstops
-    ESP_LOGI(TAG, "Initializing endstop ISRs...");
-    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
-    endstop_init(AXIS_PINS, RMT_NUM_AXES);
+    // ── 2. Enable motor drivers ─────────────────────────────────────────────
+    motor_a.enable();
+    motor_b.enable();
 
-    // 4. Initialiser le périphérique SPI slave
-    ESP_LOGI(TAG, "Initializing SPI slave...");
-    spi_slave_init(SPI_PINS);
+    // ── 3. Launch executor tasks (Core 1, priority 24) ──────────────────────
+    ESP_ERROR_CHECK(queue_a.init());
+    ESP_ERROR_CHECK(queue_b.init());
 
-    // 5. Démarrer la tâche stepper sur le Core 1
-    ESP_LOGI(TAG, "Starting FastAccelStepper task on Core 1...");
-    g_stepper_engine.start(g_cmd_queue);
+    // ── 4. Start communication interface (UART RX + flow control) ──────────
+    //
+    // Pass UART_NUM = -1 to skip UART initialisation when using demo_local.
+    // Uncomment the real init() call when the Linux host is connected:
+    //
+    //   ESP_ERROR_CHECK(comm.init(UART_NUM, UART_TX, UART_RX, UART_BAUD));
+    //
+    (void)comm; // suppress unused-variable warning in demo mode
 
-    // 6. Démarrer la tâche SPI slave sur le Core 0
-    ESP_LOGI(TAG, "Starting SPI slave task on Core 0...");
-    spi_slave_start(g_cmd_queue);
+    // ── 5. Start local demo (remove in production) ──────────────────────────
+    //
+    // ╔══════════════════════════════════════════════════════════════════════╗
+    // ║  DEMO MODE ACTIVE.  Remove demo_local_start() and uncomment         ║
+    // ║  comm.init() above when using the real Raspberry Pi host.           ║
+    // ╚══════════════════════════════════════════════════════════════════════╝
+    ESP_ERROR_CHECK(demo_local_start(&queue_a, &queue_b));
 
-    // 7. Démarrer la tâche d'acquisition capteurs sur le Core 0
-    ESP_LOGI(TAG, "Starting sensor task on Core 0...");
-    sensor_task_start();
-
-    ESP_LOGI(TAG, "Startup complete — waiting for SPI commands from RPi");
-
-    // Periodic status log (every 5 seconds) — remplace Arduino loop().
-    uint32_t last_isr_count = 0, last_thr_count = 0, last_end_count = 0;
-
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-
-        StatusFrame sf = g_stepper_engine.get_status();
-        SpiStats    ss = spi_get_stats();
-
-        uint32_t isr_delta = isr_count - last_isr_count;
-        uint32_t thr_delta = thr_count - last_thr_count;
-        uint32_t end_delta = end_count - last_end_count;
-        last_isr_count = isr_count;
-        last_thr_count = thr_count;
-        last_end_count = end_count;
-
-        ESP_LOGI(TAG,
-                 "uptime=%lus  SPI rx=%lu err=%lu  ISR_total=%lu(+%lu) THR=%lu(+%lu) END=%lu(+%lu)  "
-                 "ax0=%ldpos/%uHz  ax1=%ldpos/%uHz  ax2=%ldpos/%uHz  "
-                 "pot=%d  enc=%d",
-                 (unsigned long)(sf.uptime_ms / 1000),
-                 (unsigned long)ss.rx_frames,
-                 (unsigned long)ss.rx_crc_errors,
-                 (unsigned long)isr_count, (unsigned long)isr_delta,
-                 (unsigned long)thr_count, (unsigned long)thr_delta,
-                 (unsigned long)end_count, (unsigned long)end_delta,
-                 (long)sf.axis[0].position, sf.axis[0].current_hz,
-                 (long)sf.axis[1].position, sf.axis[1].current_hz,
-                 (long)sf.axis[2].position, sf.axis[2].current_hz,
-                 sf.pot_raw, sf.encoder_manual);
-    }
+    // app_main may return — FreeRTOS scheduler continues running the tasks.
+    ESP_LOGI(TAG, "Scheduler running — app_main exiting.");
 }

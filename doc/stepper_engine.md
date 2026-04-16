@@ -1,65 +1,50 @@
-StepperEngine (FastAccelStepper) implementation
+Stepper queue / RMT implementation
 
 Overview
 
-- New implementation `StepperEngine` uses the `FastAccelStepper` library to
-  generate hardware-driven step pulses. It lives in:
-  - `src/esp32/src/stepper_engine.h`
-  - `src/esp32/src/stepper_engine.cpp`
+- The active pulse-output path in this branch is the custom queue + RMT stack:
+  - `src/esp32/src/stepper_queue.h`
+  - `src/esp32/src/stepper_queue.cpp`
+  - `src/esp32/src/stepper_driver.h`
+  - `src/esp32/src/stepper_driver.cpp`
 
-- The previous RMT-based driver (`rmt_stepper.*`) is left in the tree as a
-  reference and is not removed.
+- `resources/FastAccelStepper` is kept in the repository as the behavioral
+  reference used for the ESP32 RMT implementation.
 
 Design
 
-- The engine exposes a per-axis wrapper `StepperAxis` that provides a small
-  subset of the API used by higher-level code (position read/write, move to
-  absolute position, reset position, emergency stop, speed/accel configuration
-  and endstop helpers).
+- `StepperQueue` receives `step_block_t` packets from the host-facing layer.
+- A dedicated executor task on Core 1 drains all pending blocks into the
+  driver's software ring buffer.
+- `StepperDriver` owns the RMT channel, the DIR/EN pins, and the
+  `simple_encoder` callback.
+- The callback is the only code that converts queued timing entries into
+  physical `rmt_symbol_word_t` step pulses.
 
-- A single global instance `g_stepper_engine` is provided and used by the
-  SPI task and the endstop handler.  The SPI task now snapshots status via
-  `g_stepper_engine.get_status()`.
+FastAccelStepper-aligned runtime rules:
 
-Commands supported
+- one `rmt_transmit()` per continuous run,
+- `simple_encoder` refills in `PART_SIZE` chunks,
+- `trans_queue_depth = 1`,
+- one balanced 50/50 HIGH/LOW RMT symbol per normal step,
+- fixed LOW-level pause chunk before a DIR toggle if the previous chunk still
+  contained steps,
+- one LOW-level pause chunk plus stop on starvation,
+- no task-side busy-spin while waiting for ring space.
 
-- MOVE_ABS (Opcode 0x02): move axis to absolute position (data = int32 steps)
-- MOVE_REL (Opcode 0x03): move axis by relative steps (data = int32 steps)
-- RESET_POS (Opcode 0x0B): reset axis position counter to 0
-- SET_SPEED (Opcode 0x01): set speed (Hz)
-- SET_ACCEL (Opcode 0x08): set acceleration (steps/s^2)
-- STOP (Opcode 0x04): controlled stop
-- ESTOP (Opcode 0x05): emergency stop (all axes)
-- ENABLE (Opcode 0x06): enable/disable driver (data[0] = 1/0)
+Lifecycle
 
-Notes & limitations
+1. Host transport enqueues `step_block_t` packets into `StepperQueue`.
+2. The executor task drains the block queue into the driver's software ring.
+3. If idle, `StepperDriver` starts one RMT transmission.
+4. The RMT `simple_encoder` callback streams `PART_SIZE` symbols per refill.
+5. On starvation, one LOW-level pause chunk is emitted and the transaction
+  ends on the next callback.
 
-- The `endstop` ISR marks the axis as in a fault/home state and requests an
-  emergency stop. The actual force-stop work is performed in task context for
-  safety; the ISR also disables the driver pin immediately to reduce risk.
+Notes
 
-- This initial wrapper implements a minimal, compatible subset of the RMT
-  engine API.  It focuses on the "move to position" and "reset position"
-  commands requested. Additional features (limits, complex ramping, tightly
-  synchronized multi-axis moves) can be added on top of `StepperAxis` if
-  needed.
-
-Usage
-
-- Initialization in `app_main()` (changed):
-
-  - `g_stepper_engine.init(AXIS_PINS);`
-  - `g_stepper_engine.start(g_cmd_queue);`
-
-- SPI transactions still carry the 8-byte `CmdFrame`; the engine responds to
-  the same opcodes and fills the 44-byte `StatusFrame` as before.
-
-Next steps / suggestions
-
-- Add unit tests that exercise `MOVE_ABS` and `RESET_POS` via the mock SPI
-  transport (existing test harnesses in `src/rpi/tests/` can be adapted).
-
-- If ISR-to-hardware latency is critical for your use-case, consider
-  implementing a faster ISR path (e.g., direct register toggles) for the
-  enable/disable path or a small RMT fallback for safety-critical emergency
-  stops.
+- This document covers the queue/RMT pulse-output path only.
+- Motion planning and winding geometry remain host-driven.
+- The custom implementation does not embed the FastAccelStepper library, but
+  its queue/RMT behavior is intentionally matched to the ESP32 IDF5 backend in
+  `resources/FastAccelStepper`.
