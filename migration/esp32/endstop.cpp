@@ -17,17 +17,17 @@ static const char* TAG = "endstop";
 
 static void IRAM_ATTR endstop_isr_handler(void* arg) {
     uint8_t axis_id = reinterpret_cast<uintptr_t>(arg);
-    if (axis_id < NUM_AXES) {
-        // Immediate stop via direct axis method
-        g_engine.axis(axis_id).emergency_stop();
-        g_engine.axis(axis_id).set_endstop_active(true);
+    if (axis_id < RMT_NUM_AXES) {
+        // emergency_stop_from_isr() uses only direct register writes — ISR-safe.
+        g_stepper_engine.axis(axis_id).emergency_stop_from_isr();
+        g_stepper_engine.axis(axis_id).set_endstop_active(true);
     }
 }
 
 // ── Init ────────────────────────────────────────────────────────────────────
 
 void endstop_init(const AxisPins pins[], uint8_t num_axes) {
-    for (uint8_t i = 0; i < num_axes && i < NUM_AXES; ++i) {
+    for (uint8_t i = 0; i < num_axes && i < RMT_NUM_AXES; ++i) {
         if (pins[i].endstop_no < 0) continue;
 
         // GPIO already configured as INPUT_PULLUP by axis.init()
@@ -51,18 +51,18 @@ void endstop_init(const AxisPins pins[], uint8_t num_axes) {
 
 bool endstop_home_axis(uint8_t axis_id, uint32_t approach_hz,
                         uint32_t backoff_steps, uint32_t timeout_ms) {
-    if (axis_id >= NUM_AXES) return false;
+    if (axis_id >= RMT_NUM_AXES) return false;
 
-    Axis& ax = g_engine.axis(axis_id);
+    auto& ax = g_stepper_engine.axis(axis_id);
     if (ax.endstop_active()) {
         // Already on endstop — back off first
         ESP_LOGI(TAG, "Axis %d already on endstop — backing off", axis_id);
         ax.set_direction(false);  // forward (away from endstop)
-        ax.move_to(ax.position() + static_cast<int32_t>(backoff_steps),
-                   HZ_MIN, approach_hz / 2, backoff_steps / 4);
+        ax.set_speed_hz(approach_hz / 2);
+        ax.move_to(ax.position() + static_cast<int32_t>(backoff_steps));
 
         uint64_t t0 = esp_timer_get_time();
-        while (ax.state() != AxisState::IDLE) {
+        while (ax.state() != RmtAxisState::IDLE) {
             if ((uint32_t)((esp_timer_get_time() - t0) / 1000) > timeout_ms) {
                 ESP_LOGE(TAG, "Homing backoff timeout for axis %d", axis_id);
                 return false;
@@ -96,11 +96,11 @@ bool endstop_home_axis(uint8_t axis_id, uint32_t approach_hz,
     // Back off
     ax.clear_event();
     ax.set_direction(false);
-    ax.move_to(ax.position() + static_cast<int32_t>(backoff_steps),
-               HZ_MIN, approach_hz / 2, backoff_steps / 4);
+    ax.set_speed_hz(approach_hz / 2);
+    ax.move_to(ax.position() + static_cast<int32_t>(backoff_steps));
 
     t0 = esp_timer_get_time();
-    while (ax.state() != AxisState::IDLE) {
+    while (ax.state() != RmtAxisState::IDLE) {
         if ((uint32_t)((esp_timer_get_time() - t0) / 1000) > timeout_ms) {
             ESP_LOGE(TAG, "Homing backoff timeout for axis %d", axis_id);
             return false;

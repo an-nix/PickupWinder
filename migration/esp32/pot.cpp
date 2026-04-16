@@ -11,7 +11,7 @@ static const char* TAG = "pot";
 
 // ADC1 channel 0 = GPIO 36 (VP, input-only).
 static constexpr adc1_channel_t  POT_CHANNEL = ADC1_CHANNEL_0;
-static constexpr adc_atten_t     POT_ATTEN   = ADC_ATTEN_DB_11;   // ~0–3.9 V
+static constexpr adc_atten_t     POT_ATTEN   = ADC_ATTEN_DB_12;  // ~0–3.9 V (was DB_11, same value)
 static constexpr adc_bits_width_t POT_WIDTH  = ADC_WIDTH_BIT_12;  // 0–4095
 
 static uint32_t s_samples[POT_FILTER_SIZE] = {};

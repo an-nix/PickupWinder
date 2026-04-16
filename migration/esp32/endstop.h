@@ -15,7 +15,7 @@
 #pragma once
 
 #include <cstdint>
-#include "axis.h"
+#include "stepper_engine.h"
 
 /// Configure endstop GPIO interrupts for safety stop.
 /// Must be called after axes are initialized.

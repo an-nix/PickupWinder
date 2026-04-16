@@ -37,6 +37,11 @@ class CmdOpcode(IntEnum):
     ACK_EVENT    = 0x0D
     SET_TENSION  = 0x0E  # data = tension setpoint in 0.1g units
     TARE_HX711   = 0x0F  # axis = sensor index (0 or 1)
+    # Host-uploaded ramp segments
+    UPLOAD_RAMP_START = 0x10  # data = segment count (uint32)
+    UPLOAD_RAMP_SEG   = 0x11  # data = next 32-bit word for current segment (start_iv, add, count in sequence)
+    UPLOAD_RAMP_COMMIT= 0x12  # data = target position (int32) to apply uploaded segments
+    UPLOAD_RAMP_ABORT = 0x13  # abort current upload
 
 
 class AxisId(IntEnum):
