@@ -113,6 +113,14 @@ uint32_t StepperQueue::available() const
 // ---------------------------------------------------------------------------
 // executeConstantRateBlock() / kickStart()
 // ---------------------------------------------------------------------------
+//
+// executeConstantRateBlock() deliberately does NOT call maybeStartDriver().
+// The start decision belongs to the caller: multiAxisExecutorTask drain loop
+// in comm_interface.cpp calls kickStart() ONCE per block batch, after ALL
+// available blocks have been written to the ring.  This guarantees the ring
+// is pre-filled with multiple segments of look-ahead before RMT starts,
+// preventing the per-segment underruns that occur at low speed when each
+// segment contributes only 2–5 steps.
 
 esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
                                                   uint16_t step_count,
@@ -122,7 +130,7 @@ esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
         return ESP_OK;
     }
 
-    // Compute uniform interval: RMT clock is 2 MHz → 2 ticks/µs.
+    // Compute uniform interval: RMT clock is 80 MHz → 80 ticks/µs.
     uint32_t interval_ticks = (duration_us * RMT_TICKS_PER_US) / step_count;
     if (interval_ticks < RMT_STEP_MIN_TICKS) {
         interval_ticks = RMT_STEP_MIN_TICKS;

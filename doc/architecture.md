@@ -7,47 +7,78 @@ The ESP32 firmware uses the **ESP-IDF framework** (not Arduino). Entry point is 
 
 Current pulse-output path:
 
-`segment planner (RPi)` → `SPI SEGMENT_BLOCK` → `StepperQueue (motion_block_t)`
-→ `segment expansion on ESP32` → `StepperDriver ring` → `RMT simple_encoder`
-→ STEP GPIO
+`segment planner (RPi)` → `SPI MULTI_AXIS_SEGMENT_BLOCK` → `multiAxisExecutorTask drain loop`
+→ `executeConstantRateBlock() → ring buffer` → `RMT simple_encoder` → STEP GPIO
 
-The queue/RMT hand-off stays aligned with the ESP32 IDF5 FastAccelStepper model:
-task-side blocking backpressure, ISR-side chunk refill, stop-on-starvation.
+The queue/RMT hand-off uses the Klipper look-ahead drain pattern:
+the executor fills the ring from all queued blocks before starting the RMT,
+providing maximum buffer depth at motion start.
 
-Protocol definitions are in:
+Protocol definitions: `src/esp32/src/messages.h` / `src/rpi/messages.py`
 
-- `src/esp32/src/messages.h`
-- `src/rpi/messages.py`
+## Full Data Flow
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Raspberry Pi — Python application (asyncio)                 │
-│  demo_spi.py / streamer.py / ramp.py                         │
-│                    │ spidev (SPI0, 4 MHz)                    │
-│      512-byte fixed SPI frames (CRC16, sequence, type)       │
-├──────────────────────────────────────────────────────────────┤
-│  ESP32 — dual-core, 240 MHz, FreeRTOS (ESP-IDF)              │
-│                                                              │
-│  Core 0 (priority  5): sensor_task                           │
-│    HX711 non-blocking poll every 1 ms                        │
-│    ADC1 potentiometer every 20 ms (~50 Hz)                   │
-│    PCNT quadrature encoder every 1 ms                        │
-│    Writes SensorState g_sensor under spinlock                │
-│                                                              │
-│  Core 0 (priority 10): spi_task                              │
-│    Receives/validates SPI frames, enqueues motion blocks     │
-│    Sends status payload (queue/ring/underrun/last_result)    │
-│                                                              │
-│  Core 1 (priority 24): stepper executor task                 │
-│    Dequeues motion blocks, expands segments to step blocks   │
-│    Fills driver software ring and controls stream start      │
-│    RMT callback emits deterministic STEP waveforms           │
-└──────────────────────────────────────────────────────────────┘
+Host (Python — Raspberry Pi)
+  │  SPI frames: MULTI_AXIS_SEGMENT_BLOCK (type 0x13)
+  │  Frame rate: ~500 Hz (1 frame per 2 ms poll cycle)
+  │  Segments per frame: up to MULTI_AXIS_BLOCK_SIZE (60)
+  │  Inflight cap: MAX_INFLIGHT_SEGMENTS = 24 (~96 ms at 4 ms/segment)
+  │  Buffer target: TARGET_BUFFER_TIME_S = 100 ms
+  ▼
+CommInterface — Core 0, priority 10
+  │  spiTask: double-buffered TX (s_tx_frame_a / s_tx_frame_b ping-pong)
+  │  Build order: transmit prev frame → parse RX → handleFrame → build next
+  │  Status pipeline: TX reflects state AFTER previous RX was handled
+  │  s_multi_axis_queue: depth 64 × multi_axis_block_t
+  ▼
+multiAxisExecutorTask — Core 1, priority 24
+  │  DRAIN LOOP: dequeue first block (blocking, 1 ms timeout), then
+  │    non-blocking dequeue of all subsequent available blocks into ring.
+  │    No kickStart inside the loop — ring fills without RMT running.
+  │  After drain: kickStart() once per active axis (starts RMT).
+  │  Deferred notifications: notifySegmentExecuted() fires at wall-clock
+  │    finish time of each segment (not at write time).
+  │  Timeout path: kickStart() to recover from RMT underrun while waiting.
+  ▼
+StepperQueue::executeConstantRateBlock()
+  │  Computes uniform interval: (duration_us × 80) / step_count ticks
+  │  Clamps to [RMT_STEP_MIN_TICKS=16, RMT_STEP_MAX_TICKS=0xFFFF]
+  │  Writes to ring via pushExpandedBlock() — does NOT start RMT
+  ▼
+StepperDriver ring buffer
+  │  STEP_RING_SIZE = 4096 entries (lock-free SPSC)
+  │  Producer: Core 1 (multiAxisExecutorTask) writes ring_write_
+  │  Consumer: ISR (encode_steps) reads ring_read_
+  │  Auto-start threshold: STEP_STREAM_START_FILL = 32 steps
+  ▼
+encode_steps ISR — IRAM_ATTR, RMT clock 80 MHz (12.5 ns/tick)
+  │  PART_SIZE = 16 symbols per callback
+  │  Balanced pulse: HIGH = ticks/2, LOW = ticks − HIGH
+  │  Both halves clamped to ≥ RMT_STEP_PULSE_TICKS (8) = 100 ns
+  │  On empty ring: emit pause chunk, set rmt_stopped_=true
+  │  Notifies producer_task_ AND executor_task_ on each callback
+  ▼
+RMT hardware → STEP GPIO → motor driver (A4988/DRV8825) → stepper motor
 ```
 
-### Task Summary
+## Key Timing Parameters
 
-| Task          | Core | Priority | Stack | Responsibility                          |
+| Parameter | Value | Notes |
+|---|---|---|
+| RMT clock | 80 MHz | 12.5 ns/tick |
+| RMT_STEP_MIN_TICKS | 16 | 200 ns min interval |
+| Max step rate | 5 000 000 steps/sec | 80e6 / 16 |
+| Max RPM (32µstep) | 781 RPM | 5e6 / (200 × 32) |
+| Segment duration | 4000 µs | host configurable |
+| PART_SIZE | 16 | ISR callback size |
+| STEP_RING_SIZE | 4096 | ~820 ms at 5 kHz |
+| STEP_STREAM_START_FILL | 32 | = 2 × PART_SIZE |
+| MULTI_AXIS_BLOCK_SIZE | 60 | segments per frame |
+| MULTI_AXIS_QUEUE_DEPTH | 64 | ~960 ms look-ahead |
+| MAX_INFLIGHT_SEGMENTS | 24 | ~96 ms at 4ms/seg |
+
+```
 |---------------|------|----------|-------|-----------------------------------------|
 | sensor_task   | 0    | 5        | 4 KB  | HX711, ADC pot, PCNT encoder            |
 | spi_task      | 0    | 10       | 4 KB  | SPI frame RX/TX, CRC16 validation, dispatch |

@@ -78,14 +78,15 @@ Full-duplex, SPI Mode 0, 4 MHz. Each transfer exchanges one fixed-size frame.
 
 Primary motion message:
 
-- `SEGMENT_BLOCK` (`0x11`)
-  - payload: `SegmentBlockPayload`
-  - contains arithmetic segments (`step_count`, `start_ticks`, `add_ticks`, dir)
-  - expanded by ESP32 executor before RMT output
+- `MULTI_AXIS_SEGMENT_BLOCK` (`0x13`)
+  - payload: `MultiAxisSegmentBlockPayload`
+  - contains synchronised multi-axis time segments (`step_counts`, `duration_us`, `direction_mask`)
+  - expanded by ESP32 multiAxisExecutorTask via drain loop before RMT start
 
-Legacy/debug motion message:
+Legacy/debug motion messages:
 
-- `STEP_BLOCK` (`0x10`) explicit per-step intervals
+- `SEGMENT_BLOCK` (`0x11`) — single-axis arithmetic segments
+- `STEP_BLOCK` (`0x10`) — explicit per-step intervals (debug only)
 
 Status response:
 
@@ -97,9 +98,54 @@ Status response:
   - last RX sequence/type/result
   - enabled/running masks
 
----
+## 5. Hard Rules
 
-## 4. Pin Assignments (ESP32 — MUST NOT change implicitly)
+### 5.1 ESP32 Firmware
+
+- **Framework is ESP-IDF**, not Arduino. Use `app_main()`, not `setup()/loop()`.
+  Never use Arduino HAL functions (`digitalWrite`, `digitalRead`, `millis`, `pinMode`, etc.).
+  Use ESP-IDF equivalents: `gpio_set_level()`, `gpio_get_level()`, `esp_timer_get_time()`, `gpio_config()`.
+- **NEVER** call `vTaskDelay()` or blocking I/O from a timer ISR.
+- All timer ISRs must be `IRAM_ATTR` and declared as free functions with `void(*)(void*)` signature.
+- `IRAM_ATTR` placement: on the function signature line in the `.cpp` file, not on the declaration in the header.
+- The `SensorState g_sensor` is protected by a `portMUX_TYPE` spinlock.
+  Always use `portENTER_CRITICAL / portEXIT_CRITICAL` for cross-core access.
+- `volatile` required on all shared-state fields in `Axis` that are written by the ISR
+  and read by the stepper task or SPI task.
+- `AxisPins.endstop_no` / `endstop_nc` — set to -1 when not used.
+  Never assume a pin is valid without checking `>= 0`.
+- HX711 reads are **non-blocking**: check `gpio_get_level(DOUT) == 0` first.
+  Never spin-wait for DOUT in sensor_task tight loop.
+- GPIO 12 must not be driven HIGH at boot.
+- For GPIO >= 32, use `GPIO.out1_w1ts.val` / `GPIO.out1_w1tc.val` for fast bit-bang.
+  `GPIO.out_w1ts` only affects GPIO 0–31.
+
+#### Motion execution invariants (NEVER violate)
+
+- `encode_steps()` and `on_trans_done_isr()` must always be `IRAM_ATTR`.
+- `s_rx_frame`, `s_tx_frame_a`, `s_tx_frame_b` must always have `DMA_ATTR`.
+- Ring buffer is lock-free SPSC: **only Core 1 writes `ring_write_`**, **only the ISR writes `ring_read_`**. Never add locks around these.
+- `executeConstantRateBlock()` must **NEVER** call `maybeStartDriver()`.
+  The drain loop in `multiAxisExecutorTask` owns the start decision.
+- `kickStart()` inside the drain loop is called **ONCE per batch**, after all available blocks are written to the ring.
+- `STEP_STREAM_START_FILL` must always be `>= 2 * PART_SIZE`.
+  The `static_assert` in `stepper_queue.cpp` enforces this at compile time.
+
+### 5.2 Python Application
+
+- Python **never** touches GPIO directly.
+- SPI access must go through `src/rpi/spi_transport.py`.
+- Motion planning belongs on host (`ramp.py` / kinematics modules).
+- Host should stream **MULTI_AXIS_SEGMENT_BLOCK** messages for production use.
+- `MAX_INFLIGHT_SEGMENTS = 24` in `streamer.py` — do not raise above 24.
+
+### 5.3 Protocol
+
+- CRC16-CCITT over each frame header+payload.
+- Fixed frame size = 512 bytes.
+- `messages.h` and `messages.py` must stay bit-identical (sizes, ordering, packing).
+- Sequence/result semantics are pipelined by one SPI transaction; keep host
+  confirmation logic sequence-aware.
 
 ### Stepper axes
 
@@ -257,6 +303,25 @@ ESP32 expands to concrete steps and streams them through RMT.
 | portMUX not used on shared sensor/status data | tasks run on different cores concurrently |
 | HX711 scale = 0 | Division by zero in `raw_to_dg()` — always validate before calibrating |
 | Start stream with too little ring fill | high-rate runs underrun before host can refill |
+| `executeConstantRateBlock()` calls `maybeStartDriver()` | Starts RMT too early (after 1 segment = 2-5 steps); causes per-segment underruns at low speed |
+| `kickStart()` inside per-segment loop | Starts RMT before ring is pre-filled; use the post-drain batch kickStart instead |
+| `STEP_STREAM_START_FILL < 2 * PART_SIZE` | Breaks the static_assert in stepper_queue.cpp |
+| `MAX_INFLIGHT_SEGMENTS > 24` on host | Risk of firmware queue overflow and deferred notification backlog |
+
+## 8b. Debugging with Status Logs
+
+Key `StatusPayload` fields to watch during a motion run:
+
+| Field | Healthy range | Problem if... |
+|---|---|---|
+| `ring_free[0]` | < 3900 during cruise | = 4096 → motor stopped / ring empty |
+| `underrun[0]` | 0 during `running=1` | any non-zero = real ring starvation |
+| `running` | `0x01` after first kickStart | stays `0x00` → kickStart not firing |
+| `inflight` (host) | 20–24 during steady motion | < 10 → host not sending fast enough |
+| `buf` (host ms) | 80–100 ms | = 0 → all segments executed, move done |
+
+`underrun` during `running=0` at move **start** is benign — the RMT fires a
+pause symbol during the first encoder callback before the ring is seeded.
 
 ---
 

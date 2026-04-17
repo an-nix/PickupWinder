@@ -19,14 +19,14 @@ static const char* TAG = "stepper_driver";
 // encode_steps() — simple_encoder callback, runs in ISR context (IRAM)
 // ---------------------------------------------------------------------------
 //
+// RMT clock: 80 MHz (1 tick = 12.5 ns).
 // Called by the RMT driver whenever it needs more symbols. Reads up to
-// PART_SIZE entries from the ring buffer and converts each to one
+// PART_SIZE=16 entries from the ring buffer and converts each to one
 // rmt_symbol_word_t with a FastAccelStepper-style balanced pulse:
-//   duration0 = ticks / 2        (HIGH)
-//   duration1 = ticks - duration0 (LOW)
-//
-// This 50/50 split is closer to the reference FastAccelStepper RMT backend
-// than a fixed-width HIGH pulse and reduces timing quantization asymmetry.
+//   HIGH = ticks / 2         (rounded down)
+//   LOW  = ticks − HIGH
+// Both halves are clamped to >= RMT_STEP_PULSE_TICKS (8) = 100 ns,
+// which meets A4988/DRV8825 STEP pulse width requirements.
 //
 // Direction changes:
 //   If a ring entry has toggle_dir=1 and the previous chunk contained steps,
@@ -202,8 +202,11 @@ esp_err_t StepperDriver::init()
     io_conf.mode          = GPIO_MODE_OUTPUT;
     io_conf.intr_type     = GPIO_INTR_DISABLE;
     io_conf.pin_bit_mask  = (1ULL << dir_pin_) | (1ULL << en_pin_);
-    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), TAG,
-                        "motor%u: gpio_config DIR/EN failed", motor_id_);
+    esp_err_t err = gpio_config(&io_conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor%u: gpio_config DIR/EN failed: %s", motor_id_, esp_err_to_name(err));
+        return err;
+    }
 
     gpio_set_level(en_pin_,  1);
     gpio_set_level(dir_pin_, last_dir_ ? 1 : 0);
@@ -218,8 +221,11 @@ esp_err_t StepperDriver::init()
     tx_cfg.flags.invert_out   = false;
     tx_cfg.flags.with_dma     = false;
 
-    ESP_RETURN_ON_ERROR(rmt_new_tx_channel(&tx_cfg, &channel_), TAG,
-                        "motor%u: rmt_new_tx_channel failed", motor_id_);
+    err = rmt_new_tx_channel(&tx_cfg, &channel_);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor%u: rmt_new_tx_channel failed: %s", motor_id_, esp_err_to_name(err));
+        return err;
+    }
 
     // ── 3. Simple encoder with callback ─────────────────────────────────────
     rmt_simple_encoder_config_t enc_cfg = {};
@@ -227,8 +233,11 @@ esp_err_t StepperDriver::init()
     enc_cfg.arg            = this;
     enc_cfg.min_chunk_size = PART_SIZE;
 
-    ESP_RETURN_ON_ERROR(rmt_new_simple_encoder(&enc_cfg, &encoder_), TAG,
-                        "motor%u: rmt_new_simple_encoder failed", motor_id_);
+    err = rmt_new_simple_encoder(&enc_cfg, &encoder_);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor%u: rmt_new_simple_encoder failed: %s", motor_id_, esp_err_to_name(err));
+        return err;
+    }
 
     // ── 4. Transmit config ──────────────────────────────────────────────────
     tx_config_.loop_count              = 0;
@@ -238,13 +247,18 @@ esp_err_t StepperDriver::init()
     // ── 5. on_trans_done callback ───────────────────────────────────────────
     rmt_tx_event_callbacks_t cbs = {};
     cbs.on_trans_done = &StepperDriver::on_trans_done_isr;
-    ESP_RETURN_ON_ERROR(
-        rmt_tx_register_event_callbacks(channel_, &cbs, this), TAG,
-        "motor%u: rmt_tx_register_event_callbacks failed", motor_id_);
+    err = rmt_tx_register_event_callbacks(channel_, &cbs, this);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor%u: rmt_tx_register_event_callbacks failed: %s", motor_id_, esp_err_to_name(err));
+        return err;
+    }
 
     // ── 6. Enable the RMT channel ───────────────────────────────────────────
-    ESP_RETURN_ON_ERROR(rmt_enable(channel_), TAG,
-                        "motor%u: rmt_enable failed", motor_id_);
+    err = rmt_enable(channel_);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "motor%u: rmt_enable failed: %s", motor_id_, esp_err_to_name(err));
+        return err;
+    }
 
     ESP_LOGI(TAG, "motor%u: init OK  step=GPIO%d  dir=GPIO%d  en=GPIO%d  "
                   "ring=%u  part=%u",

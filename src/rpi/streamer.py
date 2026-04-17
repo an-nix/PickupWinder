@@ -134,9 +134,10 @@ class MultiAxisRampStreamer:
 
     POLL_SLEEP_S = 0.0005   # normal inter-loop sleep: 0.5 ms
 
-    # Maximum number of segments allowed in flight simultaneously.  Prevents
-    # runaway memory growth and SPI overload if the MCU stops acknowledging.
-    MAX_INFLIGHT_SEGMENTS = 32
+    # Maximum number of segments allowed in flight simultaneously.  Set to 24
+    # (leaving 1-slot margin below the firmware's 64-deep queue at 4ms/segment)
+    # to prevent memory growth and SPI overload if the MCU stops acknowledging.
+    MAX_INFLIGHT_SEGMENTS = 24
 
     def __init__(
         self,

@@ -13,13 +13,19 @@
  *   inter-block gaps that caused step loss with the old copy_encoder approach.
  *
  * ── RMT resolution analysis ────────────────────────────────────────────────
- *   Resolution : 40 MHz  (1 tick = 25 ns)
- *   Step shape : one RMT symbol per step; HIGH = PULSE_TICKS (4), LOW = remainder
+ *   Resolution : 80 MHz  (1 tick = 12.5 ns)
+ *   Step shape : one RMT symbol per step
+ *     HIGH = ticks / 2  (balanced pulse, FastAccelStepper-style)
+ *     LOW  = ticks − HIGH
+ *     Minimum: HIGH = LOW = RMT_STEP_PULSE_TICKS = 8 ticks = 100 ns each
  *
- *   5 MHz max  : interval =   8 ticks   (200 ns period) — hardware ceiling
- *   160 kHz    : interval = 250 ticks   (6.25 µs)
- *   100 Hz min : interval = 400 000 ticks  → use RMT_STEP_MAX_TICKS (65535) in practice
- *    15 Hz abs : interval =  65535 ticks = 1.638 ms  (16-bit RMT field limit)
+ *   Max step rate : 80 MHz / RMT_STEP_MIN_TICKS(16) = 5 000 000 steps/sec
+ *   Max RPM       : 5 000 000 / (200 × 32) = 781 RPM  (at minimum ticks)
+ *   160 kHz target: interval = 80 000 000 / 160 000 = 500 ticks  (6.25 µs)
+ *   100 Hz  min   : interval = 800 000 ticks → clamped to 0xFFFF (65535)
+ *
+ *   PART_SIZE=16: one encoder callback per 16 steps.
+ *     At 160 kHz: callback every 100 µs — well within FreeRTOS tick budget.
  */
 
 #pragma once
@@ -63,10 +69,14 @@ extern "C" {
 // RMT streaming constants (FastAccelStepper-style ping-pong)
 // ---------------------------------------------------------------------------
 
-/** Symbols per ping-pong half-buffer.  Must divide RMT_MEM_SYMBOLS evenly. */
+/** Symbols per ping-pong half-buffer.  Must divide RMT_MEM_SYMBOLS evenly.
+ *  Hardware requires `mem_block_symbols` to be even and at least 64, so the
+ *  minimum practical PART_SIZE is 32 (2 × PART_SIZE = 64 symbols per channel).
+ *  PART_SIZE=32 gives one encoder callback per 32 steps. */
 #define PART_SIZE               32U
 
-/** Total RMT hardware memory per channel (2 × PART_SIZE for ping-pong). */
+/** Total RMT hardware memory per channel (2 × PART_SIZE for ping-pong).
+ *  Must be >= 64 for IDF RMT driver constraints. */
 #define RMT_MEM_SYMBOLS         (2U * PART_SIZE)
 
 /**
@@ -100,12 +110,8 @@ extern "C" {
 #define SEGMENT_BLOCK_SIZE      60
 
 /** Buffered step target before starting/restarting the RMT stream.
- *  64 = 2 × PART_SIZE: the minimum safe value for the static_assert, and
- *  low enough that the auto-start path fires during low-speed acceleration
- *  (where segments may contain only 2-64 steps each).
- *  The primary start path at low speed is the explicit kickStart() called
- *  by multiAxisExecutorTask after draining each block (see comm_interface.cpp).
- *  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE. */
+ *  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE. For
+ *  PART_SIZE=32 the minimum safe value is 64. */
 #define STEP_STREAM_START_FILL  64U
 
 /**

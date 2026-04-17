@@ -609,16 +609,29 @@ void CommInterface::spiTask(void* arg)
 void CommInterface::multiAxisExecutorTask(void* arg)
 {
     /*
-     * The multi-axis executor consumes multi_axis_block_t objects from the
-     * global queue.  For each segment it:
-     *   1. Fires any deferred segment-executed notifications that are now due.
-     *   2. Polls the flush queue — if a flush arrived, drain the segment
-     *      queue, clear deferred notifications, and notify the host.
-     *   3. For each axis: call StepperQueue::executeConstantRateBlock() to
-     *      fill the per-axis RMT ring with uniform-rate pulses.
-     *   4. KickStart every axis that received steps so streaming begins.
-     *   5. Push a deferred notification: fire notifySegmentExecuted() at the
-     *      wall-clock time when this segment will FINISH on the motor.
+     * multiAxisExecutorTask — Core 1, priority 24.
+     *
+     * Architecture: see doc/architecture.md for the full data-flow diagram.
+     *
+     * This task implements the Klipper-style look-ahead drain pattern:
+     *
+     *   1. Block on s_multi_axis_queue until the first block of a new move
+     *      arrives (or a 1ms timeout for underrun recovery / notifications).
+     *   2. DRAIN LOOP: process the first block AND all immediately available
+     *      subsequent blocks (non-blocking xQueueReceive) into the ring buffer
+     *      WITHOUT starting the RMT.  This pre-fills the ring with as many
+     *      steps as the host has already queued, giving maximum look-ahead
+     *      depth before motion begins.
+     *   3. After the drain loop, call kickStart() ONCE on each active axis.
+     *      kickStart() calls maybeStartDriver(force=true) which starts the RMT
+     *      if and only if buffered_steps >= PART_SIZE (16).
+     *
+     * WHY the drain loop is necessary:
+     *   At low speed during acceleration, each segment contains only 2–5 steps.
+     *   Without the drain loop, the RMT starts after one block (~33 steps),
+     *   consuming them in <1 ms before the next FreeRTOS scheduling tick.
+     *   With the drain loop, the ring accumulates steps from all queued blocks
+     *   before the RMT starts, providing sufficient buffer depth.
      *
      * Deferred notifications keep the host's _buffered_time_s accurate
      * WITHOUT blocking the executor.  Blocking until the ring drains starved

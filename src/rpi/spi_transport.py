@@ -94,7 +94,37 @@ class Esp32SpiTransport:
             time.sleep(poll_interval_s)
 
     def poll_status(self) -> StatusPayload:
-        return self.transfer_frame(make_get_status(self._next_sequence()))
+        last_exc: Exception | None = None
+        for attempt in range(5):
+            seq = self._next_sequence()
+            frame = make_get_status(seq)
+            try:
+                # perform raw transfer so we can inspect the response on failure
+                response = bytes(self._spi.xfer2(list(frame)))
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(0.01)
+                continue
+
+            try:
+                return parse_status_frame(response)
+            except ValueError as exc:
+                last_exc = exc
+                # show a short hex preview to aid debugging (first 32 bytes)
+                try:
+                    preview = response[:32].hex()
+                except Exception:
+                    preview = "<unavailable>"
+                print(f"spi_transport: attempt {attempt+1}: parse error: {exc!s}; frame_preview={preview}")
+                if "bad magic" in str(exc) or "bad response CRC" in str(exc):
+                    time.sleep(0.01)
+                    continue
+                raise
+
+        raise RuntimeError(
+            "SPI status poll failed after 5 attempts: "
+            f"{last_exc!s}"
+        ) from last_exc
 
     def get_status(self) -> StatusPayload:
         return self.poll_status()
