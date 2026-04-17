@@ -30,25 +30,32 @@ static constexpr uint16_t SPI_MSG_MAGIC          = 0x5057; // 'P''W'
 static constexpr uint8_t  SPI_MSG_VERSION        = 1;
 static constexpr size_t   SPI_FRAME_SIZE         = 512;
 static constexpr size_t   SPI_MAX_PAYLOAD_SIZE   = SPI_FRAME_SIZE - 12;
-static constexpr uint8_t  SPI_MAX_AXES           = 2;
+static constexpr uint8_t  SPI_MAX_AXES           = 4;
 
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
 
 enum class SpiMessageType : uint8_t {
-    NOP          = 0x00,
-    ENABLE_AXIS  = 0x01,
-    ESTOP        = 0x02,
-    STOP_AXIS    = 0x03,
-    DISABLE_ALL  = 0x04,
-    RESET_STATS  = 0x05,
-    GET_STATUS   = 0x06,
-    STEP_BLOCK   = 0x10,
-    SEGMENT_BLOCK = 0x11,
-    PING         = 0x7F,
+    NOP                      = 0x00,
+    ENABLE_AXIS              = 0x01,
+    ESTOP                    = 0x02,
+    STOP_AXIS                = 0x03,
+    DISABLE_ALL              = 0x04,
+    RESET_STATS              = 0x05,
+    GET_STATUS               = 0x06,
+    STEP_BLOCK               = 0x10,
+    SEGMENT_BLOCK            = 0x11,
+    /** Discard all queued segments with motion_sequence > flush_sequence. */
+    FLUSH                    = 0x12,
+    /**
+     * Synchronised multi-axis time-based segment block.
+     * All axes share the same duration_us; steps may differ per axis.
+     */
+    MULTI_AXIS_SEGMENT_BLOCK = 0x13,
+    PING                     = 0x7F,
 
-    STATUS       = 0x80,
+    STATUS                   = 0x80,
 };
 
 enum class SpiMessageResult : uint8_t {
@@ -134,6 +141,58 @@ struct __attribute__((packed)) SegmentBlockPayload {
 
 static_assert(sizeof(SegmentBlockPayload) == 484, "SegmentBlockPayload must be 484 bytes");
 
+/**
+ * @brief Payload for FLUSH (0x12).
+ *
+ * The ESP32 must discard every queued MULTI_AXIS_SEGMENT_BLOCK whose
+ * motion_sequence > flush_sequence, completing the current executing segment
+ * first.  After flush the executor resumes from the next segment the host
+ * sends.
+ */
+struct __attribute__((packed)) FlushPayload {
+    uint16_t flush_sequence; /**< Discard segments with motion_sequence > this  */
+    uint8_t  reserved[2];
+};
+
+static_assert(sizeof(FlushPayload) == 4, "FlushPayload must be 4 bytes");
+
+/**
+ * @brief Per-axis step count entry inside a MultiAxisSegmentEntry.
+ *
+ * axis_count entries immediately follow the fixed MultiAxisSegmentEntry header
+ * in the wire payload; they are not a separate struct.
+ */
+
+/**
+ * @brief One synchronised multi-axis segment (variable-length wire record).
+ *
+ * Wire layout:
+ *   uint16_t  motion_sequence   — monotonically increasing segment identifier
+ *   uint16_t  duration_us       — wall-clock duration of this segment in µs
+ *   uint16_t  direction_mask    — bit i = 1 → axis i runs in reverse
+ *   uint16_t  step_counts[N]    — one per axis (N = axis_count in block header)
+ *
+ * Total per-segment: 6 + N*2 bytes.
+ */
+
+/**
+ * @brief Header of a MULTI_AXIS_SEGMENT_BLOCK payload.
+ *
+ * Followed immediately by `segment_count` variable-length segment records.
+ */
+struct __attribute__((packed)) MultiAxisSegmentBlockHeader {
+    uint16_t block_seq;      /**< Block rolling sequence for duplicate detect   */
+    uint8_t  segment_count;  /**< Number of segment records that follow          */
+    uint8_t  axis_count;     /**< Number of axes per segment record              */
+    /**
+     * axis_ids[axis_count] follows the header as a variable-length region.
+     * Each element maps slot index → logical axis_id.
+     */
+};
+
+static_assert(sizeof(MultiAxisSegmentBlockHeader) == 4,
+              "MultiAxisSegmentBlockHeader must be 4 bytes");
+
 // ---------------------------------------------------------------------------
 // Response payloads
 // ---------------------------------------------------------------------------
@@ -149,10 +208,21 @@ struct __attribute__((packed)) StatusPayload {
     uint8_t  protocol_version;
     uint8_t  enabled_mask;
     uint8_t  running_mask;
-    uint8_t  reserved[5];
+    /**
+     * Motion sequence of the most recently fully-executed multi-axis segment.
+     * The host uses this to compute how much future motion is still buffered
+     * on the MCU.  Initialised to 0xFFFF ("nothing executed yet") so that the
+     * host's starting condition (segment.sequence > last_executed_sequence)
+     * is always true before the first segment completes.
+     *
+     * This field is updated by the executor task (Core 1) under a spinlock
+     * and read by the SPI task (Core 0) — both must access it atomically.
+     */
+    uint16_t last_executed_sequence;
+    uint8_t  reserved[3];
 };
 
-static_assert(sizeof(StatusPayload) == 32, "StatusPayload must be 32 bytes");
+static_assert(sizeof(StatusPayload) == 48, "StatusPayload must be 48 bytes");
 
 // ---------------------------------------------------------------------------
 // CRC16-CCITT-FALSE

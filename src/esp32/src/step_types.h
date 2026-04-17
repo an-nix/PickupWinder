@@ -214,6 +214,49 @@ typedef struct {
     step_cmd_t steps[STEP_BLOCK_SIZE]; /**< Step payload                          */
 } comm_packet_t;
 
+// ---------------------------------------------------------------------------
+// Multi-axis synchronised segment block (MULTI_AXIS_SEGMENT_BLOCK = 0x13)
+// ---------------------------------------------------------------------------
+
+/** Maximum number of axes in a multi-axis segment block. */
+#define MULTI_AXIS_MAX_AXES  4
+
+/** Maximum number of segments per multi-axis block. */
+#define MULTI_AXIS_BLOCK_SIZE  60
+
+/**
+ * @brief One synchronised multi-axis time-based segment.
+ *
+ * The host sends one of these records per segment.  All axes execute their
+ * respective step_counts over the shared duration_us, with steps distributed
+ * evenly in time by the MCU.  direction_mask bit i = 1 means axis i reverses.
+ */
+typedef struct {
+    uint16_t motion_sequence; /**< Globally increasing motion identifier       */
+    uint16_t duration_us;     /**< Wall-clock duration of this segment in µs   */
+    uint16_t direction_mask;  /**< Bit i=1: axis i runs in reverse direction   */
+    uint16_t step_counts[MULTI_AXIS_MAX_AXES]; /**< Steps per axis             */
+} multi_axis_segment_t;
+
+/**
+ * @brief Block of synchronised multi-axis segments received from the host.
+ *
+ * Enqueued into the global multi-axis queue and consumed by the executor.
+ */
+typedef struct {
+    uint8_t              axis_ids[MULTI_AXIS_MAX_AXES]; /**< Logical axis IDs  */
+    uint8_t              axis_count;                    /**< Valid entries      */
+    uint8_t              segment_count;                 /**< Valid segments     */
+    multi_axis_segment_t segments[MULTI_AXIS_BLOCK_SIZE];
+} multi_axis_block_t;
+
+/**
+ * @brief Flush request: discard all segments with motion_sequence > threshold.
+ */
+typedef struct {
+    uint16_t flush_sequence; /**< Keep segments ≤ this; discard the rest       */
+} flush_request_t;
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

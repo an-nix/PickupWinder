@@ -8,9 +8,10 @@ from typing import Iterable, List
 SPI_MSG_MAGIC = 0x5057
 SPI_MSG_VERSION = 1
 SPI_FRAME_SIZE = 512
-SPI_MAX_AXES = 2
+SPI_MAX_AXES = 4
 STEP_BLOCK_SIZE = 64
 SEGMENT_BLOCK_SIZE = 60
+MULTI_AXIS_SEGMENT_BLOCK_SIZE = 60
 
 _HEADER_STRUCT = struct.Struct("<HBBHHHH")
 _ENABLE_STRUCT = struct.Struct("<BB2x")
@@ -19,7 +20,11 @@ _STEP_BLOCK_HEAD_STRUCT = struct.Struct("<BBH")
 _STEP_ENTRY_STRUCT = struct.Struct("<IB")
 _SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<BBH")
 _SEGMENT_ENTRY_STRUCT = struct.Struct("<HHhBB")
-_STATUS_STRUCT = struct.Struct("<IHHHHIIHBBBBB5x")
+_MULTI_AXIS_SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<HBB")
+_MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HH")
+_STEP_COUNT_STRUCT = struct.Struct("<H")
+_FLUSH_STRUCT = struct.Struct("<H2x")
+_STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBH3x")
 
 
 class SpiMessageType(IntEnum):
@@ -32,6 +37,8 @@ class SpiMessageType(IntEnum):
     GET_STATUS = 0x06
     STEP_BLOCK = 0x10
     SEGMENT_BLOCK = 0x11
+    FLUSH = 0x12
+    MULTI_AXIS_SEGMENT_BLOCK = 0x13
     PING = 0x7F
     STATUS = 0x80
 
@@ -155,32 +162,89 @@ class SegmentBlockPayload:
 
 
 @dataclass(slots=True)
+class MultiAxisSegment:
+    sequence: int
+    duration_us: int
+    steps: List[int]
+    directions: List[int]
+
+
+@dataclass(slots=True)
+class MultiAxisSegmentBlockPayload:
+    axis_ids: List[int]
+    block_seq: int
+    segments: List[MultiAxisSegment]
+
+    def pack(self) -> bytes:
+        if len(self.axis_ids) == 0:
+            raise ValueError("multi-axis segment block requires at least one axis")
+        if len(self.segments) > MULTI_AXIS_SEGMENT_BLOCK_SIZE:
+            raise ValueError(
+                f"multi-axis segment block too large: {len(self.segments)} > {MULTI_AXIS_SEGMENT_BLOCK_SIZE}"
+            )
+
+        axis_count = len(self.axis_ids)
+        payload = bytearray()
+        payload += _MULTI_AXIS_SEGMENT_BLOCK_HEAD_STRUCT.pack(self.block_seq, len(self.segments), axis_count)
+        payload += bytes(self.axis_ids)
+        for segment in self.segments:
+            if len(segment.steps) != axis_count:
+                raise ValueError(
+                    f"segment step count {len(segment.steps)} does not match axis count {axis_count}"
+                )
+            if len(segment.directions) != axis_count:
+                raise ValueError(
+                    f"segment direction count {len(segment.directions)} does not match axis count {axis_count}"
+                )
+
+            direction_mask = 0
+            for axis_index, direction in enumerate(segment.directions):
+                if direction:
+                    direction_mask |= 1 << axis_index
+
+            payload += _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT.pack(segment.duration_us, direction_mask)
+            for step in segment.steps:
+                payload += _STEP_COUNT_STRUCT.pack(step)
+        return bytes(payload)
+
+
+@dataclass(slots=True)
+class FlushPayload:
+    flush_sequence: int
+
+    def pack(self) -> bytes:
+        return _FLUSH_STRUCT.pack(self.flush_sequence)
+
+
+@dataclass(slots=True)
 class StatusPayload:
     uptime_ms: int
-    queue_free_slots: tuple[int, int]
-    ring_free_slots: tuple[int, int]
-    underrun_count: tuple[int, int]
+    queue_free_slots: tuple[int, int, int, int]
+    ring_free_slots: tuple[int, int, int, int]
+    underrun_count: tuple[int, int, int, int]
     last_rx_sequence: int
     last_rx_type: int
     last_result: int
     protocol_version: int
     enabled_mask: int
     running_mask: int
+    last_executed_sequence: int
 
     @classmethod
     def unpack(cls, payload: bytes) -> "StatusPayload":
         values = _STATUS_STRUCT.unpack(payload[: _STATUS_STRUCT.size])
         return cls(
             uptime_ms=values[0],
-            queue_free_slots=(values[1], values[2]),
-            ring_free_slots=(values[3], values[4]),
-            underrun_count=(values[5], values[6]),
-            last_rx_sequence=values[7],
-            last_rx_type=values[8],
-            last_result=values[9],
-            protocol_version=values[10],
-            enabled_mask=values[11],
-            running_mask=values[12],
+            queue_free_slots=(values[1], values[2], values[3], values[4]),
+            ring_free_slots=(values[5], values[6], values[7], values[8]),
+            underrun_count=(values[9], values[10], values[11], values[12]),
+            last_rx_sequence=values[13],
+            last_rx_type=values[14],
+            last_result=values[15],
+            protocol_version=values[16],
+            enabled_mask=values[17],
+            running_mask=values[18],
+            last_executed_sequence=values[19],
         )
 
 
@@ -273,3 +337,11 @@ def make_step_block(payload: StepBlockPayload, sequence: int = 0) -> bytes:
 
 def make_segment_block(payload: SegmentBlockPayload, sequence: int = 0) -> bytes:
     return build_frame(SpiMessageType.SEGMENT_BLOCK, payload.pack(), sequence=sequence)
+
+
+def make_multi_axis_segment_block(payload: MultiAxisSegmentBlockPayload, sequence: int = 0) -> bytes:
+    return build_frame(SpiMessageType.MULTI_AXIS_SEGMENT_BLOCK, payload.pack(), sequence=sequence)
+
+
+def make_flush(payload: FlushPayload, sequence: int = 0) -> bytes:
+    return build_frame(SpiMessageType.FLUSH, payload.pack(), sequence=sequence)

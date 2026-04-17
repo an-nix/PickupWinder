@@ -63,6 +63,35 @@ public:
     }
 
     /**
+     * @brief Emit a constant-rate step burst for use by the multi-axis executor.
+     *
+     * Computes a uniform step interval from @p duration_us / @p step_count,
+     * clamps it to the RMT hardware limits, then calls pushExpandedBlock()
+     * to fill the RMT ring.
+     *
+     * This method is intended to be called from the global multi-axis executor
+     * task (Core 1) when the per-axis queue is empty and not competing for the
+     * driver.  It must NOT be called concurrently with the per-axis executor
+     * task for the same motor.
+     *
+     * @param direction   true = forward, false = reverse.
+     * @param step_count  Number of steps to emit.
+     * @param duration_us Segment wall-clock duration in microseconds.
+     * @return ESP_OK on success, error code on RMT/ring error.
+     */
+    esp_err_t executeConstantRateBlock(bool direction,
+                                       uint16_t step_count,
+                                       uint32_t duration_us);
+
+    /**
+     * @brief Force-start the RMT stream if ring has data and is not running.
+     *
+     * Call after distributing steps across all axes in a multi-axis segment
+     * to ensure all drivers begin streaming simultaneously.
+     */
+    esp_err_t kickStart();
+
+    /**
      * @brief Number of free slots remaining in the block queue.
      *
      * Use for flow control: signal the host when this drops below

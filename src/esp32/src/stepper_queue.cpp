@@ -105,6 +105,49 @@ uint32_t StepperQueue::available() const
 }
 
 // ---------------------------------------------------------------------------
+// executeConstantRateBlock() / kickStart()
+// ---------------------------------------------------------------------------
+
+esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
+                                                  uint16_t step_count,
+                                                  uint32_t duration_us)
+{
+    if (step_count == 0) {
+        return ESP_OK;
+    }
+
+    // Compute uniform interval: RMT clock is 2 MHz → 2 ticks/µs.
+    uint32_t interval_ticks = (duration_us * 2UL) / step_count;
+    if (interval_ticks < RMT_STEP_MIN_TICKS) {
+        interval_ticks = RMT_STEP_MIN_TICKS;
+    }
+    if (interval_ticks > RMT_STEP_MAX_TICKS) {
+        interval_ticks = RMT_STEP_MAX_TICKS;
+    }
+
+    uint32_t remaining = step_count;
+    while (remaining > 0) {
+        step_block_t expanded {};
+        expanded.count = (remaining > STEP_BLOCK_SIZE) ? STEP_BLOCK_SIZE : remaining;
+        for (uint32_t i = 0; i < expanded.count; ++i) {
+            expanded.steps[i].interval_ticks = interval_ticks;
+            expanded.steps[i].direction       = direction;
+        }
+        esp_err_t err = pushExpandedBlock(driver_, expanded);
+        if (err != ESP_OK) {
+            return err;
+        }
+        remaining -= expanded.count;
+    }
+    return ESP_OK;
+}
+
+esp_err_t StepperQueue::kickStart()
+{
+    return maybeStartDriver(driver_, true);
+}
+
+// ---------------------------------------------------------------------------
 // maybeStartDriver() / pushExpandedBlock() / executeSegmentBlock()
 // ---------------------------------------------------------------------------
 

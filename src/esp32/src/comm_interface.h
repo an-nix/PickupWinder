@@ -51,6 +51,18 @@ private:
     uint8_t         last_rx_type_ {static_cast<uint8_t>(SpiMessageType::NOP)};
     uint8_t         last_result_ {static_cast<uint8_t>(SpiMessageResult::OK)};
 
+    /**
+     * @brief Motion sequence of the most recently fully-executed multi-axis
+     *        segment.  Updated by the executor task (Core 1) and read by the
+     *        SPI task (Core 0); access is protected by the portMUX spinlock
+     *        below.  Initialised to 0xFFFF so the host's first segment always
+     *        compares as "not yet executed".
+     */
+    volatile uint16_t   last_executed_sequence_ {0xFFFFu};
+
+    /** Spinlock protecting last_executed_sequence_ across cores. */
+    portMUX_TYPE        exec_seq_mux_ {portMUX_INITIALIZER_UNLOCKED};
+
     /** Build the status payload for the next SPI response frame. */
     void buildStatusFrame(uint8_t* out_frame) const;
 
@@ -65,6 +77,47 @@ private:
     esp_err_t handleStepBlock(const StepBlockPayload& payload);
     esp_err_t handleSegmentBlock(const SegmentBlockPayload& payload);
 
+    /**
+     * @brief Handle a MULTI_AXIS_SEGMENT_BLOCK (0x13) frame.
+     *
+     * Decodes the variable-length multi-axis segment payload and dispatches
+     * one multi_axis_segment_block_t to the global multi-axis queue.
+     */
+    esp_err_t handleMultiAxisSegmentBlock(const uint8_t* payload, uint16_t payload_length);
+
+    /**
+     * @brief Handle a FLUSH (0x12) frame.
+     *
+     * Instructs the executor to discard all queued segments whose
+     * motion_sequence > flush_sequence, allowing the host to inject a
+     * new trajectory without draining the current buffer first.
+     */
+    esp_err_t handleFlush(const FlushPayload& payload);
+
+    /**
+     * @brief Update last_executed_sequence_ under the spinlock.
+     *
+     * Must be called by the executor task whenever it completes a
+     * multi-axis segment.
+     *
+     * @param motion_seq  The motion_sequence of the just-completed segment.
+     */
+    void notifySegmentExecuted(uint16_t motion_seq);
+
     /** Core 0 SPI slave task. */
     static void spiTask(void* arg);
+
+    /**
+     * @brief Core 1 multi-axis segment executor task.
+     *
+     * Consumes multi_axis_block_t objects from the global multi-axis queue,
+     * distributes constant-rate step bursts to each per-axis StepperQueue,
+     * and calls notifySegmentExecuted() after each segment completes.  Also
+     * drains the global flush queue between blocks to support host trajectory
+     * cancellation without draining the entire axis queue first.
+     *
+     * Pinned to Core 1 at priority 24 (same as per-axis executor tasks).
+     * Only one multi-axis executor task is ever launched.
+     */
+    static void multiAxisExecutorTask(void* arg);
 };

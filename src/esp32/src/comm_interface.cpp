@@ -27,6 +27,26 @@ static constexpr uint32_t  SPI_TASK_STACK  = 4096;
 static constexpr UBaseType_t SPI_TASK_PRIO = 10;
 static constexpr BaseType_t  SPI_TASK_CORE = 0;
 
+static constexpr uint32_t    MULTI_EXEC_STACK  = 6144;
+static constexpr UBaseType_t MULTI_EXEC_PRIO   = 24;
+static constexpr BaseType_t  MULTI_EXEC_CORE   = 1;
+
+/**
+ * @brief Global queue of multi-axis segment blocks fed by the SPI task and
+ *        consumed by the multi-axis executor task.
+ *
+ * Depth is sized to hold ~600 ms of motion at 4 ms/segment.
+ */
+static constexpr uint32_t MULTI_AXIS_QUEUE_DEPTH = 64;
+static QueueHandle_t s_multi_axis_queue  = nullptr;
+
+/**
+ * @brief Global queue for flush requests.  Depth 4 is more than enough since
+ *        the host can only issue one flush at a time.
+ */
+static constexpr uint32_t FLUSH_QUEUE_DEPTH = 4;
+static QueueHandle_t s_flush_queue = nullptr;
+
 DMA_ATTR static uint8_t s_rx_frame[SPI_FRAME_SIZE];
 DMA_ATTR static uint8_t s_tx_frame[SPI_FRAME_SIZE];
 
@@ -49,6 +69,16 @@ CommInterface::CommInterface(StepperQueue* queues[], uint8_t n_motors)
 esp_err_t CommInterface::init(const SpiBusPins& pins)
 {
     pins_ = pins;
+
+    // Create the global multi-axis segment queue.
+    s_multi_axis_queue = xQueueCreate(MULTI_AXIS_QUEUE_DEPTH, sizeof(multi_axis_block_t));
+    ESP_RETURN_ON_FALSE(s_multi_axis_queue != nullptr, ESP_ERR_NO_MEM, TAG,
+                        "failed to create multi-axis queue");
+
+    // Create the global flush request queue.
+    s_flush_queue = xQueueCreate(FLUSH_QUEUE_DEPTH, sizeof(flush_request_t));
+    ESP_RETURN_ON_FALSE(s_flush_queue != nullptr, ESP_ERR_NO_MEM, TAG,
+                        "failed to create flush queue");
 
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = pins_.mosi;
@@ -81,6 +111,18 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
 
     ESP_RETURN_ON_FALSE(rc == pdPASS, ESP_ERR_NO_MEM, TAG,
                         "failed to create comm_spi task");
+
+    rc = xTaskCreatePinnedToCore(
+        &CommInterface::multiAxisExecutorTask,
+        "multi_exec",
+        MULTI_EXEC_STACK,
+        this,
+        MULTI_EXEC_PRIO,
+        nullptr,
+        MULTI_EXEC_CORE);
+
+    ESP_RETURN_ON_FALSE(rc == pdPASS, ESP_ERR_NO_MEM, TAG,
+                        "failed to create multi_exec task");
 
     ESP_LOGI(TAG, "SPI slave ready  MOSI=%d MISO=%d SCLK=%d CS=%d  frame=%uB",
              (int)pins_.mosi, (int)pins_.miso, (int)pins_.sclk, (int)pins_.cs,
@@ -115,14 +157,19 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
             }
         } else {
             payload->queue_free_slots[axis] = 0;
-            payload->ring_free_slots[axis] = 0;
-            payload->underrun_count[axis] = 0;
+            payload->ring_free_slots[axis]  = 0;
+            payload->underrun_count[axis]   = 0;
         }
     }
     payload->last_rx_sequence = last_rx_sequence_;
-    payload->last_rx_type = last_rx_type_;
-    payload->last_result = last_result_;
+    payload->last_rx_type     = last_rx_type_;
+    payload->last_result      = last_result_;
     payload->protocol_version = SPI_MSG_VERSION;
+
+    // Read last_executed_sequence_ under spinlock (written by Core 1 executor).
+    portENTER_CRITICAL(const_cast<portMUX_TYPE*>(&exec_seq_mux_));
+    payload->last_executed_sequence = last_executed_sequence_;
+    portEXIT_CRITICAL(const_cast<portMUX_TYPE*>(&exec_seq_mux_));
 
     spi_message_finalize(out_frame);
 }
@@ -243,6 +290,121 @@ esp_err_t CommInterface::handleSegmentBlock(const SegmentBlockPayload& payload)
     return queues_[payload.axis_id]->enqueueMotionBlock(block, 0);
 }
 
+esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
+                                                     uint16_t payload_length)
+{
+    /*
+     * Wire layout for MULTI_AXIS_SEGMENT_BLOCK payload:
+     *
+     *   MultiAxisSegmentBlockHeader   (4 bytes)
+     *   uint8_t  axis_ids[axis_count] (axis_count bytes)
+     *   For each segment:
+     *     uint16_t motion_sequence    (2 bytes)
+     *     uint16_t duration_us        (2 bytes)
+     *     uint16_t direction_mask     (2 bytes)
+     *     uint16_t step_counts[axis_count] (2 * axis_count bytes)
+     *
+     * Total minimum: 4 + axis_count + segment_count * (6 + 2*axis_count)
+     */
+    if (payload_length < sizeof(MultiAxisSegmentBlockHeader)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const auto* hdr = reinterpret_cast<const MultiAxisSegmentBlockHeader*>(payload);
+    const uint8_t axis_count     = hdr->axis_count;
+    const uint8_t segment_count  = hdr->segment_count;
+
+    if (axis_count == 0 || axis_count > MULTI_AXIS_MAX_AXES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (segment_count == 0 || segment_count > MULTI_AXIS_BLOCK_SIZE) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Validate total payload length before reading any further.
+    const size_t expected_length =
+        sizeof(MultiAxisSegmentBlockHeader)
+        + static_cast<size_t>(axis_count)
+        + static_cast<size_t>(segment_count) * (6u + 2u * axis_count);
+    if (payload_length < static_cast<uint16_t>(expected_length)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Deserialise.
+    multi_axis_block_t block {};
+    block.axis_count     = axis_count;
+    block.segment_count  = segment_count;
+
+    const uint8_t* cursor = payload + sizeof(MultiAxisSegmentBlockHeader);
+
+    // axis_ids
+    for (uint8_t a = 0; a < axis_count; ++a) {
+        block.axis_ids[a] = cursor[a];
+    }
+    cursor += axis_count;
+
+    // segments
+    for (uint8_t s = 0; s < segment_count; ++s) {
+        uint16_t motion_seq, duration_us, dir_mask;
+        memcpy(&motion_seq,  cursor,     2);
+        memcpy(&duration_us, cursor + 2, 2);
+        memcpy(&dir_mask,    cursor + 4, 2);
+        cursor += 6;
+
+        block.segments[s].motion_sequence = motion_seq;
+        block.segments[s].duration_us     = duration_us;
+        block.segments[s].direction_mask  = dir_mask;
+
+        for (uint8_t a = 0; a < axis_count; ++a) {
+            uint16_t steps;
+            memcpy(&steps, cursor, 2);
+            block.segments[s].step_counts[a] = steps;
+            cursor += 2;
+        }
+    }
+
+    // Non-blocking enqueue: return QUEUE_FULL immediately if full.
+    if (xQueueSend(s_multi_axis_queue, &block, 0) != pdTRUE) {
+        return ESP_ERR_TIMEOUT; // maps to QUEUE_FULL result code
+    }
+    return ESP_OK;
+}
+
+esp_err_t CommInterface::handleFlush(const FlushPayload& flush_payload)
+{
+    /*
+     * Post a flush_request_t to the flush queue.  The executor task
+     * watches this queue and applies the flush before processing the next
+     * segment.  Using a queue (instead of an atomic variable) ensures that
+     * a flush posted just before new segments arrive is always processed in
+     * the correct order.
+     */
+    flush_request_t req { .flush_sequence = flush_payload.flush_sequence };
+    if (xQueueSend(s_flush_queue, &req, 0) != pdTRUE) {
+        // Flush queue full — this should never happen in normal operation.
+        ESP_LOGW(TAG, "flush queue full — flush_seq=%u dropped",
+                 (unsigned)flush_payload.flush_sequence);
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+void CommInterface::notifySegmentExecuted(uint16_t motion_seq)
+{
+    /*
+     * Called by the executor task (Core 1) after each multi-axis segment
+     * completes.  Updates last_executed_sequence_ under the portMUX spinlock
+     * so the SPI task (Core 0) can safely read it in buildStatusFrame().
+     *
+     * Only advances the sequence — never moves it backward.  This handles
+     * the 16-bit wrap-around case correctly because we only call this in
+     * strict execution order.
+     */
+    portENTER_CRITICAL(&exec_seq_mux_);
+    last_executed_sequence_ = motion_seq;
+    portEXIT_CRITICAL(&exec_seq_mux_);
+}
+
 esp_err_t CommInterface::handleFrame(const SpiMessageHeader& header, const uint8_t* payload)
 {
     switch (static_cast<SpiMessageType>(header.msg_type)) {
@@ -292,6 +454,16 @@ esp_err_t CommInterface::handleFrame(const SpiMessageHeader& header, const uint8
             return ESP_ERR_INVALID_SIZE;
         }
         return handleSegmentBlock(*reinterpret_cast<const SegmentBlockPayload*>(payload));
+
+    case SpiMessageType::MULTI_AXIS_SEGMENT_BLOCK:
+        // Variable-length payload — pass raw buffer + length.
+        return handleMultiAxisSegmentBlock(payload, header.payload_length);
+
+    case SpiMessageType::FLUSH:
+        if (header.payload_length != sizeof(FlushPayload)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        return handleFlush(*reinterpret_cast<const FlushPayload*>(payload));
 
     default:
         return ESP_ERR_NOT_SUPPORTED;
@@ -356,6 +528,101 @@ void CommInterface::spiTask(void* arg)
             self->last_result_ = static_cast<uint8_t>(SpiMessageResult::INTERNAL_ERROR);
             ESP_LOGW(TAG, "message 0x%02X failed: %s",
                      header.msg_type, esp_err_to_name(err));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// multiAxisExecutorTask()  — Core 1, priority 24
+// ---------------------------------------------------------------------------
+
+void CommInterface::multiAxisExecutorTask(void* arg)
+{
+    /*
+     * The multi-axis executor consumes multi_axis_block_t objects from the
+     * global queue.  For each segment it:
+     *   1. Polls the flush queue — if a flush arrived, drain the segment
+     *      queue entirely and notify the host, then loop.
+     *   2. For each axis: call StepperQueue::executeConstantRateBlock() to
+     *      fill the per-axis RMT ring with uniform-rate pulses.
+     *   3. KickStart every axis that received steps so streaming begins.
+     *   4. Notify the host via notifySegmentExecuted(motion_sequence).
+     *
+     * The per-axis executor tasks (running on the same core at the same
+     * priority) remain idle when only MULTI_AXIS_SEGMENT_BLOCK messages are
+     * in flight, so there is no concurrent driver access.
+     */
+    auto* self = static_cast<CommInterface*>(arg);
+    multi_axis_block_t block;
+    flush_request_t    flush_req;
+
+    ESP_LOGI(TAG, "multi-axis executor started on core %d", xPortGetCoreID());
+
+    for (;;) {
+        // ── Priority 0: drain flush queue before dequeueing new motion ──────────
+        if (xQueueReceive(s_flush_queue, &flush_req, 0) == pdTRUE) {
+            // Discard every pending block from the motion queue.
+            while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
+            // Inform the host that the flush completed.
+            self->notifySegmentExecuted(flush_req.flush_sequence);
+            ESP_LOGI(TAG, "flush completed at seq=%u",
+                     (unsigned)flush_req.flush_sequence);
+            continue;
+        }
+
+        // ── Block until a motion block arrives (100 ms keeps flush checks live) ─
+        if (xQueueReceive(s_multi_axis_queue, &block, pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+
+        // ── Execute segments, checking for flush between each one ──────────────
+        bool did_flush = false;
+        for (uint8_t s = 0; s < block.segment_count && !did_flush; ++s) {
+
+            // Mid-block flush check.
+            if (xQueueReceive(s_flush_queue, &flush_req, 0) == pdTRUE) {
+                while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
+                self->notifySegmentExecuted(flush_req.flush_sequence);
+                ESP_LOGI(TAG, "mid-block flush at seq=%u",
+                         (unsigned)flush_req.flush_sequence);
+                did_flush = true;
+                break;
+            }
+
+            const multi_axis_segment_t& seg = block.segments[s];
+
+            // Distribute constant-rate steps to each axis.
+            for (uint8_t a = 0; a < block.axis_count; ++a) {
+                const uint8_t axis_id = block.axis_ids[a];
+                if (axis_id >= self->n_motors_ ||
+                        self->queues_[axis_id] == nullptr) {
+                    continue;
+                }
+                if (seg.step_counts[a] == 0) {
+                    continue;
+                }
+
+                const bool direction = ((seg.direction_mask >> a) & 1u) != 0;
+                esp_err_t err = self->queues_[axis_id]->executeConstantRateBlock(
+                    direction, seg.step_counts[a], seg.duration_us);
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "axis %u seg %u: executeConstantRateBlock: %s",
+                             axis_id, s, esp_err_to_name(err));
+                }
+            }
+
+            // Kick-start any axis that has data but hasn’t started streaming.
+            for (uint8_t a = 0; a < block.axis_count; ++a) {
+                const uint8_t axis_id = block.axis_ids[a];
+                if (axis_id < self->n_motors_ &&
+                        self->queues_[axis_id] != nullptr &&
+                        seg.step_counts[a] > 0) {
+                    self->queues_[axis_id]->kickStart();
+                }
+            }
+
+            // Publish completion so the host can retire inflight entries.
+            self->notifySegmentExecuted(seg.motion_sequence);
         }
     }
 }
