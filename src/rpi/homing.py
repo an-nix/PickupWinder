@@ -9,37 +9,24 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-try:
-    from .messages import (
-        LATERAL_ENDSTOP_ABSENT,
-        LATERAL_ENDSTOP_PRESENT_CLOSED,
-        LATERAL_ENDSTOP_PRESENT_OPEN,
-        MultiAxisSegment,
-        MultiAxisSegmentBlockPayload,
-        SpiMessageResult,
-    )
-    from .spi_transport import Esp32SpiTransport
-    from .axis import Axis
-    from .axis_controller import AxisController, AxisControllerError
-except ImportError:  # pragma: no cover - direct script execution fallback
-    from messages import (
-        LATERAL_ENDSTOP_ABSENT,
-        LATERAL_ENDSTOP_PRESENT_CLOSED,
-        LATERAL_ENDSTOP_PRESENT_OPEN,
-        MultiAxisSegment,
-        MultiAxisSegmentBlockPayload,
-        SpiMessageResult,
-    )
-    from spi_transport import Esp32SpiTransport
-    from axis import Axis
-    from axis_controller import AxisController, AxisControllerError
+from messages import (
+    LATERAL_ENDSTOP_ABSENT,
+    LATERAL_ENDSTOP_PRESENT_CLOSED,
+    LATERAL_ENDSTOP_PRESENT_OPEN,
+    MultiAxisSegment,
+    MultiAxisSegmentBlockPayload,
+    SpiMessageResult,
+)
+from spi_transport import Esp32SpiTransport
+from axis import Axis
+from axis_controller import AxisController, AxisControllerError
 
 
 @dataclass(slots=True)
 class LateralHomingConfig:
     axis: Axis
     steps_per_attempt: int = 20
-    duration_us: int = 200_000
+    duration_us: int = 50_000
     max_attempts: int = 200
     poll_interval_s: float = 0.02
     reverse: bool = False
@@ -69,7 +56,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--speed-hz", type=int, default=4_000_000)
     parser.add_argument("--steps-per-attempt", type=int, default=20)
-    parser.add_argument("--duration-us", type=int, default=200_000)
+    parser.add_argument(
+        "--duration-us",
+        type=int,
+        default=50_000,
+        help="Durée d'une tentative de homing en microsecondes (max 65535)",
+    )
     parser.add_argument("--max-attempts", type=int, default=200)
     parser.add_argument("--poll-interval-s", type=float, default=0.02)
     parser.add_argument("--reverse", action="store_true")

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
-from .axis import Axis
-from .messages import (
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from axis import Axis
+from messages import (
     LATERAL_ENDSTOP_ABSENT,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
     LATERAL_ENDSTOP_PRESENT_OPEN,
@@ -13,7 +18,7 @@ from .messages import (
     MultiAxisSegmentBlockPayload,
     SpiMessageResult,
 )
-from .spi_transport import Esp32SpiTransport
+from spi_transport import Esp32SpiTransport
 
 
 class AxisControllerError(RuntimeError):
@@ -63,6 +68,11 @@ class AxisController:
         if status.lateral_endstop_state == LATERAL_ENDSTOP_PRESENT_CLOSED:
             self.axis.mark_homed()
             return
+
+        if duration_us < 1 or duration_us > 0xFFFF:
+            raise AxisControllerError(
+                f"duration_us must be between 1 and 65535, got {duration_us}"
+            )
 
         for attempt in range(1, max_attempts + 1):
             segment = MultiAxisSegment(
