@@ -20,10 +20,10 @@ class StreamAxisConfig:
     axis_id: int
     ramp: RampConfig
     minimum_free_blocks: int = 1
-    prefill_blocks: int | None = 8
+    prefill_blocks: int | None = 6
     low_watermark_blocks: int | None = None
     max_queued_blocks: int | None = None
-    ring_send_threshold: int = 64
+    ring_send_threshold: int = 1
 
 
 @dataclass(slots=True)
@@ -128,6 +128,12 @@ class MultiAxisRampStreamer:
     def _should_fill(self, status, stream: _AxisStreamState, *, initial_fill: bool) -> bool:
         queued_blocks = self._queued_blocks(status, stream)
         return queued_blocks < self._target_fill(stream)
+
+    def _is_ring_full(self, status) -> bool:
+        return any(
+            axis_id < len(status.ring_free_slots) and int(status.ring_free_slots[axis_id]) == 0
+            for axis_id in range(len(status.ring_free_slots))
+        )
 
     def _is_ready_to_send(self, status, stream: _AxisStreamState, *, initial_fill: bool) -> bool:
         queued_blocks = self._queued_blocks(status, stream)
@@ -338,7 +344,10 @@ class MultiAxisRampStreamer:
                 continue
 
             if any(not stream.finished for stream in self._streams):
-                time.sleep(self._poll_interval_s)
+                sleep_interval = self._poll_interval_s
+                if self._is_ring_full(status):
+                    sleep_interval = min(self._poll_interval_s, 0.00025)
+                time.sleep(sleep_interval)
                 status = self._transport.get_status()
                 self._update_queue_depths(status)
 
