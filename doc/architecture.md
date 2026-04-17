@@ -245,6 +245,21 @@ The executor task blocks on a task notification from the encoder ISR whenever
 the software ring is full. This keeps CPU 1 watchdog-safe while preserving
 deterministic RMT timing.
 
+### Multi-axis completion feedback (`last_executed_sequence`)
+
+For `SEGMENT_BLOCK` streaming, the ESP32 multi-axis executor publishes
+`last_executed_sequence` through **deferred notifications**:
+
+- each segment is scheduled on a motor timeline (`duration_us` cumulative),
+- notification is emitted when that segment is expected to have physically
+  finished,
+- host (`streamer.py`) retires in-flight segments from this feedback.
+
+To avoid false early completion during real stalls (ring empty / stream
+stopped), the firmware pauses this deferred timeline while stalled and
+compensates all pending deadlines by the stall duration before resuming.
+This keeps host-side buffered-time estimation aligned with actual motor output.
+
 ## Acceleration Model (Klipper-style)
 
 Host-side planner emits arithmetic segments:

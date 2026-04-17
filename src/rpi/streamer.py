@@ -118,12 +118,12 @@ class MultiAxisRampStreamer:
     """
 
     # ── Real-time buffer targets ──────────────────────────────────────────────
-    # TARGET_BUFFER_TIME_S defines the nominal look-ahead window.  20–50 ms is
-    # a safe range: enough to absorb OS jitter on the Pi while staying well
-    # below any perceptible motion lag.
-    TARGET_BUFFER_TIME_S = 0.03   # nominal look-ahead: 30 ms
-    MIN_BUFFER_TIME_S    = 0.02   # emergency refill threshold: 20 ms
-    MAX_BUFFER_TIME_S    = 0.05   # hard cap: 50 ms
+    # TARGET_BUFFER_TIME_S defines the nominal look-ahead window.  100 ms prevents
+    # ring starvation and smooths low-speed motion by maintaining larger look-ahead.
+    # Larger buffers reduce jitter and ring drain-to-zero events.
+    TARGET_BUFFER_TIME_S = 0.10   # nominal look-ahead: 100 ms
+    MIN_BUFFER_TIME_S    = 0.06   # emergency refill threshold: 60 ms
+    MAX_BUFFER_TIME_S    = 0.12   # hard cap: 120 ms
 
     # ── Segment duration clamp ────────────────────────────────────────────────
     # 2–5 ms per segment balances SPI bandwidth against latency.  Shorter
@@ -215,6 +215,9 @@ class MultiAxisRampStreamer:
         # Transport sequence of the most recently sent SPI frame, for ACK check.
         self._last_sent_transport_seq: int = -1
 
+        # Diagnostic counter for non-fatal ACK drift warnings.
+        self._ack_drift_warnings: int = 0
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _timestamp(self) -> str:
@@ -253,30 +256,46 @@ class MultiAxisRampStreamer:
             RuntimeError: if ``last_rx_sequence`` does not match the most
                 recently confirmed transport sequence from the in-flight queue.
         """
+        # No in-flight motion: nothing to validate.
         if not self._inflight:
             return
 
-        # The front of the inflight queue is the oldest unconfirmed segment.
-        # Its transport sequence must be ≤ last_rx_sequence (because the ESP32
-        # only updates last_rx_sequence when it actually processes a frame).
+        # last_rx_sequence is global transport traffic (status polls + motion),
+        # while _inflight tracks only unexecuted motion segments. Therefore
+        # last_rx_sequence can legitimately advance far beyond the oldest
+        # in-flight transport sequence during normal operation.
+        #
+        # Keep this check diagnostic-only: detect obvious impossible states,
+        # but never abort streaming on ACK drift.
         oldest_transport_seq = self._inflight[0][1]
         last_rx = int(status.last_rx_sequence)
-
-        # Allow for 16-bit sequence wrap-around (distance check).
-        diff = (last_rx - oldest_transport_seq) & 0xFFFF
-        if diff > 0x8000:
-            # The ESP32 has NOT yet processed the oldest inflight frame — this
-            # is expected if we recently sent it.  Not an error.
+        newest_sent = self._last_sent_transport_seq
+        if newest_sent < 0:
             return
 
-        # If the oldest frame is already past our last known rx, something is
-        # wrong (the MCU skipped or reordered frames).
-        if diff > self.MAX_INFLIGHT_SEGMENTS * 2:
-            raise RuntimeError(
-                f"transport sequence desynchronised: "
-                f"oldest_inflight_transport_seq={oldest_transport_seq:#06x} "
-                f"last_rx_sequence={last_rx:#06x}"
-            )
+        # If last_rx is "behind" oldest by > 32768, modulo arithmetic indicates
+        # it is actually ahead due wrap; not an error.
+        oldest_gap = (last_rx - oldest_transport_seq) & 0xFFFF
+        if oldest_gap > 0x8000:
+            return
+
+        # Outstanding unacked frames based on latest sent transport sequence.
+        # In nominal conditions this should stay reasonably bounded.
+        outstanding = (newest_sent - last_rx) & 0xFFFF
+        if outstanding > 0x8000:
+            # last_rx has already moved past newest_sent (wrap/ordering); OK.
+            return
+
+        if outstanding > (self.MAX_INFLIGHT_SEGMENTS * 4):
+            self._ack_drift_warnings += 1
+            if self._ack_drift_warnings <= 5 or (self._ack_drift_warnings % 50) == 0:
+                print(
+                    f"[{self._timestamp()}] WARN transport ACK drift: "
+                    f"oldest_inflight_tx={oldest_transport_seq:#06x} "
+                    f"last_sent_tx={newest_sent:#06x} "
+                    f"last_rx_tx={last_rx:#06x} "
+                    f"outstanding={outstanding}"
+                )
 
     def _remove_confirmed_segments(self, status) -> None:
         """Retire all in-flight segments that the MCU has fully executed.
@@ -305,17 +324,22 @@ class MultiAxisRampStreamer:
     def _queue_full(self, status) -> bool:
         """Return True if the MCU queue or ring buffer has no free space.
 
-        Checks both ``queue_free_slots`` (FreeRTOS motion queue) and
-        ``ring_free_slots`` (RMT step ring) so that back-pressure is applied
-        at either level.
+        Only the configured axes are considered.  The ESP32 status payload may
+        report zero free slots for unused axes, and those must not block the
+        host streamer.
 
         Args:
             status: ``StatusPayload`` received from the ESP32.
         """
-        if min(status.queue_free_slots) == 0:
-            return True
-        if hasattr(status, "ring_free_slots") and min(status.ring_free_slots) == 0:
-            return True
+        for axis_id in self._axis_ids:
+            if axis_id < len(status.queue_free_slots) and status.queue_free_slots[axis_id] == 0:
+                return True
+
+        if hasattr(status, "ring_free_slots"):
+            for axis_id in self._axis_ids:
+                if axis_id < len(status.ring_free_slots) and status.ring_free_slots[axis_id] == 0:
+                    return True
+
         return False
 
     def _block_summary(self, segment: MultiAxisSegment) -> dict:
@@ -505,6 +529,7 @@ class MultiAxisRampStreamer:
 
                 # Send non-blocking: one attempt, no retry on QUEUE_FULL.
                 transport_seq, send_status = self._transport.send_multi_axis_segment_block_request(payload)
+                status = send_status
 
                 if send_status.last_result == int(SpiMessageResult.OK):
                     # Track the segment and update ALL state atomically.
@@ -526,7 +551,9 @@ class MultiAxisRampStreamer:
                             f"inflight={len(self._inflight)} "
                             f"enabled=0x{send_status.enabled_mask:02X} "
                             f"running=0x{send_status.running_mask:02X} "
-                            f"queue_free={send_status.queue_free_slots}"
+                            f"queue_free={send_status.queue_free_slots} "
+                            f"ring_free={send_status.ring_free_slots} "
+                            f"underrun={send_status.underrun_count}"
                         )
 
                 elif send_status.last_result == int(SpiMessageResult.QUEUE_FULL):
@@ -550,13 +577,21 @@ class MultiAxisRampStreamer:
                 break
 
             # ── 6. Adaptive sleep ─────────────────────────────────────────────
-            # Emergency refill mode: if the buffer is below the minimum
-            # threshold, skip the sleep entirely and spin to refill as fast
-            # as possible.  This prevents MCU step-ring underrun.
-            if self._buffered_time_s < self.MIN_BUFFER_TIME_S:
-                continue  # no sleep — aggressively refill
-
-            time.sleep(self.POLL_SLEEP_S)
+            # Ring-aware: if axis-0 ring has fewer than 1024 steps left, skip
+            # sleep entirely regardless of buffer level. At high cruise rates
+            # this preserves ~10 ms of runway and avoids host-side sleep from
+            # letting the ring drain into underrun territory.
+            ring_free_0 = status.ring_free_slots[0] if status.ring_free_slots else 0
+            ring_critically_low = ring_free_0 > 3072  # < 1024 steps remain (for 4096 ring)
+            if ring_critically_low:
+                pass  # no sleep — ring needs immediate refill
+            elif self._buffered_time_s >= self._target_buffer_time_s:
+                # Buffer full — sleep one segment duration
+                time.sleep(0.004)   # 4 ms (one segment)
+            elif self._buffered_time_s >= self.MIN_BUFFER_TIME_S:
+                # Buffer adequate — half segment sleep
+                time.sleep(0.002)   # 2 ms
+            # else: buffer < MIN, no sleep — refill immediately
 
         self._write_send_log()
         return total_segments

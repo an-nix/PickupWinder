@@ -161,9 +161,15 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
 
     drv->ring_read_ = rd;
     drv->last_chunk_had_steps_ = has_steps;
-    if (drv->producer_task_ != nullptr) {
+    if (drv->producer_task_ != nullptr || drv->executor_task_ != nullptr) {
         BaseType_t woken = pdFALSE;
-        vTaskNotifyGiveFromISR(drv->producer_task_, &woken);
+        if (drv->producer_task_ != nullptr) {
+            vTaskNotifyGiveFromISR(drv->producer_task_, &woken);
+        }
+        if (drv->executor_task_ != nullptr &&
+                drv->executor_task_ != drv->producer_task_) {
+            vTaskNotifyGiveFromISR(drv->executor_task_, &woken);
+        }
         if (woken == pdTRUE) {
             portYIELD_FROM_ISR();
         }
@@ -319,10 +325,24 @@ esp_err_t StepperDriver::startStream()
 }
 
 // ---------------------------------------------------------------------------
+// gracefulStop()
+// ---------------------------------------------------------------------------
+
+void StepperDriver::gracefulStop()
+{
+    // Signal the encoder callback to stop after the current ring contents
+    // have been consumed (no ring reset, unlike emergencyStop).
+    rmt_stopped_ = true;
+    // Do not call rmt_tx_wait_all_done here — the caller should not block.
+    // The RMT transaction will end naturally after the pause chunk fires.
+    rmt_running_ = false;
+}
+
+// ---------------------------------------------------------------------------
 // pushBlock()
 // ---------------------------------------------------------------------------
 
-esp_err_t StepperDriver::pushBlock(const step_block_t& block)
+esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t caller_task)
 {
     if (ring_underrun_count_ > 0) {
         ESP_LOGW(TAG, "motor%u: ring underrun x%lu since last pushBlock",
@@ -334,9 +354,12 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block)
         return ESP_OK;
     }
 
-    if (producer_task_ == nullptr) {
-        producer_task_ = xTaskGetCurrentTaskHandle();
-    }
+    // Always update producer_task_ unconditionally so the ISR ring-space
+    // notification always wakes the task that is actually blocked here,
+    // not a stale handle from a previous call.
+    producer_task_ = (caller_task != nullptr)
+                     ? caller_task
+                     : xTaskGetCurrentTaskHandle();
 
     const uint32_t count = std::min<uint32_t>(block.count, STEP_BLOCK_SIZE);
 
@@ -387,10 +410,13 @@ bool IRAM_ATTR StepperDriver::on_trans_done_isr(
 {
     StepperDriver* self = static_cast<StepperDriver*>(user_ctx);
     self->rmt_running_ = false;
+    BaseType_t woken = pdFALSE;
     if (self->producer_task_ != nullptr) {
-        BaseType_t woken = pdFALSE;
         vTaskNotifyGiveFromISR(self->producer_task_, &woken);
-        return woken == pdTRUE;
     }
-    return false;
+    if (self->executor_task_ != nullptr &&
+            self->executor_task_ != self->producer_task_) {
+        vTaskNotifyGiveFromISR(self->executor_task_, &woken);
+    }
+    return woken == pdTRUE;
 }

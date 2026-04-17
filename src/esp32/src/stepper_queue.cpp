@@ -10,6 +10,12 @@
 
 static const char* TAG = "stepper_queue";
 
+// Compile-time invariant: the auto-start fill threshold must be large enough
+// that the second encode_steps ping-pong callback never immediately underruns.
+static_assert(STEP_STREAM_START_FILL >= 2 * PART_SIZE,
+              "STEP_STREAM_START_FILL must be >= 2 * PART_SIZE to prevent "
+              "immediate ISR underrun on second encoder callback");
+
 // Task parameters
 static constexpr uint32_t EXECUTOR_STACK_WORDS = 4096;
 static constexpr UBaseType_t EXECUTOR_PRIORITY  = 24;
@@ -117,7 +123,7 @@ esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
     }
 
     // Compute uniform interval: RMT clock is 2 MHz → 2 ticks/µs.
-    uint32_t interval_ticks = (duration_us * 2UL) / step_count;
+    uint32_t interval_ticks = (duration_us * RMT_TICKS_PER_US) / step_count;
     if (interval_ticks < RMT_STEP_MIN_TICKS) {
         interval_ticks = RMT_STEP_MIN_TICKS;
     }
@@ -139,12 +145,21 @@ esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
         }
         remaining -= expanded.count;
     }
+    // After ALL steps for this segment are written to the ring, attempt a
+    // force-start.  Doing it once here (rather than inside the loop) maximises
+    // ring fill depth before the RMT encoder starts consuming entries.
+    maybeStartDriver(driver_, true);
     return ESP_OK;
 }
 
 esp_err_t StepperQueue::kickStart()
 {
     return maybeStartDriver(driver_, true);
+}
+
+void StepperQueue::gracefulStop()
+{
+    driver_.gracefulStop();
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +174,13 @@ esp_err_t StepperQueue::maybeStartDriver(StepperDriver& driver, bool force_start
         return ESP_OK;
     }
 
-    const bool should_start = force_start
+    // Guard force_start: never begin streaming with fewer than PART_SIZE steps.
+    // The RMT ping-pong encoder's first callback requests PART_SIZE symbols; if
+    // fewer steps are available it immediately underruns and halts the motor.
+    // At slow speeds (2-9 steps/segment during acceleration) this was causing a
+    // stutter on every segment.  STEP_STREAM_START_FILL and the ring-full case
+    // are unaffected — those scenarios already imply >= PART_SIZE steps buffered.
+    const bool should_start = (force_start && buffered_steps >= PART_SIZE)
         || (buffered_steps >= STEP_STREAM_START_FILL)
         || (driver.ringFreeSlots() == 0);
     if (!should_start) {
@@ -185,7 +206,10 @@ esp_err_t StepperQueue::pushExpandedBlock(StepperDriver& driver, const step_bloc
         }
     }
 
-    esp_err_t err = driver.pushBlock(block);
+    // Pass the current task handle so ISR ring-space notifications wake
+    // whichever task is currently blocked on this ring (multiAxisExecutorTask
+    // or per-axis executorTask).
+    esp_err_t err = driver.pushBlock(block, xTaskGetCurrentTaskHandle());
     if (err != ESP_OK) {
         return err;
     }

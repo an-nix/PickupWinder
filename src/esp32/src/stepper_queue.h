@@ -92,6 +92,14 @@ public:
     esp_err_t kickStart();
 
     /**
+     * @brief Signal the motor to stop after the current ring contents drain.
+     *
+     * Does NOT flush the ring buffer (contrast with emergencyStop via driver).
+     * The motor decelerates naturally to zero as pre-queued steps are consumed.
+     */
+    void gracefulStop();
+
+    /**
      * @brief Number of free slots remaining in the block queue.
      *
      * Use for flow control: signal the host when this drops below

@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
         SpiMessageType,
         SpiMessageResult,
         StatusPayload,
+        MultiAxisSegmentBlockPayload,
         SegmentBlockPayload,
         StepBlockPayload,
         make_disable_all,
@@ -40,6 +41,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
         make_segment_block,
         make_step_block,
         make_stop_axis,
+        make_multi_axis_segment_block,
         parse_status_frame,
     )
 

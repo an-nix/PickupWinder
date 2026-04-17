@@ -63,7 +63,7 @@ private:
     volatile uint16_t   last_executed_sequence_ {0xFFFFu};
 
     /** Spinlock protecting last_executed_sequence_ across cores. */
-    portMUX_TYPE        exec_seq_mux_ {portMUX_INITIALIZER_UNLOCKED};
+    portMUX_TYPE        exec_seq_mux_ = portMUX_INITIALIZER_UNLOCKED;
 
     /** Build the status payload for the next SPI response frame. */
     void buildStatusFrame(uint8_t* out_frame) const;

@@ -13,13 +13,13 @@
  *   inter-block gaps that caused step loss with the old copy_encoder approach.
  *
  * ── RMT resolution analysis ────────────────────────────────────────────────
- *   Resolution : 2 MHz  (1 tick = 0.5 µs)
- *   Step shape : one RMT symbol per step, split 50/50 HIGH/LOW
- *                (minimum high/low still comfortably above DRV8825 limits)
+ *   Resolution : 40 MHz  (1 tick = 25 ns)
+ *   Step shape : one RMT symbol per step; HIGH = PULSE_TICKS (4), LOW = remainder
  *
- *   160 kHz max : interval = 6.25 µs  →  12 ticks  (actual 166.7 kHz, <4% err)
- *   100 Hz  min : interval = 10 000 µs → 20 000 ticks  ≤  32 767 max ✓
- *    61 Hz  abs : interval = 16 384 µs → 32 767 ticks  (RMT 15-bit limit)
+ *   5 MHz max  : interval =   8 ticks   (200 ns period) — hardware ceiling
+ *   160 kHz    : interval = 250 ticks   (6.25 µs)
+ *   100 Hz min : interval = 400 000 ticks  → use RMT_STEP_MAX_TICKS (65535) in practice
+ *    15 Hz abs : interval =  65535 ticks = 1.638 ms  (16-bit RMT field limit)
  */
 
 #pragma once
@@ -35,20 +35,26 @@ extern "C" {
 // RMT timing constants
 // ---------------------------------------------------------------------------
 
-/** RMT TX channel resolution: 2 MHz  (1 tick = 0.5 µs) */
-#define RMT_STEP_RESOLUTION_HZ  2000000UL
+/** RMT TX channel resolution: 40 MHz  (1 tick = 25 ns) */
+#define RMT_STEP_RESOLUTION_HZ  40000000UL
 
-/** Minimum half-period guard in RMT ticks (2 µs — meets DRV8825 1.9 µs min) */
+/** Ticks per microsecond derived from RMT_STEP_RESOLUTION_HZ (40 at 40 MHz). */
+#define RMT_TICKS_PER_US        (RMT_STEP_RESOLUTION_HZ / 1000000UL)
+
+/** Minimum half-period guard in RMT ticks (100 ns — DRV8825 requires 1.9 µs
+ *  for the DIR setup, but STEP pulse width minimum is 1 µs per datasheet;
+ *  4 ticks × 25 ns = 100 ns is tight — increase if step loss occurs). */
 #define RMT_STEP_PULSE_TICKS    4U
 
 /**
- * Minimum total interval in ticks (6 µs → ~166 kHz).
- * Ensures duration1 = interval_ticks - PULSE_TICKS ≥ 2 (never 0 or negative).
+ * Minimum total interval in ticks.
+ * 8 ticks × 25 ns = 200 ns → 5 MHz step rate ceiling at hardware level.
+ * Ensures duration1 = interval_ticks − PULSE_TICKS ≥ 4 ticks.
  */
-#define RMT_STEP_MIN_TICKS      12U
+#define RMT_STEP_MIN_TICKS      8U
 
-/** Maximum interval in ticks: RMT 15-bit field limit → ~61 Hz floor */
-#define RMT_STEP_MAX_TICKS      32767U
+/** Maximum interval in ticks: 16-bit RMT field → 65535 ticks = ~1.6 ms → ~0.6 Hz floor */
+#define RMT_STEP_MAX_TICKS      0xFFFFU
 
 /** Default hold interval before any step has been consumed (= minimum interval).
  *  Prevents duration1 wraparound to ~65535 ticks on first ring-empty hold. */
@@ -75,9 +81,11 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 /** Ring buffer size — must be a power of 2.
- *  2048 entries = 38.6ms at 53kHz (500 RPM) / 19.3ms at 106kHz (1000 RPM).
- *  Sized so that even a 10ms FreeRTOS scheduling gap cannot drain the buffer. */
-#define STEP_RING_SIZE          2048U
+ *  4096 entries = 58ms at 70kHz (cruise speed, ~660 RPM).
+ *  Must cover the worst-case host re-fill time: 25 segments × 1ms SPI = 25ms,
+ *  plus OS jitter.  4096 gives 58ms >> 25ms, preventing ring starvation when
+ *  all deferred notifications fire simultaneously. */
+#define STEP_RING_SIZE          4096U
 
 /** Bit mask for ring buffer index wrap-around. */
 #define STEP_RING_MASK          (STEP_RING_SIZE - 1U)
@@ -92,8 +100,11 @@ extern "C" {
 /** Number of compressed motion segments per transport block. */
 #define SEGMENT_BLOCK_SIZE      60
 
-/** Buffered step target before starting/restarting the RMT stream. */
-#define STEP_STREAM_START_FILL  512U
+/** Buffered step target before starting/restarting the RMT stream.
+ *  128 = 4 × PART_SIZE: enough for two full ping-pong encoder callbacks
+ *  before the task even runs, greatly reducing startup underruns at high
+ *  step rates.  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE. */
+#define STEP_STREAM_START_FILL  128U
 
 /**
  * Depth of the FreeRTOS step-block queue (per motor).

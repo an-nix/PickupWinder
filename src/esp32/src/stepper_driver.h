@@ -43,6 +43,13 @@
 
 class StepperDriver {
 public:
+    // ─── RMT clock constants (typed aliases — authoritative values in step_types.h) ──
+    // These use different names to avoid colliding with the same-named macros.
+    static constexpr uint32_t RMT_CLK_HZ          = 40000000UL;          // 40 MHz
+    static constexpr uint32_t RMT_TICKS_PER_US_C  = RMT_CLK_HZ / 1000000UL; // 40
+    static constexpr uint32_t RMT_PULSE_TICKS_C   = 4U;   // 4 × 25 ns = 100 ns HIGH
+    static constexpr uint32_t RMT_MIN_TICKS_C     = 8U;   // 200 ns → 5 MHz ceiling
+    static constexpr uint32_t RMT_MAX_TICKS_C     = 0xFFFFU;
     /**
      * @brief Construct a StepperDriver.
      *
@@ -80,19 +87,29 @@ public:
     void stopStream();
 
     /**
+     * @brief Signal the RMT stream to stop after the current ring contents
+     *        have been consumed.  Does NOT reset the ring buffer.
+     *
+     * Contrast with emergencyStop() which flushes the ring immediately.
+     * Safe to call from task context only.
+     */
+    void gracefulStop();
+
+    /**
      * @brief Push a block of steps into the ring buffer for streaming.
      *
-    * Converts step_block_t → ring_entry_t[] and writes them to the SPSC
-    * ring buffer.  If the ring is full, blocks on a task notification from
-    * the ISR until space becomes available.
+     * Converts step_block_t → ring_entry_t[] and writes them to the SPSC
+     * ring buffer.  If the ring is full, blocks on a task notification from
+     * the ISR until space becomes available.
      *
-     * Automatically starts RMT streaming if not already running.
-     *
-     * @param block  Block of pre-timed step commands.  All steps must share
-     *               the same direction (see file-level note).
+     * @param block        Block of pre-timed step commands.
+     * @param caller_task  Handle of the calling task; stored as producer_task_
+     *                     so the ISR ring-space notification wakes the right
+     *                     task.  Pass xTaskGetCurrentTaskHandle() from the
+     *                     caller (StepperQueue::pushExpandedBlock).
      * @return ESP_OK, or an RMT error code on stream start failure.
      */
-    esp_err_t pushBlock(const step_block_t& block);
+    esp_err_t pushBlock(const step_block_t& block, TaskHandle_t caller_task);
 
     /** @brief Return the motor id supplied at construction (0 or 1). */
     uint8_t motorId() const { return motor_id_; }
@@ -124,7 +141,28 @@ public:
     volatile bool         rmt_stopped_ {true};       /**< Set by encoder ISR    */
     bool                  last_chunk_had_steps_ {false}; /**< Dir-change safety */
     uint16_t              last_ticks_ {RMT_STEP_DEFAULT_TICKS}; /**< Last step interval for hold symbols */
-    TaskHandle_t          producer_task_ {nullptr};  /**< Single producer task  */
+
+    /**
+     * @brief Task handle of the current ring producer.
+     *
+     * Set to the calling task every time pushBlock() is entered so the ring
+     * back-pressure (ulTaskNotifyTake) always wakes the correct task.
+     * Written from task context, read from ISR — must be treated as volatile.
+     */
+    TaskHandle_t          producer_task_ {nullptr};
+
+    /**
+     * @brief Task handle of the multi-axis executor (Core 1).
+     *
+     * Set once at startup by CommInterface via setExecutorTask().
+     * encode_steps notifies BOTH this handle and producer_task_ so the
+     * executor can pre-emptively refill the ring before it stalls.
+     */
+    TaskHandle_t          executor_task_ {nullptr};
+
+    /** Register the multi-axis executor task handle for ring-low wakeups. */
+    void setExecutorTask(TaskHandle_t t) { executor_task_ = t; }
+
     // Incremented in ISR each time encode_steps() finds the ring empty
     // and emits a pause chunk before stopping the transaction. Use to detect
     // pipeline starvation at runtime.

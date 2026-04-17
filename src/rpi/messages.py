@@ -21,7 +21,7 @@ _STEP_ENTRY_STRUCT = struct.Struct("<IB")
 _SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<BBH")
 _SEGMENT_ENTRY_STRUCT = struct.Struct("<HHhBB")
 _MULTI_AXIS_SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<HBB")
-_MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HH")
+_MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HHH")
 _STEP_COUNT_STRUCT = struct.Struct("<H")
 _FLUSH_STRUCT = struct.Struct("<H2x")
 _STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBBH2x")
@@ -208,7 +208,11 @@ class MultiAxisSegmentBlockPayload:
                 if direction:
                     direction_mask |= 1 << axis_index
 
-            payload += _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT.pack(segment.duration_us, direction_mask)
+            payload += _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT.pack(
+                segment.sequence,
+                segment.duration_us,
+                direction_mask,
+            )
             for step in segment.steps:
                 payload += _STEP_COUNT_STRUCT.pack(step)
         return bytes(payload)
