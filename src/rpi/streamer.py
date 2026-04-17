@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import time
 from typing import Iterator
 
@@ -19,9 +20,10 @@ class StreamAxisConfig:
     axis_id: int
     ramp: RampConfig
     minimum_free_blocks: int = 1
-    prefill_blocks: int | None = None
+    prefill_blocks: int | None = 8
     low_watermark_blocks: int | None = None
     max_queued_blocks: int | None = None
+    ring_send_threshold: int = 64
 
 
 @dataclass(slots=True)
@@ -55,11 +57,16 @@ class MultiAxisRampStreamer:
         axis_streams: list[StreamAxisConfig],
         *,
         poll_interval_s: float = 0.001,
-        print_every: int = 8,
+        print_every: int = 1,
+        log_each_send: bool = False,
+        send_log_path: str | None = None,
     ):
         self._transport = transport
         self._poll_interval_s = poll_interval_s
         self._print_every = max(print_every, 1)
+        self._log_each_send = log_each_send
+        self._send_log_path = send_log_path
+        self._send_events: list[dict] = []
         self._stop_requested = False
         self._streams = [
             _AxisStreamState(
@@ -75,6 +82,12 @@ class MultiAxisRampStreamer:
             if axis_id >= len(status.queue_free_slots):
                 continue
             stream.queue_depth = max(stream.queue_depth, int(status.queue_free_slots[axis_id]))
+
+    def _timestamp(self) -> str:
+        now = time.time()
+        seconds = int(now)
+        milliseconds = int((now - seconds) * 1000)
+        return time.strftime(f"%H:%M:%S.{milliseconds:03d}", time.localtime(now))
 
     def _target_fill(self, stream: _AxisStreamState) -> int:
         depth = max(stream.queue_depth, 1)
@@ -114,9 +127,18 @@ class MultiAxisRampStreamer:
 
     def _should_fill(self, status, stream: _AxisStreamState, *, initial_fill: bool) -> bool:
         queued_blocks = self._queued_blocks(status, stream)
-        if initial_fill:
-            return queued_blocks < self._target_fill(stream)
-        return queued_blocks <= self._low_watermark(stream)
+        return queued_blocks < self._target_fill(stream)
+
+    def _is_ready_to_send(self, status, stream: _AxisStreamState, *, initial_fill: bool) -> bool:
+        queued_blocks = self._queued_blocks(status, stream)
+        if queued_blocks <= self._low_watermark(stream):
+            return True
+
+        axis_id = stream.config.axis_id
+        if axis_id < len(status.ring_free_slots):
+            ring_free = int(status.ring_free_slots[axis_id])
+            return ring_free >= stream.config.ring_send_threshold
+        return True
 
     def _next_block(self, stream: _AxisStreamState) -> StepBlockPayload | SegmentBlockPayload | None:
         if stream.finished:
@@ -126,6 +148,20 @@ class MultiAxisRampStreamer:
         except StopIteration:
             stream.finished = True
             return None
+
+    def _block_summary(self, block: StepBlockPayload | SegmentBlockPayload) -> dict:
+        if isinstance(block, StepBlockPayload):
+            return {
+                "type": "step",
+                "entry_count": len(block.entries),
+            }
+
+        total_steps = sum(int(segment.step_count) for segment in block.segments)
+        return {
+            "type": "segment",
+            "segment_count": len(block.segments),
+            "step_count_total": total_steps,
+        }
 
     def _choose_stream(self, status, *, initial_fill: bool) -> _AxisStreamState | None:
         eligible: list[tuple[int, _AxisStreamState]] = []
@@ -138,6 +174,8 @@ class MultiAxisRampStreamer:
             if int(status.queue_free_slots[axis_id]) < stream.config.minimum_free_blocks:
                 continue
             if not self._should_fill(status, stream, initial_fill=initial_fill):
+                continue
+            if not self._is_ready_to_send(status, stream, initial_fill=initial_fill):
                 continue
             eligible.append((self._queued_blocks(status, stream), stream))
 
@@ -184,6 +222,40 @@ class MultiAxisRampStreamer:
         self._confirm_pending(pending, status)
         return status
 
+    def _record_send_event(
+        self,
+        stream: _AxisStreamState,
+        block: StepBlockPayload | SegmentBlockPayload,
+        sequence: int,
+        status,
+    ) -> None:
+        now = time.time()
+        event = {
+            "timestamp": now,
+            "timestamp_str": self._timestamp(),
+            "axis_id": stream.config.axis_id,
+            "sequence": sequence,
+            "block_summary": self._block_summary(block),
+            "queue_free": list(status.queue_free_slots),
+            "ring_free": list(status.ring_free_slots),
+            "last_result": int(status.last_result),
+            "enabled_mask": int(status.enabled_mask),
+            "running_mask": int(status.running_mask),
+        }
+        self._send_events.append(event)
+        if self._log_each_send:
+            print(
+                f"[{event['timestamp_str']}] send axis={event['axis_id']} seq={event['sequence']} "
+                f"type={event['block_summary']['type']} queue_free={event['queue_free']} "
+                f"ring_free={event['ring_free']} result=0x{event['last_result']:02X}"
+            )
+
+    def _write_send_log(self) -> None:
+        if self._send_log_path is None:
+            return
+        with open(self._send_log_path, "w", encoding="utf-8") as handle:
+            json.dump(self._send_events, handle, indent=2)
+
     def request_stop(self) -> None:
         """Request the streamer to stop sending new blocks."""
         self._stop_requested = True
@@ -223,14 +295,16 @@ class MultiAxisRampStreamer:
                         sequence, next_status = self._transport.send_segment_block_request(block)
                     else:
                         sequence, next_status = self._transport.send_step_block_request(block)
+                    self._record_send_event(stream, block, sequence, next_status)
                     if pending is not None:
                         self._confirm_pending(pending, next_status)
                         total_blocks += 1
                         if total_blocks % self._print_every == 0:
                             print(
-                                f"block={total_blocks} axis={pending.stream.config.axis_id} enabled=0x{next_status.enabled_mask:02X} "
-                                f"running=0x{next_status.running_mask:02X} queue_free={next_status.queue_free_slots} "
-                                f"ring_free={next_status.ring_free_slots} underruns={next_status.underrun_count}"
+                                f"[{self._timestamp()}] block={total_blocks} axis={pending.stream.config.axis_id} "
+                                f"enabled=0x{next_status.enabled_mask:02X} running=0x{next_status.running_mask:02X} "
+                                f"queue_free={next_status.queue_free_slots} ring_free={next_status.ring_free_slots} "
+                                f"underruns={next_status.underrun_count}"
                             )
                     pending = _PendingBlock(sequence=sequence, stream=stream, block=block)
                     status = next_status
@@ -255,9 +329,10 @@ class MultiAxisRampStreamer:
                 total_blocks += 1
                 if total_blocks % self._print_every == 0:
                     print(
-                        f"block={total_blocks} axis={pending.stream.config.axis_id} enabled=0x{status.enabled_mask:02X} "
-                        f"running=0x{status.running_mask:02X} queue_free={status.queue_free_slots} "
-                        f"ring_free={status.ring_free_slots} underruns={status.underrun_count}"
+                        f"[{self._timestamp()}] block={total_blocks} axis={pending.stream.config.axis_id} "
+                        f"enabled=0x{status.enabled_mask:02X} running=0x{status.running_mask:02X} "
+                        f"queue_free={status.queue_free_slots} ring_free={status.ring_free_slots} "
+                        f"underruns={status.underrun_count}"
                     )
                 pending = None
                 continue
@@ -267,4 +342,5 @@ class MultiAxisRampStreamer:
                 status = self._transport.get_status()
                 self._update_queue_depths(status)
 
+        self._write_send_log()
         return total_blocks

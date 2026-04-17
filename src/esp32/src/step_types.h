@@ -97,9 +97,10 @@ extern "C" {
 
 /**
  * Depth of the FreeRTOS step-block queue (per motor).
+ * Increased to 24 to handle slower host SPI latency and maintain RMT fill rate.
  * Provides ~(STEPPER_QUEUE_DEPTH × STEP_BLOCK_SIZE) steps of look-ahead.
  */
-#define STEPPER_QUEUE_DEPTH     16
+#define STEPPER_QUEUE_DEPTH     24
 
 /**
  * Flow-control threshold: the comm layer sends a NACK / buffer-full warning

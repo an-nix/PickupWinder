@@ -91,6 +91,8 @@ def run_demo(args: argparse.Namespace) -> DemoSummary:
             axis_streams,
             poll_interval_s=args.poll_interval_s,
             print_every=args.print_every,
+            log_each_send=args.log_each_send,
+            send_log_path=args.send_log_path,
         )
         block_count = streamer.stream_all()
 
@@ -142,6 +144,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--poll-interval-s", type=float, default=0.001)
     parser.add_argument("--print-every", type=int, default=8)
+    parser.add_argument("--log-each-send", action="store_true",
+        help="print a log line for each block send request"
+    )
+    parser.add_argument("--send-log-path", type=str, default=None,
+        help="write send history as JSON to this path when streaming finishes"
+    )
     parser.add_argument("--final-polls", type=int, default=5)
     parser.add_argument("--disable-all", action="store_true")
     return parser

@@ -208,7 +208,7 @@ esp_err_t StepperDriver::init()
     tx_cfg.clk_src            = RMT_CLK_SRC_DEFAULT;
     tx_cfg.resolution_hz      = RMT_STEP_RESOLUTION_HZ;
     tx_cfg.mem_block_symbols  = RMT_MEM_SYMBOLS;
-    tx_cfg.trans_queue_depth  = 1;
+    tx_cfg.trans_queue_depth  = 4;
     tx_cfg.flags.invert_out   = false;
     tx_cfg.flags.with_dma     = false;
 
