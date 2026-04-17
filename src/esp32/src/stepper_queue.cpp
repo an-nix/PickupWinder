@@ -145,10 +145,6 @@ esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
         }
         remaining -= expanded.count;
     }
-    // After ALL steps for this segment are written to the ring, attempt a
-    // force-start.  Doing it once here (rather than inside the loop) maximises
-    // ring fill depth before the RMT encoder starts consuming entries.
-    maybeStartDriver(driver_, true);
     return ESP_OK;
 }
 

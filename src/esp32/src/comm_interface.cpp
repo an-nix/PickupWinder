@@ -730,105 +730,111 @@ void CommInterface::multiAxisExecutorTask(void* arg)
             continue;  // loop back to fire pending notifications
         }
 
-        // ── Execute segments, checking for flush between each one ─────────────
-        // Update active axis list from this block for the recovery check above.
-        active_axis_count = block.axis_count < MULTI_AXIS_MAX_AXES
-            ? block.axis_count : MULTI_AXIS_MAX_AXES;
-        for (uint8_t a = 0; a < active_axis_count; ++a) {
-            active_axis_ids[a] = block.axis_ids[a];
-        }
-
+        // ── Drain loop: process this block AND all immediately available ──────
+        // blocks before starting the RMT. This fills the ring with multiple
+        // segments of look-ahead before motion begins, preventing underruns
+        // at low speed where each segment contains only a few steps.
         bool did_flush = false;
-        for (uint8_t s = 0; s < block.segment_count && !did_flush; ++s) {
+        do {
+            // Update active axis list from this block for recovery checks.
+            active_axis_count = block.axis_count < MULTI_AXIS_MAX_AXES
+                ? block.axis_count : MULTI_AXIS_MAX_AXES;
+            for (uint8_t a = 0; a < active_axis_count; ++a) {
+                active_axis_ids[a] = block.axis_ids[a];
+            }
 
-            // Fire any due notifications between segments.
-            while (defer_head != defer_tail) {
-                const int idx = defer_head & (DEFER_DEPTH - 1);
-                if (esp_timer_get_time() >= defer_fire_us[idx]) {
-                    self->notifySegmentExecuted(
-                        static_cast<uint16_t>(defer_seqs[idx]));
-                    ++defer_head;
-                } else {
+            for (uint8_t s = 0; s < block.segment_count && !did_flush; ++s) {
+
+                // Fire any due notifications between segments.
+                while (defer_head != defer_tail) {
+                    const int idx = defer_head & (DEFER_DEPTH - 1);
+                    if (esp_timer_get_time() >= defer_fire_us[idx]) {
+                        self->notifySegmentExecuted(
+                            static_cast<uint16_t>(defer_seqs[idx]));
+                        ++defer_head;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Mid-block flush check.
+                if (xQueueReceive(s_flush_queue, &flush_req, 0) == pdTRUE) {
+                    while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
+                    defer_head = defer_tail = 0;
+                    motor_timeline_us = 0;
+                    self->notifySegmentExecuted(flush_req.flush_sequence);
+                    ESP_LOGI(TAG, "mid-block flush at seq=%u",
+                             (unsigned)flush_req.flush_sequence);
+                    did_flush = true;
                     break;
                 }
-            }
 
-            // Mid-block flush check.
-            if (xQueueReceive(s_flush_queue, &flush_req, 0) == pdTRUE) {
-                while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
-                defer_head = defer_tail = 0;
-                motor_timeline_us = 0;
-                self->notifySegmentExecuted(flush_req.flush_sequence);
-                ESP_LOGI(TAG, "mid-block flush at seq=%u",
-                         (unsigned)flush_req.flush_sequence);
-                did_flush = true;
-                break;
-            }
+                const multi_axis_segment_t& seg = block.segments[s];
 
-            const multi_axis_segment_t& seg = block.segments[s];
+                // Read the lateral endstop state once per segment.
+                const uint8_t lateral_state = self->readLateralEndstopState();
+                const bool lateral_blocked =
+                    lateral_state != static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
 
-            // Read the lateral endstop state once per segment.
-            const uint8_t lateral_state = self->readLateralEndstopState();
-            const bool lateral_blocked =
-                lateral_state != static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
-
-            // Distribute constant-rate steps to each axis.
-            for (uint8_t a = 0; a < block.axis_count; ++a) {
-                const uint8_t axis_id = block.axis_ids[a];
-                if (axis_id >= self->n_motors_ ||
-                        self->queues_[axis_id] == nullptr) {
-                    continue;
-                }
-                if (seg.step_counts[a] == 0) {
-                    continue;
-                }
-                if (axis_id == 1 && lateral_blocked) {
-                    ESP_LOGW(TAG,
-                             "axis1 blocked by lateral endstop state 0x%02X, skipping %u steps",
-                             lateral_state, seg.step_counts[a]);
-                    continue;
+                // Write steps into the ring (does NOT start RMT).
+                for (uint8_t a = 0; a < block.axis_count; ++a) {
+                    const uint8_t axis_id = block.axis_ids[a];
+                    if (axis_id >= self->n_motors_ ||
+                            self->queues_[axis_id] == nullptr) {
+                        continue;
+                    }
+                    if (seg.step_counts[a] == 0) {
+                        continue;
+                    }
+                    if (axis_id == 1 && lateral_blocked) {
+                        ESP_LOGW(TAG,
+                                 "axis1 blocked by lateral endstop state 0x%02X, skipping %u steps",
+                                 lateral_state, seg.step_counts[a]);
+                        continue;
+                    }
+                    const bool direction = ((seg.direction_mask >> a) & 1u) != 0;
+                    esp_err_t err = self->queues_[axis_id]->executeConstantRateBlock(
+                        direction, seg.step_counts[a], seg.duration_us);
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "axis %u seg %u: executeConstantRateBlock: %s",
+                                 axis_id, s, esp_err_to_name(err));
+                    }
                 }
 
-                const bool direction = ((seg.direction_mask >> a) & 1u) != 0;
-                esp_err_t err = self->queues_[axis_id]->executeConstantRateBlock(
-                    direction, seg.step_counts[a], seg.duration_us);
-                if (err != ESP_OK) {
-                    ESP_LOGW(TAG, "axis %u seg %u: executeConstantRateBlock: %s",
-                             axis_id, s, esp_err_to_name(err));
+                // ── Schedule deferred notification ────────────────────────────
+                const int64_t now_us = esp_timer_get_time();
+                if (motor_timeline_us < now_us) {
+                    motor_timeline_us = now_us;
                 }
-            }
+                motor_timeline_us += static_cast<int64_t>(seg.duration_us);
 
-            // Kick-start any axis that has data but hasn't started streaming.
-            for (uint8_t a = 0; a < block.axis_count; ++a) {
-                const uint8_t axis_id = block.axis_ids[a];
+                if ((defer_tail - defer_head) < DEFER_DEPTH) {
+                    const int idx = defer_tail & (DEFER_DEPTH - 1);
+                    defer_fire_us[idx] = motor_timeline_us;
+                    defer_seqs[idx]    = seg.motion_sequence;
+                    ++defer_tail;
+                } else {
+                    // Overflow guard (shouldn't happen: 64 slots > MAX_INFLIGHT=32).
+                    ESP_LOGW(TAG, "defer queue overflow, immediate notify seq=%u",
+                             (unsigned)seg.motion_sequence);
+                    self->notifySegmentExecuted(
+                        static_cast<uint16_t>(seg.motion_sequence));
+                }
+            }  // end inner segment loop
+
+        // Grab the next block immediately (non-blocking) and keep draining.
+        // Stop if: a flush occurred, or no more blocks are queued.
+        } while (!did_flush
+                 && xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE);
+
+        // ── Start RMT on all active axes ONCE, after ring is pre-filled ───────
+        if (!did_flush) {
+            for (uint8_t a = 0; a < active_axis_count; ++a) {
+                const uint8_t axis_id = active_axis_ids[a];
                 if (axis_id < self->n_motors_ &&
-                        self->queues_[axis_id] != nullptr &&
-                        seg.step_counts[a] > 0 &&
-                        !(axis_id == 1 && lateral_blocked)) {
+                        self->queues_[axis_id] != nullptr) {
                     self->queues_[axis_id]->kickStart();
                 }
-            }
-
-            // ── Schedule deferred notification ────────────────────────────────
-            // Advance the motor timeline by this segment's duration.  If the
-            // timeline has fallen behind real time (idle gap), clamp to now.
-            const int64_t now_us = esp_timer_get_time();
-            if (motor_timeline_us < now_us) {
-                motor_timeline_us = now_us;
-            }
-            motor_timeline_us += static_cast<int64_t>(seg.duration_us);
-
-            if ((defer_tail - defer_head) < DEFER_DEPTH) {
-                const int idx = defer_tail & (DEFER_DEPTH - 1);
-                defer_fire_us[idx] = motor_timeline_us;
-                defer_seqs[idx]    = seg.motion_sequence;
-                ++defer_tail;
-            } else {
-                // Overflow guard (shouldn't happen: 64 slots > MAX_INFLIGHT=32).
-                ESP_LOGW(TAG, "defer queue overflow, immediate notify seq=%u",
-                         (unsigned)seg.motion_sequence);
-                self->notifySegmentExecuted(
-                    static_cast<uint16_t>(seg.motion_sequence));
             }
         }
     }

@@ -35,25 +35,24 @@ extern "C" {
 // RMT timing constants
 // ---------------------------------------------------------------------------
 
-/** RMT TX channel resolution: 40 MHz  (1 tick = 25 ns) */
-#define RMT_STEP_RESOLUTION_HZ  40000000UL
+/** RMT TX channel resolution: 80 MHz  (1 tick = 12.5 ns) */
+#define RMT_STEP_RESOLUTION_HZ  80000000UL
 
-/** Ticks per microsecond derived from RMT_STEP_RESOLUTION_HZ (40 at 40 MHz). */
+/** Ticks per microsecond derived from RMT_STEP_RESOLUTION_HZ (80 at 80 MHz). */
 #define RMT_TICKS_PER_US        (RMT_STEP_RESOLUTION_HZ / 1000000UL)
 
-/** Minimum half-period guard in RMT ticks (100 ns — DRV8825 requires 1.9 µs
- *  for the DIR setup, but STEP pulse width minimum is 1 µs per datasheet;
- *  4 ticks × 25 ns = 100 ns is tight — increase if step loss occurs). */
-#define RMT_STEP_PULSE_TICKS    4U
+/** Minimum half-period guard in RMT ticks (100 ns — 8 × 12.5 ns at 80 MHz;
+ *  meets DRV8825/A4988 STEP pulse width minimum of 1 µs when low half is added). */
+#define RMT_STEP_PULSE_TICKS    8U
 
 /**
  * Minimum total interval in ticks.
- * 8 ticks × 25 ns = 200 ns → 5 MHz step rate ceiling at hardware level.
- * Ensures duration1 = interval_ticks − PULSE_TICKS ≥ 4 ticks.
+ * 16 ticks × 12.5 ns = 200 ns → 5 MHz step rate ceiling at hardware level.
+ * Ensures duration1 = interval_ticks − PULSE_TICKS ≥ 8 ticks.
  */
-#define RMT_STEP_MIN_TICKS      8U
+#define RMT_STEP_MIN_TICKS      16U
 
-/** Maximum interval in ticks: 16-bit RMT field → 65535 ticks = ~1.6 ms → ~0.6 Hz floor */
+/** Maximum interval in ticks: 16-bit RMT field → 65535 ticks = ~819 µs → ~1.2 kHz floor */
 #define RMT_STEP_MAX_TICKS      0xFFFFU
 
 /** Default hold interval before any step has been consumed (= minimum interval).
@@ -101,10 +100,13 @@ extern "C" {
 #define SEGMENT_BLOCK_SIZE      60
 
 /** Buffered step target before starting/restarting the RMT stream.
- *  128 = 4 × PART_SIZE: enough for two full ping-pong encoder callbacks
- *  before the task even runs, greatly reducing startup underruns at high
- *  step rates.  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE. */
-#define STEP_STREAM_START_FILL  128U
+ *  64 = 2 × PART_SIZE: the minimum safe value for the static_assert, and
+ *  low enough that the auto-start path fires during low-speed acceleration
+ *  (where segments may contain only 2-64 steps each).
+ *  The primary start path at low speed is the explicit kickStart() called
+ *  by multiAxisExecutorTask after draining each block (see comm_interface.cpp).
+ *  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE. */
+#define STEP_STREAM_START_FILL  64U
 
 /**
  * Depth of the FreeRTOS step-block queue (per motor).

@@ -45,10 +45,10 @@ class StepperDriver {
 public:
     // ─── RMT clock constants (typed aliases — authoritative values in step_types.h) ──
     // These use different names to avoid colliding with the same-named macros.
-    static constexpr uint32_t RMT_CLK_HZ          = 40000000UL;          // 40 MHz
-    static constexpr uint32_t RMT_TICKS_PER_US_C  = RMT_CLK_HZ / 1000000UL; // 40
-    static constexpr uint32_t RMT_PULSE_TICKS_C   = 4U;   // 4 × 25 ns = 100 ns HIGH
-    static constexpr uint32_t RMT_MIN_TICKS_C     = 8U;   // 200 ns → 5 MHz ceiling
+    static constexpr uint32_t RMT_CLK_HZ          = 80000000UL;          // 80 MHz
+    static constexpr uint32_t RMT_TICKS_PER_US_C  = RMT_CLK_HZ / 1000000UL; // 80
+    static constexpr uint32_t RMT_PULSE_TICKS_C   = 8U;   // 8 × 12.5 ns = 100 ns HIGH
+    static constexpr uint32_t RMT_MIN_TICKS_C     = 16U;  // 16 × 12.5 ns = 200 ns → 5 MHz ceiling
     static constexpr uint32_t RMT_MAX_TICKS_C     = 0xFFFFU;
     /**
      * @brief Construct a StepperDriver.
