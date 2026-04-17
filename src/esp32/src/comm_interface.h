@@ -25,6 +25,8 @@ struct SpiBusPins {
     gpio_num_t miso;
     gpio_num_t sclk;
     gpio_num_t cs;
+    gpio_num_t home_pin_no;
+    gpio_num_t home_pin_nc;
 };
 
 class CommInterface {
@@ -65,6 +67,12 @@ private:
 
     /** Build the status payload for the next SPI response frame. */
     void buildStatusFrame(uint8_t* out_frame) const;
+
+    /** Read the current lateral endstop state from the configured pins. */
+    uint8_t readLateralEndstopState() const;
+
+    /** Return true if the given axis may move given the lateral endstop state. */
+    bool isLateralMovementAllowed(uint8_t axis_id) const;
 
     /** Parse and execute one validated request frame. */
     esp_err_t handleFrame(const SpiMessageHeader& header, const uint8_t* payload);

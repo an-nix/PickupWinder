@@ -63,6 +63,10 @@ Le MCU renvoie périodiquement une `StatusPayload` (dans la trame RX) qui contie
 - `queue_free_slots[]` et `ring_free_slots[]` pour chaque axe (controle de flux host).
 - `underrun_count[]` pour diagnostiquer pertes.
 - `last_rx_sequence`, `last_result` pour interpréter le traitement du dernier message reçu.
+- `lateral_endstop_state` : état du capteur latéral 2‑contacts.
+  - `0xFF` = capteur absent / défaut.
+  - `0x00` = capteur présent, non contacté.
+  - `0x01` = capteur présent, contacté.
 - `last_executed_sequence` : numéro de séquence du dernier segment multi‑axe **complètement exécuté** — utilisé par le host pour savoir combien de temps de mouvement reste en file.
 
 ---

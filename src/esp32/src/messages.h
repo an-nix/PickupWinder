@@ -68,6 +68,13 @@ enum class SpiMessageResult : uint8_t {
     BAD_AXIS       = 0x06,
     QUEUE_FULL     = 0x07,
     INTERNAL_ERROR = 0x08,
+    ENDSTOP_BLOCKED = 0x09,
+};
+
+enum class LateralEndstopState : uint8_t {
+    PRESENT_OPEN   = 0x00,
+    PRESENT_CLOSED = 0x01,
+    ABSENT         = 0xFF,
 };
 
 namespace SpiStepFlags {
@@ -208,6 +215,7 @@ struct __attribute__((packed)) StatusPayload {
     uint8_t  protocol_version;
     uint8_t  enabled_mask;
     uint8_t  running_mask;
+    uint8_t lateral_endstop_state;
     /**
      * Motion sequence of the most recently fully-executed multi-axis segment.
      * The host uses this to compute how much future motion is still buffered
@@ -219,7 +227,7 @@ struct __attribute__((packed)) StatusPayload {
      * and read by the SPI task (Core 0) — both must access it atomically.
      */
     uint16_t last_executed_sequence;
-    uint8_t  reserved[3];
+    uint8_t  reserved[2];
 };
 
 static_assert(sizeof(StatusPayload) == 48, "StatusPayload must be 48 bytes");

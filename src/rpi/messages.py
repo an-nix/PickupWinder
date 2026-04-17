@@ -24,7 +24,7 @@ _MULTI_AXIS_SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<HBB")
 _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HH")
 _STEP_COUNT_STRUCT = struct.Struct("<H")
 _FLUSH_STRUCT = struct.Struct("<H2x")
-_STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBH3x")
+_STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBBH2x")
 
 
 class SpiMessageType(IntEnum):
@@ -53,11 +53,17 @@ class SpiMessageResult(IntEnum):
     BAD_AXIS = 0x06
     QUEUE_FULL = 0x07
     INTERNAL_ERROR = 0x08
+    ENDSTOP_BLOCKED = 0x09
 
 
 class SpiStepFlags(IntEnum):
     NONE = 0x00
     DIR_REVERSE = 0x01
+
+
+LATERAL_ENDSTOP_PRESENT_OPEN = 0x00
+LATERAL_ENDSTOP_PRESENT_CLOSED = 0x01
+LATERAL_ENDSTOP_ABSENT = 0xFF
 
 
 @dataclass(slots=True)
@@ -228,6 +234,7 @@ class StatusPayload:
     protocol_version: int
     enabled_mask: int
     running_mask: int
+    lateral_endstop_state: int
     last_executed_sequence: int
 
     @classmethod
@@ -244,7 +251,8 @@ class StatusPayload:
             protocol_version=values[16],
             enabled_mask=values[17],
             running_mask=values[18],
-            last_executed_sequence=values[19],
+            lateral_endstop_state=values[19],
+            last_executed_sequence=values[20],
         )
 
 

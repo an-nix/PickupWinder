@@ -15,6 +15,7 @@
 
 #include <string.h>
 #include <driver/spi_slave.h>
+#include <driver/gpio.h>
 #include <esp_attr.h>
 #include <esp_log.h>
 #include <esp_check.h>
@@ -69,6 +70,17 @@ CommInterface::CommInterface(StepperQueue* queues[], uint8_t n_motors)
 esp_err_t CommInterface::init(const SpiBusPins& pins)
 {
     pins_ = pins;
+
+    if (pins_.home_pin_no != GPIO_NUM_NC && pins_.home_pin_nc != GPIO_NUM_NC) {
+        gpio_config_t home_cfg = {};
+        home_cfg.pin_bit_mask = (1ULL << static_cast<uint32_t>(pins_.home_pin_no))
+                               | (1ULL << static_cast<uint32_t>(pins_.home_pin_nc));
+        home_cfg.mode = GPIO_MODE_INPUT;
+        home_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+        home_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        home_cfg.intr_type = GPIO_INTR_DISABLE;
+        ESP_RETURN_ON_ERROR(gpio_config(&home_cfg), TAG, "failed to configure home sensor pins");
+    }
 
     // Create the global multi-axis segment queue.
     s_multi_axis_queue = xQueueCreate(MULTI_AXIS_QUEUE_DEPTH, sizeof(multi_axis_block_t));
@@ -165,6 +177,7 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
     payload->last_rx_type     = last_rx_type_;
     payload->last_result      = last_result_;
     payload->protocol_version = SPI_MSG_VERSION;
+    payload->lateral_endstop_state = readLateralEndstopState();
 
     // Read last_executed_sequence_ under spinlock (written by Core 1 executor).
     portENTER_CRITICAL(const_cast<portMUX_TYPE*>(&exec_seq_mux_));
@@ -251,6 +264,9 @@ esp_err_t CommInterface::handleStepBlock(const StepBlockPayload& payload)
     if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!isLateralMovementAllowed(payload.axis_id)) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (payload.step_count > STEP_BLOCK_SIZE) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -270,6 +286,9 @@ esp_err_t CommInterface::handleSegmentBlock(const SegmentBlockPayload& payload)
 {
     if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (!isLateralMovementAllowed(payload.axis_id)) {
+        return ESP_ERR_INVALID_STATE;
     }
     if (payload.segment_count > SEGMENT_BLOCK_SIZE) {
         return ESP_ERR_INVALID_SIZE;
@@ -405,6 +424,32 @@ void CommInterface::notifySegmentExecuted(uint16_t motion_seq)
     portEXIT_CRITICAL(&exec_seq_mux_);
 }
 
+uint8_t CommInterface::readLateralEndstopState() const
+{
+    if (pins_.home_pin_no == GPIO_NUM_NC || pins_.home_pin_nc == GPIO_NUM_NC) {
+        return static_cast<uint8_t>(LateralEndstopState::ABSENT);
+    }
+
+    const int no_state = gpio_get_level(pins_.home_pin_no);
+    const int nc_state = gpio_get_level(pins_.home_pin_nc);
+
+    if (no_state == nc_state) {
+        return static_cast<uint8_t>(LateralEndstopState::ABSENT);
+    }
+    if (no_state == 0 && nc_state == 1) {
+        return static_cast<uint8_t>(LateralEndstopState::PRESENT_CLOSED);
+    }
+    return static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+}
+
+bool CommInterface::isLateralMovementAllowed(uint8_t axis_id) const
+{
+    if (axis_id != 1) {
+        return true;
+    }
+    return readLateralEndstopState() == static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+}
+
 esp_err_t CommInterface::handleFrame(const SpiMessageHeader& header, const uint8_t* payload)
 {
     switch (static_cast<SpiMessageType>(header.msg_type)) {
@@ -524,6 +569,8 @@ void CommInterface::spiTask(void* arg)
             self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_LENGTH);
         } else if (err == ESP_ERR_NOT_SUPPORTED) {
             self->last_result_ = static_cast<uint8_t>(SpiMessageResult::UNKNOWN_TYPE);
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            self->last_result_ = static_cast<uint8_t>(SpiMessageResult::ENDSTOP_BLOCKED);
         } else {
             self->last_result_ = static_cast<uint8_t>(SpiMessageResult::INTERNAL_ERROR);
             ESP_LOGW(TAG, "message 0x%02X failed: %s",
@@ -591,6 +638,11 @@ void CommInterface::multiAxisExecutorTask(void* arg)
 
             const multi_axis_segment_t& seg = block.segments[s];
 
+            // Read the lateral endstop state once per segment.
+            const uint8_t lateral_state = self->readLateralEndstopState();
+            const bool lateral_blocked =
+                lateral_state != static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+
             // Distribute constant-rate steps to each axis.
             for (uint8_t a = 0; a < block.axis_count; ++a) {
                 const uint8_t axis_id = block.axis_ids[a];
@@ -599,6 +651,12 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     continue;
                 }
                 if (seg.step_counts[a] == 0) {
+                    continue;
+                }
+                if (axis_id == 1 && lateral_blocked) {
+                    ESP_LOGW(TAG,
+                             "axis1 blocked by lateral endstop state 0x%02X, skipping %u steps",
+                             lateral_state, seg.step_counts[a]);
                     continue;
                 }
 
@@ -616,7 +674,8 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                 const uint8_t axis_id = block.axis_ids[a];
                 if (axis_id < self->n_motors_ &&
                         self->queues_[axis_id] != nullptr &&
-                        seg.step_counts[a] > 0) {
+                        seg.step_counts[a] > 0 &&
+                        !(axis_id == 1 && lateral_blocked)) {
                     self->queues_[axis_id]->kickStart();
                 }
             }

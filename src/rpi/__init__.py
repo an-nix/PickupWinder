@@ -11,3 +11,5 @@ from .messages import (
 from .ramp import RampConfig, RampBlockGenerator
 from .spi_transport import Esp32SpiTransport
 from .streamer import MultiAxisRampStreamer, StreamAxisConfig
+from .axis import Axis
+from .axis_controller import AxisController, AxisControllerError
