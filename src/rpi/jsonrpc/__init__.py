@@ -14,10 +14,12 @@ from .protocol import (
     make_response,
     parse_json_rpc,
 )
-from .server import UnixJsonRpcServer
+from .rpc_server import UnixJsonRpcServer
+from .rpc_server_async import AsyncUnixJsonRpcServer
 
 __all__ = [
     "UnixJsonRpcServer",
+    "AsyncUnixJsonRpcServer",
     "UnixJsonRpcClient",
     "RpcHandler",
     "AppRpcHandler",
