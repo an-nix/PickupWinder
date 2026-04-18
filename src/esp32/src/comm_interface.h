@@ -112,6 +112,11 @@ private:
      */
     void notifySegmentExecuted(uint16_t motion_seq);
 
+    /**
+     * @brief Handle an ENABLE_ENDSTOP (0x14) frame.
+     */
+    esp_err_t handleEnableEndstop(const EnableEndstopPayload& payload);
+
     /** Core 0 SPI slave task. */
     static void spiTask(void* arg);
 

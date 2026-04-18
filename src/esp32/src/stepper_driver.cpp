@@ -62,6 +62,15 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         return 0;
     }
 
+    // Check for endstop trigger — stop immediately without emitting any
+    // further step pulses. The ring is NOT reset here; emergencyStop() is
+    // called from the executor task after it detects endstop_active_.
+    if (drv->endstop_active_) {
+        drv->rmt_stopped_ = true;
+        *done = true;
+        return 0;
+    }
+
     // Ring empty — emit one LOW-level pause chunk, arm stop, and let the
     // next callback terminate the transmission.
     if (rd == wr) {
@@ -175,6 +184,84 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         }
     }
     return PART_SIZE;
+}
+
+// ---------------------------------------------------------------------------
+// endstopIsrHandler()  — GPIO ISR, IRAM_ATTR
+// ---------------------------------------------------------------------------
+//
+// Fires on any edge of either endstop contact (NO or NC).
+// Validates the dual-contact NO/NC logic to guard against noise and cable breaks:
+//   NO=0, NC=1 → endstop CLOSED (triggered) → set endstop_active_
+//   NO=1, NC=0 → endstop OPEN  (released)   → clear endstop_active_
+//   NO==NC      → ABSENT or cable break       → fail-safe: set endstop_active_
+//
+// arg = StepperDriver* (owns all needed state — no CommInterface dependency).
+
+void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
+{
+    StepperDriver* drv = static_cast<StepperDriver*>(arg);
+
+    if (!drv->isEndstopArmed()) {
+        return;
+    }
+
+    const int no_lvl = gpio_get_level(drv->endstop_no_pin_);
+    const int nc_lvl = gpio_get_level(drv->endstop_nc_pin_);
+
+    const bool triggered = (no_lvl == 0 && nc_lvl == 1) || (no_lvl == nc_lvl);
+
+    if (triggered) {
+        drv->endstop_active_ = true;
+        // Wake the executor task so it drains the pipeline immediately.
+        BaseType_t woken = pdFALSE;
+        if (drv->executor_task_ != nullptr) {
+            vTaskNotifyGiveFromISR(drv->executor_task_, &woken);
+        }
+        if (woken) portYIELD_FROM_ISR();
+    } else {
+        // Endstop released — clear flag.
+        // Host must re-arm via SPI ENABLE_ENDSTOP before the next move.
+        drv->endstop_active_ = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// initEndstopIsr()
+// ---------------------------------------------------------------------------
+
+esp_err_t StepperDriver::initEndstopIsr(gpio_num_t no_pin, gpio_num_t nc_pin)
+{
+    if (no_pin == GPIO_NUM_NC || nc_pin == GPIO_NUM_NC) {
+        ESP_LOGI(TAG, "motor%u: endstop pins not configured — ISR not installed",
+                 motor_id_);
+        return ESP_OK;
+    }
+
+    endstop_no_pin_ = no_pin;
+    endstop_nc_pin_ = nc_pin;
+
+    // gpio_install_isr_service returns ESP_ERR_INVALID_STATE if already called.
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "motor%u: gpio_install_isr_service failed: %s",
+                 motor_id_, esp_err_to_name(err));
+        return err;
+    }
+
+    const gpio_num_t pins[2] = { no_pin, nc_pin };
+    for (gpio_num_t pin : pins) {
+        ESP_RETURN_ON_ERROR(
+            gpio_set_intr_type(pin, GPIO_INTR_ANYEDGE),
+            TAG, "gpio_set_intr_type failed for pin %d", (int)pin);
+        ESP_RETURN_ON_ERROR(
+            gpio_isr_handler_add(pin, &StepperDriver::endstopIsrHandler, this),
+            TAG, "gpio_isr_handler_add failed for pin %d", (int)pin);
+    }
+
+    ESP_LOGI(TAG, "motor%u: endstop ISR installed NO=GPIO%d NC=GPIO%d",
+             motor_id_, (int)no_pin, (int)nc_pin);
+    return ESP_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -391,12 +478,25 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
         last_dir_ = new_dir;
     }
 
+    // If the endstop already fired before we even start writing, abort.
+    if (endstop_active_) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     for (uint32_t i = 0; i < count; i++) {
         // Back-pressure: wait until the encoder ISR has consumed at least one
         // chunk and notified this producer task. This avoids a CPU1 spin loop
         // and keeps the task watchdog satisfied.
         while (ringFree() == 0) {
+            // The endstop ISR also notifies this task.  If it fires while we
+            // are blocked here, break out immediately instead of spinning.
+            if (endstop_active_) {
+                return ESP_ERR_INVALID_STATE;
+            }
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            if (endstop_active_) {
+                return ESP_ERR_INVALID_STATE;
+            }
         }
 
         uint32_t ticks = block.steps[i].interval_ticks;

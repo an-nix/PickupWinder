@@ -6,24 +6,14 @@ import json
 import time
 from typing import Iterator, List
 
-try:  # pragma: no cover - import mode depends on how the script is started
-    from .messages import (
+from transport.messages import (
         MultiAxisSegment,
         MultiAxisSegmentBlockPayload,
         SpiMessageResult,
         SpiMessageType,
     )
-    from .ramp import AxisMotionConfig, MultiAxisSegmentGenerator, RampConfig
-    from .spi_transport import Esp32SpiTransport
-except ImportError:  # pragma: no cover - direct script execution fallback
-    from messages import (  # type: ignore
-        MultiAxisSegment,
-        MultiAxisSegmentBlockPayload,
-        SpiMessageResult,
-        SpiMessageType,
-    )
-    from ramp import AxisMotionConfig, MultiAxisSegmentGenerator, RampConfig  # type: ignore
-    from spi_transport import Esp32SpiTransport  # type: ignore
+from motion.ramp import AxisMotionConfig, MultiAxisSegmentGenerator, RampConfig
+from transport.spi_transport import Esp32SpiTransport
 
 
 @dataclass(slots=True)

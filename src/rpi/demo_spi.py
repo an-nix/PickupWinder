@@ -9,14 +9,9 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-try:  # pragma: no cover - import mode depends on how the script is started
-    from .ramp import RampConfig
-    from .spi_transport import Esp32SpiTransport
-    from .streamer import MultiAxisRampStreamer, StreamAxisConfig
-except ImportError:  # pragma: no cover - direct script execution fallback
-    from ramp import RampConfig  # type: ignore
-    from spi_transport import Esp32SpiTransport  # type: ignore
-    from streamer import MultiAxisRampStreamer, StreamAxisConfig  # type: ignore
+from motion import RampConfig
+from transport import Esp32SpiTransport
+from transport import MultiAxisRampStreamer, StreamAxisConfig
 
 
 @dataclass(slots=True)

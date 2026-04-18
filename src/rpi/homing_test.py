@@ -10,10 +10,10 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from axis import Axis
-from homing import LateralHomingConfig, home_lateral_axis
-from spi_transport import Esp32SpiTransport
-from messages import (
+from motion.axis import Axis
+from motion.homing import LateralHomingConfig, home_lateral_axis
+from transport import Esp32SpiTransport
+from transport import (
     LATERAL_ENDSTOP_ABSENT,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
     LATERAL_ENDSTOP_PRESENT_OPEN,

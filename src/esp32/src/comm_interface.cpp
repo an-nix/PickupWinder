@@ -138,6 +138,15 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     ESP_RETURN_ON_FALSE(rc == pdPASS, ESP_ERR_NO_MEM, TAG,
                         "failed to create multi_exec task");
 
+    // Delegate endstop ISR registration to the lateral axis driver (axis 1).
+    // StepperDriver owns endstop_active_ and executor_task_, so the ISR
+    // can act without going through CommInterface.
+    if (n_motors_ >= 2 && queues_[1] != nullptr) {
+        ESP_RETURN_ON_ERROR(
+            queues_[1]->driver().initEndstopIsr(pins_.home_pin_no, pins_.home_pin_nc),
+            TAG, "initEndstopIsr failed");
+    }
+
     ESP_LOGI(TAG, "SPI slave ready  MOSI=%d MISO=%d SCLK=%d CS=%d  frame=%uB",
              (int)pins_.mosi, (int)pins_.miso, (int)pins_.sclk, (int)pins_.cs,
              (unsigned)SPI_FRAME_SIZE);
@@ -180,6 +189,15 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
     payload->last_result      = last_result_;
     payload->protocol_version = SPI_MSG_VERSION;
     payload->lateral_endstop_state = readLateralEndstopState();
+
+    payload->endstop_armed_mask = 0;
+    for (uint8_t axis = 0; axis < SPI_MAX_AXES; ++axis) {
+        if (axis < n_motors_ && queues_[axis] != nullptr) {
+            if (queues_[axis]->driver().isEndstopArmed()) {
+                payload->endstop_armed_mask |= static_cast<uint8_t>(1U << axis);
+            }
+        }
+    }
 
     // Read last_executed_sequence_ under spinlock (written by Core 1 executor).
     portENTER_CRITICAL(const_cast<portMUX_TYPE*>(&exec_seq_mux_));
@@ -260,6 +278,22 @@ esp_err_t CommInterface::handleResetStats()
         if (queues_[axis] != nullptr) {
             queues_[axis]->driver().resetUnderrunCount();
         }
+    }
+    return ESP_OK;
+}
+
+esp_err_t CommInterface::handleEnableEndstop(const EnableEndstopPayload& payload)
+{
+    if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    StepperDriver& drv = queues_[payload.axis_id]->driver();
+    if (payload.arm) {
+        drv.armEndstop();
+        ESP_LOGI(TAG, "endstop armed on axis %u", payload.axis_id);
+    } else {
+        drv.disarmEndstop();
+        ESP_LOGI(TAG, "endstop disarmed on axis %u", payload.axis_id);
     }
     return ESP_OK;
 }
@@ -514,6 +548,13 @@ esp_err_t CommInterface::handleFrame(const SpiMessageHeader& header, const uint8
             return ESP_ERR_INVALID_SIZE;
         }
         return handleFlush(*reinterpret_cast<const FlushPayload*>(payload));
+
+    case SpiMessageType::ENABLE_ENDSTOP:
+        if (header.payload_length != sizeof(EnableEndstopPayload)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        return handleEnableEndstop(
+            *reinterpret_cast<const EnableEndstopPayload*>(payload));
 
     default:
         return ESP_ERR_NOT_SUPPORTED;
@@ -784,6 +825,27 @@ void CommInterface::multiAxisExecutorTask(void* arg)
 
                 const multi_axis_segment_t& seg = block.segments[s];
 
+                // Check endstop state before writing steps for this segment.
+                // If the endstop fired (ISR already stopped the RMT), drain the
+                // queue and notify the host -- do not write more steps.
+                for (uint8_t ea = 0; ea < block.axis_count; ++ea) {
+                    const uint8_t eid = block.axis_ids[ea];
+                    if (eid >= self->n_motors_ ||
+                            self->queues_[eid] == nullptr) {
+                        continue;
+                    }
+                    if (self->queues_[eid]->driver().endstop_active_) {
+                        while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
+                        self->queues_[eid]->driver().emergencyStop();
+                        self->notifySegmentExecuted(seg.motion_sequence);
+                        ESP_LOGW(TAG, "endstop triggered on axis %u at seg seq=%u",
+                                 eid, seg.motion_sequence);
+                        did_flush = true;
+                        break;
+                    }
+                }
+                if (did_flush) break;
+
                 // Read the lateral endstop state once per segment.
                 const uint8_t lateral_state = self->readLateralEndstopState();
                 const bool lateral_blocked =
@@ -808,10 +870,19 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     const bool direction = ((seg.direction_mask >> a) & 1u) != 0;
                     esp_err_t err = self->queues_[axis_id]->executeConstantRateBlock(
                         direction, seg.step_counts[a], seg.duration_us);
-                    if (err != ESP_OK) {
+                    if (err == ESP_ERR_INVALID_STATE) {
+                        // Endstop fired mid-segment — flush queue and stop.
+                        ESP_LOGW(TAG, "axis %u seg %u: endstop fired mid-segment, flushing",
+                                 axis_id, s);
+                        while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
+                        self->queues_[axis_id]->driver().emergencyStop();
+                        self->notifySegmentExecuted(seg.motion_sequence);
+                        did_flush = true;
+                    } else if (err != ESP_OK) {
                         ESP_LOGW(TAG, "axis %u seg %u: executeConstantRateBlock: %s",
                                  axis_id, s, esp_err_to_name(err));
                     }
+                    if (did_flush) break;
                 }
 
                 // ── Schedule deferred notification ────────────────────────────

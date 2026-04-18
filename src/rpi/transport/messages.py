@@ -24,6 +24,7 @@ _MULTI_AXIS_SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<HBB")
 _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HHH")
 _STEP_COUNT_STRUCT = struct.Struct("<H")
 _FLUSH_STRUCT = struct.Struct("<H2x")
+_ENABLE_ENDSTOP_STRUCT = struct.Struct("<BB2x")
 _STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBBH2x")
 
 
@@ -39,6 +40,7 @@ class SpiMessageType(IntEnum):
     SEGMENT_BLOCK = 0x11
     FLUSH = 0x12
     MULTI_AXIS_SEGMENT_BLOCK = 0x13
+    ENABLE_ENDSTOP = 0x14
     PING = 0x7F
     STATUS = 0x80
 
@@ -227,6 +229,15 @@ class FlushPayload:
 
 
 @dataclass(slots=True)
+class EnableEndstopPayload:
+    axis_id: int
+    arm: bool  # True = arm, False = disarm
+
+    def pack(self) -> bytes:
+        return _ENABLE_ENDSTOP_STRUCT.pack(self.axis_id, int(self.arm))
+
+
+@dataclass(slots=True)
 class StatusPayload:
     uptime_ms: int
     queue_free_slots: tuple[int, int, int, int]
@@ -357,3 +368,7 @@ def make_multi_axis_segment_block(payload: MultiAxisSegmentBlockPayload, sequenc
 
 def make_flush(payload: FlushPayload, sequence: int = 0) -> bytes:
     return build_frame(SpiMessageType.FLUSH, payload.pack(), sequence=sequence)
+
+
+def make_enable_endstop(payload: EnableEndstopPayload, sequence: int = 0) -> bytes:
+    return build_frame(SpiMessageType.ENABLE_ENDSTOP, payload.pack(), sequence=sequence)

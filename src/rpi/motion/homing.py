@@ -9,17 +9,31 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from messages import (
-    LATERAL_ENDSTOP_ABSENT,
-    LATERAL_ENDSTOP_PRESENT_CLOSED,
-    LATERAL_ENDSTOP_PRESENT_OPEN,
-    MultiAxisSegment,
-    MultiAxisSegmentBlockPayload,
-    SpiMessageResult,
-)
-from spi_transport import Esp32SpiTransport
-from axis import Axis
-from axis_controller import AxisController, AxisControllerError
+# Support both package imports and direct file execution
+if __package__:
+    from rpi.transport.messages import (
+        LATERAL_ENDSTOP_ABSENT,
+        LATERAL_ENDSTOP_PRESENT_CLOSED,
+        LATERAL_ENDSTOP_PRESENT_OPEN,
+        MultiAxisSegment,
+        MultiAxisSegmentBlockPayload,
+        SpiMessageResult,
+    )
+    from rpi.transport.spi_transport import Esp32SpiTransport
+    from rpi.motion.axis import Axis
+    from rpi.motion.axis_controller import AxisController, AxisControllerError
+else:
+    from transport.messages import (
+        LATERAL_ENDSTOP_ABSENT,
+        LATERAL_ENDSTOP_PRESENT_CLOSED,
+        LATERAL_ENDSTOP_PRESENT_OPEN,
+        MultiAxisSegment,
+        MultiAxisSegmentBlockPayload,
+        SpiMessageResult,
+    )
+    from transport.spi_transport import Esp32SpiTransport
+    from motion.axis import Axis
+    from motion.axis_controller import AxisController, AxisControllerError
 
 
 @dataclass(slots=True)
@@ -48,6 +62,9 @@ def home_lateral_axis(transport: Esp32SpiTransport, config: LateralHomingConfig)
         )
 
     controller = AxisController(axis=config.axis, transport=transport, poll_interval_s=config.poll_interval_s)
+    # Arm the hardware endstop ISR on the ESP32 so the motor stops within
+    # microseconds of contact rather than waiting for the next SPI status poll.
+    transport.arm_endstop(axis_id=config.axis.axis_id)
     try:
         controller.home(
             steps_per_attempt=config.steps_per_attempt,
@@ -58,6 +75,10 @@ def home_lateral_axis(transport: Esp32SpiTransport, config: LateralHomingConfig)
         )
     except AxisControllerError as exc:
         raise LateralHomingError(str(exc)) from exc
+    finally:
+        # Always disarm after homing (success or failure) to prevent the ISR
+        # from stopping unexpected future moves.
+        transport.disarm_endstop(axis_id=config.axis.axis_id)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

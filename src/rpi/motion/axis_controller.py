@@ -9,8 +9,10 @@ from typing import Iterable
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from axis import Axis
-from messages import (
+# Support both package imports and direct file execution
+if __package__:
+    from rpi.motion.axis import Axis
+    from rpi.transport.messages import (
     LATERAL_ENDSTOP_ABSENT,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
     LATERAL_ENDSTOP_PRESENT_OPEN,
@@ -18,7 +20,7 @@ from messages import (
     MultiAxisSegmentBlockPayload,
     SpiMessageResult,
 )
-from spi_transport import Esp32SpiTransport
+from transport.spi_transport import Esp32SpiTransport
 
 
 class AxisControllerError(RuntimeError):

@@ -3,18 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterator, List, Union
 
-try:  # pragma: no cover - import mode depends on how the script is started
-    from .messages import (
-        SEGMENT_BLOCK_SIZE,
-        STEP_BLOCK_SIZE,
-        MotionSegment,
-        MultiAxisSegment,
-        SegmentBlockPayload,
-        StepBlockPayload,
-        StepEntry,
-    )
-except ImportError:  # pragma: no cover - direct script execution fallback
-    from messages import (  # type: ignore
+from transport.messages import (
         SEGMENT_BLOCK_SIZE,
         STEP_BLOCK_SIZE,
         MotionSegment,

@@ -53,6 +53,8 @@ enum class SpiMessageType : uint8_t {
      * All axes share the same duration_us; steps may differ per axis.
      */
     MULTI_AXIS_SEGMENT_BLOCK = 0x13,
+    /** Arm or disarm the hardware endstop on a given axis. */
+    ENABLE_ENDSTOP           = 0x14,
     PING                     = 0x7F,
 
     STATUS                   = 0x80,
@@ -163,6 +165,14 @@ struct __attribute__((packed)) FlushPayload {
 
 static_assert(sizeof(FlushPayload) == 4, "FlushPayload must be 4 bytes");
 
+struct __attribute__((packed)) EnableEndstopPayload {
+    uint8_t axis_id;  ///< axis to arm/disarm
+    uint8_t arm;      ///< 1 = arm, 0 = disarm
+    uint8_t reserved[2];
+};
+
+static_assert(sizeof(EnableEndstopPayload) == 4, "EnableEndstopPayload must be 4 bytes");
+
 /**
  * @brief Per-axis step count entry inside a MultiAxisSegmentEntry.
  *
@@ -216,6 +226,8 @@ struct __attribute__((packed)) StatusPayload {
     uint8_t  enabled_mask;
     uint8_t  running_mask;
     uint8_t lateral_endstop_state;
+    /** Bit N = 1 means axis N endstop is armed (will stop motion on trigger). */
+    uint8_t endstop_armed_mask;
     /**
      * Motion sequence of the most recently fully-executed multi-axis segment.
      * The host uses this to compute how much future motion is still buffered
@@ -227,10 +239,12 @@ struct __attribute__((packed)) StatusPayload {
      * and read by the SPI task (Core 0) — both must access it atomically.
      */
     uint16_t last_executed_sequence;
-    uint8_t  reserved[2];
+    uint8_t  reserved[1];
 };
 
 static_assert(sizeof(StatusPayload) == 48, "StatusPayload must be 48 bytes");
+static_assert(sizeof(StatusPayload) <= SPI_MAX_PAYLOAD_SIZE,
+              "StatusPayload exceeds SPI_MAX_PAYLOAD_SIZE");
 
 // ---------------------------------------------------------------------------
 // CRC16-CCITT-FALSE

@@ -2,48 +2,30 @@ from __future__ import annotations
 
 import time
 
-try:  # pragma: no cover - import mode depends on how the script is started
-    from .messages import (
-        SPI_FRAME_SIZE,
-        SpiMessageType,
-        SpiMessageResult,
-        StatusPayload,
-        MultiAxisSegmentBlockPayload,
-        SegmentBlockPayload,
-        StepBlockPayload,
-        FlushPayload,
-        make_disable_all,
-        make_enable_axis,
-        make_estop,
-        make_flush,
-        make_get_status,
-        make_reset_stats,
-        make_segment_block,
-        make_step_block,
-        make_stop_axis,
-        make_multi_axis_segment_block,
-        parse_status_frame,
-    )
-except ImportError:  # pragma: no cover - direct script execution fallback
-    from messages import (  # type: ignore
-        SPI_FRAME_SIZE,
-        SpiMessageType,
-        SpiMessageResult,
-        StatusPayload,
-        MultiAxisSegmentBlockPayload,
-        SegmentBlockPayload,
-        StepBlockPayload,
-        make_disable_all,
-        make_enable_axis,
-        make_estop,
-        make_get_status,
-        make_reset_stats,
-        make_segment_block,
-        make_step_block,
-        make_stop_axis,
-        make_multi_axis_segment_block,
-        parse_status_frame,
-    )
+
+from transport.messages import (
+    SPI_FRAME_SIZE,
+    SpiMessageType,
+    SpiMessageResult,
+    StatusPayload,
+    MultiAxisSegmentBlockPayload,
+    SegmentBlockPayload,
+    StepBlockPayload,
+    FlushPayload,
+    EnableEndstopPayload,
+    make_disable_all,
+    make_enable_axis,
+    make_estop,
+    make_flush,
+    make_enable_endstop,
+    make_get_status,
+    make_reset_stats,
+    make_segment_block,
+    make_step_block,
+    make_stop_axis,
+    make_multi_axis_segment_block,
+    parse_status_frame,
+)
 
 
 class Esp32SpiTransport:
@@ -167,6 +149,18 @@ class Esp32SpiTransport:
 
     def flush_until(self, sequence: int) -> StatusPayload:
         return self.transfer_frame(make_flush(FlushPayload(flush_sequence=sequence), self._next_sequence()))
+
+    def arm_endstop(self, axis_id: int) -> StatusPayload:
+        """Send ENABLE_ENDSTOP to arm the hardware endstop ISR on *axis_id*."""
+        return self.transfer_frame(
+            make_enable_endstop(EnableEndstopPayload(axis_id=axis_id, arm=True), self._next_sequence())
+        )
+
+    def disarm_endstop(self, axis_id: int) -> StatusPayload:
+        """Send ENABLE_ENDSTOP to disarm the hardware endstop ISR on *axis_id*."""
+        return self.transfer_frame(
+            make_enable_endstop(EnableEndstopPayload(axis_id=axis_id, arm=False), self._next_sequence())
+        )
 
     def wait_for_queue_space(self, axis_id: int, *, minimum_free_blocks: int = 1, poll_interval_s: float = 0.001) -> StatusPayload:
         while True:

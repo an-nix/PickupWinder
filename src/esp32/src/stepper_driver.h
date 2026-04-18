@@ -171,6 +171,41 @@ public:
     /** Register the multi-axis executor task handle for ring-low wakeups. */
     void setExecutorTask(TaskHandle_t t) { executor_task_ = t; }
 
+    /**
+     * @brief Set by the GPIO endstop ISR when contact is detected.
+     * Read by encode_steps() in ISR context to stop the RMT immediately.
+     * Cleared by the host via SPI ENABLE_ENDSTOP command or when the
+     * endstop sensor returns to open state.
+     * Declared volatile because it is written from ISR and read from both
+     * ISR and task contexts without a lock.
+     */
+    volatile bool endstop_active_ {false};
+
+    /** @brief Arm the endstop — ISR will stop motion on trigger. */
+    void armEndstop()   { endstop_active_ = false; endstop_armed_ = true;  }
+
+    /** @brief Disarm the endstop — ISR will not stop motion on trigger.
+     *  Use during intentional clearance moves commanded by the host. */
+    void disarmEndstop() { endstop_armed_ = false; }
+
+    /** @brief True if the endstop is currently armed. */
+    bool isEndstopArmed() const { return endstop_armed_; }
+
+    /** @brief True if the endstop is currently triggered. */
+    bool isEndstopActive() const { return endstop_active_; }
+
+    /**
+     * @brief Install GPIO edge-triggered ISR on the NO/NC endstop pins.
+     *
+     * Called once from CommInterface::init() after the driver is ready.
+     * Stores the pin numbers so the static ISR can access them via the
+     * driver pointer without touching CommInterface state.
+     *
+     * @param no_pin  GPIO of the Normally-Open contact  (GPIO_NUM_NC = skip).
+     * @param nc_pin  GPIO of the Normally-Closed contact (GPIO_NUM_NC = skip).
+     */
+    esp_err_t initEndstopIsr(gpio_num_t no_pin, gpio_num_t nc_pin);
+
     // Incremented in ISR each time encode_steps() finds the ring empty
     // and emits a pause chunk before stopping the transaction. Use to detect
     // pipeline starvation at runtime.
@@ -190,6 +225,11 @@ private:
     volatile bool         rmt_running_ {false};
     bool                  last_dir_    {true};
     bool                  enabled_     {false};
+    volatile bool         endstop_armed_  {false};
+
+    /** Endstop pin numbers — set by initEndstopIsr(), read by endstopIsrHandler(). */
+    gpio_num_t            endstop_no_pin_ {GPIO_NUM_NC};
+    gpio_num_t            endstop_nc_pin_ {GPIO_NUM_NC};
 
     /** @brief Number of free slots in the ring buffer. */
     uint32_t ringFree() const {
@@ -200,6 +240,13 @@ private:
     static bool on_trans_done_isr(rmt_channel_handle_t tx_chan,
                                   const rmt_tx_done_event_data_t* edata,
                                   void* user_ctx);
+
+    /**
+     * @brief GPIO ISR — fires on any edge of either endstop pin (NO or NC).
+     * arg = StepperDriver* that owns the endstop.
+     * Validates NO/NC logic and sets endstop_active_ for sub-100 µs RMT stop.
+     */
+    static void IRAM_ATTR endstopIsrHandler(void* arg);
 };
 
 /**
