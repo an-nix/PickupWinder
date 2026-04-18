@@ -6,8 +6,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+# Ensure the parent directory is added to sys.path for proper imports
 if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from axis import Axis
 from homing import LateralHomingConfig, home_lateral_axis
@@ -24,7 +25,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bus", type=int, default=0, help="Bus SPI à utiliser (par défaut 0)")
     parser.add_argument("--device", type=int, default=0, help="Device SPI à utiliser (par défaut 0)")
     parser.add_argument("--speed-hz", type=int, default=4_000_000, help="Vitesse SPI en Hz")
-    parser.add_argument("--steps-per-attempt", type=int, default=20, help="Nombre de pas envoyés par tentative de homing")
+    parser.add_argument("--steps-per-attempt", type=int, default=32, help="Nombre de pas envoyés par tentative de homing")
     parser.add_argument(
         "--duration-us",
         type=int,

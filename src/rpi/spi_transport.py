@@ -199,3 +199,31 @@ class Esp32SpiTransport:
                 f"type=0x{status.last_rx_type:02X}"
             )
         return status
+
+    def send_multi_axis_segment_block_with_backpressure(
+        self,
+        payload: MultiAxisSegmentBlockPayload,
+        *,
+        minimum_free_blocks: int = 1,
+        poll_interval_s: float = 0.001,
+    ) -> StatusPayload:
+        # Wait until MCU reports enough free queue slots for the first axis
+        # in the block (single-axis homing uses axis_ids[0]).
+        axis_id = payload.axis_ids[0]
+        self.wait_for_queue_space(axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
+
+        sequence, _ = self.send_multi_axis_segment_block_request(payload)
+        status = self.wait_for_request_result(sequence, poll_interval_s=poll_interval_s)
+
+        while status.last_result == int(SpiMessageResult.QUEUE_FULL):
+            time.sleep(poll_interval_s)
+            self.wait_for_queue_space(axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
+            sequence, _ = self.send_multi_axis_segment_block_request(payload)
+            status = self.wait_for_request_result(sequence, poll_interval_s=poll_interval_s)
+
+        if status.last_result != int(SpiMessageResult.OK):
+            raise RuntimeError(
+                f"multi-axis segment block request seq={sequence} failed with result=0x{status.last_result:02X} "
+                f"type=0x{status.last_rx_type:02X}"
+            )
+        return status
