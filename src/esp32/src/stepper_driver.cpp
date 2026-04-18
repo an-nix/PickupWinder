@@ -379,7 +379,17 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
 
     const bool new_dir = block.steps[0].direction;
     bool need_toggle = (new_dir != last_dir_);
-    last_dir_ = new_dir;
+
+    // If the ring is empty and the motor is idle, explicitly set the DIR pin
+    // to the requested direction now. This avoids relying on the initial
+    // `last_dir_` state and ensures reverse mode is applied on the first block.
+    if (!rmt_running_ && ring_read_ == ring_write_ && need_toggle) {
+        gpio_set_level(dir_pin_, new_dir ? 1 : 0);
+        last_dir_ = new_dir;
+        need_toggle = false;
+    } else {
+        last_dir_ = new_dir;
+    }
 
     for (uint32_t i = 0; i < count; i++) {
         // Back-pressure: wait until the encoder ISR has consumed at least one
