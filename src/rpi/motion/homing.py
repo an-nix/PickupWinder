@@ -1,39 +1,21 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-# Support both package imports and direct file execution
-if __package__:
-    from rpi.transport.messages import (
-        LATERAL_ENDSTOP_ABSENT,
-        LATERAL_ENDSTOP_PRESENT_CLOSED,
-        LATERAL_ENDSTOP_PRESENT_OPEN,
-        MultiAxisSegment,
-        MultiAxisSegmentBlockPayload,
-        SpiMessageResult,
-    )
-    from rpi.transport.spi_transport import Esp32SpiTransport
-    from rpi.motion.axis import Axis
-    from rpi.motion.axis_controller import AxisController, AxisControllerError
-else:
-    from transport.messages import (
-        LATERAL_ENDSTOP_ABSENT,
-        LATERAL_ENDSTOP_PRESENT_CLOSED,
-        LATERAL_ENDSTOP_PRESENT_OPEN,
-        MultiAxisSegment,
-        MultiAxisSegmentBlockPayload,
-        SpiMessageResult,
-    )
-    from transport.spi_transport import Esp32SpiTransport
-    from motion.axis import Axis
-    from motion.axis_controller import AxisController, AxisControllerError
+from transport.messages import (
+    LATERAL_ENDSTOP_ABSENT,
+    LATERAL_ENDSTOP_PRESENT_CLOSED,
+    LATERAL_ENDSTOP_PRESENT_OPEN,
+    MultiAxisSegment,
+    MultiAxisSegmentBlockPayload,
+    SpiMessageResult,
+)
+from transport.spi_transport import Esp32SpiTransport
+from motion.axis import Axis
+from motion.axis_controller import AxisController, AxisControllerError
 
 
 @dataclass(slots=True)

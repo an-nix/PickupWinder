@@ -5,14 +5,17 @@ import time
 from pathlib import Path
 
 from domain import AppConfiguration
+from winding import WinderApp
 from jsonrpc import AppRpcHandler, UnixJsonRpcServer
 
 
 def main() -> int:
     config = AppConfiguration()
+    app = WinderApp(config)
+    app.start()
 
     socket_path = Path(config.rpc_socket_path)
-    server = UnixJsonRpcServer(str(socket_path), AppRpcHandler(config))
+    server = UnixJsonRpcServer(str(socket_path), AppRpcHandler(app))
     server.start()
 
     print(f"JSON-RPC server listening on {socket_path}")
@@ -25,6 +28,7 @@ def main() -> int:
         print("Shutting down JSON-RPC server...")
     finally:
         server.stop()
+        app.stop()
 
     return 0
 

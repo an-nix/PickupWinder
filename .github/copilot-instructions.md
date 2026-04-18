@@ -138,6 +138,7 @@ Status response:
 - Motion planning belongs on host (`ramp.py` / kinematics modules).
 - Host should stream **MULTI_AXIS_SEGMENT_BLOCK** messages for production use.
 - `MAX_INFLIGHT_SEGMENTS = 24` in `streamer.py` — do not raise above 24.
+- For `src/rpi` host code, prefer absolute bare imports such as `from motion import ...`, `from transport import ...`, `from domain import ...`; do not use `rpi.*` or conditional relative imports in this folder.
 
 ### 5.3 Protocol
 

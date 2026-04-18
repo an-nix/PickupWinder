@@ -1,24 +1,21 @@
 from __future__ import annotations
 
-import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterable
 
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-# Support both package imports and direct file execution
-if __package__:
-    from rpi.motion.axis import Axis
-    from rpi.transport.messages import (
+from motion.axis import Axis
+from motion.ramp import RampConfig
+from motion.streaming_manager import StreamingManager
+from transport import StreamAxisConfig, MultiAxisRampStreamer
+from transport.messages import (
     LATERAL_ENDSTOP_ABSENT,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
     LATERAL_ENDSTOP_PRESENT_OPEN,
     MultiAxisSegment,
     MultiAxisSegmentBlockPayload,
     SpiMessageResult,
+    StatusPayload,
 )
 from transport.spi_transport import Esp32SpiTransport
 
@@ -38,6 +35,12 @@ class AxisController:
     axis: Axis
     transport: Esp32SpiTransport
     poll_interval_s: float = 0.01
+    streaming_manager: StreamingManager = None  # type: ignore
+
+    def __post_init__(self) -> None:
+        if self.streaming_manager is None:
+            self.streaming_manager = StreamingManager()
+
 
     def can_move(self) -> bool:
         return self.axis.can_move
@@ -176,3 +179,42 @@ class AxisController:
             time.sleep(self.poll_interval_s)
 
         raise AxisControllerError("Homing failed: endstop never closed")
+
+    def run_ramp(self, duration_s: float, target_rpm: float) -> dict[str, int | float]:
+        if duration_s <= 0.0:
+            raise AxisControllerError("duration_s must be positive")
+        if target_rpm <= 0.0:
+            raise AxisControllerError("target_rpm must be positive")
+
+        accel_s = min(0.5, duration_s * 0.25)
+        decel_s = accel_s
+        cruise_s = max(duration_s - accel_s - decel_s, 0.0)
+
+        ramp = RampConfig(
+            axis_id=self.axis.axis_id,
+            target_rpm=target_rpm,
+            accel_s=accel_s,
+            cruise_s=cruise_s,
+            decel_s=decel_s,
+        )
+        stream_axis = StreamAxisConfig(axis_id=self.axis.axis_id, ramp=ramp)
+        streamer = MultiAxisRampStreamer(
+            self.transport,
+            [stream_axis],
+            poll_interval_s=self.poll_interval_s,
+            print_every=1,
+        )
+
+        # Start streaming in background thread to avoid blocking the JSON-RPC handler
+        session_id = self.streaming_manager.stream_async(
+            streamer,
+            name=f"axis{self.axis.axis_id}_ramp",
+        )
+
+        return {
+            "axis_id": self.axis.axis_id,
+            "duration_s": duration_s,
+            "target_rpm": target_rpm,
+            "session_id": session_id,
+            "status": "streaming_started",
+        }
