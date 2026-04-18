@@ -98,8 +98,8 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(motor_b.init());
 
     // ── 2. Enable motor drivers ─────────────────────────────────────────────
-    motor_a.enable();
-    motor_b.enable();
+    //motor_a.enable();
+    //motor_b.enable();
 
     // ── 3. Launch executor tasks (Core 1, priority 24) ──────────────────────
     ESP_ERROR_CHECK(queue_a.init());
