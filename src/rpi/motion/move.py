@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Iterator
 
@@ -110,6 +110,12 @@ class BaseMove(ABC):
         """
         ...
 
+    @property
+    @abstractmethod
+    def axis_ids(self) -> list[int]:
+        """List of axis IDs involved in this move."""
+        ...
+
 
 class Move(BaseMove, ABC):
     """
@@ -125,6 +131,11 @@ class Move(BaseMove, ABC):
     def segments(self) -> Iterator[MultiAxisSegment]:
         """Yield segments to be sent to the firmware."""
         ...
+
+    @property
+    def axis_configs(self) -> list[AxisMotionConfig] | None:
+        """Optional public exposure of axis configs for streamer construction."""
+        return None
 
 
 class CompositeMove(BaseMove, ABC):
@@ -188,6 +199,14 @@ class RampMove(Move):
             segment_duration_s=self._config.segment_duration_s,
         )
         yield from gen
+
+    @property
+    def axis_ids(self) -> list[int]:
+        return [cfg.axis_id for cfg in self._config.axis_configs]
+
+    @property
+    def axis_configs(self) -> list[AxisMotionConfig]:
+        return self._config.axis_configs
 
     def expected_delta_steps(self, axis_id: int) -> int | None:
         # Total steps = integral of hz over time. For position tracking
@@ -334,6 +353,10 @@ class HomingMove(CompositeMove):
     def expected_delta_steps(self, axis_id: int) -> int | None:
         return None  # Position is set explicitly after homing completes.
 
+    @property
+    def axis_ids(self) -> list[int]:
+        return [self.axis_id]
+
 
 class JogMove(Move):
     """
@@ -396,6 +419,14 @@ class JogMove(Move):
             return None
         return -self._steps if self._reverse else self._steps
 
+    @property
+    def axis_ids(self) -> list[int]:
+        return [self.axis_id]
+
+    @property
+    def axis_configs(self) -> list[AxisMotionConfig]:
+        return self._config.axis_configs
+
 
 class WoundMove(Move):
     """
@@ -440,4 +471,8 @@ class WoundMove(Move):
 
     def expected_delta_steps(self, axis_id: int) -> int | None:
         return None
+
+    @property
+    def axis_ids(self) -> list[int]:
+        return [self.spindle_cfg.axis_index, self.traverse_cfg.axis_index]
 

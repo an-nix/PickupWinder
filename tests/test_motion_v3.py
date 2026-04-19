@@ -14,6 +14,7 @@ from motion.scatter_engine import ScatterEngine
 from motion.move import WoundMove
 from motion.syncrhonized_segment_generator import SyncAxisConfig
 from winding.program import WindingProgram
+from core.config import AppConfiguration
 
 
 @pytest.mark.parametrize(
@@ -33,6 +34,31 @@ def test_trapezoidal_turns_at_deceleration(time_s: float, expected_turns: float)
     )
 
     assert pytest.approx(profile.turns_at(time_s), rel=1e-6) == expected_turns
+
+
+def test_trapezoidal_turns_clamp_beyond_total_duration():
+    profile = TrapezoidalMotionProfile(
+        start_rpm=0.0,
+        target_rpm=600.0,
+        accel_s=1.0,
+        cruise_s=1.0,
+        decel_s=1.0,
+    )
+    total = profile.total_duration
+    assert profile.turns_at(0.0) == 0.0
+    assert pytest.approx(profile.turns_at(total + 1e-9), rel=1e-12) == profile.turns_at(total)
+
+
+def test_trapezoidal_deceleration_non_negative_with_nonzero_start_rpm():
+    profile = TrapezoidalMotionProfile(
+        start_rpm=300.0,
+        target_rpm=600.0,
+        accel_s=0.5,
+        cruise_s=0.5,
+        decel_s=0.5,
+    )
+    assert profile.rps_at(profile.total_duration) >= 0.0
+    assert profile.turns_at(profile.total_duration) >= 0.0
 
 
 def test_spindle_kinematics_validates_after_dataclass_init():
@@ -110,3 +136,12 @@ def test_wound_move_rejects_duplicate_axis_indices():
             spindle_cfg=spindle_cfg,
             traverse_cfg=traverse_cfg,
         )
+
+
+def test_app_config_spindle_accel_unit_conversion_rpm_per_s_to_steps_per_s2():
+    cfg = AppConfiguration(
+        spindle_steps_per_revolution=200,
+        spindle_microstepping=32,
+        spindle_max_acceleration_rpm=600.0,
+    )
+    assert cfg.spindle_max_acceleration_steps_per_s2 == 64000.0

@@ -15,7 +15,9 @@ class AppConfiguration:
     spindle_microstepping: int = 32
     spindle_invert_direction: bool = False
     spindle_max_speed_rpm: int = 1500
+    # Unit: RPM/s (revolutions per minute gained per second).
     spindle_max_acceleration_rpm: Optional[float] = 10
+    # Unit: RPM/s (revolutions per minute lost per second).
     spindle_max_deceleration_rpm: Optional[float] = None
 
     lateral_axis_id: int = 1
@@ -23,7 +25,9 @@ class AppConfiguration:
     lateral_microstepping: int = 32
     lateral_invert_direction: bool = False
     lateral_max_rpm: int = 1000
+    # Unit: mm/s² on traverse axis.
     lateral_max_acceleration_mm_per_s2: Optional[float] = None
+    # Unit: mm/s² on traverse axis.
     lateral_max_deceleration_mm_per_s2: Optional[float] = None
     
     # Leadscrew/traverse pitch in mm per revolution for the lateral axis.
@@ -48,7 +52,7 @@ class AppConfiguration:
     def spindle_max_acceleration_steps_per_s2(self) -> float:
         """Compute spindle acceleration in steps/s^2.
 
-        Uses `spindle_max_acceleration_rpm` if provided.
+        Uses `spindle_max_acceleration_rpm` (RPM/s) if provided.
         Otherwise returns a safe default.
         """
         steps_per_rev = self.spindle_steps_per_revolution * self.spindle_microstepping
@@ -60,7 +64,7 @@ class AppConfiguration:
     def spindle_max_deceleration_steps_per_s2(self) -> float:
         """Compute spindle deceleration in steps/s^2.
 
-        Uses `spindle_max_deceleration_rpm` if provided. Otherwise falls back
+        Uses `spindle_max_deceleration_rpm` (RPM/s) if provided. Otherwise falls back
         to the configured spindle acceleration limit.
         """
         steps_per_rev = self.spindle_steps_per_revolution * self.spindle_microstepping

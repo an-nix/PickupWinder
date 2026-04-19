@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -39,6 +39,8 @@ class WindingProgram:
     bobbin_width_mm: float = 15.0
     scatter_amplitude_mm: float = 0.0
     scatter_damping_margin_mm: float = 0.0
+    scatter_freq1: float = 1.0
+    scatter_freq2: float = 1.618
     accel_s: float = 0.5
     decel_s: float = 0.5
     spindle_axis_id: int = 0
@@ -65,6 +67,10 @@ class WindingProgram:
             raise ValueError("scatter_amplitude_mm must be >= 0")
         if self.scatter_damping_margin_mm < 0.0:
             raise ValueError("scatter_damping_margin_mm must be >= 0")
+        if self.scatter_freq1 <= 0.0:
+            raise ValueError("scatter_freq1 must be positive")
+        if self.scatter_freq2 <= 0.0:
+            raise ValueError("scatter_freq2 must be positive")
         if self.accel_s < 0.0 or self.decel_s < 0.0:
             raise ValueError("accel_s and decel_s must be >= 0")
         if self.lateral_steps_per_mm <= 0.0:
@@ -73,22 +79,6 @@ class WindingProgram:
     @property
     def turns_per_mm(self) -> float:
         return 1.0 / self.layer_pitch_mm
-
-    def lateral_rpm_for_layer(self) -> float:
-        """
-        Compute the lateral traverse speed in RPM needed to advance
-        layer_pitch_mm per spindle revolution.
-
-        lateral_speed_mm_s = spindle_rps * layer_pitch_mm
-        lateral_rpm = lateral_speed_mm_s * 60 / (2π * lateral_radius_mm)
-
-        Since we work in steps/mm directly:
-        lateral_hz = spindle_hz * layer_pitch_mm * lateral_steps_per_mm
-        lateral_rpm = lateral_hz / (200 * 32) * 60
-        """
-        spindle_hz = self.spindle_rpm / 60.0
-        lateral_hz = spindle_hz * self.layer_pitch_mm * self.lateral_steps_per_mm
-        return (lateral_hz / (200.0 * 32.0)) * 60.0
 
     def layer_duration_s(self) -> float:
         """
@@ -119,8 +109,9 @@ class WindingProgram:
             "turns_per_mm": self.turns_per_mm,
             "scatter_amplitude_mm": self.scatter_amplitude_mm,
             "scatter_damping_margin_mm": self.scatter_damping_margin_mm,
+            "scatter_freq1": self.scatter_freq1,
+            "scatter_freq2": self.scatter_freq2,
             "accel_s": self.accel_s,
             "decel_s": self.decel_s,
-            "lateral_rpm": self.lateral_rpm_for_layer(),
             "layer_duration_s": self.layer_duration_s(),
         }

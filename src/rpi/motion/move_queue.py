@@ -6,7 +6,8 @@ from collections import deque
 from typing import Any
 
 from motion.axis_state import AxisState
-from motion.move import BaseMove, CompositeMove, HomingMove, Move, MoveState, RampMove
+from motion.move import BaseMove, CompositeMove, HomingMove, Move, WoundMove
+from motion.ramp_config import RampConfig
 from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
 from transport.spi_transport import Esp32SpiTransport
 
@@ -138,8 +139,12 @@ class MoveQueue:
         try:
             if isinstance(move, CompositeMove):
                 self._execute_homing(move)  # type: ignore[arg-type]
+            elif isinstance(move, WoundMove):
+                self._execute_wound_move(move)
+            elif isinstance(move, Move):
+                self._execute_ramp_move(move)
             else:
-                self._execute_ramp_move(move)  # type: ignore[arg-type]
+                move.mark_failed(f"unsupported move type: {type(move).__name__}")
         except Exception as exc:
             move.mark_failed(str(exc))
 
@@ -173,9 +178,13 @@ class MoveQueue:
     def _execute_ramp_move(self, move: Move) -> None:
         """Execute a RampMove or JogMove via MultiAxisRampStreamer."""
         move.mark_running()
-        axis_configs = getattr(move, "_config", None)
-        axis_configs = axis_configs.axis_configs if axis_configs is not None else []
-        axis_ids = [cfg.axis_id for cfg in axis_configs]
+        axis_configs = move.axis_configs
+        if not axis_configs:
+            move.mark_failed(
+                f"{type(move).__name__} has no axis_configs; use _execute_wound_move for synchronized moves"
+            )
+            return
+        axis_ids = move.axis_ids
 
         streamer = self._make_streamer(axis_configs)
         # Override the generator to use the move's segments() method, but align
@@ -211,6 +220,70 @@ class MoveQueue:
 
         move.mark_completed()
 
+    def _make_wound_streamer(self, move: WoundMove) -> MultiAxisRampStreamer:
+        spindle_steps_per_unit = max(1, int(round(move.spindle_cfg.steps_per_unit)))
+        traverse_steps_per_unit = max(1, int(round(move.traverse_cfg.steps_per_unit)))
+
+        spindle_ramp = RampConfig(
+            axis_id=move.spindle_cfg.axis_index,
+            steps_per_rev=spindle_steps_per_unit,
+            target_rpm=max(move.kinematics.target_rpm, 1.0),
+            accel_s=max(move.kinematics.accel_s, 0.0),
+            cruise_s=max(move.kinematics.cruise_s, 0.0),
+            decel_s=max(move.kinematics.decel_s, 0.0),
+            reverse_direction=move.spindle_cfg.reverse_direction,
+        )
+        traverse_ramp = RampConfig(
+            axis_id=move.traverse_cfg.axis_index,
+            steps_per_rev=traverse_steps_per_unit,
+            target_rpm=max(move.kinematics.target_rpm, 1.0),
+            accel_s=max(move.kinematics.accel_s, 0.0),
+            cruise_s=max(move.kinematics.cruise_s, 0.0),
+            decel_s=max(move.kinematics.decel_s, 0.0),
+            reverse_direction=move.traverse_cfg.reverse_direction,
+        )
+        return MultiAxisRampStreamer(
+            self._transport,
+            [
+                StreamAxisConfig(axis_id=move.spindle_cfg.axis_index, ramp=spindle_ramp),
+                StreamAxisConfig(axis_id=move.traverse_cfg.axis_index, ramp=traverse_ramp),
+            ],
+            poll_interval_s=self._poll_interval_s,
+            print_every=self._print_every,
+            target_buffer_time_s=0.150,
+        )
+
+    def _execute_wound_move(self, move: WoundMove) -> None:
+        """Execute a WoundMove with explicit spindle/traverse streamer setup."""
+        move.mark_running()
+        axis_ids = move.axis_ids
+
+        streamer = self._make_wound_streamer(move)
+        streamer._generator = self._wrap_segment_sequence(
+            move.segments(),
+            self._next_motion_sequence(),
+        )
+        streamer._generator_finished = False
+
+        try:
+            streamer.stream_all()
+        except Exception as exc:
+            move.mark_failed(str(exc))
+            return
+
+        if streamer.endstop_triggered:
+            for ax_id in axis_ids:
+                if ax_id in self._axis_states:
+                    self._axis_states[ax_id].invalidate_position()
+            move.mark_aborted("endstop triggered", by_endstop=True)
+            return
+
+        if self._stop_requested:
+            move.mark_aborted("stop requested")
+            return
+
+        move.mark_completed()
+
     def _execute_homing(self, move: HomingMove) -> None:
         """
         Execute a HomingMove phase by phase.
@@ -234,7 +307,14 @@ class MoveQueue:
             self._transport.enable_endstop_request(move.axis_id, arm=arm_endstop)
 
             # Execute the sub-move.
-            streamer = self._make_streamer(sub_move._config.axis_configs)
+            sub_move_axis_configs = sub_move.axis_configs
+            if not sub_move_axis_configs:
+                self._transport.enable_endstop_request(move.axis_id, arm=False)
+                move.mark_failed(
+                    f"homing sub-move {phase_name} has no public axis_configs"
+                )
+                return
+            streamer = self._make_streamer(sub_move_axis_configs)
             streamer._generator = self._wrap_segment_sequence(
                 sub_move.segments(),
                 self._next_motion_sequence(),

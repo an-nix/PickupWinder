@@ -136,6 +136,8 @@ class WindingEngine:
         turns_per_mm: float,
         scatter_amplitude_mm: float = 0.0,
         scatter_damping_margin_mm: float = 0.0,
+        scatter_freq1: float = 1.0,
+        scatter_freq2: float = 1.618,
         spindle_reverse: bool = False,
         traverse_reverse: bool = False,
     ) -> None:
@@ -182,6 +184,8 @@ class WindingEngine:
             ),
             scatter=ScatterEngine(
                 amplitude_mm=scatter_amplitude_mm,
+                freq1=scatter_freq1,
+                freq2=scatter_freq2,
                 damping_margin_mm=scatter_damping_margin_mm,
             ),
             spindle_cfg=SyncAxisConfig(
@@ -457,6 +461,8 @@ class WindingEngine:
             ),
             scatter=ScatterEngine(
                 amplitude_mm=program.scatter_amplitude_mm,
+                freq1=program.scatter_freq1,
+                freq2=program.scatter_freq2,
                 damping_margin_mm=program.scatter_damping_margin_mm,
             ),
             spindle_cfg=SyncAxisConfig(

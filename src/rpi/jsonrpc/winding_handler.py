@@ -96,6 +96,8 @@ class WindingRpcHandler:
         decel_s: float | None = None,
         scatter_amplitude_mm: float = 0.0,
         scatter_damping_margin_mm: float = 0.0,
+        scatter_freq1: float = 1.0,
+        scatter_freq2: float = 1.618,
         spindle_reverse: bool = False,
         traverse_reverse: bool = False,
     ) -> dict[str, Any]:
@@ -111,6 +113,8 @@ class WindingRpcHandler:
             turns_per_mm=turns_per_mm,
             scatter_amplitude_mm=scatter_amplitude_mm,
             scatter_damping_margin_mm=scatter_damping_margin_mm,
+            scatter_freq1=scatter_freq1,
+            scatter_freq2=scatter_freq2,
             spindle_reverse=spindle_reverse,
             traverse_reverse=traverse_reverse,
         )
