@@ -68,6 +68,10 @@ class WindingEngine:
         self._program_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
+    @property
+    def config(self) -> AppConfiguration:
+        return self._config
+
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def start(self) -> None:

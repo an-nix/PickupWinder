@@ -17,14 +17,56 @@ from motion.winding_pattern import WindingPattern
 from motion.scatter_engine import ScatterEngine
 from motion.move import HomingMove, WoundMove
 from motion.axis_state import AxisState
+from motion.ramp_config import RampConfig
 from motion.move_queue import MoveQueue
 from motion.synchronized_segment_generator import SyncAxisConfig
 from motion.engine import WindingEngine
-from transport.streamer import MultiAxisRampStreamer
+from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
 from winding.program import WindingProgram
 from core.config import AppConfiguration
 from core.events import EventBus
 from core.shared_state import SharedState
+
+
+def test_motion_public_import_does_not_emit_deprecation_warning():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        from motion import AxisMotionConfig as ImportedAxisMotionConfig
+
+    assert ImportedAxisMotionConfig is not None
+    assert not any(issubclass(item.category, DeprecationWarning) for item in caught)
+
+
+def test_streamer_set_generator_replaces_generator_and_resets_finished_state():
+    class FakeTransport:
+        def get_status(self):
+            return SimpleNamespace(last_executed_sequence=0xFFFF)
+
+    streamer = MultiAxisRampStreamer(
+        transport=FakeTransport(),
+        axis_streams=[StreamAxisConfig(axis_id=0, ramp=RampConfig(target_rpm=300.0))],
+    )
+    original = streamer._generator
+    streamer._generator_finished = True
+
+    replacement = iter([SimpleNamespace(axis_steps=[0], duration_us=1000, direction_mask=0)])
+    streamer.set_generator(replacement)
+
+    assert streamer._generator is replacement
+    assert streamer._generator is not original
+    assert streamer._generator_finished is False
+
+
+def test_engine_exposes_public_config_property():
+    config = AppConfiguration()
+    engine = WindingEngine(
+        transport=SimpleNamespace(),
+        shared_state=SharedState(axis_states={}),
+        event_bus=EventBus(),
+        config=config,
+    )
+
+    assert engine.config is config
 
 
 @pytest.mark.parametrize(
@@ -227,6 +269,10 @@ def test_execute_homing_waits_for_endstop_request_confirmation(monkeypatch):
             self._generator = None
             self._generator_finished = False
 
+        def set_generator(self, generator) -> None:
+            self._generator = generator
+            self._generator_finished = False
+
         def stream_all(self) -> int:
             return 0
 
@@ -268,6 +314,10 @@ def test_execute_wound_move_invalidates_positions_on_stop_requested(monkeypatch)
             self._generator_finished = False
             self.endstop_triggered = False
             self._queue = queue
+
+        def set_generator(self, generator) -> None:
+            self._generator = generator
+            self._generator_finished = False
 
         def stream_all(self) -> int:
             self._queue._stop_requested = True

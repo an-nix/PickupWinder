@@ -12,8 +12,14 @@ class UnixJsonRpcClient:
     def __init__(self, socket_path: str, timeout_s: float = 5.0) -> None:
         self.socket_path = Path(socket_path)
         self.timeout_s = timeout_s
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
 
     def call(self, method: str, params: Any | None = None, request_id: int = 1) -> Any:
+        if self._closed:
+            raise RuntimeError("JSON-RPC client is closed")
         payload = {
             "jsonrpc": JSONRPC_VERSION,
             "method": method,
@@ -31,6 +37,8 @@ class UnixJsonRpcClient:
         return self._parse_response(response)
 
     def notify(self, method: str, params: Any | None = None) -> None:
+        if self._closed:
+            raise RuntimeError("JSON-RPC client is closed")
         payload = {
             "jsonrpc": JSONRPC_VERSION,
             "method": method,

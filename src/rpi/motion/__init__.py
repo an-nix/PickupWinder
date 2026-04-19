@@ -25,10 +25,10 @@ def __getattr__(name: str):
         from .ramp_config import compute_ramp_times
         return compute_ramp_times
     if name == "AxisMotionConfig":
-        from .ramp import AxisMotionConfig
+        from .multi_axis_segment_generator import AxisMotionConfig
         return AxisMotionConfig
     if name == "MultiAxisSegmentGenerator":
-        from .ramp import MultiAxisSegmentGenerator
+        from .multi_axis_segment_generator import MultiAxisSegmentGenerator
         return MultiAxisSegmentGenerator
     if name == "SpindleKinematics":
         from .spindle_kinematics import SpindleKinematics

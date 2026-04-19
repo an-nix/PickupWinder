@@ -195,11 +195,12 @@ class MoveQueue:
         streamer = self._make_streamer(axis_configs)
         # Override the generator to use the move's segments() method, but align
         # motion_sequence values with the ESP32 last_executed_sequence.
-        streamer._generator = self._wrap_segment_sequence(
-            move.segments(),
-            self._next_motion_sequence(),
+        streamer.set_generator(
+            self._wrap_segment_sequence(
+                move.segments(),
+                self._next_motion_sequence(),
+            )
         )
-        streamer._generator_finished = False
 
         try:
             streamer.stream_all()
@@ -247,11 +248,12 @@ class MoveQueue:
         axis_ids = move.axis_ids
 
         streamer = self._make_wound_streamer(move)
-        streamer._generator = self._wrap_segment_sequence(
-            move.segments(),
-            self._next_motion_sequence(),
+        streamer.set_generator(
+            self._wrap_segment_sequence(
+                move.segments(),
+                self._next_motion_sequence(),
+            )
         )
-        streamer._generator_finished = False
 
         try:
             streamer.stream_all()
@@ -309,11 +311,12 @@ class MoveQueue:
                 )
                 return
             streamer = self._make_streamer(sub_move_axis_configs)
-            streamer._generator = self._wrap_segment_sequence(
-                sub_move.segments(),
-                self._next_motion_sequence(),
+            streamer.set_generator(
+                self._wrap_segment_sequence(
+                    sub_move.segments(),
+                    self._next_motion_sequence(),
+                )
             )
-            streamer._generator_finished = False
             streamer.stream_all()
 
             if phase_name in ("approach", "search") and not streamer.endstop_triggered:

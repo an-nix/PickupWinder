@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 import json
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from transport.messages import (
     MULTI_AXIS_SEGMENT_BLOCK_SIZE,
@@ -16,6 +17,8 @@ from transport.messages import (
 )
 from motion import AxisMotionConfig, MultiAxisSegmentGenerator, RampConfig
 from transport.spi_transport import Esp32SpiTransport
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -253,10 +256,10 @@ class MultiAxisRampStreamer:
 
         if pqf < 16 and not self._planner_under_pressure:
             self._planner_under_pressure = True
-            print(f"[{self._timestamp()}] planner pressure: planner_queue_free={pqf} (< 16)")
+            logger.debug("planner pressure: planner_queue_free=%s (< 16)", pqf)
         elif pqf > 64 and self._planner_under_pressure:
             self._planner_under_pressure = False
-            print(f"[{self._timestamp()}] planner recovered: planner_queue_free={pqf} (> 64)")
+            logger.debug("planner recovered: planner_queue_free=%s (> 64)", pqf)
 
         # During prefill we bypass the pressure gate so the host can seed a deep buffer.
         if self._prefilling:
@@ -313,6 +316,15 @@ class MultiAxisRampStreamer:
             return requested_time_s
         safe_time_s = (self.STEP_RING_CAPACITY * self.RING_BUFFER_HEADROOM) / max_hz
         return max(self.MIN_BUFFER_TIME_S, min(requested_time_s, safe_time_s))
+
+    def set_generator(self, generator: Iterator[MultiAxisSegment]) -> None:
+        """Override the segment generator for this streamer.
+
+        Call before stream_all() when the segments are produced externally
+        (e.g. by a WoundMove or RampMove).
+        """
+        self._generator = generator
+        self._generator_finished = False
 
     def _sync_with_firmware_status(self) -> None:
         """Synchronize stream state with the ESP32's last executed sequence."""
@@ -374,11 +386,11 @@ class MultiAxisRampStreamer:
                 self._premature_notify_count = 0
                 self._premature_notify_window_start = now
             self._premature_notify_count += 1
-            print(
-                f"[{self._timestamp()}] WARNING premature completion: "
-                f"got seq={received_sequence} but last sent={self._last_sent_motion_seq} "
-                f"— ESP32 reported completion before host sent this segment "
-                f"(count={self._premature_notify_count})"
+            logger.warning(
+                "premature completion: got seq=%s but last sent=%s — ESP32 reported completion before host sent this segment (count=%s)",
+                received_sequence,
+                self._last_sent_motion_seq,
+                self._premature_notify_count,
             )
 
         # Advance confirmed pointer only when sequence strictly increases.
@@ -411,11 +423,11 @@ class MultiAxisRampStreamer:
 
         elapsed = time.time() - self._last_sequence_advance_time
         if elapsed > self._stall_timeout_s:
-            print(
-                f"[{self._timestamp()}] WARNING motor stall detected: "
-                f"last_executed_sequence={received_sequence} unchanged for "
-                f"{elapsed:.1f}s with {len(self._inflight)} segments in flight "
-                f"— requesting stop and flush"
+            logger.warning(
+                "motor stall detected: last_executed_sequence=%s unchanged for %.1fs with %s segments in flight — requesting stop and flush",
+                received_sequence,
+                elapsed,
+                len(self._inflight),
             )
             self.request_stop()
             self.request_flush(self._last_sent_motion_seq)
@@ -459,10 +471,14 @@ class MultiAxisRampStreamer:
         }
         self._send_events.append(event)
         if self._log_each_send:
-            print(
-                f"[{event['timestamp_str']}] send tx_seq={transport_seq} "
-                f"motion_seq={segment.sequence} duration_us={segment.duration_us} "
-                f"total_steps={event['total_steps']} result=0x{event['last_result']:02X}"
+            logger.debug(
+                "[%s] send tx_seq=%s motion_seq=%s duration_us=%s total_steps=%s result=0x%02X",
+                event["timestamp_str"],
+                transport_seq,
+                segment.sequence,
+                segment.duration_us,
+                event["total_steps"],
+                event["last_result"],
             )
 
     def _write_send_log(self) -> None:
@@ -671,13 +687,14 @@ class MultiAxisRampStreamer:
                     cycle_segments_sent += n
                     total_segments += n
                     if total_segments % self._print_every == 0:
-                        print(
-                            f"[{self._timestamp()}] segments={total_segments} "
-                            f"buffered={self._buffered_time_s*1000:.1f}ms "
-                            f"inflight={len(self._inflight)} "
-                            f"queue_free={status.queue_free_slots} "
-                            f"ring_free={status.ring_free_slots} "
-                            f"underrun={status.underrun_count}"
+                        logger.debug(
+                            "segments=%s buffered=%.1fms inflight=%s queue_free=%s ring_free=%s underrun=%s",
+                            total_segments,
+                            self._buffered_time_s * 1000.0,
+                            len(self._inflight),
+                            status.queue_free_slots,
+                            status.ring_free_slots,
+                            status.underrun_count,
                         )
 
                 if self._flush_sequence_requested is not None:
@@ -695,9 +712,7 @@ class MultiAxisRampStreamer:
                 try:
                     self._disable_axes()
                 except Exception as exc:
-                    print(
-                        f"[{self._timestamp()}] WARNING failed to disable axes: {exc}"
-                    )
+                    logger.error("failed to disable axes: %s", exc)
 
         self._write_send_log()
         return total_segments

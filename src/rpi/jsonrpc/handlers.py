@@ -69,7 +69,7 @@ class AppRpcHandler(RpcHandler):
     def config(self) -> dict[str, Any]:
         if self.app is None:
             return {}
-        cfg = getattr(self.app, "_config", None) or getattr(self.app, "config", None)
+        cfg = getattr(self.app, "config", None) or getattr(self.app, "_config", None)
         if cfg is None:
             return {}
 
