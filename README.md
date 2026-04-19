@@ -5,51 +5,77 @@ Automated/assisted guitar pickup coil winding.
 - **Host**: Raspberry Pi (Python)
 - **MCU**: ESP32 (ESP-IDF / FreeRTOS)
 - **Link**: SPI full-duplex, fixed 512-byte frames
-- **Motion transport**: compressed arithmetic segments (`SEGMENT_BLOCK`)
+- **Motion transport**: compressed multi-axis segment blocks (`MULTI_AXIS_SEGMENT_BLOCK`)
 
-## Current runtime model
+## Architecture overview
 
-The active motion path is:
+The host is the motion planner and stream controller. The ESP32 is a deterministic executor.
 
-1. Host computes trajectory.
-2. Host sends `SEGMENT_BLOCK` messages (compact segments).
-3. ESP32 expands segments into `step_block_t` chunks locally.
-4. RMT `simple_encoder` streams step pulses.
+- `src/rpi/main.py`: application entry point launching the JSON-RPC server.
+- `src/rpi/core/app.py`: `WinderApp`, host state, and background streaming session manager.
+- `src/rpi/transport/spi_transport.py`: SPI frame transport wrapper for request/response exchanges.
+- `src/rpi/transport/streamer.py`: deterministic streamer that sends motion segments and maintains a modest look-ahead buffer.
+- `src/rpi/transport/messages.py`: frame and payload packing/unpacking.
+- `src/rpi/motion/ramp.py`: motion segment generation for axis ramps.
 
-Legacy `STEP_BLOCK` (explicit per-step entries) is still supported for debug,
-but the production path is segment mode.
+## Runtime flow
 
-## Protocol summary (current)
+1. The host computes motion segments from `RampConfig`.
+2. The host sends `MULTI_AXIS_SEGMENT_BLOCK` frames over SPI.
+3. The ESP32 receives segments, enqueues them, expands them to step timing, and streams pulses through RMT.
+4. The host polls status and keeps the MCU queue/ring filled without overflowing it.
 
-Protocol definitions:
-
-- `src/esp32/src/messages.h`
-- `src/rpi/messages.py`
+## Protocol summary
 
 Key points:
 
 - Frame size: **512 bytes**
-- Header: 12 bytes (`magic`, `version`, `type`, `sequence`, `length`, `flags`, `crc16`)
-- CRC: **CRC16-CCITT**
-- Motion messages:
-  - `SEGMENT_BLOCK` (primary)
-  - `STEP_BLOCK` (legacy/debug)
-- Status includes queue/ring fill and underrun counters per axis
+- Header size: 12 bytes
+- CRC: **CRC16-CCITT** over header + payload
+- Primary production message: `MULTI_AXIS_SEGMENT_BLOCK`
+- Status includes queue/ring free slots, `last_executed_sequence`, `last_rx_sequence`, and execution results
+
+## Streaming semantics
+
+The host streamer maintains a small in-flight queue of sent segments and tracks buffered motion time in seconds.
+
+- Target look-ahead: ~100 ms
+- Minimum look-ahead: ~60 ms
+- Maximum in-flight segments: 24
+- The host stops sending when the MCU reports a full queue/ring or when the in-flight window is reached.
+
+## JSON-RPC client model
+
+There is no session concept in the host application. Multiple JSON-RPC clients share the same `WinderApp` instance and command the same motion pipeline.
+
+Only one motion operation can run at a time; concurrent motion requests are serialized or rejected to protect the motors and the shared SPI/ESP32 state.
+
+The JSON-RPC API exposes the shared operation state and supports graceful stop:
+
+- `winder.operation.status` — query the current shared operation.
+- `winder.operation.stop` — request a graceful stop of the active motion.
+- `winder.session.status` / `winder.session.wait` are compatibility aliases for the shared operation state.
 
 ## Build / Flash / Run
 
-ESP32:
+ESP32 firmware:
 
 ```bash
 cd src/esp32
 pio run -t upload
 ```
 
-RPi demo:
+Host app:
 
 ```bash
-cd /home/pi/winder
-python3 demo_spi.py --queue-prefill-blocks 12 --queue-low-watermark-blocks 4
+cd src/rpi
+python3 main.py
+```
+
+Default JSON-RPC socket:
+
+```bash
+/tmp/pickup_winder_rpc.sock
 ```
 
 ## Pin assignments (ESP32)

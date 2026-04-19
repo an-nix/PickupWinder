@@ -23,6 +23,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include "motion_planner.h"
+
 static const char* TAG = "comm_iface";
 
 static constexpr uint32_t  SPI_TASK_STACK  = 4096;
@@ -30,8 +32,30 @@ static constexpr UBaseType_t SPI_TASK_PRIO = 10;
 static constexpr BaseType_t  SPI_TASK_CORE = 0;
 
 static constexpr uint32_t    MULTI_EXEC_STACK  = 6144;
-static constexpr UBaseType_t MULTI_EXEC_PRIO   = 24;
+static constexpr UBaseType_t MULTI_EXEC_PRIO   = 20;
 static constexpr BaseType_t  MULTI_EXEC_CORE   = 1;
+
+/**
+ * @brief Hard wall-clock budget for one drain-loop sub-slice before the
+ *        executor unconditionally yields to the FreeRTOS scheduler.
+ *
+ * The yield is UNCONDITIONAL — it does NOT depend on ring-fill level.
+ * RMT pulse timing is in hardware, so a 1 ms scheduler sleep never
+ * introduces step jitter.
+ *
+ * NOTE: Superseded by EXEC_TIME_BUDGET_US in motion_planner.h for the
+ * state-machine executor. Retained for the per-axis executorTask in
+ * stepper_queue.cpp which still uses it indirectly.
+ */
+static constexpr int64_t  YIELD_INTERVAL_US      = 400;
+
+/**
+ * @brief Maximum queue entries drained in a single bounded flush loop.
+ *
+ * Used by handleFlush() in the SPI ingestion path only.
+ * The planner and executor have their own bounded drain constants.
+ */
+static constexpr uint32_t MAX_FLUSH_DRAIN        = 8;
 
 /**
  * @brief Global queue of multi-axis segment blocks fed by the SPI task and
@@ -126,6 +150,10 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     ESP_RETURN_ON_FALSE(rc == pdPASS, ESP_ERR_NO_MEM, TAG,
                         "failed to create comm_spi task");
 
+    // ── Planner layer: decomposes multi-axis blocks into planned segments ───
+    ESP_RETURN_ON_ERROR(planner_.init(s_multi_axis_queue, s_flush_queue),
+                        TAG, "failed to init motion planner");
+
     rc = xTaskCreatePinnedToCore(
         &CommInterface::multiAxisExecutorTask,
         "multi_exec",
@@ -199,10 +227,8 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
         }
     }
 
-    // Read last_executed_sequence_ under spinlock (written by Core 1 executor).
-    portENTER_CRITICAL(const_cast<portMUX_TYPE*>(&exec_seq_mux_));
-    payload->last_executed_sequence = last_executed_sequence_;
-    portEXIT_CRITICAL(const_cast<portMUX_TYPE*>(&exec_seq_mux_));
+    // Atomic load — lock-free cross-core read (written by Core 1 executor).
+    payload->last_executed_sequence = last_executed_sequence_.load(std::memory_order_acquire);
 
     spi_message_finalize(out_frame);
 }
@@ -368,9 +394,10 @@ esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    const auto* hdr = reinterpret_cast<const MultiAxisSegmentBlockHeader*>(payload);
-    const uint8_t axis_count     = hdr->axis_count;
-    const uint8_t segment_count  = hdr->segment_count;
+    MultiAxisSegmentBlockHeader hdr_val;
+    memcpy(&hdr_val, payload, sizeof(hdr_val));
+    const uint8_t axis_count     = hdr_val.axis_count;
+    const uint8_t segment_count  = hdr_val.segment_count;
 
     if (axis_count == 0 || axis_count > MULTI_AXIS_MAX_AXES) {
         return ESP_ERR_INVALID_ARG;
@@ -451,16 +478,14 @@ void CommInterface::notifySegmentExecuted(uint16_t motion_seq)
 {
     /*
      * Called by the executor task (Core 1) after each multi-axis segment
-     * completes.  Updates last_executed_sequence_ under the portMUX spinlock
+     * completes.  Updates last_executed_sequence_ with an atomic store
      * so the SPI task (Core 0) can safely read it in buildStatusFrame().
      *
      * Only advances the sequence — never moves it backward.  This handles
      * the 16-bit wrap-around case correctly because we only call this in
      * strict execution order.
      */
-    portENTER_CRITICAL(&exec_seq_mux_);
-    last_executed_sequence_ = motion_seq;
-    portEXIT_CRITICAL(&exec_seq_mux_);
+    last_executed_sequence_.store(motion_seq, std::memory_order_release);
 }
 
 uint8_t CommInterface::readLateralEndstopState() const
@@ -497,23 +522,32 @@ esp_err_t CommInterface::handleFrame(const SpiMessageHeader& header, const uint8
     case SpiMessageType::PING:
         return ESP_OK;
 
-    case SpiMessageType::ENABLE_AXIS:
+    case SpiMessageType::ENABLE_AXIS: {
         if (header.payload_length != sizeof(EnableAxisPayload)) {
             return ESP_ERR_INVALID_SIZE;
         }
-        return handleEnableAxis(*reinterpret_cast<const EnableAxisPayload*>(payload));
+        EnableAxisPayload p;
+        memcpy(&p, payload, sizeof(p));
+        return handleEnableAxis(p);
+    }
 
-    case SpiMessageType::ESTOP:
+    case SpiMessageType::ESTOP: {
         if (header.payload_length != sizeof(EmergencyStopPayload)) {
             return ESP_ERR_INVALID_SIZE;
         }
-        return handleEmergencyStop(*reinterpret_cast<const EmergencyStopPayload*>(payload));
+        EmergencyStopPayload p;
+        memcpy(&p, payload, sizeof(p));
+        return handleEmergencyStop(p);
+    }
 
-    case SpiMessageType::STOP_AXIS:
+    case SpiMessageType::STOP_AXIS: {
         if (header.payload_length != sizeof(EmergencyStopPayload)) {
             return ESP_ERR_INVALID_SIZE;
         }
-        return handleStopAxis(*reinterpret_cast<const EmergencyStopPayload*>(payload));
+        EmergencyStopPayload p;
+        memcpy(&p, payload, sizeof(p));
+        return handleStopAxis(p);
+    }
 
     case SpiMessageType::DISABLE_ALL:
         if (header.payload_length != 0) {
@@ -527,34 +561,45 @@ esp_err_t CommInterface::handleFrame(const SpiMessageHeader& header, const uint8
         }
         return handleResetStats();
 
-    case SpiMessageType::STEP_BLOCK:
+    case SpiMessageType::STEP_BLOCK: {
         if (header.payload_length != sizeof(StepBlockPayload)) {
             return ESP_ERR_INVALID_SIZE;
         }
-        return handleStepBlock(*reinterpret_cast<const StepBlockPayload*>(payload));
+        StepBlockPayload p;
+        memcpy(&p, payload, sizeof(p));
+        return handleStepBlock(p);
+    }
 
-    case SpiMessageType::SEGMENT_BLOCK:
+    case SpiMessageType::SEGMENT_BLOCK: {
         if (header.payload_length != sizeof(SegmentBlockPayload)) {
             return ESP_ERR_INVALID_SIZE;
         }
-        return handleSegmentBlock(*reinterpret_cast<const SegmentBlockPayload*>(payload));
+        SegmentBlockPayload p;
+        memcpy(&p, payload, sizeof(p));
+        return handleSegmentBlock(p);
+    }
 
     case SpiMessageType::MULTI_AXIS_SEGMENT_BLOCK:
         // Variable-length payload — pass raw buffer + length.
         return handleMultiAxisSegmentBlock(payload, header.payload_length);
 
-    case SpiMessageType::FLUSH:
+    case SpiMessageType::FLUSH: {
         if (header.payload_length != sizeof(FlushPayload)) {
             return ESP_ERR_INVALID_SIZE;
         }
-        return handleFlush(*reinterpret_cast<const FlushPayload*>(payload));
+        FlushPayload p;
+        memcpy(&p, payload, sizeof(p));
+        return handleFlush(p);
+    }
 
-    case SpiMessageType::ENABLE_ENDSTOP:
+    case SpiMessageType::ENABLE_ENDSTOP: {
         if (header.payload_length != sizeof(EnableEndstopPayload)) {
             return ESP_ERR_INVALID_SIZE;
         }
-        return handleEnableEndstop(
-            *reinterpret_cast<const EnableEndstopPayload*>(payload));
+        EnableEndstopPayload p;
+        memcpy(&p, payload, sizeof(p));
+        return handleEnableEndstop(p);
+    }
 
     default:
         return ESP_ERR_NOT_SUPPORTED;
@@ -644,55 +689,30 @@ void CommInterface::spiTask(void* arg)
 }
 
 // ---------------------------------------------------------------------------
-// multiAxisExecutorTask()  — Core 1, priority 24
+// multiAxisExecutorTask()  — Core 1, priority 20 — STATE MACHINE
 // ---------------------------------------------------------------------------
+//
+// Refactored from a monolithic nested-loop drain pattern into a bounded
+// state machine.  Each state transition does bounded work (≤ EXEC_TIME_BUDGET_US
+// or ≤ EXEC_BATCH_LIMIT segments) then yields to the scheduler.
+//
+//   IDLE ──► FETCH ──► DRAIN ──► RUN ──► IDLE
+//              │                          ▲
+//              ├── (flush sentinel) ──► FLUSH ──┘
+//              └── (error/underrun) ──► RECOVERY ──┘
+//
+// Watchdog safety: NO state executes for more than ~300 µs without exiting
+// to the for(;;) top-level loop which naturally yields via xQueueReceive
+// or explicit vTaskDelay(1).
 
 void CommInterface::multiAxisExecutorTask(void* arg)
 {
-    /*
-     * multiAxisExecutorTask — Core 1, priority 24.
-     *
-     * Architecture: see doc/architecture.md for the full data-flow diagram.
-     *
-     * This task implements the Klipper-style look-ahead drain pattern:
-     *
-     *   1. Block on s_multi_axis_queue until the first block of a new move
-     *      arrives (or a 1ms timeout for underrun recovery / notifications).
-     *   2. DRAIN LOOP: process the first block AND all immediately available
-     *      subsequent blocks (non-blocking xQueueReceive) into the ring buffer
-     *      WITHOUT starting the RMT.  This pre-fills the ring with as many
-     *      steps as the host has already queued, giving maximum look-ahead
-     *      depth before motion begins.
-     *   3. After the drain loop, call kickStart() ONCE on each active axis.
-     *      kickStart() calls maybeStartDriver(force=true) which starts the RMT
-     *      if and only if buffered_steps >= PART_SIZE (16).
-     *
-     * WHY the drain loop is necessary:
-     *   At low speed during acceleration, each segment contains only 2–5 steps.
-     *   Without the drain loop, the RMT starts after one block (~33 steps),
-     *   consuming them in <1 ms before the next FreeRTOS scheduling tick.
-     *   With the drain loop, the ring accumulates steps from all queued blocks
-     *   before the RMT starts, providing sufficient buffer depth.
-     *
-     * Deferred notifications keep the host's _buffered_time_s accurate
-     * WITHOUT blocking the executor.  Blocking until the ring drains starved
-     * the ring and caused underruns because no new steps were written while
-     * the executor waited.
-     *
-     * motor_timeline_us is a cumulative wall-clock "finish time" for the last
-     * segment pushed to the ring.  Each new segment advances it by duration_us.
-     * If the executor was idle (motor_timeline_us drifted into the past) it
-     * clamps to esp_timer_get_time() so notifications don't accumulate stale.
-     */
     auto* self = static_cast<CommInterface*>(arg);
-    multi_axis_block_t block;
-    flush_request_t    flush_req;
 
-    ESP_LOGI(TAG, "multi-axis executor started on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "multi-axis executor (state machine) started on core %d",
+             xPortGetCoreID());
 
-    // FIX 7: Register this task as the executor task on every driver so that
-    // the ISR ring-space notification (encode_steps / on_trans_done_isr) also
-    // wakes this task — not just whichever task last called pushBlock.
+    // Register this task for ISR ring-space wakeups on all drivers.
     {
         TaskHandle_t my_handle = xTaskGetCurrentTaskHandle();
         for (uint8_t a = 0; a < self->n_motors_; ++a) {
@@ -702,224 +722,304 @@ void CommInterface::multiAxisExecutorTask(void* arg)
         }
     }
 
-    // ── Deferred notification ring ────────────────────────────────────────────
-    // Capacity must be a power of 2 and exceed MAX_INFLIGHT_SEGMENTS (32).
-    static const int DEFER_DEPTH = 64;
+    // ── Segment queue handle from the planner ─────────────────────────────
+    QueueHandle_t seg_queue = self->planner_.segmentQueue();
+
+    // ── Deferred notification ring ────────────────────────────────────────
+    static constexpr int DEFER_DEPTH = 64;
     int64_t  defer_fire_us[DEFER_DEPTH];
     uint32_t defer_seqs[DEFER_DEPTH];
-    int      defer_head = 0;   // next entry to fire
-    int      defer_tail = 0;   // next slot to write
-    int64_t  motor_timeline_us = 0;  // cumulative finish time of last scheduled seg
+    int      defer_head = 0;
+    int      defer_tail = 0;
 
-    // ── Active axis tracking ──────────────────────────────────────────────────
-    // Maintained across blocks so the timeout-path recovery check knows which
-    // axes to restart after an RMT underrun.
+    // ── Active axis tracking (persists across iterations for recovery) ────
     uint8_t active_axis_ids[MULTI_AXIS_MAX_AXES] = {};
     uint8_t active_axis_count = 0;
 
-    for (;;) {
-        // ── Fire any due deferred notifications ───────────────────────────────
+    // ── Batch buffer for FETCH state ──────────────────────────────────────
+    planned_segment_t batch[EXEC_BATCH_LIMIT];
+    uint32_t batch_count = 0;
+    uint32_t batch_index = 0;
+
+    // ── State machine ─────────────────────────────────────────────────────
+    ExecState state = ExecState::IDLE;
+
+    // Lambda: fire all due deferred notifications.
+    auto fireDeferred = [&]() {
+        const int64_t now = esp_timer_get_time();
         while (defer_head != defer_tail) {
             const int idx = defer_head & (DEFER_DEPTH - 1);
-            if (esp_timer_get_time() >= defer_fire_us[idx]) {
-                self->notifySegmentExecuted(static_cast<uint16_t>(defer_seqs[idx]));
+            if (now >= defer_fire_us[idx]) {
+                self->notifySegmentExecuted(
+                    static_cast<uint16_t>(defer_seqs[idx]));
                 ++defer_head;
             } else {
                 break;
             }
         }
+    };
 
-        // ── Priority 0: drain flush queue before dequeueing new motion ────────
-        if (xQueueReceive(s_flush_queue, &flush_req, 0) == pdTRUE) {
-            while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
-            // Supersede all pending deferred notifications with the flush seq.
-            defer_head = defer_tail = 0;
-            motor_timeline_us = 0;
-            self->notifySegmentExecuted(flush_req.flush_sequence);
-            ESP_LOGI(TAG, "flush completed at seq=%u",
-                     (unsigned)flush_req.flush_sequence);
-            continue;
+    // Lambda: kickStart all active axes.
+    auto kickStartActiveAxes = [&]() {
+        for (uint8_t a = 0; a < active_axis_count; ++a) {
+            const uint8_t axis_id = active_axis_ids[a];
+            if (axis_id < self->n_motors_ && self->queues_[axis_id] != nullptr) {
+                self->queues_[axis_id]->kickStart();
+            }
         }
+    };
 
-        // ── Compute wait timeout respecting next notification deadline ─────────
-        // Wake early if a notification is about to fire so we don't miss it
-        // while blocked on xQueueReceive.
-        //
-        // IMPORTANT: cap at 1 ms regardless.  If an RMT underrun occurs, the
-        // ISR fires vTaskNotifyGiveFromISR — but that wakes ulTaskNotifyTake,
-        // NOT xQueueReceive.  Without this cap the executor could sleep up to
-        // 4 ms after the motor stops, causing a noticeable stall at high speed.
-        TickType_t wait_ticks;
-        if (defer_head != defer_tail) {
-            const int idx = defer_head & (DEFER_DEPTH - 1);
-            const int64_t remaining_us = defer_fire_us[idx] - esp_timer_get_time();
-            if (remaining_us <= 500) {
-                // Within half a millisecond — fire immediately without sleeping.
-                wait_ticks = 0;
-            } else if (remaining_us < 1000) {
-                // Less than 1 ms but more than 500 µs — one tick is enough.
-                wait_ticks = 1;
+    // ── Main loop ─────────────────────────────────────────────────────────
+    for (;;) {
+        // Always fire due deferred notifications at top of loop.
+        fireDeferred();
+
+        switch (state) {
+
+        // ══════════════════════════════════════════════════════════════════
+        // IDLE: wait for segments from the planner (blocking with timeout)
+        // ══════════════════════════════════════════════════════════════════
+        case ExecState::IDLE: {
+            // Compute wait timeout: wake early if a deferred notification
+            // is about to fire.  Hard-cap at 1 ms so ISR ring-space
+            // notifications (which wake ulTaskNotifyTake, not xQueueReceive)
+            // don't cause >1 ms stalls.
+            TickType_t wait_ticks;
+            if (defer_head != defer_tail) {
+                const int idx = defer_head & (DEFER_DEPTH - 1);
+                const int64_t remaining_us =
+                    defer_fire_us[idx] - esp_timer_get_time();
+                if (remaining_us <= 500) {
+                    wait_ticks = 0;
+                } else {
+                    wait_ticks = 1;
+                }
             } else {
-                // More than 1 ms remaining: sleep one tick (hard-capped at 1 ms
-                // so a ring underrun in the ISR wakes us quickly).
-                wait_ticks = pdMS_TO_TICKS(remaining_us / 1000);
-                if (wait_ticks > 1) wait_ticks = 1;
+                wait_ticks = pdMS_TO_TICKS(1);
             }
-        } else {
-            wait_ticks = pdMS_TO_TICKS(1);  // max 1 ms even when idle
+
+            planned_segment_t seg;
+            if (xQueueReceive(seg_queue, &seg, wait_ticks) == pdTRUE) {
+                batch[0]    = seg;
+                batch_count = 1;
+                batch_index = 0;
+                state = ExecState::FETCH;
+            } else {
+                // Timeout — kick-start any stalled axes (RMT underrun
+                // while we were blocked on xQueueReceive).
+                kickStartActiveAxes();
+            }
+            break;
         }
 
-        // ── Block until a motion block arrives ────────────────────────────────
-        if (xQueueReceive(s_multi_axis_queue, &block, wait_ticks) != pdTRUE) {
-            // Timeout — no new segments.  Kick-start any axis whose RMT
-            // transaction ended (underrun) while the executor was waiting here.
-            // This is necessary because on_trans_done_isr fires
-            // vTaskNotifyGiveFromISR which cannot wake xQueueReceive.
-            for (uint8_t a = 0; a < active_axis_count; ++a) {
-                const uint8_t aid = active_axis_ids[a];
-                if (aid < self->n_motors_ && self->queues_[aid] != nullptr) {
-                    self->queues_[aid]->kickStart();
-                }
+        // ══════════════════════════════════════════════════════════════════
+        // FETCH: non-blocking batch fill up to EXEC_BATCH_LIMIT
+        // ══════════════════════════════════════════════════════════════════
+        case ExecState::FETCH: {
+            // Fill remaining batch slots non-blocking.
+            while (batch_count < EXEC_BATCH_LIMIT) {
+                planned_segment_t seg;
+                if (xQueueReceive(seg_queue, &seg, 0) != pdTRUE) break;
+                batch[batch_count++] = seg;
             }
-            continue;  // loop back to fire pending notifications
+            batch_index = 0;
+            state = ExecState::DRAIN;
+            break;
         }
 
-        // ── Drain loop: process this block AND all immediately available ──────
-        // blocks before starting the RMT. This fills the ring with multiple
-        // segments of look-ahead before motion begins, preventing underruns
-        // at low speed where each segment contains only a few steps.
-        bool did_flush = false;
-        do {
-            // Update active axis list from this block for recovery checks.
-            active_axis_count = block.axis_count < MULTI_AXIS_MAX_AXES
-                ? block.axis_count : MULTI_AXIS_MAX_AXES;
-            for (uint8_t a = 0; a < active_axis_count; ++a) {
-                active_axis_ids[a] = block.axis_ids[a];
-            }
+        // ══════════════════════════════════════════════════════════════════
+        // DRAIN: process batch segments — write steps to RMT ring
+        // ══════════════════════════════════════════════════════════════════
+        case ExecState::DRAIN: {
+            const int64_t drain_start = esp_timer_get_time();
 
-            for (uint8_t s = 0; s < block.segment_count && !did_flush; ++s) {
-
-                // Fire any due notifications between segments.
-                while (defer_head != defer_tail) {
-                    const int idx = defer_head & (DEFER_DEPTH - 1);
-                    if (esp_timer_get_time() >= defer_fire_us[idx]) {
-                        self->notifySegmentExecuted(
-                            static_cast<uint16_t>(defer_seqs[idx]));
-                        ++defer_head;
-                    } else {
-                        break;
-                    }
+            while (batch_index < batch_count) {
+                // ── Pre-check: yield if time budget will be exceeded ───────────
+                // This prevents accumulating too much CPU time before yielding.
+                if ((esp_timer_get_time() - drain_start) >= EXEC_TIME_BUDGET_US) {
+                    kickStartActiveAxes();
+                    taskYIELD();
+                    // Restart from FETCH to get fresh batch and reset timer.
+                    state = ExecState::FETCH;
+                    goto exit_drain;
                 }
 
-                // Mid-block flush check.
-                if (xQueueReceive(s_flush_queue, &flush_req, 0) == pdTRUE) {
-                    while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
-                    defer_head = defer_tail = 0;
-                    motor_timeline_us = 0;
-                    self->notifySegmentExecuted(flush_req.flush_sequence);
-                    ESP_LOGI(TAG, "mid-block flush at seq=%u",
-                             (unsigned)flush_req.flush_sequence);
-                    did_flush = true;
-                    break;
+                planned_segment_t& seg = batch[batch_index];
+
+                // ── Flush sentinel ────────────────────────────────────────
+                if (seg.is_flush) {
+                    state = ExecState::FLUSH;
+                    goto exit_drain;  // break out of DRAIN, handle in FLUSH
                 }
 
-                const multi_axis_segment_t& seg = block.segments[s];
+                // ── Update active axis list ───────────────────────────────
+                active_axis_count = seg.axis_count < MULTI_AXIS_MAX_AXES
+                    ? seg.axis_count : MULTI_AXIS_MAX_AXES;
+                for (uint8_t a = 0; a < active_axis_count; ++a) {
+                    active_axis_ids[a] = seg.axis_ids[a];
+                }
 
-                // Check endstop state before writing steps for this segment.
-                // If the endstop fired (ISR already stopped the RMT), drain the
-                // queue and notify the host -- do not write more steps.
-                for (uint8_t ea = 0; ea < block.axis_count; ++ea) {
-                    const uint8_t eid = block.axis_ids[ea];
+                // ── Endstop check (per-segment, real-time) ───────────────
+                bool endstop_hit = false;
+                for (uint8_t a = 0; a < seg.axis_count && !endstop_hit; ++a) {
+                    const uint8_t eid = seg.axis_ids[a];
                     if (eid >= self->n_motors_ ||
-                            self->queues_[eid] == nullptr) {
-                        continue;
-                    }
-                    if (self->queues_[eid]->driver().endstop_active_) {
-                        while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
+                        self->queues_[eid] == nullptr) continue;
+                    if (self->queues_[eid]->driver().isEndstopActive()) {
+                        // Drain remaining batch, e-stop, notify host.
                         self->queues_[eid]->driver().emergencyStop();
                         self->notifySegmentExecuted(seg.motion_sequence);
-                        ESP_LOGW(TAG, "endstop triggered on axis %u at seg seq=%u",
+                        ESP_LOGW(TAG, "endstop on axis %u at seq=%u",
                                  eid, seg.motion_sequence);
-                        did_flush = true;
-                        break;
+                        endstop_hit = true;
                     }
                 }
-                if (did_flush) break;
+                if (endstop_hit) {
+                    state = ExecState::RECOVERY;
+                    goto exit_drain;
+                }
 
-                // Read the lateral endstop state once per segment.
+                // ── Lateral endstop gate (read once per segment) ──────────
                 const uint8_t lateral_state = self->readLateralEndstopState();
                 const bool lateral_blocked =
-                    lateral_state != static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+                    lateral_state !=
+                    static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
 
-                // Write steps into the ring (does NOT start RMT).
-                for (uint8_t a = 0; a < block.axis_count; ++a) {
-                    const uint8_t axis_id = block.axis_ids[a];
+                // ── Write steps to ring buffer (no RMT start) ─────────────
+                for (uint8_t a = 0; a < seg.axis_count; ++a) {
+                    const uint8_t axis_id = seg.axis_ids[a];
                     if (axis_id >= self->n_motors_ ||
-                            self->queues_[axis_id] == nullptr) {
-                        continue;
-                    }
-                    if (seg.step_counts[a] == 0) {
-                        continue;
-                    }
+                        self->queues_[axis_id] == nullptr) continue;
+                    if (seg.axes[a].step_count == 0) continue;
                     if (axis_id == 1 && lateral_blocked) {
-                        ESP_LOGW(TAG,
-                                 "axis1 blocked by lateral endstop state 0x%02X, skipping %u steps",
-                                 lateral_state, seg.step_counts[a]);
+                        ESP_LOGD(TAG, "axis1 blocked, skip %u steps",
+                                 seg.axes[a].step_count);
                         continue;
                     }
-                    const bool direction = ((seg.direction_mask >> a) & 1u) != 0;
-                    esp_err_t err = self->queues_[axis_id]->executeConstantRateBlock(
-                        direction, seg.step_counts[a], seg.duration_us);
+
+                    esp_err_t err =
+                        self->queues_[axis_id]->executeConstantRateBlock(
+                            seg.axes[a].direction,
+                            seg.axes[a].step_count,
+                            seg.duration_us);
+
                     if (err == ESP_ERR_INVALID_STATE) {
-                        // Endstop fired mid-segment — flush queue and stop.
-                        ESP_LOGW(TAG, "axis %u seg %u: endstop fired mid-segment, flushing",
-                                 axis_id, s);
-                        while (xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE) {}
+                        ESP_LOGW(TAG, "axis %u endstop mid-seg seq=%u",
+                                 axis_id, seg.motion_sequence);
                         self->queues_[axis_id]->driver().emergencyStop();
                         self->notifySegmentExecuted(seg.motion_sequence);
-                        did_flush = true;
+                        state = ExecState::RECOVERY;
+                        goto exit_drain;
                     } else if (err != ESP_OK) {
-                        ESP_LOGW(TAG, "axis %u seg %u: executeConstantRateBlock: %s",
-                                 axis_id, s, esp_err_to_name(err));
+                        ESP_LOGW(TAG, "axis %u seg %u: %s",
+                                 axis_id, seg.motion_sequence,
+                                 esp_err_to_name(err));
                     }
-                    if (did_flush) break;
                 }
 
-                // ── Schedule deferred notification ────────────────────────────
-                const int64_t now_us = esp_timer_get_time();
-                if (motor_timeline_us < now_us) {
-                    motor_timeline_us = now_us;
-                }
-                motor_timeline_us += static_cast<int64_t>(seg.duration_us);
-
+                // ── Schedule deferred notification ────────────────────────
                 if ((defer_tail - defer_head) < DEFER_DEPTH) {
                     const int idx = defer_tail & (DEFER_DEPTH - 1);
-                    defer_fire_us[idx] = motor_timeline_us;
+                    defer_fire_us[idx] = seg.scheduled_time_us
+                                         + static_cast<int64_t>(seg.duration_us);
                     defer_seqs[idx]    = seg.motion_sequence;
                     ++defer_tail;
                 } else {
-                    // Overflow guard (shouldn't happen: 64 slots > MAX_INFLIGHT=32).
-                    ESP_LOGW(TAG, "defer queue overflow, immediate notify seq=%u",
-                             (unsigned)seg.motion_sequence);
                     self->notifySegmentExecuted(
                         static_cast<uint16_t>(seg.motion_sequence));
                 }
-            }  // end inner segment loop
 
-        // Grab the next block immediately (non-blocking) and keep draining.
-        // Stop if: a flush occurred, or no more blocks are queued.
-        } while (!did_flush
-                 && xQueueReceive(s_multi_axis_queue, &block, 0) == pdTRUE);
+                ++batch_index;
 
-        // ── Start RMT on all active axes ONCE, after ring is pre-filled ───────
-        if (!did_flush) {
-            for (uint8_t a = 0; a < active_axis_count; ++a) {
-                const uint8_t axis_id = active_axis_ids[a];
-                if (axis_id < self->n_motors_ &&
-                        self->queues_[axis_id] != nullptr) {
-                    self->queues_[axis_id]->kickStart();
+                // ── Time budget check (watchdog safety) ───────────────────
+                if ((esp_timer_get_time() - drain_start) >= EXEC_TIME_BUDGET_US) {
+                    // Budget exhausted — transition to RUN to kickStart,
+                    // then yield before processing remaining segments.
+                    kickStartActiveAxes();
+                    taskYIELD();
+                    // Continue draining after yield (reset budget).
+                    break;  // will re-enter DRAIN on next iteration
                 }
             }
+
+            // All segments in batch processed — transition to RUN.
+            if (batch_index >= batch_count) {
+                state = ExecState::RUN;
+            }
+            // else: budget break, stay in DRAIN for remaining segments.
+            break;
+
+        exit_drain:
+            break;  // state already set by the goto target
         }
-    }
+
+        // ══════════════════════════════════════════════════════════════════
+        // RUN: kickStart RMT on all active axes, return to IDLE
+        // ══════════════════════════════════════════════════════════════════
+        case ExecState::RUN: {
+            kickStartActiveAxes();
+            fireDeferred();
+            state = ExecState::IDLE;
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // FLUSH: reset pipeline state, notify host
+        // ══════════════════════════════════════════════════════════════════
+        case ExecState::FLUSH: {
+            // The flush sentinel is at batch[batch_index].
+            const planned_segment_t& flush_seg = batch[batch_index];
+
+            // Reset deferred notification ring.
+            defer_head = defer_tail = 0;
+
+            // Notify host with flush sequence.
+            self->notifySegmentExecuted(flush_seg.flush_sequence);
+
+            ESP_LOGI(TAG, "executor flush at seq=%u",
+                     (unsigned)flush_seg.flush_sequence);
+
+            // Clear batch and return to idle.
+            batch_count = 0;
+            batch_index = 0;
+            state = ExecState::IDLE;
+            break;
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // RECOVERY: handle endstop / error, drain remaining, return to IDLE
+        // ══════════════════════════════════════════════════════════════════
+        case ExecState::RECOVERY: {
+            // Drain any remaining segments in the planner's output queue
+            // (bounded drain to avoid spending too long here).
+            planned_segment_t discard;
+            uint32_t drained = 0;
+            while (drained < SEGMENT_QUEUE_DEPTH &&
+                   xQueueReceive(seg_queue, &discard, 0) == pdTRUE) {
+                ++drained;
+            }
+
+            // Reset deferred notifications.
+            defer_head = defer_tail = 0;
+
+            ESP_LOGW(TAG, "recovery: drained %lu remaining segments",
+                     (unsigned long)drained);
+
+            batch_count = 0;
+            batch_index = 0;
+            state = ExecState::IDLE;
+            break;
+        }
+
+        } // switch(state)
+
+        // ── Watchdog safety: yield if idle, sleep if very idle ───────────────
+        // If we fetched zero segments in FETCH, sleep to let IDLE1 run.
+        // Otherwise, yield to respect other tasks without 10ms stalls.
+        if (state == ExecState::IDLE && batch_count == 0) {
+            vTaskDelay(1);  // Very idle — sleep and let watchdog reset
+        } else {
+            taskYIELD();    // Still have work — yield but stay ready
+        }
+    } // for(;;)
 }

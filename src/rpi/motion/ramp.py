@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterator, List, Union
+import warnings
 
 from transport.messages import (
         SEGMENT_BLOCK_SIZE,
@@ -23,7 +24,11 @@ class RampConfig:
     accel_s: float = 10.0
     cruise_s: float = 3.0
     decel_s: float = 10.0
-    resolution_hz: int = 2_000_000
+    # Must match RMT_STEP_RESOLUTION_HZ in stepper_driver.h (80 MHz).
+    # Used only by RampBlockGenerator / SegmentBlockGenerator for tick
+    # calculations. MultiAxisSegmentGenerator works in steps, not ticks,
+    # and is not affected by this value.
+    resolution_hz: int = 80_000_000
     reverse_direction: bool = False
     phase_segments: int = 8
     segment_duration_s: float = 0.05
@@ -38,14 +43,20 @@ class RampConfig:
 
 
 class RampBlockGenerator:
-    """Generate smooth host-side step blocks in the same tick domain as ESP32.
-
-    The generator works directly in RMT ticks instead of integer microseconds.
-    A fractional tick accumulator diffuses quantization error across steps,
-    avoiding the visible stair-step speed jumps seen with coarse µs rounding.
+    """
+    .. deprecated::
+        Use MultiAxisSegmentGenerator via MultiAxisRampStreamer instead.
+        This class generates per-axis step blocks and is no longer
+        used by the main streaming path.
     """
 
     def __init__(self, config: RampConfig):
+        warnings.warn(
+            "RampBlockGenerator is deprecated. "
+            "Use MultiAxisSegmentGenerator instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
         self._time_cursor = 0.0
         self._tick_error = 0.0
@@ -101,15 +112,20 @@ class RampBlockGenerator:
 
 
 class SegmentBlockGenerator:
-    """Generate Klipper-like arithmetic motion segments for SPI transport.
-
-    Instead of first generating every single step and then compressing it, the
-    host directly emits piecewise-arithmetic segments per motion phase. This is
-    the crucial transport refactor: one segment can represent hundreds or
-    thousands of steps, which keeps the SPI bandwidth requirements practical.
+    """
+    .. deprecated::
+        Use MultiAxisSegmentGenerator via MultiAxisRampStreamer instead.
+        This class generates per-axis arithmetic segment blocks and is no longer
+        used by the main streaming path.
     """
 
     def __init__(self, config: RampConfig):
+        warnings.warn(
+            "SegmentBlockGenerator is deprecated. "
+            "Use MultiAxisSegmentGenerator instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
         self._block_seq = 0
         self._segments = iter(self._build_segments())
@@ -237,14 +253,20 @@ BlockPayload = Union[StepBlockPayload, SegmentBlockPayload]
 
 
 class HybridRampBlockGenerator:
-    """Generate a hybrid stream of step and segment blocks.
-
-    Low-speed portions of the ramp are emitted as exact step blocks, while
-    higher-speed portions remain compressed into segment blocks. This keeps
-    the SPI transport efficient without sacrificing smooth low-speed control.
+    """
+    .. deprecated::
+        Use MultiAxisSegmentGenerator via MultiAxisRampStreamer instead.
+        This class generates a hybrid of step and segment blocks and is no
+        longer used by the main streaming path.
     """
 
     def __init__(self, config: RampConfig, *, segment_threshold_hz: float = 8_000.0):
+        warnings.warn(
+            "HybridRampBlockGenerator is deprecated. "
+            "Use MultiAxisSegmentGenerator instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.config = config
         self.segment_threshold_hz = max(segment_threshold_hz, 1.0)
         self._segments = SegmentBlockGenerator(config)._build_segments()

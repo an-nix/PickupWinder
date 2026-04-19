@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 
 
@@ -31,7 +32,15 @@ from transport.messages import (
 class Esp32SpiTransport:
     """Thin wrapper around spidev using the PickupWinder fixed SPI frame format."""
 
-    def __init__(self, bus: int = 0, device: int = 0, *, speed_hz: int = 4_000_000, mode: int = 0):
+    def __init__(
+        self,
+        bus: int | None = None,
+        device: int | None = None,
+        *,
+        device_path: str | None = None,
+        speed_hz: int = 4_000_000,
+        mode: int = 0,
+    ):
         try:
             import spidev  # type: ignore
         except ImportError as exc:  # pragma: no cover - depends on host machine
@@ -39,7 +48,27 @@ class Esp32SpiTransport:
 
         self._spidev_module = spidev
         self._spi = spidev.SpiDev()
-        self._spi.open(bus, device)
+        self._device_path = None
+
+        if device_path is not None:
+            self._device_path = device_path
+            if hasattr(self._spi, "open_path"):
+                self._spi.open_path(device_path)
+            else:
+                parsed = re.fullmatch(r"/dev/spidev(\d+)\.(\d+)", device_path)
+                if parsed is None:
+                    raise ValueError(
+                        "device_path must be in the form /dev/spidev<bus>.<device>"
+                    )
+                self._spi.open(int(parsed.group(1)), int(parsed.group(2)))
+        elif bus is not None and device is not None:
+            self._device_path = f"/dev/spidev{bus}.{device}"
+            self._spi.open(bus, device)
+        else:
+            raise ValueError(
+                "Must specify either bus/device or device_path for SPI transport"
+            )
+
         self._spi.max_speed_hz = speed_hz
         self._spi.mode = mode
         self._sequence = 0
@@ -104,7 +133,7 @@ class Esp32SpiTransport:
                 raise
 
         raise RuntimeError(
-            "SPI status poll failed after 5 attempts: "
+            f"SPI status poll failed after 5 attempts on {self._device_path}: "
             f"{last_exc!s}"
         ) from last_exc
 
@@ -160,6 +189,16 @@ class Esp32SpiTransport:
         """Send ENABLE_ENDSTOP to disarm the hardware endstop ISR on *axis_id*."""
         return self.transfer_frame(
             make_enable_endstop(EnableEndstopPayload(axis_id=axis_id, arm=False), self._next_sequence())
+        )
+
+    def enable_endstop_request(self, axis_id: int, arm: bool) -> tuple[int, StatusPayload]:
+        """Send ENABLE_ENDSTOP and return (sequence, status) for deferred ACK polling.
+
+        arm=True  → firmware arms the endstop ISR on axis_id
+        arm=False → firmware disarms the endstop ISR on axis_id
+        """
+        return self.transfer_request(
+            make_enable_endstop(EnableEndstopPayload(axis_id=axis_id, arm=arm), self._next_sequence())
         )
 
     def wait_for_queue_space(self, axis_id: int, *, minimum_free_blocks: int = 1, poll_interval_s: float = 0.001) -> StatusPayload:

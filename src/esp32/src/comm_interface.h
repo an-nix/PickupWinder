@@ -14,11 +14,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <driver/gpio.h>
 #include <esp_err.h>
 
 #include "messages.h"
 #include "stepper_queue.h"
+#include "motion_planner.h"
 
 struct SpiBusPins {
     gpio_num_t mosi;
@@ -48,6 +50,7 @@ private:
     StepperQueue*   queues_[SPI_MAX_AXES];
     uint8_t         n_motors_;
     SpiBusPins      pins_ {};
+    MotionPlanner   planner_;              ///< Planning layer (SPI → executor)
 
     uint16_t        last_rx_sequence_ {0};
     uint8_t         last_rx_type_ {static_cast<uint8_t>(SpiMessageType::NOP)};
@@ -56,14 +59,12 @@ private:
     /**
      * @brief Motion sequence of the most recently fully-executed multi-axis
      *        segment.  Updated by the executor task (Core 1) and read by the
-     *        SPI task (Core 0); access is protected by the portMUX spinlock
-     *        below.  Initialised to 0xFFFF so the host's first segment always
+     *        SPI task (Core 0).  std::atomic provides lock-free cross-core
+     *        visibility without a portMUX spinlock.
+     *        Initialised to 0xFFFF so the host's first segment always
      *        compares as "not yet executed".
      */
-    volatile uint16_t   last_executed_sequence_ {0xFFFFu};
-
-    /** Spinlock protecting last_executed_sequence_ across cores. */
-    portMUX_TYPE        exec_seq_mux_ = portMUX_INITIALIZER_UNLOCKED;
+    std::atomic<uint16_t>   last_executed_sequence_ {0xFFFFu};
 
     /** Build the status payload for the next SPI response frame. */
     void buildStatusFrame(uint8_t* out_frame) const;

@@ -51,13 +51,11 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         return 0;  // Wait for more space
     }
 
-    uint32_t rd = drv->ring_read_;
-    uint32_t wr = drv->ring_write_;  // volatile read — task may be writing
-    __sync_synchronize();  // CHANGE 1: compiler+hardware barrier — ensures ring entry
-                           // data written by the producer is visible before we read it
+    uint32_t rd = drv->ring_read_.load(std::memory_order_acquire);
+    uint32_t wr = drv->ring_write_.load(std::memory_order_acquire);
 
     // Check for explicit stop request
-    if (drv->rmt_stopped_) {
+    if (drv->rmt_stopped_.load(std::memory_order_relaxed)) {
         *done = true;
         return 0;
     }
@@ -65,8 +63,8 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     // Check for endstop trigger — stop immediately without emitting any
     // further step pulses. The ring is NOT reset here; emergencyStop() is
     // called from the executor task after it detects endstop_active_.
-    if (drv->endstop_active_) {
-        drv->rmt_stopped_ = true;
+    if (drv->endstop_active_.load(std::memory_order_relaxed)) {
+        drv->rmt_stopped_.store(true, std::memory_order_relaxed);
         *done = true;
         return 0;
     }
@@ -75,8 +73,8 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     // next callback terminate the transmission.
     if (rd == wr) {
         drv->last_chunk_had_steps_ = false;
-        drv->ring_underrun_count_ = drv->ring_underrun_count_ + 1;  // starvation diagnostic
-        drv->rmt_stopped_ = true;
+        drv->ring_underrun_count_.fetch_add(1, std::memory_order_relaxed);
+        drv->rmt_stopped_.store(true, std::memory_order_relaxed);
         uint16_t t = static_cast<uint16_t>((MIN_CMD_TICKS + 2 * PART_SIZE - 1) / (2 * PART_SIZE));
         for (uint32_t i = 0; i < PART_SIZE; i++) {
             symbols[i].level0    = 0;
@@ -90,7 +88,7 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     // Data is available after underrun — clear the stop flag so we can continue
     // encoding. This handles the case where the ring was empty, we emitted a
     // pause, and now new data has arrived before on_trans_done_isr fires.
-    drv->rmt_stopped_ = false;
+    drv->rmt_stopped_.store(false, std::memory_order_relaxed);
 
     // Peek at next entry — check for direction change
     ring_entry_t* entry = &drv->ring_[rd & STEP_RING_MASK];
@@ -155,8 +153,8 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         } else {
             // Ring exhausted mid-chunk — pad the remainder with a pause chunk,
             // arm stop, and let the next callback terminate the transaction.
-            drv->ring_underrun_count_ = drv->ring_underrun_count_ + 1;  // starvation diagnostic
-            drv->rmt_stopped_ = true;
+            drv->ring_underrun_count_.fetch_add(1, std::memory_order_relaxed);
+            drv->rmt_stopped_.store(true, std::memory_order_relaxed);
             uint16_t t = static_cast<uint16_t>((MIN_CMD_TICKS + 2 * PART_SIZE - 1) / (2 * PART_SIZE));
             for (uint32_t j = i; j < PART_SIZE; j++) {
                 symbols[j].level0    = 0;
@@ -168,16 +166,18 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         }
     }
 
-    drv->ring_read_ = rd;
+    drv->ring_read_.store(rd, std::memory_order_release);
     drv->last_chunk_had_steps_ = has_steps;
-    if (drv->producer_task_ != nullptr || drv->executor_task_ != nullptr) {
+
+    TaskHandle_t prod = drv->producer_task_.load(std::memory_order_relaxed);
+    TaskHandle_t exec = drv->executor_task_.load(std::memory_order_relaxed);
+    if (prod != nullptr || exec != nullptr) {
         BaseType_t woken = pdFALSE;
-        if (drv->producer_task_ != nullptr) {
-            vTaskNotifyGiveFromISR(drv->producer_task_, &woken);
+        if (prod != nullptr) {
+            vTaskNotifyGiveFromISR(prod, &woken);
         }
-        if (drv->executor_task_ != nullptr &&
-                drv->executor_task_ != drv->producer_task_) {
-            vTaskNotifyGiveFromISR(drv->executor_task_, &woken);
+        if (exec != nullptr && exec != prod) {
+            vTaskNotifyGiveFromISR(exec, &woken);
         }
         if (woken == pdTRUE) {
             portYIELD_FROM_ISR();
@@ -212,17 +212,18 @@ void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
     const bool triggered = (no_lvl == 0 && nc_lvl == 1) || (no_lvl == nc_lvl);
 
     if (triggered) {
-        drv->endstop_active_ = true;
+        drv->endstop_active_.store(true, std::memory_order_release);
         // Wake the executor task so it drains the pipeline immediately.
         BaseType_t woken = pdFALSE;
-        if (drv->executor_task_ != nullptr) {
-            vTaskNotifyGiveFromISR(drv->executor_task_, &woken);
+        TaskHandle_t exec = drv->executor_task_.load(std::memory_order_relaxed);
+        if (exec != nullptr) {
+            vTaskNotifyGiveFromISR(exec, &woken);
         }
         if (woken) portYIELD_FROM_ISR();
     } else {
         // Endstop released — clear flag.
         // Host must re-arm via SPI ENABLE_ENDSTOP before the next move.
-        drv->endstop_active_ = false;
+        drv->endstop_active_.store(false, std::memory_order_release);
     }
 }
 
@@ -375,10 +376,10 @@ void StepperDriver::emergencyStop()
     rmt_disable(channel_);
     rmt_enable(channel_);
 
-    ring_read_  = 0;
-    ring_write_ = 0;
-    rmt_running_ = false;
-    rmt_stopped_ = true;
+    ring_read_.store(0, std::memory_order_relaxed);
+    ring_write_.store(0, std::memory_order_relaxed);
+    rmt_running_.store(false, std::memory_order_relaxed);
+    rmt_stopped_.store(true, std::memory_order_relaxed);
     last_chunk_had_steps_ = false;
 
     ESP_LOGW(TAG, "motor%u: emergency stop", motor_id_);
@@ -390,14 +391,14 @@ void StepperDriver::emergencyStop()
 
 void StepperDriver::stopStream()
 {
-    if (!rmt_running_) return;
+    if (!rmt_running_.load(std::memory_order_relaxed)) return;
 
     // Signal the encoder callback to end the transmission
-    rmt_stopped_ = true;
+    rmt_stopped_.store(true, std::memory_order_release);
 
     // Wait for the RMT hardware to finish the current transaction
     rmt_tx_wait_all_done(channel_, pdMS_TO_TICKS(500));
-    rmt_running_ = false;
+    rmt_running_.store(false, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -406,8 +407,8 @@ void StepperDriver::stopStream()
 
 esp_err_t StepperDriver::startStream()
 {
-    rmt_stopped_ = false;
-    rmt_running_ = true;
+    rmt_stopped_.store(false, std::memory_order_release);
+    rmt_running_.store(true, std::memory_order_release);
     last_chunk_had_steps_ = false;
 
     // `this` is in internal DRAM (static global) — passes esp_ptr_internal()
@@ -417,8 +418,8 @@ esp_err_t StepperDriver::startStream()
     encoder_->reset(encoder_);
     esp_err_t err = rmt_transmit(channel_, encoder_, this, sizeof(*this), &tx_config_);
     if (err != ESP_OK) {
-        rmt_running_ = false;
-        rmt_stopped_ = true;
+        rmt_running_.store(false, std::memory_order_relaxed);
+        rmt_stopped_.store(true, std::memory_order_relaxed);
         ESP_LOGE(TAG, "motor%u: rmt_transmit failed: %s",
                  motor_id_, esp_err_to_name(err));
     }
@@ -433,10 +434,10 @@ void StepperDriver::gracefulStop()
 {
     // Signal the encoder callback to stop after the current ring contents
     // have been consumed (no ring reset, unlike emergencyStop).
-    rmt_stopped_ = true;
+    rmt_stopped_.store(true, std::memory_order_release);
     // Do not call rmt_tx_wait_all_done here — the caller should not block.
     // The RMT transaction will end naturally after the pause chunk fires.
-    rmt_running_ = false;
+    rmt_running_.store(false, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -445,10 +446,10 @@ void StepperDriver::gracefulStop()
 
 esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t caller_task)
 {
-    if (ring_underrun_count_ > 0) {
+    if (ring_underrun_count_.load(std::memory_order_relaxed) > 0) {
         ESP_LOGW(TAG, "motor%u: ring underrun x%lu since last pushBlock",
-                 motor_id_, (unsigned long)ring_underrun_count_);
-        ring_underrun_count_ = 0;
+                 motor_id_, (unsigned long)ring_underrun_count_.load(std::memory_order_relaxed));
+        ring_underrun_count_.store(0, std::memory_order_relaxed);
     }
 
     if (block.count == 0) {
@@ -458,9 +459,10 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
     // Always update producer_task_ unconditionally so the ISR ring-space
     // notification always wakes the task that is actually blocked here,
     // not a stale handle from a previous call.
-    producer_task_ = (caller_task != nullptr)
+    producer_task_.store((caller_task != nullptr)
                      ? caller_task
-                     : xTaskGetCurrentTaskHandle();
+                     : xTaskGetCurrentTaskHandle(),
+                     std::memory_order_release);
 
     const uint32_t count = std::min<uint32_t>(block.count, STEP_BLOCK_SIZE);
 
@@ -470,7 +472,9 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
     // If the ring is empty and the motor is idle, explicitly set the DIR pin
     // to the requested direction now. This avoids relying on the initial
     // `last_dir_` state and ensures reverse mode is applied on the first block.
-    if (!rmt_running_ && ring_read_ == ring_write_ && need_toggle) {
+    if (!rmt_running_.load(std::memory_order_relaxed) &&
+        ring_read_.load(std::memory_order_relaxed) == ring_write_.load(std::memory_order_relaxed) &&
+        need_toggle) {
         gpio_set_level(dir_pin_, new_dir ? 1 : 0);
         last_dir_ = new_dir;
         need_toggle = false;
@@ -479,7 +483,7 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
     }
 
     // If the endstop already fired before we even start writing, abort.
-    if (endstop_active_) {
+    if (endstop_active_.load(std::memory_order_acquire)) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -490,11 +494,11 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
         while (ringFree() == 0) {
             // The endstop ISR also notifies this task.  If it fires while we
             // are blocked here, break out immediately instead of spinning.
-            if (endstop_active_) {
+            if (endstop_active_.load(std::memory_order_acquire)) {
                 return ESP_ERR_INVALID_STATE;
             }
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-            if (endstop_active_) {
+            if (endstop_active_.load(std::memory_order_acquire)) {
                 return ESP_ERR_INVALID_STATE;
             }
         }
@@ -504,14 +508,13 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
         ticks = std::max<uint32_t>(ticks, RMT_STEP_MIN_TICKS);
         ticks = std::min<uint32_t>(ticks, RMT_STEP_MAX_TICKS);
 
-        uint32_t wr = ring_write_;
+        uint32_t wr = ring_write_.load(std::memory_order_relaxed);
         ring_entry_t* e = &ring_[wr & STEP_RING_MASK];
         e->ticks      = static_cast<uint16_t>(ticks);
         e->toggle_dir = (i == 0 && need_toggle) ? 1 : 0;
         e->pad        = 0;
 
-        __sync_synchronize();
-        ring_write_ = wr + 1;
+        ring_write_.store(wr + 1, std::memory_order_release);
     }
 
     // NOTE: startStream() is NOT called here.
@@ -533,14 +536,15 @@ bool IRAM_ATTR StepperDriver::on_trans_done_isr(
     void* user_ctx)
 {
     StepperDriver* self = static_cast<StepperDriver*>(user_ctx);
-    self->rmt_running_ = false;
+    self->rmt_running_.store(false, std::memory_order_relaxed);
     BaseType_t woken = pdFALSE;
-    if (self->producer_task_ != nullptr) {
-        vTaskNotifyGiveFromISR(self->producer_task_, &woken);
+    TaskHandle_t prod = self->producer_task_.load(std::memory_order_relaxed);
+    if (prod != nullptr) {
+        vTaskNotifyGiveFromISR(prod, &woken);
     }
-    if (self->executor_task_ != nullptr &&
-            self->executor_task_ != self->producer_task_) {
-        vTaskNotifyGiveFromISR(self->executor_task_, &woken);
+    TaskHandle_t exec = self->executor_task_.load(std::memory_order_relaxed);
+    if (exec != nullptr && exec != prod) {
+        vTaskNotifyGiveFromISR(exec, &woken);
     }
     return woken == pdTRUE;
 }

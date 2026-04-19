@@ -33,6 +33,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <driver/rmt_tx.h>
 #include <driver/gpio.h>
 #include <hal/gpio_ll.h>
@@ -136,28 +137,42 @@ public:
     uint32_t ringFreeSlots() const { return ringFree(); }
 
     /** @brief True while an RMT transaction is currently active. */
-    bool isStreaming() const { return rmt_running_; }
+    bool isStreaming() const { return rmt_running_.load(std::memory_order_acquire); }
+    bool isStopped()  const { return rmt_stopped_.load(std::memory_order_acquire); }
 
     // ─── Ring buffer (SPSC: task writes, ISR reads) ────────────────────────
     // Public because the C encoder callback needs direct access in ISR context.
 
     ring_entry_t          ring_[STEP_RING_SIZE];     /**< Step ring buffer      */
-    volatile uint32_t     ring_write_ {0};           /**< Write idx (task only) */
-    volatile uint32_t     ring_read_  {0};           /**< Read idx  (ISR only)  */
+    /**
+     * Ring write index. Written ONLY by the producer task, read by ISR.
+     * std::atomic with release/acquire ordering guarantees the ISR sees
+     * fully-written ring_entry_t data before the index advances.
+     */
+    std::atomic<uint32_t> ring_write_ {0};
+    /**
+     * Ring read index. Written ONLY by the ISR (encode_steps), read by
+     * the producer task for free-slot calculation.
+     */
+    std::atomic<uint32_t> ring_read_  {0};
 
     gpio_num_t            dir_pin_;                  /**< For ISR gpio_ll       */
-    volatile bool         rmt_stopped_ {true};       /**< Set by encoder ISR    */
-    bool                  last_chunk_had_steps_ {false}; /**< Dir-change safety */
-    uint16_t              last_ticks_ {RMT_STEP_DEFAULT_TICKS}; /**< Last step interval for hold symbols */
+    /**
+     * Set by encode_steps() ISR to signal the RMT transaction should end.
+     * Read by pushBlock()/startStream() in task context.
+     */
+    std::atomic<bool>     rmt_stopped_ {true};
+    bool                  last_chunk_had_steps_ {false}; /**< Dir-change safety (ISR only) */
+    uint16_t              last_ticks_ {RMT_STEP_DEFAULT_TICKS}; /**< Last step interval (ISR only) */
 
     /**
      * @brief Task handle of the current ring producer.
      *
      * Set to the calling task every time pushBlock() is entered so the ring
      * back-pressure (ulTaskNotifyTake) always wakes the correct task.
-     * Written from task context, read from ISR — must be treated as volatile.
+     * Written from task context, read from ISR — std::atomic for safety.
      */
-    TaskHandle_t          producer_task_ {nullptr};
+    std::atomic<TaskHandle_t> producer_task_ {nullptr};
 
     /**
      * @brief Task handle of the multi-axis executor (Core 1).
@@ -166,33 +181,35 @@ public:
      * encode_steps notifies BOTH this handle and producer_task_ so the
      * executor can pre-emptively refill the ring before it stalls.
      */
-    TaskHandle_t          executor_task_ {nullptr};
+    std::atomic<TaskHandle_t> executor_task_ {nullptr};
 
     /** Register the multi-axis executor task handle for ring-low wakeups. */
-    void setExecutorTask(TaskHandle_t t) { executor_task_ = t; }
+    void setExecutorTask(TaskHandle_t t) { executor_task_.store(t, std::memory_order_release); }
 
     /**
      * @brief Set by the GPIO endstop ISR when contact is detected.
      * Read by encode_steps() in ISR context to stop the RMT immediately.
      * Cleared by the host via SPI ENABLE_ENDSTOP command or when the
      * endstop sensor returns to open state.
-     * Declared volatile because it is written from ISR and read from both
-     * ISR and task contexts without a lock.
+     * std::atomic for ISR ↔ task safety.
      */
-    volatile bool endstop_active_ {false};
+    std::atomic<bool> endstop_active_ {false};
 
     /** @brief Arm the endstop — ISR will stop motion on trigger. */
-    void armEndstop()   { endstop_active_ = false; endstop_armed_ = true;  }
+    void armEndstop() {
+        endstop_active_.store(false, std::memory_order_release);
+        endstop_armed_.store(true, std::memory_order_release);
+    }
 
     /** @brief Disarm the endstop — ISR will not stop motion on trigger.
      *  Use during intentional clearance moves commanded by the host. */
-    void disarmEndstop() { endstop_armed_ = false; }
+    void disarmEndstop() { endstop_armed_.store(false, std::memory_order_release); }
 
     /** @brief True if the endstop is currently armed. */
-    bool isEndstopArmed() const { return endstop_armed_; }
+    bool isEndstopArmed() const { return endstop_armed_.load(std::memory_order_acquire); }
 
     /** @brief True if the endstop is currently triggered. */
-    bool isEndstopActive() const { return endstop_active_; }
+    bool isEndstopActive() const { return endstop_active_.load(std::memory_order_acquire); }
 
     /**
      * @brief Install GPIO edge-triggered ISR on the NO/NC endstop pins.
@@ -206,13 +223,15 @@ public:
      */
     esp_err_t initEndstopIsr(gpio_num_t no_pin, gpio_num_t nc_pin);
 
-    // Incremented in ISR each time encode_steps() finds the ring empty
-    // and emits a pause chunk before stopping the transaction. Use to detect
-    // pipeline starvation at runtime.
-    volatile uint32_t     ring_underrun_count_ {0};
+    /**
+     * Incremented in ISR each time encode_steps() finds the ring empty
+     * and emits a pause chunk before stopping the transaction.
+     * std::atomic for ISR ↔ task safety.
+     */
+    std::atomic<uint32_t> ring_underrun_count_ {0};
 
-    uint32_t getUnderrunCount()  const { return ring_underrun_count_; }
-    void     resetUnderrunCount()      { ring_underrun_count_ = 0; }
+    uint32_t getUnderrunCount()  const { return ring_underrun_count_.load(std::memory_order_relaxed); }
+    void     resetUnderrunCount()      { ring_underrun_count_.store(0, std::memory_order_relaxed); }
 private:
     gpio_num_t            step_pin_;
     gpio_num_t            en_pin_;
@@ -222,10 +241,10 @@ private:
     rmt_encoder_handle_t  encoder_   {nullptr};
     rmt_transmit_config_t tx_config_ {};
 
-    volatile bool         rmt_running_ {false};
+    std::atomic<bool>     rmt_running_ {false};
     bool                  last_dir_    {true};
     bool                  enabled_     {false};
-    volatile bool         endstop_armed_  {false};
+    std::atomic<bool>     endstop_armed_  {false};
 
     /** Endstop pin numbers — set by initEndstopIsr(), read by endstopIsrHandler(). */
     gpio_num_t            endstop_no_pin_ {GPIO_NUM_NC};
@@ -233,7 +252,9 @@ private:
 
     /** @brief Number of free slots in the ring buffer. */
     uint32_t ringFree() const {
-        return STEP_RING_SIZE - (ring_write_ - ring_read_);
+        return STEP_RING_SIZE
+            - (ring_write_.load(std::memory_order_relaxed)
+               - ring_read_.load(std::memory_order_relaxed));
     }
 
     // ── Static ISR callbacks ────────────────────────────────────────────────

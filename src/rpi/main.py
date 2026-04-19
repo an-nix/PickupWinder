@@ -1,11 +1,8 @@
-
-
 import sys
 import time
 from pathlib import Path
 
-from domain import AppConfiguration
-from winding import WinderApp
+from core import WinderApp, AppConfiguration
 from jsonrpc import AppRpcHandler, UnixJsonRpcServer
 
 

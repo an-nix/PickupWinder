@@ -191,7 +191,7 @@ esp_err_t StepperQueue::maybeStartDriver(StepperDriver& driver, bool force_start
         return ESP_OK;
     }
 
-    if (driver.isStreaming() && !driver.rmt_stopped_) {
+    if (driver.isStreaming() && !driver.isStopped()) {
         return ESP_OK;
     }
 
@@ -259,7 +259,6 @@ esp_err_t StepperQueue::executeSegmentBlock(StepperDriver& driver, const segment
 // ---------------------------------------------------------------------------
 // executorTask()  — Core 1, priority 24
 // ---------------------------------------------------------------------------
-
 void StepperQueue::executorTask(void* arg)
 {
     StepperQueue* self = static_cast<StepperQueue*>(arg);
@@ -268,25 +267,46 @@ void StepperQueue::executorTask(void* arg)
 
     ESP_LOGI(TAG, "motor%u: executor task started", self->motor_id_);
 
+    constexpr int WORK_BUDGET = 8;  // nombre de blocks à traiter avant pause
+
     for (;;) {
-        // Block until at least one block is available.
+        // Bloque jusqu'à avoir du travail (parfait 👍)
         if (xQueueReceive(self->queue_, &block, portMAX_DELAY) != pdTRUE) {
             continue;
         }
 
+        int work_done = 0;
+
         do {
             esp_err_t err = ESP_OK;
+
             if (block.kind == MOTION_BLOCK_KIND_SEGMENT) {
                 err = executeSegmentBlock(driver, block.payload.segment);
             } else {
                 err = pushExpandedBlock(driver, block.payload.step);
             }
+
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "motor%u: motion execute error: %s",
                          self->motor_id_, esp_err_to_name(err));
             }
+
+            work_done++;
+
+            // 🔥 POINT CLÉ : respiration contrôlée
+            if (work_done >= WORK_BUDGET) {
+                work_done = 0;
+
+                // Option 1 (rapide)
+                //taskYIELD();
+
+                // Option 2 (ultra safe watchdog)
+                 vTaskDelay(1);
+            }
+
         } while (xQueueReceive(self->queue_, &block, 0) == pdTRUE);
 
+        // Start uniquement après batch complet (logique déjà bonne 👍)
         esp_err_t err = maybeStartDriver(driver, true);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "motor%u: startStream error: %s",

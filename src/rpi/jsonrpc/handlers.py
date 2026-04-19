@@ -47,7 +47,9 @@ class AppRpcHandler(RpcHandler):
         self.register_method("winder.config", lambda _: self.config())
         self.register_method("winder.spindle.run", self.spindle_run)
         self.register_method("winder.motion.run", self.motion_run)
-        self.register_method("winder.session.status", self.session_status)
+        self.register_method("winder.operation.status", lambda _: self.operation_status())
+        self.register_method("winder.operation.stop", lambda _: self.operation_stop())
+        self.register_method("winder.session.status", lambda _: self.session_status())
         self.register_method("winder.session.wait", self.session_wait)
 
     def ping(self) -> dict[str, str]:
@@ -131,57 +133,36 @@ class AppRpcHandler(RpcHandler):
             "details": result,
         }
 
-    def session_status(self, params: Any | None) -> dict[str, Any]:
-        """Query the status of a streaming session."""
-        if self.app is None or not hasattr(self.app, "streaming_manager"):
-            return {"error": "streaming manager not available"}
+    def operation_status(self) -> dict[str, Any]:
+        if self.app is None or not hasattr(self.app, "current_operation_status"):
+            return {"error": "operation status not available"}
+        return self.app.current_operation_status()
 
-        if params is None or not isinstance(params, dict):
-            raise JsonRpcError(-32602, "Invalid params: expected object with session_id")
+    def operation_stop(self) -> dict[str, Any]:
+        if self.app is None or not hasattr(self.app, "stop_operation"):
+            return {"error": "operation stop not available"}
+        return self.app.stop_operation()
 
-        session_id = params.get("session_id")
-        if not isinstance(session_id, int):
-            raise JsonRpcError(-32602, "Invalid params: session_id must be an integer")
-
-        session = self.app.streaming_manager.get_session(session_id)
-        if session is None:
-            return {"error": f"Session {session_id} not found"}
-
-        return {
-            "session_id": session.session_id,
-            "status": session.status,
-            "started_at": session.started_at,
-            "completed_at": session.completed_at,
-            "block_count": session.block_count,
-            "error": session.error,
-        }
+    def session_status(self) -> dict[str, Any]:
+        if self.app is None or not hasattr(self.app, "current_operation_status"):
+            return {"error": "operation status not available"}
+        return self.app.current_operation_status()
 
     def session_wait(self, params: Any | None) -> dict[str, Any]:
-        """Wait for a streaming session to complete (with optional timeout)."""
-        if self.app is None or not hasattr(self.app, "streaming_manager"):
-            return {"error": "streaming manager not available"}
+        if self.app is None or not hasattr(self.app, "current_operation_status"):
+            return {"error": "operation status not available"}
 
-        if params is None or not isinstance(params, dict):
-            raise JsonRpcError(-32602, "Invalid params: expected object with session_id and optional timeout_s")
+        timeout_s = 300.0
+        if params is not None and isinstance(params, dict):
+            timeout_value = params.get("timeout_s")
+            if isinstance(timeout_value, (int, float)):
+                timeout_s = float(timeout_value)
 
-        session_id = params.get("session_id")
-        timeout_s = params.get("timeout_s", 300.0)  # 5 minute default timeout
-
-        if not isinstance(session_id, int):
-            raise JsonRpcError(-32602, "Invalid params: session_id must be an integer")
-        if not isinstance(timeout_s, (int, float)):
-            raise JsonRpcError(-32602, "Invalid params: timeout_s must be a number")
-
-        try:
-            session = self.app.streaming_manager.wait_session(session_id, timeout_s)
-            return {
-                "session_id": session.session_id,
-                "status": session.status,
-                "block_count": session.block_count,
-                "error": session.error,
-                "duration_s": session.completed_at - session.started_at if session.completed_at else None,
-            }
-        except ValueError as e:
-            return {"error": str(e)}
-        except TimeoutError as e:
-            raise JsonRpcError(-32000, str(e))
+        start = time.monotonic()
+        while True:
+            status = self.app.current_operation_status()
+            if status.get("status") in ("completed", "failed", "idle"):
+                return status
+            if time.monotonic() - start > timeout_s:
+                raise JsonRpcError(-32000, f"Operation wait timed out after {timeout_s}s")
+            time.sleep(0.05)
