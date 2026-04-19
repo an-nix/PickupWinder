@@ -11,6 +11,8 @@ from transport.messages import (
     MultiAxisSegment,
     MultiAxisSegmentBlockPayload,
     SpiMessageResult,
+    sequence_is_greater,
+    sequence_is_less_equal,
 )
 from motion.ramp import AxisMotionConfig, MultiAxisSegmentGenerator, RampConfig
 from transport.spi_transport import Esp32SpiTransport
@@ -49,13 +51,33 @@ class MultiAxisRampStreamer:
 
     # Planner→executor segment queue depth on the ESP32 (matches SEGMENT_QUEUE_DEPTH in firmware).
     SEGMENT_QUEUE_DEPTH = 128
-    # Gate: do not send if fewer than this many slots are free in the planner queue.
-    # Equals EXEC_BATCH_LIMIT * 2 (firmware constant), giving two full executor batches of headroom.
+    # Legacy constant kept for reference (= EXEC_BATCH_LIMIT * 2).
+    # The active gate is now required_lookahead() which is speed-dependent.
     PLANNER_QUEUE_SEND_THRESHOLD = 32
 
     # ESP32 step ring capacity in firmware: one step consumes one ring entry.
     STEP_RING_CAPACITY = 4096
     RING_BUFFER_HEADROOM = 0.8
+
+    @staticmethod
+    def required_lookahead(steps_per_segment: int) -> int:
+        """Speed-dependent minimum segment lookahead depth in the ESP32 planner queue.
+
+        At low speed each segment contains very few steps, so the ring drains
+        faster relative to the inter-segment host→ESP32 pipeline latency (~3–5 ms).
+        A deeper buffer prevents ring underruns and motor stutter.
+
+        Thresholds match firmware EXEC_BATCH_LIMIT tiers:
+          < 10  steps → 48 segments (low speed,  ~50 RPM)
+          < 50  steps → 32 segments (mid speed)
+          >= 50 steps → 16 segments (high speed, > ~200 RPM)
+        """
+        if steps_per_segment < 10:
+            return 48
+        elif steps_per_segment < 50:
+            return 32
+        else:
+            return 16
 
     def __init__(
         self,
@@ -86,14 +108,36 @@ class MultiAxisRampStreamer:
         self._target_buffer_time_s = self._compute_target_buffer_time(target_buffer_time_s)
         self._min_buffer_time_s = min(self.MIN_BUFFER_TIME_S, self._target_buffer_time_s * 0.5)
 
-        self._generator = iter(MultiAxisSegmentGenerator(self._axis_configs, segment_duration_s=self._segment_duration_s))
-        self._generator_finished = False
         self._inflight: deque[tuple[MultiAxisSegment, int]] = deque()
         self._buffered_time_s = 0.0
         self._last_sent_motion_seq = -1
         self._last_sent_transport_seq = -1
         self._planner_under_pressure = False  # True while planner_queue_free < threshold
         self._buffered_segments = 0           # SEGMENT_QUEUE_DEPTH - planner_queue_free
+        self._current_steps_per_segment = 0  # updated per-segment; drives required_lookahead()
+        self._prefilling = False              # suppresses pressure gate during initial prefill
+        # Premature-completion detection
+        self._last_confirmed_sequence: int = -1
+        self._premature_notify_count: int = 0
+        self._premature_notify_window_start: float = 0.0
+        self._last_sequence_advance_time: float = time.time()
+        self._last_sequence_advance_value: int = -1
+        self._stall_timeout_s: float = 2.0  # stall if no progress for 2s
+
+        self._sync_with_firmware_status()
+        start_sequence = (
+            (self._last_confirmed_sequence + 1) & 0xFFFF
+            if self._last_confirmed_sequence >= 0
+            else 0
+        )
+        self._generator = iter(
+            MultiAxisSegmentGenerator(
+                self._axis_configs,
+                segment_duration_s=self._segment_duration_s,
+                start_sequence=start_sequence,
+            )
+        )
+        self._generator_finished = False
 
     # -- Helpers ---------------------------------------------------------------
 
@@ -115,14 +159,17 @@ class MultiAxisRampStreamer:
         return int(getattr(status, "planner_queue_free", self.SEGMENT_QUEUE_DEPTH))
 
     def _check_planner_pressure(self, status) -> bool:
-        """Return True (blocked) if planner queue has insufficient free slots.
+        """Return True (blocked) when the ESP32 planner buffer already has enough lookahead.
 
-        Also logs edge transitions for diagnostics:
-          - 'planner pressure' when free slots drop below 16
-          - 'planner recovered' when free slots recover above 64
+        Uses Klipper's move-queue model: send if buffered < needed, not if free > threshold.
+        During initial prefill (_prefilling=True) the gate is bypassed entirely so
+        the host can fill up to the speed-appropriate prefill target without interference.
+
+        Logs edge transitions:
+          - 'planner pressure' when planner_queue_free drops below 16
+          - 'planner recovered' when planner_queue_free recovers above 64
         """
         pqf = self._planner_queue_free(status)
-        # Update lookahead counter used by buffered_segments property.
         self._buffered_segments = self.SEGMENT_QUEUE_DEPTH - pqf
 
         if pqf < 16 and not self._planner_under_pressure:
@@ -132,7 +179,48 @@ class MultiAxisRampStreamer:
             self._planner_under_pressure = False
             print(f"[{self._timestamp()}] planner recovered: planner_queue_free={pqf} (> 64)")
 
-        return pqf < self.PLANNER_QUEUE_SEND_THRESHOLD
+        # During prefill we bypass the pressure gate so the host can seed a deep buffer.
+        if self._prefilling:
+            return False
+
+        # Klipper model: block if the buffer already holds the required lookahead depth.
+        # This inverts the old "send if free slots >= threshold" gate: we now gate on
+        # buffered depth rather than remaining free space, which is speed-aware.
+        needed = self.required_lookahead(self._current_steps_per_segment)
+        return self._buffered_segments >= needed
+
+    def _max_segments_per_cycle(self) -> int:
+        """Speed-dependent send cap per polling cycle.
+
+        At low speed (few steps/segment) the defer ring on the ESP32 cannot
+        overflow (each segment contributes <10 ring entries) so a higher cap
+        is safe and necessary to keep the ring fed between underruns.
+        At high speed a lower cap prevents burst-after-throttle overflow.
+
+          < 10  steps/segment → 16 segments/cycle (low speed, 50 RPM)
+          < 50  steps/segment →  8 segments/cycle (mid speed)
+          >= 50 steps/segment →  4 segments/cycle (high speed, > 200 RPM)
+        """
+        if self._current_steps_per_segment < 10:
+            return 16
+        elif self._current_steps_per_segment < 50:
+            return 8
+        else:
+            return 4
+
+    def _max_inflight_segments(self) -> int:
+        """Speed-dependent in-flight segment cap.
+
+        At low speed each segment executes slowly so more can be in-flight
+        simultaneously without risking the host advancing too far ahead
+        of the motor's actual position.
+        """
+        if self._current_steps_per_segment < 10:
+            return 96
+        elif self._current_steps_per_segment < 50:
+            return 48
+        else:
+            return 24
 
     def _timestamp(self) -> str:
         now = time.time()
@@ -149,6 +237,21 @@ class MultiAxisRampStreamer:
             return requested_time_s
         safe_time_s = (self.STEP_RING_CAPACITY * self.RING_BUFFER_HEADROOM) / max_hz
         return max(self.MIN_BUFFER_TIME_S, min(requested_time_s, safe_time_s))
+
+    def _sync_with_firmware_status(self) -> None:
+        """Synchronize stream state with the ESP32's last executed sequence."""
+        try:
+            status = self._transport.get_status()
+        except Exception:
+            return
+
+        received_sequence = int(getattr(status, "last_executed_sequence", -1))
+        if received_sequence == 0xFFFF or received_sequence < 0:
+            return
+
+        self._last_confirmed_sequence = received_sequence
+        self._last_sequence_advance_value = received_sequence
+        self._last_sequence_advance_time = time.time()
 
     def _enable_axes(self) -> None:
         for axis_id in self._axis_ids:
@@ -169,12 +272,72 @@ class MultiAxisRampStreamer:
         last_executed = int(getattr(status, "last_executed_sequence", -1))
         while self._inflight:
             segment, _transport_seq = self._inflight[0]
-            if segment.sequence <= last_executed:
+            if sequence_is_less_equal(segment.sequence, last_executed):
                 self._buffered_time_s -= segment.duration_us / 1_000_000.0
                 self._buffered_time_s = max(0.0, self._buffered_time_s)
                 self._inflight.popleft()
             else:
                 break
+
+    def _check_premature_completion(self, status) -> None:
+        received_sequence = int(getattr(status, "last_executed_sequence", -1))
+        if received_sequence == 0xFFFF or received_sequence < 0:
+            return
+
+        # True premature: ESP32 reports completion of a seq we never sent.
+        if self._last_sent_motion_seq >= 0 and sequence_is_greater(received_sequence, self._last_sent_motion_seq):
+            now = time.time()
+            if now - self._premature_notify_window_start > 1.0:
+                self._premature_notify_count = 0
+                self._premature_notify_window_start = now
+            self._premature_notify_count += 1
+            print(
+                f"[{self._timestamp()}] WARNING premature completion: "
+                f"got seq={received_sequence} but last sent={self._last_sent_motion_seq} "
+                f"— ESP32 reported completion before host sent this segment "
+                f"(count={self._premature_notify_count})"
+            )
+
+        # Advance confirmed pointer only when sequence strictly increases.
+        if self._last_confirmed_sequence < 0 or sequence_is_greater(
+            received_sequence, self._last_confirmed_sequence
+        ):
+            self._last_confirmed_sequence = received_sequence
+
+    def _check_stall(self, status) -> bool:
+        """Return True and request stop if last_executed_sequence has not
+        advanced for _stall_timeout_s while segments are in flight.
+
+        A stall means the RMT is dead and pushBlock() is likely deadlocked.
+        Requesting a stop+flush allows the host to recover gracefully.
+        """
+        received_sequence = int(getattr(status, "last_executed_sequence", -1))
+        if received_sequence == 0xFFFF or received_sequence < 0:
+            return False
+        if not self._inflight:
+            # No in-flight segments — not a stall, just idle.
+            self._last_sequence_advance_time = time.time()
+            return False
+
+        if self._last_sequence_advance_value < 0 or sequence_is_greater(
+            received_sequence, self._last_sequence_advance_value
+        ):
+            self._last_sequence_advance_value = received_sequence
+            self._last_sequence_advance_time = time.time()
+            return False
+
+        elapsed = time.time() - self._last_sequence_advance_time
+        if elapsed > self._stall_timeout_s:
+            print(
+                f"[{self._timestamp()}] WARNING motor stall detected: "
+                f"last_executed_sequence={received_sequence} unchanged for "
+                f"{elapsed:.1f}s with {len(self._inflight)} segments in flight "
+                f"— requesting stop and flush"
+            )
+            self.request_stop()
+            self.request_flush(self._last_sent_motion_seq)
+            return True
+        return False
 
     def _check_endstop(self, status) -> bool:
         """Return True if an endstop was triggered on any armed axis.
@@ -286,7 +449,7 @@ class MultiAxisRampStreamer:
         while (
             len(batch) < MULTI_AXIS_SEGMENT_BLOCK_SIZE
             and self._buffered_time_s < self._target_buffer_time_s
-            and len(self._inflight) < self.MAX_INFLIGHT_SEGMENTS
+            and len(self._inflight) < self._max_inflight_segments()
             and not self._queue_full(status)
             and not self._check_planner_pressure(status)
         ):
@@ -296,12 +459,17 @@ class MultiAxisRampStreamer:
                 self._generator_finished = True
                 break
 
-            if segment.sequence <= self._last_sent_motion_seq:
+            if self._last_sent_motion_seq >= 0 and not sequence_is_greater(
+                segment.sequence, self._last_sent_motion_seq
+            ):
                 raise RuntimeError(
                     f"motion sequence not strictly increasing: "
                     f"got {segment.sequence}, last was {self._last_sent_motion_seq}"
                 )
             batch.append(segment)
+            # Keep speed estimate current so required_lookahead() uses fresh data.
+            if segment.steps:
+                self._current_steps_per_segment = sum(segment.steps)
 
         if not batch:
             return None
@@ -330,23 +498,39 @@ class MultiAxisRampStreamer:
             )
 
     def _prefill(self, status) -> tuple[int, Any]:
-        """Send MIN_PREFILL_BATCHES back-to-back without waiting between them.
+        """Pre-send segments to seed the ESP32 planner queue before RMT starts.
 
-        Ensures the firmware ring has deep look-ahead before the RMT starts.
+        The prefill target is speed-dependent:
+          - Low speed  (steps_per_segment < 10): 64 segments (half of SEGMENT_QUEUE_DEPTH)
+            because the ring drains very fast at low RPM and needs a large head start.
+          - Otherwise: required_lookahead(current_steps_per_segment) segments.
+
+        The _prefilling flag is set for the duration of this call so that
+        _check_planner_pressure() does not prematurely gate sends before the
+        target depth has been reached.
+
         Returns (total_segments_sent, last_status).
-        MIN_PREFILL_BATCHES = 3 fills ~3 x MULTI_AXIS_SEGMENT_BLOCK_SIZE segments.
         """
-        MIN_PREFILL_BATCHES = 3
+        is_low_speed = self._current_steps_per_segment < 10
+        if is_low_speed:
+            prefill_target = 64   # half of SEGMENT_QUEUE_DEPTH
+        else:
+            prefill_target = self.required_lookahead(self._current_steps_per_segment)
+
         total = 0
         last_status = status
-        for _ in range(MIN_PREFILL_BATCHES):
-            result = self._collect_and_send_batch(last_status)
-            if result is None:
-                break
-            n, last_status = result
-            total += n
-            if n == 0:  # QUEUE_FULL -- stop prefilling
-                break
+        self._prefilling = True
+        try:
+            while total < prefill_target:
+                result = self._collect_and_send_batch(last_status)
+                if result is None:
+                    break
+                n, last_status = result
+                total += n
+                if n == 0:  # QUEUE_FULL — firmware can't accept more right now
+                    break
+        finally:
+            self._prefilling = False
         return total, last_status
 
     def _should_sleep(self) -> float:
@@ -378,17 +562,26 @@ class MultiAxisRampStreamer:
 
             status = self._transport.get_status()
             self._remove_confirmed_segments(status)
+            self._check_premature_completion(status)
+            if self._check_stall(status):
+                break
 
             if self._check_endstop(status):
                 break
 
+            # Rate-limit sends to MAX_SEGMENTS_PER_CYCLE per polling iteration to
+            # prevent burst-after-throttle that overflows the ESP32 defer ring.
+            cycle_segments_sent = 0
             while not self._generator_finished:
+                if cycle_segments_sent >= self._max_segments_per_cycle():
+                    break
                 result = self._collect_and_send_batch(status)
                 if result is None:
                     break
                 n, status = result
                 if n == 0:  # QUEUE_FULL
                     break
+                cycle_segments_sent += n
                 total_segments += n
                 if total_segments % self._print_every == 0:
                     print(

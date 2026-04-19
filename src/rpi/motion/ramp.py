@@ -348,10 +348,10 @@ class AxisMotionConfig:
 
 
 class MultiAxisSegmentGenerator:
-    def __init__(self, axis_configs: list[AxisMotionConfig], *, segment_duration_s: float = 0.004):
+    def __init__(self, axis_configs: list[AxisMotionConfig], *, segment_duration_s: float = 0.004, start_sequence: int = 0):
         self.axis_configs = axis_configs
         self.segment_duration_s = max(0.002, min(0.005, segment_duration_s))
-        self._sequence = 0
+        self._sequence = start_sequence & 0xFFFF
         self._axis_errors = [0.0 for _ in axis_configs]
         self._axis_total_durations = [config.ramp.total_duration for config in axis_configs]
         self._overall_duration = max(self._axis_total_durations) if axis_configs else 0.0

@@ -407,8 +407,8 @@ void StepperDriver::stopStream()
 
 esp_err_t StepperDriver::startStream()
 {
-    rmt_stopped_.store(false, std::memory_order_release);
     rmt_running_.store(true, std::memory_order_release);
+    rmt_stopped_.store(false, std::memory_order_release);
     last_chunk_had_steps_ = false;
 
     // `this` is in internal DRAM (static global) — passes esp_ptr_internal()
@@ -496,6 +496,16 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
             // are blocked here, break out immediately instead of spinning.
             if (endstop_active_.load(std::memory_order_acquire)) {
                 return ESP_ERR_INVALID_STATE;
+            }
+            // If RMT is not running and ring is full, the encoder callback
+            // will never fire and ring_read_ will never advance.
+            // Kick startStream() directly instead of waiting forever.
+            if (!rmt_running_.load(std::memory_order_acquire)) {
+                esp_err_t kick_err = startStream();
+                if (kick_err != ESP_OK) {
+                    ESP_LOGW(TAG, "motor%u: pushBlock kick startStream: %s",
+                             motor_id_, esp_err_to_name(kick_err));
+                }
             }
             ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(5));
             if (endstop_active_.load(std::memory_order_acquire)) {

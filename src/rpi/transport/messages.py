@@ -330,6 +330,30 @@ def parse_status_frame(frame: bytes) -> StatusPayload:
     return StatusPayload.unpack(payload)
 
 
+def sequence_signed_distance(a: int, b: int) -> int:
+    """Return the signed 16-bit distance from b to a.
+
+    This is useful for comparing motion_sequence values that wrap at 0xFFFF.
+    """
+    return ((a - b + 0x8000) & 0xFFFF) - 0x8000
+
+
+def sequence_is_greater(a: int, b: int) -> bool:
+    return sequence_signed_distance(a, b) > 0
+
+
+def sequence_is_greater_equal(a: int, b: int) -> bool:
+    return sequence_signed_distance(a, b) >= 0
+
+
+def sequence_is_less_equal(a: int, b: int) -> bool:
+    return sequence_signed_distance(a, b) <= 0
+
+
+def increment_sequence(sequence: int, increment: int = 1) -> int:
+    return (sequence + increment) & 0xFFFF
+
+
 def make_nop(sequence: int = 0) -> bytes:
     return build_frame(SpiMessageType.NOP, b"", sequence=sequence)
 

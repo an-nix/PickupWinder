@@ -31,7 +31,7 @@ static constexpr uint32_t  SPI_TASK_STACK  = 4096;
 static constexpr UBaseType_t SPI_TASK_PRIO = 10;
 static constexpr BaseType_t  SPI_TASK_CORE = 0;
 
-static constexpr uint32_t    MULTI_EXEC_STACK  = 6144;
+static constexpr uint32_t    MULTI_EXEC_STACK  = 8192;
 static constexpr UBaseType_t MULTI_EXEC_PRIO   = 20;
 static constexpr BaseType_t  MULTI_EXEC_CORE   = 1;
 
@@ -729,13 +729,16 @@ void CommInterface::multiAxisExecutorTask(void* arg)
         }
     }
 
+    ESP_LOGI(TAG, "multi_exec stack high watermark at start: %u bytes free",
+             (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+
     // ── Segment queue handle from the planner ─────────────────────────────
     QueueHandle_t seg_queue = self->planner_.segmentQueue();
 
     // ── Deferred notification ring ────────────────────────────────────────
     static constexpr int DEFER_DEPTH = 256;
-    int64_t  defer_fire_us[DEFER_DEPTH];
-    uint32_t defer_seqs[DEFER_DEPTH];
+    static int64_t  defer_fire_us[DEFER_DEPTH];
+    static uint32_t defer_seqs[DEFER_DEPTH];
     int      defer_head = 0;
     int      defer_tail = 0;
 
@@ -778,6 +781,12 @@ void CommInterface::multiAxisExecutorTask(void* arg)
 
     // ── Main loop ─────────────────────────────────────────────────────────
     for (;;) {
+        static uint32_t wm_iter = 0;
+        if (++wm_iter % 2000 == 0) {
+            ESP_LOGD(TAG, "multi_exec stack watermark: %u bytes free",
+                     (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+        }
+
         // Always fire due deferred notifications at top of loop.
         fireDeferred();
 
@@ -950,6 +959,18 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     ESP_LOGW(TAG, "defer ring full: evicted seq=%u to make room for seq=%u",
                              (unsigned)evicted_seq,
                              (unsigned)seg.motion_sequence);
+                }
+
+                // Restart RMT immediately if it stopped mid-batch due to ring drain.
+                // Do not wait for ExecState::RUN — the ring may fill with unconsumed
+                // steps causing pushBlock() to deadlock on ulTaskNotifyTake.
+                for (uint8_t a = 0; a < seg.axis_count; ++a) {
+                    const uint8_t axis_id = seg.axis_ids[a];
+                    if (axis_id >= self->n_motors_ ||
+                        self->queues_[axis_id] == nullptr) continue;
+                    if (!self->queues_[axis_id]->driver().isStreaming()) {
+                        self->queues_[axis_id]->kickStart();
+                    }
                 }
 
                 ++batch_index;

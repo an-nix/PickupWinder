@@ -156,6 +156,20 @@ class MoveQueue:
             target_buffer_time_s=0.150,
         )
 
+    def _next_motion_sequence(self) -> int:
+        status = self._transport.get_status()
+        last_executed = int(getattr(status, "last_executed_sequence", -1))
+        if last_executed == 0xFFFF or last_executed < 0:
+            return 0
+        return (last_executed + 1) & 0xFFFF
+
+    def _wrap_segment_sequence(self, generator: Any, start_sequence: int):
+        sequence = start_sequence & 0xFFFF
+        for segment in generator:
+            segment.sequence = sequence
+            yield segment
+            sequence = (sequence + 1) & 0xFFFF
+
     def _execute_ramp_move(self, move: Move) -> None:
         """Execute a RampMove or JogMove via MultiAxisRampStreamer."""
         move.mark_running()
@@ -164,8 +178,12 @@ class MoveQueue:
         axis_ids = [cfg.axis_id for cfg in axis_configs]
 
         streamer = self._make_streamer(axis_configs)
-        # Override the generator to use the move's segments() method.
-        streamer._generator = move.segments()
+        # Override the generator to use the move's segments() method, but align
+        # motion_sequence values with the ESP32 last_executed_sequence.
+        streamer._generator = self._wrap_segment_sequence(
+            move.segments(),
+            self._next_motion_sequence(),
+        )
         streamer._generator_finished = False
 
         try:
@@ -217,7 +235,10 @@ class MoveQueue:
 
             # Execute the sub-move.
             streamer = self._make_streamer(sub_move._config.axis_configs)
-            streamer._generator = sub_move.segments()
+            streamer._generator = self._wrap_segment_sequence(
+                sub_move.segments(),
+                self._next_motion_sequence(),
+            )
             streamer._generator_finished = False
             streamer.stream_all()
 
