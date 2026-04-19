@@ -25,7 +25,7 @@ _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HHH")
 _STEP_COUNT_STRUCT = struct.Struct("<H")
 _FLUSH_STRUCT = struct.Struct("<H2x")
 _ENABLE_ENDSTOP_STRUCT = struct.Struct("<BB2x")
-_STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBBBH1x")
+_STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBBBHB")
 
 
 class SpiMessageType(IntEnum):  # Must match SpiMessageType in messages.h
@@ -252,6 +252,7 @@ class StatusPayload:
     lateral_endstop_state: int
     endstop_armed_mask: int
     last_executed_sequence: int
+    planner_queue_free: int
 
     @classmethod
     def unpack(cls, payload: bytes) -> "StatusPayload":
@@ -270,6 +271,7 @@ class StatusPayload:
             lateral_endstop_state=values[19],
             endstop_armed_mask=values[20],
             last_executed_sequence=values[21],
+            planner_queue_free=values[22],
         )
 
 

@@ -47,6 +47,12 @@ class MultiAxisRampStreamer:
     POLL_SLEEP_S = 0.0005
     MAX_INFLIGHT_SEGMENTS = 24
 
+    # Planner→executor segment queue depth on the ESP32 (matches SEGMENT_QUEUE_DEPTH in firmware).
+    SEGMENT_QUEUE_DEPTH = 128
+    # Gate: do not send if fewer than this many slots are free in the planner queue.
+    # Equals EXEC_BATCH_LIMIT * 2 (firmware constant), giving two full executor batches of headroom.
+    PLANNER_QUEUE_SEND_THRESHOLD = 32
+
     # ESP32 step ring capacity in firmware: one step consumes one ring entry.
     STEP_RING_CAPACITY = 4096
     RING_BUFFER_HEADROOM = 0.8
@@ -86,8 +92,47 @@ class MultiAxisRampStreamer:
         self._buffered_time_s = 0.0
         self._last_sent_motion_seq = -1
         self._last_sent_transport_seq = -1
+        self._planner_under_pressure = False  # True while planner_queue_free < threshold
+        self._buffered_segments = 0           # SEGMENT_QUEUE_DEPTH - planner_queue_free
 
     # -- Helpers ---------------------------------------------------------------
+
+    @property
+    def buffered_segments(self) -> int:
+        """Number of segments currently buffered in the planner→executor queue.
+
+        Computed from the last received planner_queue_free field:
+            buffered = SEGMENT_QUEUE_DEPTH - planner_queue_free
+
+        This mirrors Klipper's "move queue available" check: when buffered_segments
+        approaches SEGMENT_QUEUE_DEPTH the host should stop requesting more motion.
+        Value is 0 when no status has been received yet.
+        """
+        return self._buffered_segments
+
+    def _planner_queue_free(self, status) -> int:
+        """Return planner_queue_free from status, defaulting to full if absent."""
+        return int(getattr(status, "planner_queue_free", self.SEGMENT_QUEUE_DEPTH))
+
+    def _check_planner_pressure(self, status) -> bool:
+        """Return True (blocked) if planner queue has insufficient free slots.
+
+        Also logs edge transitions for diagnostics:
+          - 'planner pressure' when free slots drop below 16
+          - 'planner recovered' when free slots recover above 64
+        """
+        pqf = self._planner_queue_free(status)
+        # Update lookahead counter used by buffered_segments property.
+        self._buffered_segments = self.SEGMENT_QUEUE_DEPTH - pqf
+
+        if pqf < 16 and not self._planner_under_pressure:
+            self._planner_under_pressure = True
+            print(f"[{self._timestamp()}] planner pressure: planner_queue_free={pqf} (< 16)")
+        elif pqf > 64 and self._planner_under_pressure:
+            self._planner_under_pressure = False
+            print(f"[{self._timestamp()}] planner recovered: planner_queue_free={pqf} (> 64)")
+
+        return pqf < self.PLANNER_QUEUE_SEND_THRESHOLD
 
     def _timestamp(self) -> str:
         now = time.time()
@@ -243,6 +288,7 @@ class MultiAxisRampStreamer:
             and self._buffered_time_s < self._target_buffer_time_s
             and len(self._inflight) < self.MAX_INFLIGHT_SEGMENTS
             and not self._queue_full(status)
+            and not self._check_planner_pressure(status)
         ):
             try:
                 segment = next(self._generator)
