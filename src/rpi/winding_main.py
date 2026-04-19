@@ -62,7 +62,7 @@ def main() -> None:
         event_bus=event_bus,
         config=config,
     )
-    rpc_handler = AppRpcHandler()
+    rpc_handler = AppRpcHandler(app=engine)
     WindingRpcHandler(engine=engine, shared_state=shared_state).register_all(rpc_handler)
     rpc_server = JsonRpcServer(
         handler=rpc_handler,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Any, Optional
@@ -21,6 +22,9 @@ from core.config import AppConfiguration
 from core.events import EventBus, EventKind
 from winding.program import WindingProgram
 from core.shared_state import EngineState, SharedState
+
+
+logger = logging.getLogger(__name__)
 
 
 class WindingEngine:
@@ -164,6 +168,25 @@ class WindingEngine:
             accel_s = accel_s if accel_s is not None else computed_accel_s
             cruise_s = cruise_s if cruise_s is not None else computed_cruise_s
             decel_s = decel_s if decel_s is not None else computed_decel_s
+
+        expected_turns = 2.0 * bobbin_width_mm * turns_per_mm
+        profile = SpindleKinematics(
+            target_rpm=target_rpm,
+            start_rpm=0.0,
+            accel_s=accel_s,
+            cruise_s=cruise_s,
+            decel_s=decel_s,
+        )
+        profile_turns = profile.turns_at(accel_s + cruise_s + decel_s)
+        if expected_turns > 0.0:
+            error_pct = abs(profile_turns - expected_turns) / expected_turns * 100.0
+            if error_pct > 5.0:
+                logger.warning(
+                    "wound_run: profile produces %.1f turns but geometry expects %.1f turns (%.1f%% error)",
+                    profile_turns,
+                    expected_turns,
+                    error_pct,
+                )
 
         move = WoundMove(
             name="winding_electronic_gearing",

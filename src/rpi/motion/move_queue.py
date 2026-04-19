@@ -235,6 +235,7 @@ class MoveQueue:
             self._transport,
             move.axis_ids,
             target_hz=max(target_hz, 1.0),
+            segment_duration_s=move.segment_duration_s,
             poll_interval_s=self._poll_interval_s,
             print_every=self._print_every,
             target_buffer_time_s=0.150,
@@ -266,13 +267,16 @@ class MoveQueue:
             return
 
         if self._stop_requested:
+            for ax_id in axis_ids:
+                if ax_id in self._axis_states:
+                    self._axis_states[ax_id].invalidate_position()
             move.mark_aborted("stop requested")
             return
 
-        move.mark_completed()
         for ax_id in move.axis_ids:
             if ax_id in self._axis_states:
                 self._axis_states[ax_id].invalidate_position()
+        move.mark_completed()
 
     def _execute_homing(self, move: HomingMove) -> None:
         """

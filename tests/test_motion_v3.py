@@ -1,5 +1,8 @@
 import os
 import sys
+import logging
+import importlib
+import warnings
 from types import SimpleNamespace
 
 root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "rpi"))
@@ -15,8 +18,9 @@ from motion.scatter_engine import ScatterEngine
 from motion.move import HomingMove, WoundMove
 from motion.axis_state import AxisState
 from motion.move_queue import MoveQueue
-from motion.syncrhonized_segment_generator import SyncAxisConfig
+from motion.synchronized_segment_generator import SyncAxisConfig
 from motion.engine import WindingEngine
+from transport.streamer import MultiAxisRampStreamer
 from winding.program import WindingProgram
 from core.config import AppConfiguration
 from core.events import EventBus
@@ -251,3 +255,100 @@ def test_execute_homing_waits_for_endstop_request_confirmation(monkeypatch):
     assert move.state.name == "COMPLETED"
     # approach arm + backoff disarm + search arm + final disarm
     assert len(transport.wait_calls) == 4
+
+
+def test_execute_wound_move_invalidates_positions_on_stop_requested(monkeypatch):
+    class FakeTransport:
+        def get_status(self):
+            return SimpleNamespace(last_executed_sequence=0xFFFF)
+
+    class FakeStreamer:
+        def __init__(self, queue: MoveQueue) -> None:
+            self._generator = None
+            self._generator_finished = False
+            self.endstop_triggered = False
+            self._queue = queue
+
+        def stream_all(self) -> int:
+            self._queue._stop_requested = True
+            return 0
+
+    spindle_state = AxisState(axis_id=0)
+    traverse_state = AxisState(axis_id=1)
+    spindle_state.mark_homed(100)
+    traverse_state.mark_homed(200)
+
+    queue = MoveQueue(
+        transport=FakeTransport(),
+        axis_states={0: spindle_state, 1: traverse_state},
+        poll_interval_s=0.001,
+        print_every=1,
+    )
+    monkeypatch.setattr(queue, "_make_wound_streamer", lambda move: FakeStreamer(queue))
+
+    move = WoundMove(
+        name="wound_stop",
+        kinematics=SpindleKinematics(target_rpm=600.0, accel_s=0.2, cruise_s=0.2, decel_s=0.2),
+        pattern=WindingPattern(bobbin_width_mm=10.0, turns_per_mm=5.0),
+        scatter=ScatterEngine(amplitude_mm=0.0),
+        spindle_cfg=SyncAxisConfig(axis_index=0, steps_per_unit=6400.0),
+        traverse_cfg=SyncAxisConfig(axis_index=1, steps_per_unit=800.0),
+    )
+
+    queue._execute_wound_move(move)
+
+    assert move.state.name == "ABORTED"
+    assert spindle_state.position_steps is None
+    assert traverse_state.position_steps is None
+
+
+def test_wound_run_logs_warning_for_inconsistent_explicit_profile(caplog):
+    config = AppConfiguration()
+    engine = WindingEngine(
+        transport=SimpleNamespace(),
+        shared_state=SharedState(axis_states={}),
+        event_bus=EventBus(),
+        config=config,
+    )
+    engine._move_queue.enqueue = lambda move: None  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="motion.engine"):
+        engine.wound_run(
+            spindle_axis_id=0,
+            traverse_axis_id=1,
+            target_rpm=600.0,
+            accel_s=0.1,
+            cruise_s=0.1,
+            decel_s=0.1,
+            bobbin_width_mm=10.0,
+            turns_per_mm=5.0,
+        )
+
+    assert "wound_run: profile produces" in caplog.text
+
+
+def test_from_axis_ids_respects_segment_duration_s_parameter():
+    class FakeTransport:
+        def get_status(self):
+            return SimpleNamespace(last_executed_sequence=0xFFFF)
+
+    streamer = MultiAxisRampStreamer.from_axis_ids(
+        FakeTransport(),
+        [0, 1],
+        target_hz=1000.0,
+        segment_duration_s=0.003,
+    )
+    assert streamer._segment_duration_s == pytest.approx(0.003)
+
+
+def test_legacy_syncrhonized_module_emits_deprecation_warning():
+    module_name = "motion.syncrhonized_segment_generator"
+    sys.modules.pop(module_name, None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", DeprecationWarning)
+        importlib.import_module(module_name)
+    assert any(
+        isinstance(w.message, DeprecationWarning)
+        and "deprecated" in str(w.message)
+        for w in caught
+    )

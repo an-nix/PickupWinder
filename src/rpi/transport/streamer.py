@@ -4,7 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 import json
 import time
-from typing import Any, Iterator, List
+from typing import Any
 
 from transport.messages import (
     MULTI_AXIS_SEGMENT_BLOCK_SIZE,
@@ -111,6 +111,7 @@ class MultiAxisRampStreamer:
         axis_ids: list[int],
         *,
         target_hz: float,
+        segment_duration_s: float = 0.004,
         poll_interval_s: float = 0.001,
         print_every: int = 1,
         target_buffer_time_s: float = 0.150,
@@ -134,7 +135,7 @@ class MultiAxisRampStreamer:
             transport=transport,
             axis_configs=[],
             axis_ids=axis_ids,
-            segment_duration_s=0.004,
+            segment_duration_s=segment_duration_s,
             target_buffer_time_s=target_buffer_time_s,
             poll_interval_s=poll_interval_s,
             print_every=print_every,
@@ -173,9 +174,12 @@ class MultiAxisRampStreamer:
         self._axis_ids = list(axis_ids)
         self._segment_duration_s = max(self.MIN_SEGMENT_TIME_S, min(self.MAX_SEGMENT_TIME_S, segment_duration_s))
         if explicit_target_hz is None:
-            self._target_buffer_time_s = self._compute_target_buffer_time(target_buffer_time_s)
+            max_hz = 0.0
+            if self._axis_configs:
+                max_hz = max(config.ramp.target_hz for config in self._axis_configs)
+            self._target_buffer_time_s = self._safe_buffer_time_s(target_buffer_time_s, max_hz)
         else:
-            self._target_buffer_time_s = self._compute_target_buffer_time_from_hz(target_buffer_time_s, explicit_target_hz)
+            self._target_buffer_time_s = self._safe_buffer_time_s(target_buffer_time_s, explicit_target_hz)
         self._min_buffer_time_s = min(self.MIN_BUFFER_TIME_S, self._target_buffer_time_s * 0.5)
 
         self._inflight: deque[tuple[MultiAxisSegment, int]] = deque()
@@ -303,21 +307,11 @@ class MultiAxisRampStreamer:
         milliseconds = int((now - seconds) * 1000)
         return time.strftime(f"%H:%M:%S.{milliseconds:03d}", time.localtime(now))
 
-    def _compute_target_buffer_time(self, requested_time_s: float) -> float:
+    def _safe_buffer_time_s(self, requested_time_s: float, max_hz: float) -> float:
         requested_time_s = max(self.MIN_BUFFER_TIME_S, min(self.MAX_BUFFER_TIME_S, requested_time_s))
-        if not self._axis_configs:
-            return requested_time_s
-        max_hz = max(config.ramp.target_hz for config in self._axis_configs)
         if max_hz <= 0.0:
             return requested_time_s
         safe_time_s = (self.STEP_RING_CAPACITY * self.RING_BUFFER_HEADROOM) / max_hz
-        return max(self.MIN_BUFFER_TIME_S, min(requested_time_s, safe_time_s))
-
-    def _compute_target_buffer_time_from_hz(self, requested_time_s: float, target_hz: float) -> float:
-        requested_time_s = max(self.MIN_BUFFER_TIME_S, min(self.MAX_BUFFER_TIME_S, requested_time_s))
-        if target_hz <= 0.0:
-            return requested_time_s
-        safe_time_s = (self.STEP_RING_CAPACITY * self.RING_BUFFER_HEADROOM) / target_hz
         return max(self.MIN_BUFFER_TIME_S, min(requested_time_s, safe_time_s))
 
     def _sync_with_firmware_status(self) -> None:

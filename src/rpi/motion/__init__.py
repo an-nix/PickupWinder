@@ -40,10 +40,10 @@ def __getattr__(name: str):
         from .scatter_engine import ScatterEngine
         return ScatterEngine
     if name == "SyncAxisConfig":
-        from .syncrhonized_segment_generator import SyncAxisConfig
+        from .synchronized_segment_generator import SyncAxisConfig
         return SyncAxisConfig
     if name == "SynchronizedSegmentGenerator":
-        from .syncrhonized_segment_generator import SynchronizedSegmentGenerator
+        from .synchronized_segment_generator import SynchronizedSegmentGenerator
         return SynchronizedSegmentGenerator
     if name == "WindingEngine":
         from .engine import WindingEngine
