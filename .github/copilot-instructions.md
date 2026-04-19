@@ -384,62 +384,23 @@ resources/                  Reference code (DO NOT MODIFY)
 
 ---
 
-## 12. Winding Kinematics  (host side — `src/rpi/machine/winding_kinematics.py`)
+## 12. Winding Kinematics (Electronic Gearing)
 
-All winding geometry computation runs on the Raspberry Pi host.
-The ESP32 receives only motion segments (`SEGMENT_BLOCK`) and has no knowledge
-of wire geometry.
+All winding geometry computation runs on the Raspberry Pi host using an Electronic Gearing architecture.
+The ESP32 receives only multi-axis segments (`MULTI_AXIS_SEGMENT_BLOCK`) natively synced by the generator and has no knowledge
+of wire geometry or synchronization.
 
-### Frequency Ratio (general formula)
+### The Electronic Gearing Model
 
-The bobbin and lateral axes may have **different** motor specifications:
+The generation is split into four decoupled components in `src/rpi/motion/ramp.py`:
 
-```
-R = (pitch_mm / traverse_pitch_mm) × (lateral_ppr / bobbin_ppr)
-hz_lateral = hz_bobbin × R          (clamped to [1, HZ_MAX])
-```
+- **`SpindleKinematics`** (The Master): Calculates the theoretical absolute angular position (in turns) of the Bobbin over time, integrating acceleration, cruise RPM, and deceleration.
+- **`WindingPattern`** (The Slave function): A pure mathematical function converting a Spindle position (turns) into a Traverse position (mm). For a standard coil, this is a triangular wave constrained between 0 and `bobbin_width_mm` with a slope of `turns_per_mm`.
+- **`ScatterEngine`**: Introduces a spatial, non-harmonic offset to the Traverse position to avoid exact wire stacking. Uses an edge-damping factor to automatically kill the offset at the spool flanges (0 and `bobbin_width_mm`) to prevent wire spillage.
+- **`SynchronizedSegmentGenerator`**: The main iterator spanning the time domain by `segment_duration_s` steps. Computes target positions for both axes, applies a global `round(target_steps - current_steps)` to eliminate cumulative floating-point errors, and chunks the delta steps into `MultiAxisSegment` payloads for the ESP32.
 
-When both axes share the same ppr, the fraction cancels and the formula reduces
-to `R = pitch_mm / traverse_pitch_mm`.
+### Manual Mode / Single Axis
 
-**Example** (equal motors, d=0.3 mm, p_lead=2 mm):
-- `bobbin_ppr = lateral_ppr = 6400`
-- `R = (0.3/2) × 1 = 0.15`
-- `hz_lat = 160 000 × 0.15 = 24 000 Hz`
-
-**Example** (different motors, bobbin_ppr=6400, lateral_ppr=3072):
-- `R = (0.3/2) × (3072/6400) = 0.072`
-- `hz_lat = 160 000 × 0.072 = 11 520 Hz`
-
-### WindingGeometry (Python)
-
-```python
-@dataclass
-class WindingGeometry:
-    wire_diameter_mm:      float
-    bobbin_width_mm:       float
-    traverse_pitch_mm:     float   # leadscrew mm/rev
-    mandrel_diameter_mm:   float   # D0 — runtime, never hardcoded
-    bobbin_steps_per_rev:  int = 200
-    bobbin_microsteps:     int = 32
-    lateral_steps_per_rev: int = 200   # may differ from bobbin motor
-    lateral_microsteps:    int = 32
-```
-
-### MotionSegment (transport dataclass)
-
-| Field          | Description                                    |
-|----------------|------------------------------------------------|
-| step_count     | Number of steps encoded by the segment         |
-| start_ticks    | First interval in RMT ticks                    |
-| add_ticks      | Delta added after each emitted step            |
-| direction      | Segment direction                              |
-
-### Winding Diameter per Layer
-
-```
-D(n) = D0 + d_wire × (1 + 2n × PACK)
-  PACK = 1.0     (FIXED_PITCH / CUSTOM_PITCH)
-  PACK = 0.86603 (ORTHOCYCLIC — sin 60°)
-```
+For UI jog buttons, homing moves, or individual axis tests, the system transparently utilizes the older `MultiAxisSegmentGenerator` fed by `AxisMotionConfig` arrays.
+Both `SynchronizedSegmentGenerator` (winding) and `MultiAxisSegmentGenerator` (jogging) output standard `MultiAxisSegment` objects. The host `MultiAxisRampStreamer` does not need to know which one is driving it.
 

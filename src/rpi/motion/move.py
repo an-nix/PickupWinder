@@ -6,7 +6,16 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Iterator
 
-from motion.ramp import AxisMotionConfig, MultiAxisSegmentGenerator, RampConfig
+from motion import (
+    AxisMotionConfig,
+    MultiAxisSegmentGenerator,
+    RampConfig,
+    SpindleKinematics,
+    WindingPattern,
+    ScatterEngine,
+    SyncAxisConfig,
+    SynchronizedSegmentGenerator,
+)
 from transport.messages import MultiAxisSegment
 
 
@@ -351,3 +360,42 @@ class JogMove(Move):
         if axis_id != self.axis_id:
             return None
         return -self._steps if self._reverse else self._steps
+
+
+class WoundMove(Move):
+    """
+    A single continuous move executing the Electronic Gearing winding pattern.
+    Utilizes SynchronizedSegmentGenerator to slave the Traverse to the Spindle.
+    """
+    def __init__(
+        self,
+        name: str,
+        kinematics: SpindleKinematics,
+        pattern: WindingPattern,
+        scatter: ScatterEngine,
+        spindle_cfg: SyncAxisConfig,
+        traverse_cfg: SyncAxisConfig,
+        segment_duration_s: float = 0.004,
+    ) -> None:
+        super().__init__(name)
+        self.kinematics = kinematics
+        self.pattern = pattern
+        self.scatter = scatter
+        self.spindle_cfg = spindle_cfg
+        self.traverse_cfg = traverse_cfg
+        self.segment_duration_s = segment_duration_s
+
+    def segments(self) -> Iterator[MultiAxisSegment]:
+        gen = SynchronizedSegmentGenerator(
+            self.kinematics,
+            self.pattern,
+            self.scatter,
+            self.spindle_cfg,
+            self.traverse_cfg,
+            segment_duration_s=self.segment_duration_s,
+        )
+        yield from gen
+
+    def expected_delta_steps(self, axis_id: int) -> int | None:
+        return None
+

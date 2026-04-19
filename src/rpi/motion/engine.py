@@ -5,13 +5,20 @@ import time
 from typing import Any
 
 from motion.axis_state import AxisState
-from motion.move import HomingMove, JogMove, RampMove, RampMoveConfig
+from motion.move import HomingMove, JogMove, RampMove, RampMoveConfig, WoundMove
 from motion.move_queue import MoveQueue
-from motion.ramp import AxisMotionConfig, RampConfig
+from motion import (
+    AxisMotionConfig,
+    RampConfig,
+    SpindleKinematics,
+    WindingPattern,
+    ScatterEngine,
+    SyncAxisConfig,
+)
 from transport.spi_transport import Esp32SpiTransport
-from winding.events import EventBus, EventKind
+from core.events import EventBus, EventKind
 from winding.program import WindingProgram
-from winding.shared_state import EngineState, SharedState
+from core.shared_state import EngineState, SharedState
 
 
 class WindingEngine:
@@ -102,6 +109,68 @@ class WindingEngine:
     def clear_fault(self) -> None:
         """Clear fault state so a new program can be submitted."""
         self._state.clear_fault()
+
+    def arm_endstop(self, axis_id: int) -> None:
+        """Arm the specified endstop through the transport."""
+        sequence, _ = self._transport.enable_endstop_request(axis_id, arm=True)
+        self._transport.wait_for_request_result(sequence)
+
+    def disarm_endstop(self, axis_id: int) -> None:
+        """Disarm the specified endstop through the transport."""
+        sequence, _ = self._transport.enable_endstop_request(axis_id, arm=False)
+        self._transport.wait_for_request_result(sequence)
+
+    def wound_run(
+        self,
+        spindle_axis_id: int,
+        traverse_axis_id: int,
+        target_rpm: float,
+        accel_s: float,
+        cruise_s: float,
+        decel_s: float,
+        bobbin_width_mm: float,
+        turns_per_mm: float,
+        scatter_amplitude_mm: float = 0.0,
+        scatter_damping_margin_mm: float = 0.0,
+        spindle_reverse: bool = False,
+        traverse_reverse: bool = False,
+    ) -> None:
+        """
+        Execute a synchronized winding operation (Electronic Gearing).
+        Only allowed when engine is IDLE.
+        """
+        if self._state.engine_state != EngineState.IDLE:
+            raise RuntimeError("Winding run only allowed when engine is IDLE")
+        
+        move = WoundMove(
+            name="winding_electronic_gearing",
+            kinematics=SpindleKinematics(
+                target_rpm=target_rpm,
+                start_rpm=0.0,    
+                accel_s=accel_s,
+                cruise_s=cruise_s,
+                decel_s=decel_s
+            ),
+            pattern=WindingPattern(
+                bobbin_width_mm=bobbin_width_mm,
+                turns_per_mm=turns_per_mm
+            ),
+            scatter=ScatterEngine(
+                amplitude_mm=scatter_amplitude_mm,
+                damping_margin_mm=scatter_damping_margin_mm
+            ),
+            spindle_cfg=SyncAxisConfig(
+                axis_index=spindle_axis_id,
+                steps_per_unit=6400.0,
+                reverse_direction=spindle_reverse
+            ),
+            traverse_cfg=SyncAxisConfig(
+                axis_index=traverse_axis_id,
+                steps_per_unit=3072.0,
+                reverse_direction=traverse_reverse
+            )
+        )
+        self._move_queue.enqueue(move)
 
     def jog(
         self,

@@ -3,10 +3,22 @@
 Lazy imports to avoid circular dependencies with transport module.
 """
 
+__all__ = [
+    "RampConfig",
+    "AxisMotionConfig",
+    "MultiAxisSegmentGenerator",
+    "SpindleKinematics",
+    "WindingPattern",
+    "ScatterEngine",
+    "SyncAxisConfig",
+    "SynchronizedSegmentGenerator",
+    "WindingEngine",
+]
+
 
 def __getattr__(name: str):
     if name == "RampConfig":
-        from .ramp import RampConfig
+        from .ramp_config import RampConfig
         return RampConfig
     if name == "AxisMotionConfig":
         from .ramp import AxisMotionConfig
@@ -14,8 +26,26 @@ def __getattr__(name: str):
     if name == "MultiAxisSegmentGenerator":
         from .ramp import MultiAxisSegmentGenerator
         return MultiAxisSegmentGenerator
+    if name == "SpindleKinematics":
+        from .spindle_kinematics import SpindleKinematics
+        return SpindleKinematics
+    if name == "WindingPattern":
+        from .winding_pattern import WindingPattern
+        return WindingPattern
+    if name == "ScatterEngine":
+        from .scatter_engine import ScatterEngine
+        return ScatterEngine
+    if name == "SyncAxisConfig":
+        from .syncrhonized_segment_generator import SyncAxisConfig
+        return SyncAxisConfig
+    if name == "SynchronizedSegmentGenerator":
+        from .syncrhonized_segment_generator import SynchronizedSegmentGenerator
+        return SynchronizedSegmentGenerator
+    if name == "WindingEngine":
+        from .engine import WindingEngine
+        return WindingEngine
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():
-    return ["RampConfig", "AxisMotionConfig", "MultiAxisSegmentGenerator"]
+    return __all__

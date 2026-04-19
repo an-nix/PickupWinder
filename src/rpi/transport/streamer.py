@@ -14,7 +14,7 @@ from transport.messages import (
     sequence_is_greater,
     sequence_is_less_equal,
 )
-from motion.ramp import AxisMotionConfig, MultiAxisSegmentGenerator, RampConfig
+from motion import AxisMotionConfig, MultiAxisSegmentGenerator, RampConfig
 from transport.spi_transport import Esp32SpiTransport
 
 

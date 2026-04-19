@@ -7,7 +7,7 @@ from .config import AppConfiguration
 from motion.axis_state import AxisLimits, AxisState
 from motion.move import HomingMove, JogMove, RampMove, RampMoveConfig
 from motion.move_queue import MoveQueue
-from motion.ramp import AxisMotionConfig, RampConfig
+from motion import AxisMotionConfig, RampConfig
 from transport import Esp32SpiTransport
 
 

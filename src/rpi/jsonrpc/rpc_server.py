@@ -1,193 +1,183 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import socket
 import threading
-from pathlib import Path
 from typing import Any
-import asyncio
 
+from core.events import EventBus, EventKind
 from .handlers import RpcHandler
-from .protocol import JsonRpcError, JsonRpcInvalidRequestError, JsonRpcMethodNotFoundError, JsonRpcRequest, make_error_response, make_response, parse_json_rpc
+from .protocol import JsonRpcMethodNotFoundError
+
+logger = logging.getLogger(__name__)
 
 
-class UnixJsonRpcServer:
-    def __init__(self, socket_path: str, handler: RpcHandler, backlog: int = 5) -> None:
-        self.socket_path = Path(socket_path)
-        self.handler = handler
-        self.backlog = backlog
-        self._server_socket: socket.socket | None = None
+class JsonRpcServer:
+    """
+    JSON-RPC 2.0 server over a Unix domain socket.
+
+    One thread accepts connections (one client at a time).
+    One thread drains the EventBus and pushes notifications to the
+    connected client as JSON-RPC notifications (no id field).
+
+    The server contains NO business logic. It forwards JSON-RPC
+    method calls to a registered RpcHandler.
+
+    Supported methods are defined by the handler registered with the server.
+
+    Notifications pushed to client:
+      winding.event  params: {kind, data}
+    """
+
+    BUFFER_SIZE = 65536
+
+    def __init__(
+        self,
+        handler: RpcHandler,
+        event_bus: EventBus,
+        socket_path: str = "/tmp/winding.sock",
+    ) -> None:
+        self._handler = handler
+        self._events = event_bus
+        self._socket_path = socket_path
+
         self._accept_thread: threading.Thread | None = None
+        self._notify_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._client_lock = threading.Lock()
+        self._current_client: socket.socket | None = None
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        if self._server_socket is not None:
-            return
-        if self.socket_path.exists():
-            self.socket_path.unlink()
-
-        self._server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._server_socket.bind(str(self.socket_path))
-        self._server_socket.listen(self.backlog)
-        self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
+        if os.path.exists(self._socket_path):
+            os.unlink(self._socket_path)
+        self._accept_thread = threading.Thread(
+            target=self._accept_loop,
+            daemon=True,
+            name="rpc_accept",
+        )
+        self._notify_thread = threading.Thread(
+            target=self._notify_loop,
+            daemon=True,
+            name="rpc_notify",
+        )
         self._accept_thread.start()
+        self._notify_thread.start()
+        logger.info("JSON-RPC server listening on %s", self._socket_path)
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._server_socket is not None:
-            try:
-                self._server_socket.close()
-            except Exception:
-                pass
-            self._server_socket = None
-        if self._accept_thread is not None:
-            self._accept_thread.join(timeout=1.0)
-            self._accept_thread = None
-        if self.socket_path.exists():
-            try:
-                self.socket_path.unlink()
-            except Exception:
-                pass
+        if os.path.exists(self._socket_path):
+            os.unlink(self._socket_path)
+
+    # ── Accept loop ────────────────────────────────────────────────────────
 
     def _accept_loop(self) -> None:
-        assert self._server_socket is not None
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self._socket_path)
+        srv.listen(1)
+        srv.settimeout(1.0)
         while not self._stop_event.is_set():
             try:
-                connection, _ = self._server_socket.accept()
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 break
-            thread = threading.Thread(target=self._handle_connection, args=(connection,), daemon=True)
-            thread.start()
-
-    def _handle_connection(self, connection: socket.socket) -> None:
-        with connection:
-            file = connection.makefile(mode="r", encoding="utf-8", newline="\n")
-            for raw_line in file:
-                line = raw_line.strip()
-                if not line or self._stop_event.is_set():
-                    continue
-                self._process_message(connection, line)
-
-    def _process_message(self, connection: socket.socket, raw_message: str) -> None:
-        try:
-            request = parse_json_rpc(raw_message)
-        except JsonRpcError as exc:
-            payload = make_error_response(exc, None)
-            self._send_payload(connection, payload)
-            return
-
-        if request.id is None:
-            # Notification: no response expected.
+            with self._client_lock:
+                self._current_client = conn
             try:
-                self.handler.dispatch(request.method, request.params)
-            except JsonRpcError:
-                pass
-            return
+                self._handle_client(conn)
+            finally:
+                with self._client_lock:
+                    self._current_client = None
+                conn.close()
+        srv.close()
+
+    def _handle_client(self, conn: socket.socket) -> None:
+        """Read newline-delimited JSON-RPC requests from one client."""
+        buf = b""
+        conn.settimeout(0.5)
+        while not self._stop_event.is_set():
+            try:
+                chunk = conn.recv(self.BUFFER_SIZE)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if line.strip():
+                    response = self._dispatch(line.decode("utf-8"))
+                    if response is not None:
+                        try:
+                            conn.sendall((json.dumps(response) + "\n").encode())
+                        except OSError:
+                            return
+
+    # ── Notify loop ────────────────────────────────────────────────────────
+
+    def _notify_loop(self) -> None:
+        """Drain EventBus and push notifications to connected client."""
+        while not self._stop_event.is_set():
+            event = self._events.consume(timeout_s=0.1)
+            if event is None:
+                continue
+            notification = {
+                "jsonrpc": "2.0",
+                "method": "winding.event",
+                "params": {
+                    "kind": event.kind.name,
+                    "data": event.data,
+                },
+            }
+            with self._client_lock:
+                client = self._current_client
+            if client is not None:
+                try:
+                    client.sendall((json.dumps(notification) + "\n").encode())
+                except OSError:
+                    pass
+
+    # ── JSON-RPC dispatch ──────────────────────────────────────────────────
+
+    def _dispatch(self, raw: str) -> dict | None:
+        """Parse one JSON-RPC request and return a response dict or None."""
+        try:
+            req = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return self._error_response(None, -32700, f"Parse error: {exc}")
+
+        req_id = req.get("id")
+        method = req.get("method", "")
+        params = req.get("params", None)
 
         try:
-            result = self.handler.dispatch(request.method, request.params)
-            payload = make_response(result, request.id)
-        except JsonRpcError as exc:
-            payload = make_error_response(exc, request.id)
+            result = self._handler.dispatch(method, params)
+        except JsonRpcMethodNotFoundError as exc:
+            return self._error_response(req_id, -32601, str(exc))
+        except TypeError as exc:
+            return self._error_response(req_id, -32602, f"Invalid params: {exc}")
         except Exception as exc:
-            payload = make_error_response(JsonRpcError(-32000, str(exc)), request.id)
+            logger.exception("RPC method %s raised", method)
+            return self._error_response(req_id, -32000, str(exc))
 
-        self._send_payload(connection, payload)
+        # Notifications (no id) get no response.
+        if req_id is None:
+            return None
+        return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
-    def _send_payload(self, connection: socket.socket, payload: str) -> None:
-        try:
-            connection.sendall(payload.encode("utf-8") + b"\n")
-        except OSError:
-            pass
+    @staticmethod
+    def _error_response(req_id: Any, code: int, message: str) -> dict:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": code, "message": message},
+        }
 
-
-class AsyncUnixJsonRpcServer:
-    """Asyncio-based Unix-socket JSON-RPC server.
-
-    Uses asyncio streams and runs handler dispatches in the default executor
-    so synchronous handler implementations won't block the event loop.
-    """
-
-    def __init__(self, socket_path: str, handler: RpcHandler, backlog: int = 5) -> None:
-        self.socket_path = Path(socket_path)
-        self.handler = handler
-        self.backlog = backlog
-        self._server: asyncio.AbstractServer | None = None
-
-    async def start(self) -> None:
-        if self._server is not None:
-            return
-        if self.socket_path.exists():
-            try:
-                self.socket_path.unlink()
-            except Exception:
-                pass
-
-        self._server = await asyncio.start_unix_server(self._handle_client, str(self.socket_path), backlog=self.backlog)
-
-    async def stop(self) -> None:
-        if self._server is None:
-            return
-        self._server.close()
-        try:
-            await self._server.wait_closed()
-        except Exception:
-            pass
-        self._server = None
-        if self.socket_path.exists():
-            try:
-                self.socket_path.unlink()
-            except Exception:
-                pass
-
-    async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            while not reader.at_eof():
-                raw = await reader.readline()
-                if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                await self._process_message(line, writer)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-    async def _process_message(self, raw_message: str, writer: asyncio.StreamWriter) -> None:
-        loop = asyncio.get_running_loop()
-        try:
-            request = parse_json_rpc(raw_message)
-        except JsonRpcError as exc:
-            payload = make_error_response(exc, None)
-            await self._send_payload(writer, payload)
-            return
-
-        # Notifications: no response expected — dispatch in executor and forget
-        if request.id is None:
-            loop.run_in_executor(None, self.handler.dispatch, request.method, request.params)
-            return
-
-        try:
-            result = await loop.run_in_executor(None, self.handler.dispatch, request.method, request.params)
-            payload = make_response(result, request.id)
-        except JsonRpcError as exc:
-            payload = make_error_response(exc, request.id)
-        except Exception as exc:
-            payload = make_error_response(JsonRpcError(-32000, str(exc)), request.id)
-
-        await self._send_payload(writer, payload)
-
-    async def _send_payload(self, writer: asyncio.StreamWriter, payload: str) -> None:
-        try:
-            writer.write(payload.encode("utf-8") + b"\n")
-            await writer.drain()
-        except Exception:
-            pass
