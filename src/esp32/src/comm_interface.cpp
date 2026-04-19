@@ -230,6 +230,10 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
     // Atomic load — lock-free cross-core read (written by Core 1 executor).
     payload->last_executed_sequence = last_executed_sequence_.load(std::memory_order_acquire);
 
+    // Planner lookahead pressure: how many slots are free in segment_queue_.
+    const uint32_t pqf = planner_.segmentQueueFree();
+    payload->planner_queue_free = static_cast<uint8_t>(pqf < 255u ? pqf : 255u);
+
     spi_message_finalize(out_frame);
 }
 

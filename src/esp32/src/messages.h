@@ -239,7 +239,10 @@ struct __attribute__((packed)) StatusPayload {
      * and read by the SPI task (Core 0) — both must access it atomically.
      */
     uint16_t last_executed_sequence;
-    uint8_t  reserved[1];
+    /** Free slots in the planner→executor segment queue (0–128).
+     *  The host uses this to gate how many blocks it sends ahead.
+     *  Replaces the former reserved[1] byte — struct size unchanged. */
+    uint8_t  planner_queue_free;
 };
 
 static_assert(sizeof(StatusPayload) == 48, "StatusPayload must be 48 bytes");

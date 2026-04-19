@@ -30,7 +30,7 @@ def main() -> int:
             print(f"Error: invalid RPM '{sys.argv[1]}', must be a number")
             return 1
 
-    duration_s = 30.0
+    duration_s = 5.0
     steps_per_rev = 200 * 32
     steps = int(rpm / 60.0 * steps_per_rev * duration_s)
 

@@ -108,14 +108,6 @@ extern "C" void app_main(void)
     // ── 4. Start SPI communication interface (Core 0, priority 10) ────────
     ESP_ERROR_CHECK(comm.init({SPI_MOSI, SPI_MISO, SPI_SCLK, SPI_CS, HOME_NO, HOME_NC}));
 
-    // ── 5. Re-enable Task Watchdog with a safe configuration ──────────────
-    esp_task_wdt_config_t wdt_config = {
-        .timeout_ms     = 5000,
-        .idle_core_mask = 0,       // do not watch IDLE tasks
-        .trigger_panic  = false,   // log only, no reboot during tuning
-    };
-    esp_task_wdt_reconfigure(&wdt_config);
-
     // app_main may return — FreeRTOS scheduler continues running the tasks.
     ESP_LOGI(TAG, "Scheduler running — app_main exiting.");
 }

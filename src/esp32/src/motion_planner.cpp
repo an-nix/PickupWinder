@@ -224,21 +224,20 @@ void MotionPlanner::plannerTask(void* arg)
                 seg.axes[a].direction  = ((src.direction_mask >> a) & 1u) != 0;
             }
 
-            // Advance timeline immediately so scheduled timestamps are
-            // monotonic even if some planned segments are dropped.
-            self->timeline_us_ += static_cast<int64_t>(src.duration_us);
-
-            // Non-blocking enqueue: drop if full.
+            // Advance timeline and enqueue atomically: only advance if the
+            // segment was successfully enqueued so the timeline stays in sync.
+            // On full queue, break out of the inner loop — the executor will
+            // drain a slot, and we will retry this segment on the next
+            // planner iteration (natural backpressure, no data loss).
             if (xQueueSend(self->segment_queue_, &seg, 0) == pdTRUE) {
+                self->timeline_us_ += static_cast<int64_t>(src.duration_us);
                 ++self->segments_planned_;
+                ++self->pending_segment_idx_;
+                ++processed;
             } else {
-                ++self->segments_dropped_;
-                ESP_LOGW(TAG, "planner: segment queue full — dropped seq=%u",
-                         (unsigned)seg.motion_sequence);
+                // Queue full — yield and retry this segment next iteration.
+                break;
             }
-
-            ++self->pending_segment_idx_;
-            ++processed;
         }
 
         // 5) Yield behavior: if we processed nothing, sleep briefly to let

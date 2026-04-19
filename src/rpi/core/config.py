@@ -15,7 +15,8 @@ class AppConfiguration:
     spindle_microstepping: int = 32
     spindle_invert_direction: bool = False
     spindle_max_speed_rpm: int = 1500
-    spindle_max_acceleration_rpm: Optional[float] = None
+    spindle_max_acceleration_rpm: Optional[float] = 100
+    spindle_max_deceleration_rpm: Optional[float] = None
 
     lateral_axis_id: int = 1
     lateral_steps_per_revolution: int = 200
