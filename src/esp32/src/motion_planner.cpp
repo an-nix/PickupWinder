@@ -131,7 +131,7 @@ void MotionPlanner::handleFlush(const flush_request_t& req)
     // output queue without blocking; if that fails we remember the flush
     // and retry on the next planner loop iteration.
     has_pending_block_ = false; // drop current pending block
-    timeline_us_ = 0;
+    timeline_us_ = esp_timer_get_time();
     planned_segment_t flush_seg {};
     flush_seg.is_flush = true;
     flush_seg.flush_sequence = req.flush_sequence;

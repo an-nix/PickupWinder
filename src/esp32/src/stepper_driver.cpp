@@ -497,7 +497,7 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
             if (endstop_active_.load(std::memory_order_acquire)) {
                 return ESP_ERR_INVALID_STATE;
             }
-            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(5));
             if (endstop_active_.load(std::memory_order_acquire)) {
                 return ESP_ERR_INVALID_STATE;
             }

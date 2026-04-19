@@ -485,7 +485,10 @@ void CommInterface::notifySegmentExecuted(uint16_t motion_seq)
      * the 16-bit wrap-around case correctly because we only call this in
      * strict execution order.
      */
-    last_executed_sequence_.store(motion_seq, std::memory_order_release);
+    uint16_t current = last_executed_sequence_.load(std::memory_order_relaxed);
+    if (static_cast<int16_t>(motion_seq - current) > 0) {
+        last_executed_sequence_.store(motion_seq, std::memory_order_release);
+    }
 }
 
 uint8_t CommInterface::readLateralEndstopState() const
@@ -726,7 +729,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
     QueueHandle_t seg_queue = self->planner_.segmentQueue();
 
     // ── Deferred notification ring ────────────────────────────────────────
-    static constexpr int DEFER_DEPTH = 64;
+    static constexpr int DEFER_DEPTH = 128;
     int64_t  defer_fire_us[DEFER_DEPTH];
     uint32_t defer_seqs[DEFER_DEPTH];
     int      defer_head = 0;
@@ -925,6 +928,8 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     defer_seqs[idx]    = seg.motion_sequence;
                     ++defer_tail;
                 } else {
+                    ESP_LOGW(TAG, "defer ring overflow at seq=%u — notifying immediately",
+                             (unsigned)seg.motion_sequence);
                     self->notifySegmentExecuted(
                         static_cast<uint16_t>(seg.motion_sequence));
                 }
