@@ -9,15 +9,17 @@ class WindingPattern:
     bobbin_width_mm: float
     turns_per_mm: float
 
+    def __post_init__(self) -> None:
+        if self.turns_per_mm <= 0.0:
+            raise ValueError("turns_per_mm must be positive")
+        if self.bobbin_width_mm <= 0.0:
+            raise ValueError("bobbin_width_mm must be positive")
+
     def guide_pos_mm(self, spindle_turns: float) -> float:
-        if self.turns_per_mm <= 0 or self.bobbin_width_mm <= 0:
-            return 0.0
-            
         total_dist = spindle_turns / self.turns_per_mm
         cycle_length = 2.0 * self.bobbin_width_mm
-            
+
         mod_dist = total_dist % cycle_length
         if mod_dist <= self.bobbin_width_mm:
             return mod_dist
-        else:
-            return cycle_length - mod_dist
+        return cycle_length - mod_dist

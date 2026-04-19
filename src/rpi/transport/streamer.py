@@ -260,6 +260,13 @@ class MultiAxisRampStreamer:
             if status.last_result != int(SpiMessageResult.OK):
                 raise RuntimeError(f"enable axis {axis_id} failed with result=0x{status.last_result:02X}")
 
+    def _disable_axes(self) -> None:
+        for axis_id in self._axis_ids:
+            sequence, status = self._transport.set_axis_enabled_request(axis_id, False)
+            status = self._transport.wait_for_request_result(sequence, poll_interval_s=self._poll_interval_s)
+            if status.last_result != int(SpiMessageResult.OK):
+                raise RuntimeError(f"disable axis {axis_id} failed with result=0x{status.last_result:02X}")
+
     def _queue_full(self, status) -> bool:
         for axis_id in self._axis_ids:
             if axis_id < len(status.queue_free_slots) and status.queue_free_slots[axis_id] == 0:
@@ -549,60 +556,72 @@ class MultiAxisRampStreamer:
     def stream_all(self) -> int:
         self._generator_finished = False
         status = self._transport.get_status()
-        self._enable_axes()
-        status = self._transport.get_status()
+        axes_enabled = False
 
-        total_segments, status = self._prefill(status)
+        try:
+            self._enable_axes()
+            axes_enabled = True
+            status = self._transport.get_status()
 
-        while True:
-            if self._stop_requested:
+            total_segments, status = self._prefill(status)
+
+            while True:
+                if self._stop_requested:
+                    if self._flush_sequence_requested is not None:
+                        self.flush_until(self._flush_sequence_requested)
+                    break
+
+                status = self._transport.get_status()
+                self._remove_confirmed_segments(status)
+                self._check_premature_completion(status)
+                if self._check_stall(status):
+                    break
+
+                if self._check_endstop(status):
+                    break
+
+                # Rate-limit sends to MAX_SEGMENTS_PER_CYCLE per polling iteration to
+                # prevent burst-after-throttle that overflows the ESP32 defer ring.
+                cycle_segments_sent = 0
+                while not self._generator_finished:
+                    if cycle_segments_sent >= self._max_segments_per_cycle():
+                        break
+                    result = self._collect_and_send_batch(status)
+                    if result is None:
+                        break
+                    n, status = result
+                    if n == 0:  # QUEUE_FULL
+                        break
+                    cycle_segments_sent += n
+                    total_segments += n
+                    if total_segments % self._print_every == 0:
+                        print(
+                            f"[{self._timestamp()}] segments={total_segments} "
+                            f"buffered={self._buffered_time_s*1000:.1f}ms "
+                            f"inflight={len(self._inflight)} "
+                            f"queue_free={status.queue_free_slots} "
+                            f"ring_free={status.ring_free_slots} "
+                            f"underrun={status.underrun_count}"
+                        )
+
                 if self._flush_sequence_requested is not None:
                     self.flush_until(self._flush_sequence_requested)
-                break
+                    self._flush_sequence_requested = None
 
-            status = self._transport.get_status()
-            self._remove_confirmed_segments(status)
-            self._check_premature_completion(status)
-            if self._check_stall(status):
-                break
+                if self._generator_finished and not self._inflight:
+                    break
 
-            if self._check_endstop(status):
-                break
-
-            # Rate-limit sends to MAX_SEGMENTS_PER_CYCLE per polling iteration to
-            # prevent burst-after-throttle that overflows the ESP32 defer ring.
-            cycle_segments_sent = 0
-            while not self._generator_finished:
-                if cycle_segments_sent >= self._max_segments_per_cycle():
-                    break
-                result = self._collect_and_send_batch(status)
-                if result is None:
-                    break
-                n, status = result
-                if n == 0:  # QUEUE_FULL
-                    break
-                cycle_segments_sent += n
-                total_segments += n
-                if total_segments % self._print_every == 0:
+                sleep_s = self._should_sleep()
+                if sleep_s > 0.0:
+                    time.sleep(sleep_s)
+        finally:
+            if axes_enabled:
+                try:
+                    self._disable_axes()
+                except Exception as exc:
                     print(
-                        f"[{self._timestamp()}] segments={total_segments} "
-                        f"buffered={self._buffered_time_s*1000:.1f}ms "
-                        f"inflight={len(self._inflight)} "
-                        f"queue_free={status.queue_free_slots} "
-                        f"ring_free={status.ring_free_slots} "
-                        f"underrun={status.underrun_count}"
+                        f"[{self._timestamp()}] WARNING failed to disable axes: {exc}"
                     )
-
-            if self._flush_sequence_requested is not None:
-                self.flush_until(self._flush_sequence_requested)
-                self._flush_sequence_requested = None
-
-            if self._generator_finished and not self._inflight:
-                break
-
-            sleep_s = self._should_sleep()
-            if sleep_s > 0.0:
-                time.sleep(sleep_s)
 
         self._write_send_log()
         return total_segments

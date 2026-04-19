@@ -5,6 +5,7 @@ Lazy imports to avoid circular dependencies with transport module.
 
 __all__ = [
     "RampConfig",
+    "compute_ramp_times",
     "AxisMotionConfig",
     "MultiAxisSegmentGenerator",
     "SpindleKinematics",
@@ -20,6 +21,9 @@ def __getattr__(name: str):
     if name == "RampConfig":
         from .ramp_config import RampConfig
         return RampConfig
+    if name == "compute_ramp_times":
+        from .ramp_config import compute_ramp_times
+        return compute_ramp_times
     if name == "AxisMotionConfig":
         from .ramp import AxisMotionConfig
         return AxisMotionConfig

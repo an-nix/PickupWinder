@@ -36,6 +36,9 @@ class WindingProgram:
     spindle_rpm: float
     layer_pitch_mm: float
     wire_diameter_mm: float
+    bobbin_width_mm: float = 15.0
+    scatter_amplitude_mm: float = 0.0
+    scatter_damping_margin_mm: float = 0.0
     accel_s: float = 0.5
     decel_s: float = 0.5
     spindle_axis_id: int = 0
@@ -56,10 +59,20 @@ class WindingProgram:
             raise ValueError("layer_pitch_mm must be positive")
         if self.wire_diameter_mm <= 0.0:
             raise ValueError("wire_diameter_mm must be positive")
+        if self.bobbin_width_mm <= 0.0:
+            raise ValueError("bobbin_width_mm must be positive")
+        if self.scatter_amplitude_mm < 0.0:
+            raise ValueError("scatter_amplitude_mm must be >= 0")
+        if self.scatter_damping_margin_mm < 0.0:
+            raise ValueError("scatter_damping_margin_mm must be >= 0")
         if self.accel_s < 0.0 or self.decel_s < 0.0:
             raise ValueError("accel_s and decel_s must be >= 0")
         if self.lateral_steps_per_mm <= 0.0:
             raise ValueError("lateral_steps_per_mm must be positive")
+
+    @property
+    def turns_per_mm(self) -> float:
+        return 1.0 / self.layer_pitch_mm
 
     def lateral_rpm_for_layer(self) -> float:
         """
@@ -79,13 +92,21 @@ class WindingProgram:
 
     def layer_duration_s(self) -> float:
         """
-        Estimate the duration of one layer in seconds.
-        Based on the lateral axis traversing one full layer width.
-        Override if layer width is known from machine geometry.
-        Returns accel_s + cruise_s + decel_s where cruise is estimated
-        from a nominal 100mm layer width. Subclass for exact geometry.
+        Duration of a full winding layer in seconds.
+
+        A single layer is defined as a forward/backward pass across the bobbin
+        width. The total spindle turns required for one layer are:
+
+            total_turns = 2 * bobbin_width_mm * turns_per_mm
+
+        The layer duration is therefore the total spindle turns divided by
+        spindle revolutions per second.
         """
-        return self.accel_s + self.decel_s + 1.0  # placeholder cruise
+        spindle_rps = self.spindle_rpm / 60.0
+        if spindle_rps <= 0.0:
+            raise ValueError("spindle_rpm must be positive to compute layer duration")
+        total_turns = 2.0 * self.bobbin_width_mm * self.turns_per_mm
+        return total_turns / spindle_rps
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -94,7 +115,12 @@ class WindingProgram:
             "spindle_rpm": self.spindle_rpm,
             "layer_pitch_mm": self.layer_pitch_mm,
             "wire_diameter_mm": self.wire_diameter_mm,
+            "bobbin_width_mm": self.bobbin_width_mm,
+            "turns_per_mm": self.turns_per_mm,
+            "scatter_amplitude_mm": self.scatter_amplitude_mm,
+            "scatter_damping_margin_mm": self.scatter_damping_margin_mm,
             "accel_s": self.accel_s,
             "decel_s": self.decel_s,
             "lateral_rpm": self.lateral_rpm_for_layer(),
+            "layer_duration_s": self.layer_duration_s(),
         }

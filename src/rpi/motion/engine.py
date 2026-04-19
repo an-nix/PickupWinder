@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any
+from typing import Any, Optional
 
 from motion.axis_state import AxisState
 from motion.move import HomingMove, JogMove, RampMove, RampMoveConfig, WoundMove
@@ -15,7 +15,9 @@ from motion import (
     ScatterEngine,
     SyncAxisConfig,
 )
+from motion.ramp_config import compute_ramp_times
 from transport.spi_transport import Esp32SpiTransport
+from core.config import AppConfiguration
 from core.events import EventBus, EventKind
 from winding.program import WindingProgram
 from core.shared_state import EngineState, SharedState
@@ -42,10 +44,12 @@ class WindingEngine:
         transport: Esp32SpiTransport,
         shared_state: SharedState,
         event_bus: EventBus,
+        config: AppConfiguration | None = None,
     ) -> None:
         self._transport = transport
         self._state = shared_state
         self._events = event_bus
+        self._config = config or AppConfiguration()
 
         self._move_queue = MoveQueue(
             transport=transport,
@@ -125,9 +129,9 @@ class WindingEngine:
         spindle_axis_id: int,
         traverse_axis_id: int,
         target_rpm: float,
-        accel_s: float,
-        cruise_s: float,
-        decel_s: float,
+        accel_s: float | None,
+        cruise_s: float | None,
+        decel_s: float | None,
         bobbin_width_mm: float,
         turns_per_mm: float,
         scatter_amplitude_mm: float = 0.0,
@@ -141,34 +145,142 @@ class WindingEngine:
         """
         if self._state.engine_state != EngineState.IDLE:
             raise RuntimeError("Winding run only allowed when engine is IDLE")
-        
+
+        if accel_s is None or cruise_s is None or decel_s is None:
+            total_turns = 2.0 * bobbin_width_mm * turns_per_mm
+            target_rps = target_rpm / 60.0
+            duration_s = total_turns / target_rps if target_rps > 0.0 else 0.0
+            if duration_s <= 0.0:
+                duration_s = 0.05
+            steps_per_rev = (
+                self._config.spindle_steps_per_revolution
+                * self._config.spindle_microstepping
+            )
+            computed_accel_s, computed_cruise_s, computed_decel_s = compute_ramp_times(
+                target_rpm=target_rpm,
+                duration_s=duration_s,
+                max_accel_steps_per_s2=self._config.spindle_max_acceleration_steps_per_s2,
+                max_decel_steps_per_s2=self._config.spindle_max_deceleration_steps_per_s2,
+                steps_per_rev=steps_per_rev,
+            )
+            accel_s = accel_s if accel_s is not None else computed_accel_s
+            cruise_s = cruise_s if cruise_s is not None else computed_cruise_s
+            decel_s = decel_s if decel_s is not None else computed_decel_s
+
         move = WoundMove(
             name="winding_electronic_gearing",
             kinematics=SpindleKinematics(
                 target_rpm=target_rpm,
-                start_rpm=0.0,    
+                start_rpm=0.0,
                 accel_s=accel_s,
                 cruise_s=cruise_s,
-                decel_s=decel_s
+                decel_s=decel_s,
             ),
             pattern=WindingPattern(
                 bobbin_width_mm=bobbin_width_mm,
-                turns_per_mm=turns_per_mm
+                turns_per_mm=turns_per_mm,
             ),
             scatter=ScatterEngine(
                 amplitude_mm=scatter_amplitude_mm,
-                damping_margin_mm=scatter_damping_margin_mm
+                damping_margin_mm=scatter_damping_margin_mm,
             ),
             spindle_cfg=SyncAxisConfig(
                 axis_index=spindle_axis_id,
-                steps_per_unit=6400.0,
-                reverse_direction=spindle_reverse
+                steps_per_unit=(
+                    self._config.spindle_steps_per_revolution
+                    * self._config.spindle_microstepping
+                ),
+                reverse_direction=spindle_reverse,
             ),
             traverse_cfg=SyncAxisConfig(
                 axis_index=traverse_axis_id,
-                steps_per_unit=3072.0,
-                reverse_direction=traverse_reverse
+                steps_per_unit=(
+                    self._config.lateral_steps_per_revolution
+                    * self._config.lateral_microstepping
+                ),
+                reverse_direction=traverse_reverse,
+            ),
+        )
+        self._move_queue.enqueue(move)
+
+    def run_axis(
+        self,
+        duration_s: float,
+        targets: list[dict[str, Any]],
+    ) -> None:
+        """
+        Queue one or two axes for a trapezoidal ramp move.
+        The acceleration and deceleration times are calculated from the
+        application configuration limits.
+        """
+        if self._state.engine_state != EngineState.IDLE:
+            raise RuntimeError("run_axis only allowed when engine is IDLE")
+        if duration_s <= 0.0:
+            raise ValueError("duration_s must be positive")
+        if not targets:
+            raise ValueError("targets must contain at least one axis")
+        if len(targets) > 2:
+            raise ValueError("run_axis supports at most two axes")
+
+        axis_ids: set[int] = set()
+        axis_configs: list[AxisMotionConfig] = []
+
+        for target in targets:
+            if not isinstance(target, dict):
+                raise TypeError("each target must be a dict")
+            if "axis_id" not in target or "rpm" not in target:
+                raise ValueError("each target must contain axis_id and rpm")
+
+            axis_id = int(target["axis_id"])
+            rpm = float(target["rpm"])
+            reverse = bool(target.get("reverse", False))
+
+            if axis_id in axis_ids:
+                raise ValueError(f"duplicate axis_id {axis_id}")
+            axis_ids.add(axis_id)
+
+            if axis_id == self._config.spindle_axis_id:
+                max_rpm = float(self._config.spindle_max_speed_rpm)
+                steps_per_rev = self._config.spindle_steps_per_revolution * self._config.spindle_microstepping
+                max_accel = self._config.spindle_max_acceleration_steps_per_s2
+                max_decel = self._config.spindle_max_deceleration_steps_per_s2
+            elif axis_id == self._config.lateral_axis_id:
+                max_rpm = float(self._config.lateral_max_rpm)
+                steps_per_rev = self._config.lateral_steps_per_revolution * self._config.lateral_microstepping
+                max_accel = self._config.lateral_max_acceleration_steps_per_s2
+                max_decel = self._config.lateral_max_deceleration_steps_per_s2
+            else:
+                raise ValueError(f"Unsupported axis_id {axis_id}")
+
+            if rpm <= 0.0:
+                raise ValueError("rpm must be positive")
+
+            target_rpm = min(rpm, max_rpm)
+            accel_s, cruise_s, decel_s = compute_ramp_times(
+                target_rpm=target_rpm,
+                duration_s=duration_s,
+                max_accel_steps_per_s2=max_accel,
+                max_decel_steps_per_s2=max_decel,
+                steps_per_rev=steps_per_rev,
             )
+
+            axis_configs.append(
+                AxisMotionConfig(
+                    axis_id=axis_id,
+                    ramp=RampConfig(
+                        axis_id=axis_id,
+                        target_rpm=target_rpm,
+                        accel_s=accel_s,
+                        cruise_s=cruise_s,
+                        decel_s=decel_s,
+                        reverse_direction=reverse,
+                    ),
+                )
+            )
+
+        move = RampMove(
+            name="run_axis",
+            config=RampMoveConfig(axis_configs=axis_configs),
         )
         self._move_queue.enqueue(move)
 
@@ -185,10 +297,24 @@ class WindingEngine:
         """
         if self._state.engine_state != EngineState.IDLE:
             raise RuntimeError("Jog only allowed when engine is IDLE")
+
+        if axis_id == self._config.spindle_axis_id:
+            steps_per_rev = (
+                self._config.spindle_steps_per_revolution
+                * self._config.spindle_microstepping
+            )
+        elif axis_id == self._config.lateral_axis_id:
+            steps_per_rev = (
+                self._config.lateral_steps_per_revolution
+                * self._config.lateral_microstepping
+            )
+        else:
+            raise ValueError(f"jog: unsupported axis_id {axis_id}")
+
         move = JogMove(
             name=f"jog_{axis_id}",
             axis_id=axis_id,
-            steps_per_rev=200 * 32,
+            steps_per_rev=steps_per_rev,
             steps=steps,
             rpm=rpm,
             reverse_direction=reverse,
@@ -271,14 +397,18 @@ class WindingEngine:
         Sets FAULT state and publishes event on failure.
         """
         self._events.publish(EventKind.HOMING_STARTED, axis_id=program.lateral_axis_id)
+        steps_per_rev = (
+            self._config.lateral_steps_per_revolution
+            * self._config.lateral_microstepping
+        )
         move = HomingMove(
             name="home_lateral",
             axis_id=program.lateral_axis_id,
-            steps_per_rev=200 * 32,
+            steps_per_rev=steps_per_rev,
             approach_rpm=program.home_approach_rpm,
             search_rpm=program.home_search_rpm,
             backoff_steps=program.home_backoff_steps,
-            max_approach_steps=int(200 * 32 * 20),
+            max_approach_steps=int(steps_per_rev * 20),
         )
         self._move_queue.enqueue(move)
         self._wait_for_move_queue()
@@ -289,7 +419,7 @@ class WindingEngine:
             )
             return True
         else:
-            msg = f"Homing failed: {move._error}"
+            msg = f"Homing failed: {move.error}"
             self._state.set_fault(msg)
             self._events.publish(
                 EventKind.HOMING_FAILED,
@@ -309,37 +439,37 @@ class WindingEngine:
         Returns True on completion, False on abort or fault.
         """
         reverse_lateral = (direction == "reverse")
-        lateral_rpm = program.lateral_rpm_for_layer()
         duration_s = program.layer_duration_s()
         cruise_s = max(duration_s - program.accel_s - program.decel_s, 0.0)
 
-        move = RampMove(
+        move = WoundMove(
             name=f"layer_{layer_index}",
-            config=RampMoveConfig(
-                axis_configs=[
-                    AxisMotionConfig(
-                        axis_id=program.spindle_axis_id,
-                        ramp=RampConfig(
-                            axis_id=program.spindle_axis_id,
-                            target_rpm=program.spindle_rpm,
-                            accel_s=program.accel_s,
-                            cruise_s=cruise_s,
-                            decel_s=program.decel_s,
-                            reverse_direction=False,
-                        ),
-                    ),
-                    AxisMotionConfig(
-                        axis_id=program.lateral_axis_id,
-                        ramp=RampConfig(
-                            axis_id=program.lateral_axis_id,
-                            target_rpm=lateral_rpm,
-                            accel_s=program.accel_s,
-                            cruise_s=cruise_s,
-                            decel_s=program.decel_s,
-                            reverse_direction=reverse_lateral,
-                        ),
-                    ),
-                ],
+            kinematics=SpindleKinematics(
+                target_rpm=program.spindle_rpm,
+                start_rpm=0.0,
+                accel_s=program.accel_s,
+                cruise_s=cruise_s,
+                decel_s=program.decel_s,
+            ),
+            pattern=WindingPattern(
+                bobbin_width_mm=program.bobbin_width_mm,
+                turns_per_mm=program.turns_per_mm,
+            ),
+            scatter=ScatterEngine(
+                amplitude_mm=program.scatter_amplitude_mm,
+                damping_margin_mm=program.scatter_damping_margin_mm,
+            ),
+            spindle_cfg=SyncAxisConfig(
+                axis_index=program.spindle_axis_id,
+                steps_per_unit=(
+                    self._config.spindle_steps_per_revolution
+                    * self._config.spindle_microstepping
+                ),
+            ),
+            traverse_cfg=SyncAxisConfig(
+                axis_index=program.lateral_axis_id,
+                steps_per_unit=program.lateral_steps_per_mm,
+                reverse_direction=reverse_lateral,
             ),
         )
         self._move_queue.enqueue(move)
@@ -356,7 +486,7 @@ class WindingEngine:
             return False
 
         if move.state.name == "FAILED":
-            self._state.set_fault(move._error or "unknown error")
+            self._state.set_fault(move.error or "unknown error")
             return False
 
         if self._stop_event.is_set():
@@ -373,11 +503,20 @@ class WindingEngine:
             "move_queue": self._move_queue.status(),
         }
 
-    def _wait_for_move_queue(self, poll_s: float = 0.05) -> None:
+    def _wait_for_move_queue(
+        self,
+        poll_s: float = 0.05,
+        timeout_s: float = 60.0,
+    ) -> None:
         """
         Block until the MoveQueue has no pending or running moves,
-        or until a stop is requested.
+        until a stop is requested, or until *timeout_s* seconds have
+        elapsed.
+
+        On timeout the engine transitions to FAULT so the caller can
+        detect the condition via ``move.state``.
         """
+        deadline = time.monotonic() + timeout_s
         while (
             not self._stop_event.is_set()
             and (
@@ -385,4 +524,11 @@ class WindingEngine:
                 or self._move_queue.current_move is not None
             )
         ):
+            if time.monotonic() >= deadline:
+                msg = (
+                    f"_wait_for_move_queue timed out after {timeout_s:.1f} s — "
+                    "firmware may have stopped responding"
+                )
+                self._state.set_fault(msg)
+                break
             time.sleep(poll_s)

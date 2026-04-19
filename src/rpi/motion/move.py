@@ -27,19 +27,20 @@ class MoveState(Enum):
     FAILED = auto()
 
 
-class Move(ABC):
+class BaseMove(ABC):
     """
-    Abstract base class for all motion commands.
+    Shared lifecycle base for all motion commands.
 
-    A Move knows how to produce segments (via segments()) and reports
-    its outcome via state and result. The MoveQueue executes moves one
-    at a time by calling segments() and feeding them to the
-    StreamingEngine.
+    Carries state machine, timing, error, and snapshot logic.
+    Does NOT prescribe a segment interface — concrete sub-hierarchies
+    define their own execution contracts (``Move`` and ``CompositeMove``).
 
-    Subclasses must implement:
-      - segments(): yields MultiAxisSegment objects
-      - expected_delta_steps(axis_id): returns expected step delta for
-        position tracking (return None if unknown / variable)
+    Public properties
+    -----------------
+    state               Current MoveState.
+    done                True when the move has reached a terminal state.
+    error               Last error/abort message (None if none).
+    aborted_by_endstop  True if an endstop triggered the abort.
     """
 
     def __init__(self, name: str) -> None:
@@ -50,6 +51,8 @@ class Move(ABC):
         self._error: str | None = None
         self._aborted_by_endstop: bool = False
 
+    # ── Read-only public interface ─────────────────────────────────────────
+
     @property
     def state(self) -> MoveState:
         return self._state
@@ -59,8 +62,15 @@ class Move(ABC):
         return self._state in (MoveState.COMPLETED, MoveState.ABORTED, MoveState.FAILED)
 
     @property
+    def error(self) -> str | None:
+        """Last error or abort reason; ``None`` if the move has not failed."""
+        return self._error
+
+    @property
     def aborted_by_endstop(self) -> bool:
         return self._aborted_by_endstop
+
+    # ── Lifecycle transitions ─────────────────────────────────────────────
 
     def mark_running(self) -> None:
         self._state = MoveState.RUNNING
@@ -93,15 +103,49 @@ class Move(ABC):
         }
 
     @abstractmethod
+    def expected_delta_steps(self, axis_id: int) -> int | None:
+        """Expected step delta for *axis_id* after this move completes.
+
+        Return ``None`` if not applicable or variable (e.g. homing moves).
+        """
+        ...
+
+
+class Move(BaseMove, ABC):
+    """
+    Abstract base for *segmented* moves — moves that produce a stream of
+    ``MultiAxisSegment`` objects fed directly to the firmware streamer.
+
+    Subclasses must implement:
+      - ``segments()``            — yields ``MultiAxisSegment`` objects.
+      - ``expected_delta_steps()``— inherited from ``BaseMove``.
+    """
+
+    @abstractmethod
     def segments(self) -> Iterator[MultiAxisSegment]:
         """Yield segments to be sent to the firmware."""
         ...
 
+
+class CompositeMove(BaseMove, ABC):
+    """
+    Abstract base for *composite* (multi-phase) moves that cannot be
+    expressed as a single contiguous segment stream.
+
+    ``CompositeMove`` deliberately does **not** declare ``segments()`` as
+    obligatory, avoiding an LSP violation for moves like homing that
+    require the MoveQueue to arm/disarm endstops between phases.
+
+    Subclasses must implement:
+      - ``phases()``              — returns ordered phase descriptors.
+      - ``expected_delta_steps()``— inherited from ``BaseMove``.
+    """
+
     @abstractmethod
-    def expected_delta_steps(self, axis_id: int) -> int | None:
-        """
-        Expected step delta for axis_id after this move completes.
-        Return None if not applicable or variable (e.g. homing moves).
+    def phases(self) -> list[tuple[str, "Move", bool]]:
+        """Return an ordered list of ``(phase_name, sub_move, endstop_armed)``
+        tuples.  The ``MoveQueue`` iterates these, arming / disarming the
+        endstop between phases.
         """
         ...
 
@@ -152,7 +196,7 @@ class RampMove(Move):
         return None
 
 
-class HomingMove(Move):
+class HomingMove(CompositeMove):
     """
     A homing sequence on a single axis.
 
@@ -166,8 +210,10 @@ class HomingMove(Move):
     The MoveQueue must arm the endstop before each approach phase and
     disarm it during the backoff phase.
 
-    Phases are exposed as separate sub-moves so MoveQueue can arm/disarm
-    the endstop and update axis state between phases.
+    ``HomingMove`` extends ``CompositeMove``: execution is driven by
+    ``phases()``, not by ``segments()``.  This satisfies the Liskov
+    Substitution Principle — ``HomingMove`` never claims to be a
+    ``Move`` and will never be passed to a segment streamer directly.
     """
 
     def __init__(
@@ -193,10 +239,6 @@ class HomingMove(Move):
         self.home_position_steps = home_position_steps
         self.segment_duration_s = segment_duration_s
         self.reverse_direction = reverse_direction
-
-        # HomingMove is composed of sub-phases.
-        # MoveQueue uses these directly, not segments().
-        self._current_phase: str = "approach"
 
     def _make_approach_move(self) -> RampMove:
         """Phase 1: fast move toward endstop."""
@@ -279,22 +321,15 @@ class HomingMove(Move):
 
     def phases(self) -> list[tuple[str, RampMove, bool]]:
         """
-        Returns list of (phase_name, sub_move, endstop_armed).
-        MoveQueue iterates this list, arming/disarming between phases.
+        Return an ordered list of ``(phase_name, sub_move, endstop_armed)``.
+        The ``MoveQueue`` iterates this list, arming/disarming the endstop
+        between phases and updating ``AxisState`` after search completes.
         """
         return [
             ("approach", self._make_approach_move(), True),
             ("backoff", self._make_backoff_move(), False),
             ("search", self._make_search_move(), True),
         ]
-
-    def segments(self) -> Iterator[MultiAxisSegment]:
-        # HomingMove is executed phase-by-phase by MoveQueue.
-        # This method is not used directly.
-        raise NotImplementedError(
-            "HomingMove is executed via phases(), not segments(). "
-            "Use MoveQueue.enqueue() instead of running it directly."
-        )
 
     def expected_delta_steps(self, axis_id: int) -> int | None:
         return None  # Position is set explicitly after homing completes.
@@ -378,6 +413,13 @@ class WoundMove(Move):
         segment_duration_s: float = 0.004,
     ) -> None:
         super().__init__(name)
+        if spindle_cfg.axis_index == traverse_cfg.axis_index:
+            raise ValueError("spindle_cfg.axis_index and traverse_cfg.axis_index must differ")
+        if segment_duration_s <= 0.0:
+            raise ValueError("segment_duration_s must be positive")
+        if kinematics.total_duration <= 0.0:
+            raise ValueError("kinematics.total_duration must be positive")
+
         self.kinematics = kinematics
         self.pattern = pattern
         self.scatter = scatter

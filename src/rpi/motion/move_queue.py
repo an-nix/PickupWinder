@@ -6,7 +6,7 @@ from collections import deque
 from typing import Any
 
 from motion.axis_state import AxisState
-from motion.move import HomingMove, Move, MoveState, RampMove
+from motion.move import BaseMove, CompositeMove, HomingMove, Move, MoveState, RampMove
 from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
 from transport.spi_transport import Esp32SpiTransport
 
@@ -41,18 +41,18 @@ class MoveQueue:
         self._poll_interval_s = poll_interval_s
         self._print_every = print_every
 
-        self._queue: deque[Move] = deque()
+        self._queue: deque[BaseMove] = deque()
         self._queue_lock = threading.Lock()
         self._queue_event = threading.Event()
 
         self._stop_requested = False
         self._thread: threading.Thread | None = None
-        self._current_move: Move | None = None
-        self._history: list[Move] = []
+        self._current_move: BaseMove | None = None
+        self._history: list[BaseMove] = []
 
     # ── Public API ───────────────────────────────────────────────────────
 
-    def enqueue(self, move: Move) -> None:
+    def enqueue(self, move: BaseMove) -> None:
         """Add a move to the queue. Safe to call from any thread."""
         with self._queue_lock:
             self._queue.append(move)
@@ -82,7 +82,7 @@ class MoveQueue:
             self._queue.clear()
 
     @property
-    def current_move(self) -> Move | None:
+    def current_move(self) -> BaseMove | None:
         return self._current_move
 
     @property
@@ -130,16 +130,16 @@ class MoveQueue:
                 if len(self._history) > _MAX_HISTORY:
                     self._history = self._history[-_MAX_HISTORY:]
 
-    def _execute_move(self, move: Move) -> None:
+    def _execute_move(self, move: BaseMove) -> None:
         """Dispatch to the correct executor based on move type."""
         if self._stop_requested:
             move.mark_aborted("stop requested before execution")
             return
         try:
-            if isinstance(move, HomingMove):
-                self._execute_homing(move)
+            if isinstance(move, CompositeMove):
+                self._execute_homing(move)  # type: ignore[arg-type]
             else:
-                self._execute_ramp_move(move)
+                self._execute_ramp_move(move)  # type: ignore[arg-type]
         except Exception as exc:
             move.mark_failed(str(exc))
 
