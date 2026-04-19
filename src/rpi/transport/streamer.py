@@ -91,6 +91,73 @@ class MultiAxisRampStreamer:
         log_each_send: bool = False,
         send_log_path: str | None = None,
     ):
+        self._initialize_streamer_state(
+            transport=transport,
+            axis_configs=[AxisMotionConfig(axis_id=s.axis_id, ramp=s.ramp) for s in axis_streams],
+            axis_ids=[s.axis_id for s in axis_streams],
+            segment_duration_s=segment_duration_s,
+            target_buffer_time_s=target_buffer_time_s,
+            poll_interval_s=poll_interval_s,
+            print_every=print_every,
+            log_each_send=log_each_send,
+            send_log_path=send_log_path,
+            explicit_target_hz=None,
+        )
+
+    @classmethod
+    def from_axis_ids(
+        cls,
+        transport: Esp32SpiTransport,
+        axis_ids: list[int],
+        *,
+        target_hz: float,
+        poll_interval_s: float = 0.001,
+        print_every: int = 1,
+        target_buffer_time_s: float = 0.150,
+    ) -> "MultiAxisRampStreamer":
+        """Build a streamer from explicit axis IDs and a known target frequency.
+
+        Use this constructor when the move generator is external (e.g. `WoundMove`)
+        and no reliable `RampConfig` objects are available.
+
+        Differences vs `__init__`:
+          - `__init__`: derives `target_hz` from `RampConfig.target_hz`.
+          - `from_axis_ids`: receives `target_hz` explicitly and avoids synthetic ramps.
+        """
+        if not axis_ids:
+            raise ValueError("axis_ids must not be empty")
+        if target_hz <= 0.0:
+            raise ValueError("target_hz must be positive")
+
+        streamer = cls.__new__(cls)
+        streamer._initialize_streamer_state(
+            transport=transport,
+            axis_configs=[],
+            axis_ids=axis_ids,
+            segment_duration_s=0.004,
+            target_buffer_time_s=target_buffer_time_s,
+            poll_interval_s=poll_interval_s,
+            print_every=print_every,
+            log_each_send=False,
+            send_log_path=None,
+            explicit_target_hz=target_hz,
+        )
+        return streamer
+
+    def _initialize_streamer_state(
+        self,
+        *,
+        transport: Esp32SpiTransport,
+        axis_configs: list[AxisMotionConfig],
+        axis_ids: list[int],
+        segment_duration_s: float,
+        target_buffer_time_s: float,
+        poll_interval_s: float,
+        print_every: int,
+        log_each_send: bool,
+        send_log_path: str | None,
+        explicit_target_hz: float | None,
+    ) -> None:
         self._transport = transport
         self._poll_interval_s = poll_interval_s
         self._print_every = max(print_every, 1)
@@ -102,10 +169,13 @@ class MultiAxisRampStreamer:
         self._endstop_triggered = False
         self._endstop_armed_axes: set[int] = set()
 
-        self._axis_configs = [AxisMotionConfig(axis_id=s.axis_id, ramp=s.ramp) for s in axis_streams]
-        self._axis_ids = [s.axis_id for s in axis_streams]
+        self._axis_configs = axis_configs
+        self._axis_ids = list(axis_ids)
         self._segment_duration_s = max(self.MIN_SEGMENT_TIME_S, min(self.MAX_SEGMENT_TIME_S, segment_duration_s))
-        self._target_buffer_time_s = self._compute_target_buffer_time(target_buffer_time_s)
+        if explicit_target_hz is None:
+            self._target_buffer_time_s = self._compute_target_buffer_time(target_buffer_time_s)
+        else:
+            self._target_buffer_time_s = self._compute_target_buffer_time_from_hz(target_buffer_time_s, explicit_target_hz)
         self._min_buffer_time_s = min(self.MIN_BUFFER_TIME_S, self._target_buffer_time_s * 0.5)
 
         self._inflight: deque[tuple[MultiAxisSegment, int]] = deque()
@@ -115,6 +185,8 @@ class MultiAxisRampStreamer:
         self._planner_under_pressure = False  # True while planner_queue_free < threshold
         self._buffered_segments = 0           # SEGMENT_QUEUE_DEPTH - planner_queue_free
         self._current_steps_per_segment = 0  # updated per-segment; drives required_lookahead()
+        if explicit_target_hz is not None:
+            self._current_steps_per_segment = max(1, int(round(explicit_target_hz * self._segment_duration_s)))
         self._prefilling = False              # suppresses pressure gate during initial prefill
         # Premature-completion detection
         self._last_confirmed_sequence: int = -1
@@ -130,13 +202,16 @@ class MultiAxisRampStreamer:
             if self._last_confirmed_sequence >= 0
             else 0
         )
-        self._generator = iter(
-            MultiAxisSegmentGenerator(
-                self._axis_configs,
-                segment_duration_s=self._segment_duration_s,
-                start_sequence=start_sequence,
+        if self._axis_configs:
+            self._generator = iter(
+                MultiAxisSegmentGenerator(
+                    self._axis_configs,
+                    segment_duration_s=self._segment_duration_s,
+                    start_sequence=start_sequence,
+                )
             )
-        )
+        else:
+            self._generator = iter(())
         self._generator_finished = False
 
     # -- Helpers ---------------------------------------------------------------
@@ -236,6 +311,13 @@ class MultiAxisRampStreamer:
         if max_hz <= 0.0:
             return requested_time_s
         safe_time_s = (self.STEP_RING_CAPACITY * self.RING_BUFFER_HEADROOM) / max_hz
+        return max(self.MIN_BUFFER_TIME_S, min(requested_time_s, safe_time_s))
+
+    def _compute_target_buffer_time_from_hz(self, requested_time_s: float, target_hz: float) -> float:
+        requested_time_s = max(self.MIN_BUFFER_TIME_S, min(self.MAX_BUFFER_TIME_S, requested_time_s))
+        if target_hz <= 0.0:
+            return requested_time_s
+        safe_time_s = (self.STEP_RING_CAPACITY * self.RING_BUFFER_HEADROOM) / target_hz
         return max(self.MIN_BUFFER_TIME_S, min(requested_time_s, safe_time_s))
 
     def _sync_with_firmware_status(self) -> None:

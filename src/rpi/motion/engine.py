@@ -150,17 +150,13 @@ class WindingEngine:
 
         if accel_s is None or cruise_s is None or decel_s is None:
             total_turns = 2.0 * bobbin_width_mm * turns_per_mm
-            target_rps = target_rpm / 60.0
-            duration_s = total_turns / target_rps if target_rps > 0.0 else 0.0
-            if duration_s <= 0.0:
-                duration_s = 0.05
             steps_per_rev = (
                 self._config.spindle_steps_per_revolution
                 * self._config.spindle_microstepping
             )
-            computed_accel_s, computed_cruise_s, computed_decel_s = compute_ramp_times(
+            _, computed_accel_s, computed_cruise_s, computed_decel_s = self._compute_duration_and_ramp_times(
                 target_rpm=target_rpm,
-                duration_s=duration_s,
+                total_turns=total_turns,
                 max_accel_steps_per_s2=self._config.spindle_max_acceleration_steps_per_s2,
                 max_decel_steps_per_s2=self._config.spindle_max_deceleration_steps_per_s2,
                 steps_per_rev=steps_per_rev,
@@ -443,7 +439,14 @@ class WindingEngine:
         Returns True on completion, False on abort or fault.
         """
         reverse_lateral = (direction == "reverse")
-        duration_s = program.layer_duration_s()
+        total_turns = 2.0 * program.bobbin_width_mm * program.turns_per_mm
+        target_rps = program.spindle_rpm / 60.0
+        duration_s = self._adjust_duration_for_ramp_deficit(
+            total_turns=total_turns,
+            target_rps=target_rps,
+            accel_s=program.accel_s,
+            decel_s=program.decel_s,
+        )
         cruise_s = max(duration_s - program.accel_s - program.decel_s, 0.0)
 
         move = WoundMove(
@@ -538,3 +541,59 @@ class WindingEngine:
                 self._state.set_fault(msg)
                 break
             time.sleep(poll_s)
+
+    @staticmethod
+    def _adjust_duration_for_ramp_deficit(
+        *,
+        total_turns: float,
+        target_rps: float,
+        accel_s: float,
+        decel_s: float,
+    ) -> float:
+        """Return duration corrected for turns lost during accel/decel ramps."""
+        if target_rps <= 0.0:
+            return 0.05
+        turns_deficit = 0.5 * target_rps * (max(accel_s, 0.0) + max(decel_s, 0.0))
+        adjusted_turns = max(total_turns, 0.0) + turns_deficit
+        return max(adjusted_turns / target_rps, 0.05)
+
+    def _compute_duration_and_ramp_times(
+        self,
+        *,
+        target_rpm: float,
+        total_turns: float,
+        max_accel_steps_per_s2: float,
+        max_decel_steps_per_s2: float,
+        steps_per_rev: int,
+    ) -> tuple[float, float, float, float]:
+        """Compute corrected duration and final ramp times with two-pass estimation."""
+        target_rps = target_rpm / 60.0
+        if target_rps <= 0.0:
+            base_duration_s = 0.05
+        else:
+            base_duration_s = max(total_turns / target_rps, 0.05)
+
+        # Pass 1: estimate accel/decel from a duration that ignores ramp deficits.
+        accel_s_p1, _cruise_s_p1, decel_s_p1 = compute_ramp_times(
+            target_rpm=target_rpm,
+            duration_s=base_duration_s,
+            max_accel_steps_per_s2=max_accel_steps_per_s2,
+            max_decel_steps_per_s2=max_decel_steps_per_s2,
+            steps_per_rev=steps_per_rev,
+        )
+
+        # Pass 2: extend duration to compensate turns not produced at cruise speed during ramps.
+        duration_s = self._adjust_duration_for_ramp_deficit(
+            total_turns=total_turns,
+            target_rps=target_rps,
+            accel_s=accel_s_p1,
+            decel_s=decel_s_p1,
+        )
+        accel_s, cruise_s, decel_s = compute_ramp_times(
+            target_rpm=target_rpm,
+            duration_s=duration_s,
+            max_accel_steps_per_s2=max_accel_steps_per_s2,
+            max_decel_steps_per_s2=max_decel_steps_per_s2,
+            steps_per_rev=steps_per_rev,
+        )
+        return duration_s, accel_s, cruise_s, decel_s

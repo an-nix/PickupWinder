@@ -7,7 +7,6 @@ from typing import Any
 
 from motion.axis_state import AxisState
 from motion.move import BaseMove, CompositeMove, HomingMove, Move, WoundMove
-from motion.ramp_config import RampConfig
 from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
 from transport.spi_transport import Esp32SpiTransport
 
@@ -168,6 +167,13 @@ class MoveQueue:
             return 0
         return (last_executed + 1) & 0xFFFF
 
+    def _set_endstop_armed(self, axis_id: int, arm: bool) -> None:
+        sequence, _ = self._transport.enable_endstop_request(axis_id, arm=arm)
+        self._transport.wait_for_request_result(
+            sequence,
+            poll_interval_s=self._poll_interval_s,
+        )
+
     def _wrap_segment_sequence(self, generator: Any, start_sequence: int):
         sequence = start_sequence & 0xFFFF
         for segment in generator:
@@ -221,33 +227,14 @@ class MoveQueue:
         move.mark_completed()
 
     def _make_wound_streamer(self, move: WoundMove) -> MultiAxisRampStreamer:
-        spindle_steps_per_unit = max(1, int(round(move.spindle_cfg.steps_per_unit)))
-        traverse_steps_per_unit = max(1, int(round(move.traverse_cfg.steps_per_unit)))
-
-        spindle_ramp = RampConfig(
-            axis_id=move.spindle_cfg.axis_index,
-            steps_per_rev=spindle_steps_per_unit,
-            target_rpm=max(move.kinematics.target_rpm, 1.0),
-            accel_s=max(move.kinematics.accel_s, 0.0),
-            cruise_s=max(move.kinematics.cruise_s, 0.0),
-            decel_s=max(move.kinematics.decel_s, 0.0),
-            reverse_direction=move.spindle_cfg.reverse_direction,
+        target_hz = (
+            max(move.kinematics.target_rpm, 1.0) / 60.0
+            * float(move.spindle_cfg.steps_per_unit)
         )
-        traverse_ramp = RampConfig(
-            axis_id=move.traverse_cfg.axis_index,
-            steps_per_rev=traverse_steps_per_unit,
-            target_rpm=max(move.kinematics.target_rpm, 1.0),
-            accel_s=max(move.kinematics.accel_s, 0.0),
-            cruise_s=max(move.kinematics.cruise_s, 0.0),
-            decel_s=max(move.kinematics.decel_s, 0.0),
-            reverse_direction=move.traverse_cfg.reverse_direction,
-        )
-        return MultiAxisRampStreamer(
+        return MultiAxisRampStreamer.from_axis_ids(
             self._transport,
-            [
-                StreamAxisConfig(axis_id=move.spindle_cfg.axis_index, ramp=spindle_ramp),
-                StreamAxisConfig(axis_id=move.traverse_cfg.axis_index, ramp=traverse_ramp),
-            ],
+            move.axis_ids,
+            target_hz=max(target_hz, 1.0),
             poll_interval_s=self._poll_interval_s,
             print_every=self._print_every,
             target_buffer_time_s=0.150,
@@ -283,6 +270,9 @@ class MoveQueue:
             return
 
         move.mark_completed()
+        for ax_id in move.axis_ids:
+            if ax_id in self._axis_states:
+                self._axis_states[ax_id].invalidate_position()
 
     def _execute_homing(self, move: HomingMove) -> None:
         """
@@ -299,17 +289,17 @@ class MoveQueue:
 
         for phase_name, sub_move, arm_endstop in move.phases():
             if self._stop_requested:
-                self._transport.enable_endstop_request(move.axis_id, arm=False)
+                self._set_endstop_armed(move.axis_id, arm=False)
                 move.mark_aborted("stop requested during homing")
                 return
 
             # Arm or disarm endstop for this phase.
-            self._transport.enable_endstop_request(move.axis_id, arm=arm_endstop)
+            self._set_endstop_armed(move.axis_id, arm=arm_endstop)
 
             # Execute the sub-move.
             sub_move_axis_configs = sub_move.axis_configs
             if not sub_move_axis_configs:
-                self._transport.enable_endstop_request(move.axis_id, arm=False)
+                self._set_endstop_armed(move.axis_id, arm=False)
                 move.mark_failed(
                     f"homing sub-move {phase_name} has no public axis_configs"
                 )
@@ -324,7 +314,7 @@ class MoveQueue:
 
             if phase_name in ("approach", "search") and not streamer.endstop_triggered:
                 # Endstop did not fire — homing failed.
-                self._transport.enable_endstop_request(move.axis_id, arm=False)
+                self._set_endstop_armed(move.axis_id, arm=False)
                 move.mark_failed(
                     f"homing {phase_name} phase completed without "
                     f"endstop trigger on axis {move.axis_id}"
@@ -332,12 +322,12 @@ class MoveQueue:
                 return
 
             if self._stop_requested:
-                self._transport.enable_endstop_request(move.axis_id, arm=False)
+                self._set_endstop_armed(move.axis_id, arm=False)
                 move.mark_aborted("stop requested during homing")
                 return
 
         # All phases complete — disarm endstop and set home position.
-        self._transport.enable_endstop_request(move.axis_id, arm=False)
+        self._set_endstop_armed(move.axis_id, arm=False)
         if axis_state is not None:
             axis_state.mark_homed(move.home_position_steps)
 

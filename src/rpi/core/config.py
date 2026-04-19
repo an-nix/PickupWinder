@@ -3,10 +3,10 @@ from typing import Optional
 
 @dataclass
 class AppConfiguration:
+    """Configuration parameters for the PickupWinder host application."""
 
 
     rpc_socket_path: str = "/tmp/pickup_winder_rpc.sock"
-    """Configuration parameters for the application."""
     spi_device: str = "/dev/spidev0.0"
     spi_speed_hz: int = 1_000_000
 

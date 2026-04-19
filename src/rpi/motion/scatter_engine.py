@@ -3,9 +3,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-
-
-
 @dataclass(slots=True)
 class ScatterEngine:
     """Adds a spatial offset to the guide position to avoid exact layer stacking."""
@@ -13,6 +10,16 @@ class ScatterEngine:
     freq1: float = 1.0     # rad/turn
     freq2: float = 1.618   # rad/turn
     damping_margin_mm: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.amplitude_mm < 0.0:
+            raise ValueError("amplitude_mm must be >= 0")
+        if self.freq1 <= 0.0:
+            raise ValueError("freq1 must be positive")
+        if self.freq2 <= 0.0:
+            raise ValueError("freq2 must be positive")
+        if self.damping_margin_mm < 0.0:
+            raise ValueError("damping_margin_mm must be >= 0")
 
     def get_offset(self, spindle_turns: float, base_guide_pos_mm: float, bobbin_width_mm: float) -> float:
         if self.amplitude_mm <= 0.0:
