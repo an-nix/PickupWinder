@@ -70,6 +70,28 @@ class WinderApp:
             self._move_queue.current_move.mark_aborted("stop_operation called")
         return self._move_queue.status()
 
+    def _compute_ramp_times(
+        self,
+        target_rpm: float,
+        duration_s: float,
+        max_accel_steps_per_s2: float,
+        max_decel_steps_per_s2: float,
+        steps_per_rev: int,
+    ) -> tuple[float, float, float]:
+        start_hz = RampConfig().start_hz
+        target_hz = target_rpm / 60.0 * float(steps_per_rev)
+
+        accel_s = min(0.5, duration_s * 0.25)
+        if max_accel_steps_per_s2 > 0.0:
+            accel_s = max(accel_s, max(0.05, (target_hz - start_hz) / max_accel_steps_per_s2))
+
+        decel_s = min(0.5, duration_s * 0.25)
+        if max_decel_steps_per_s2 > 0.0:
+            decel_s = max(decel_s, max(0.05, (target_hz - start_hz) / max_decel_steps_per_s2))
+
+        cruise_s = max(duration_s - accel_s - decel_s, 0.0)
+        return accel_s, cruise_s, decel_s
+
     def run_spindle(self, duration_s: float, rpm: float) -> dict[str, Any]:
         if self._move_queue is None:
             raise RuntimeError("Application not started")
@@ -77,6 +99,17 @@ class WinderApp:
             raise ValueError("duration_s must be positive")
         if rpm <= 0.0:
             raise ValueError("rpm must be positive")
+
+        target_rpm = min(rpm, float(self.config.spindle_max_speed_rpm))
+        steps_per_rev = self.config.spindle_steps_per_revolution * self.config.spindle_microstepping
+        accel_s, cruise_s, decel_s = self._compute_ramp_times(
+            target_rpm=target_rpm,
+            duration_s=duration_s,
+            max_accel_steps_per_s2=self.config.spindle_max_acceleration_steps_per_s2,
+            max_decel_steps_per_s2=self.config.spindle_max_deceleration_steps_per_s2,
+            steps_per_rev=steps_per_rev,
+        )
+
         move = RampMove(
             name="spindle",
             config=RampMoveConfig(
@@ -85,10 +118,10 @@ class WinderApp:
                         axis_id=self.config.spindle_axis_id,
                         ramp=RampConfig(
                             axis_id=self.config.spindle_axis_id,
-                            target_rpm=min(rpm, float(self.config.spindle_max_speed_rpm)),
-                            accel_s=min(0.5, duration_s * 0.25),
-                            cruise_s=max(duration_s - 1.0, 0.0),
-                            decel_s=min(0.5, duration_s * 0.25),
+                            target_rpm=target_rpm,
+                            accel_s=accel_s,
+                            cruise_s=cruise_s,
+                            decel_s=decel_s,
                         ),
                     )
                 ],
@@ -104,6 +137,26 @@ class WinderApp:
             raise ValueError("duration_s must be positive")
         if spindle_rpm < 0.0 or lateral_rpm < 0.0:
             raise ValueError("rpm values must be non-negative")
+        spindle_target_rpm = min(spindle_rpm, float(self.config.spindle_max_speed_rpm))
+        spindle_steps_per_rev = self.config.spindle_steps_per_revolution * self.config.spindle_microstepping
+        spindle_accel_s, spindle_cruise_s, spindle_decel_s = self._compute_ramp_times(
+            target_rpm=spindle_target_rpm,
+            duration_s=duration_s,
+            max_accel_steps_per_s2=self.config.spindle_max_acceleration_steps_per_s2,
+            max_decel_steps_per_s2=self.config.spindle_max_deceleration_steps_per_s2,
+            steps_per_rev=spindle_steps_per_rev,
+        )
+
+        lateral_target_rpm = min(lateral_rpm, float(self.config.lateral_max_rpm))
+        lateral_steps_per_rev = self.config.lateral_steps_per_revolution * self.config.lateral_microstepping
+        lateral_accel_s, lateral_cruise_s, lateral_decel_s = self._compute_ramp_times(
+            target_rpm=lateral_target_rpm,
+            duration_s=duration_s,
+            max_accel_steps_per_s2=self.config.lateral_max_acceleration_steps_per_s2,
+            max_decel_steps_per_s2=self.config.lateral_max_deceleration_steps_per_s2,
+            steps_per_rev=lateral_steps_per_rev,
+        )
+
         move = RampMove(
             name="multi_axis",
             config=RampMoveConfig(
@@ -112,20 +165,20 @@ class WinderApp:
                         axis_id=self.config.spindle_axis_id,
                         ramp=RampConfig(
                             axis_id=self.config.spindle_axis_id,
-                            target_rpm=min(spindle_rpm, float(self.config.spindle_max_speed_rpm)),
-                            accel_s=min(0.5, duration_s * 0.2),
-                            cruise_s=max(duration_s - 1.0, 0.0),
-                            decel_s=min(0.5, duration_s * 0.2),
+                            target_rpm=spindle_target_rpm,
+                            accel_s=spindle_accel_s,
+                            cruise_s=spindle_cruise_s,
+                            decel_s=spindle_decel_s,
                         ),
                     ),
                     AxisMotionConfig(
                         axis_id=self.config.lateral_axis_id,
                         ramp=RampConfig(
                             axis_id=self.config.lateral_axis_id,
-                            target_rpm=min(lateral_rpm, float(self.config.lateral_max_rpm)),
-                            accel_s=min(0.5, duration_s * 0.2),
-                            cruise_s=max(duration_s - 1.0, 0.0),
-                            decel_s=min(0.5, duration_s * 0.2),
+                            target_rpm=lateral_target_rpm,
+                            accel_s=lateral_accel_s,
+                            cruise_s=lateral_cruise_s,
+                            decel_s=lateral_decel_s,
                         ),
                     ),
                 ],
@@ -227,6 +280,10 @@ class WinderApp:
             "spi_device": self.config.spi_device,
             "spi_speed_hz": self.config.spi_speed_hz,
             "spindle_max_speed_rpm": self.config.spindle_max_speed_rpm,
+            "spindle_max_acceleration_rpm": self.config.spindle_max_acceleration_rpm,
+            "spindle_max_deceleration_rpm": self.config.spindle_max_deceleration_rpm,
             "lateral_max_rpm": self.config.lateral_max_rpm,
+            "lateral_max_acceleration_mm_per_s2": self.config.lateral_max_acceleration_mm_per_s2,
+            "lateral_max_deceleration_mm_per_s2": self.config.lateral_max_deceleration_mm_per_s2,
             "lateral_traverse_pitch_mm": self.config.lateral_traverse_pitch_mm,
         }
