@@ -733,7 +733,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
     QueueHandle_t seg_queue = self->planner_.segmentQueue();
 
     // ── Deferred notification ring ────────────────────────────────────────
-    static constexpr int DEFER_DEPTH = 128;
+    static constexpr int DEFER_DEPTH = 256;
     int64_t  defer_fire_us[DEFER_DEPTH];
     uint32_t defer_seqs[DEFER_DEPTH];
     int      defer_head = 0;
@@ -932,10 +932,24 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     defer_seqs[idx]    = seg.motion_sequence;
                     ++defer_tail;
                 } else {
-                    ESP_LOGW(TAG, "defer ring overflow at seq=%u — notifying immediately",
-                             (unsigned)seg.motion_sequence);
+                    // Ring full: evict the oldest (earliest scheduled) entry,
+                    // notify it now (it is already overdue), then enqueue the
+                    // current segment normally. This preserves ordering and
+                    // avoids signalling completion before steps reach the ring.
+                    const int evict_idx = defer_head & (DEFER_DEPTH - 1);
+                    const uint32_t evicted_seq = defer_seqs[evict_idx];
                     self->notifySegmentExecuted(
-                        static_cast<uint16_t>(seg.motion_sequence));
+                        static_cast<uint16_t>(evicted_seq));
+                    ++defer_head;
+                    // Enqueue current segment.
+                    const int idx = defer_tail & (DEFER_DEPTH - 1);
+                    defer_fire_us[idx] = seg.scheduled_time_us
+                                         + static_cast<int64_t>(seg.duration_us);
+                    defer_seqs[idx]    = seg.motion_sequence;
+                    ++defer_tail;
+                    ESP_LOGW(TAG, "defer ring full: evicted seq=%u to make room for seq=%u",
+                             (unsigned)evicted_seq,
+                             (unsigned)seg.motion_sequence);
                 }
 
                 ++batch_index;

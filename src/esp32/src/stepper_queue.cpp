@@ -184,9 +184,13 @@ esp_err_t StepperQueue::maybeStartDriver(StepperDriver& driver, bool force_start
     // At slow speeds (2-9 steps/segment during acceleration) this was causing a
     // stutter on every segment.  STEP_STREAM_START_FILL and the ring-full case
     // are unaffected — those scenarios already imply >= PART_SIZE steps buffered.
+    const bool is_restart = !driver.isStreaming()
+                            && buffered_steps > 0
+                            && driver.getUnderrunCount() > 0;
     const bool should_start = (force_start && buffered_steps >= PART_SIZE)
         || (buffered_steps >= STEP_STREAM_START_FILL)
-        || (driver.ringFreeSlots() == 0);
+        || (driver.ringFreeSlots() == 0)
+        || (is_restart && buffered_steps >= STEP_STREAM_RESTART_FILL);
     if (!should_start) {
         return ESP_OK;
     }

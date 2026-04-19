@@ -114,6 +114,11 @@ extern "C" {
  *  PART_SIZE=32 the minimum safe value is 64. */
 #define STEP_STREAM_START_FILL  64U
 
+/** Minimum steps required to restart RMT after an underrun (low-speed safe).
+ *  Lower than STEP_STREAM_START_FILL to allow restart with few steps buffered.
+ *  Equals one encoder callback worth of steps (PART_SIZE). */
+#define STEP_STREAM_RESTART_FILL  (PART_SIZE)   // = 32, one encoder callback
+
 /**
  * Depth of the FreeRTOS step-block queue (per motor).
  * Increased to 24 to handle slower host SPI latency and maintain RMT fill rate.
