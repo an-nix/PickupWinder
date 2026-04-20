@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import tornado.web
@@ -13,6 +14,7 @@ from rpc import (
     UnixJsonRpcClient,
     make_error_response,
     make_response,
+    make_request,
     parse_json_rpc,
 )
 
@@ -76,6 +78,59 @@ class OpenApiHandler(tornado.web.RequestHandler):
         self.write(json.dumps(self.application.openapi_schema))
 
 
+class WindingRunAxisHandler(tornado.web.RequestHandler):
+    def get(self) -> None:
+        try:
+            axis_id = int(self.get_query_argument("axis_id"))
+            rpm = float(self.get_query_argument("rpm"))
+            duration_s = float(self.get_query_argument("duration_s"))
+        except tornado.web.MissingArgumentError as exc:
+            self.set_status(400)
+            self.write(json.dumps({"error": str(exc)}))
+            return
+        except ValueError as exc:
+            self.set_status(400)
+            self.write(json.dumps({"error": f"Invalid parameter: {exc}"}))
+            return
+
+        request_id = int(time.time() * 1000)
+        request_payload = make_request(
+            "winding.run_axis",
+            params={
+                "duration_s": duration_s,
+                "targets": [
+                    {"axis_id": axis_id, "rpm": rpm},
+                ],
+            },
+            request_id=request_id,
+        )
+        response = self.application.rpc_client.send_raw(request_payload)
+        if response is None:
+            self.set_status(204)
+            return
+        if "error" in response:
+            self.set_status(502)
+            self.write(json.dumps(response))
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps(response.get("result", response)))
+
+
+class WindingStatusHandler(tornado.web.RequestHandler):
+    def get(self) -> None:
+        request_payload = make_request("winding.status", params=None, request_id=1)
+        response = self.application.rpc_client.send_raw(request_payload)
+        if response is None:
+            self.set_status(204)
+            return
+        if "error" in response:
+            self.set_status(502)
+            self.write(json.dumps(response))
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps(response.get("result", response)))
+
+
 class ReDocHandler(tornado.web.RequestHandler):
     def get(self) -> None:
         self.set_header("Content-Type", "text/html")
@@ -107,6 +162,8 @@ def make_application(
         [
             (r"/rpc", JsonRpcHttpHandler, dict(rpc_client=rpc_client)),
             (r"/ws", JsonRpcWebSocketHandler),
+            (r"/run_axis", WindingRunAxisHandler),
+            (r"/status", WindingStatusHandler),
             (r"/openapi.json", OpenApiHandler),
             (r"/docs", ReDocHandler),
             (r"/swagger", SwaggerUIHandler),

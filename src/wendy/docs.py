@@ -45,6 +45,71 @@ def make_openapi_schema(
                         }
                     },
                 }
+            },
+            "/status": {
+                "get": {
+                    "summary": "Winding status",
+                    "description": "Return the current winding engine status using winding.status.",
+                    "responses": {
+                        "200": {
+                            "description": "Winding engine status result",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/run_axis": {
+                "get": {
+                    "summary": "Run axis for a duration",
+                    "description": "Compute steps from RPM and duration, then call winding.jog on the backend.",
+                    "parameters": [
+                        {
+                            "name": "axis_id",
+                            "in": "query",
+                            "required": True,
+                            "schema": {"type": "integer"},
+                            "description": "Axis index to drive.",
+                        },
+                        {
+                            "name": "rpm",
+                            "in": "query",
+                            "required": True,
+                            "schema": {"type": "number"},
+                            "description": "Target speed in RPM.",
+                        },
+                        {
+                            "name": "duration_s",
+                            "in": "query",
+                            "required": True,
+                            "schema": {"type": "number"},
+                            "description": "Duration of the motion in seconds.",
+                        },
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Run axis command result",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object"
+                                    }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Invalid request parameters"
+                        },
+                        "502": {
+                            "description": "Backend RPC error"
+                        }
+                    }
+                }
             }
         },
         "components": {
