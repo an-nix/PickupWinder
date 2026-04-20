@@ -1030,15 +1030,6 @@ void CommInterface::multiAxisExecutorTask(void* arg)
             const int64_t drain_start = esp_timer_get_time();
 
             while (batch_index < batch_count) {
-                // ── Pre-check: yield if time budget will be exceeded ───────────
-                // This prevents accumulating too much CPU time before yielding.
-                if ((esp_timer_get_time() - drain_start) >= EXEC_TIME_BUDGET_US) {
-                    kickStartActiveAxes();
-                    taskYIELD();
-                    // Restart from FETCH to get fresh batch and reset timer.
-                    state = ExecState::FETCH;
-                    goto exit_drain;
-                }
 
                 planned_segment_t& seg = batch[batch_index];
 
@@ -1164,40 +1155,28 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                              (unsigned)seg.motion_sequence);
                 }
 
-                // Restart RMT immediately if it stopped mid-batch due to ring drain.
-                // Do not wait for ExecState::RUN — the ring may fill with unconsumed
-                // steps causing pushBlock() to deadlock on ulTaskNotifyTake.
-                for (uint8_t a = 0; a < seg.axis_count; ++a) {
-                    const uint8_t axis_id = seg.axis_ids[a];
-                    if (axis_id >= self->n_motors_ ||
-                        self->queues_[axis_id] == nullptr) continue;
-                    if (!self->queues_[axis_id]->driver().isStreaming()) {
-                        self->queues_[axis_id]->kickStart();
-                    }
-                }
-
                 ++batch_index;
 
-                // ── Time budget check (watchdog safety) ───────────────────
+                // ── B4 FIX: UN SEUL check budget, comportement uniforme ─────
+                // kickStart + yield + reste en DRAIN (drain_start se reset au
+                // prochain passage car il est local au case DRAIN).
                 if ((esp_timer_get_time() - drain_start) >= EXEC_TIME_BUDGET_US) {
-                    // Budget exhausted — transition to RUN to kickStart,
-                    // then yield before processing remaining segments.
                     kickStartActiveAxes();
                     taskYIELD();
-                    // Continue draining after yield (reset budget).
-                    break;  // will re-enter DRAIN on next iteration
+                    goto exit_drain;  // reste en DRAIN, batch_index progresse
                 }
             }
 
-            // All segments in batch processed — transition to RUN.
+            // Batch complet → transition vers RUN.
+            // Si on est sorti par goto exit_drain (budget), batch_index < batch_count:
+            // on reviendra ici au prochain tick, l'état est déjà DRAIN.
             if (batch_index >= batch_count) {
                 state = ExecState::RUN;
             }
-            // else: budget break, stay in DRAIN for remaining segments.
             break;
 
         exit_drain:
-            break;  // state already set by the goto target
+            break;  // state = DRAIN, reprend au prochain tick
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -2301,17 +2280,18 @@ extern "C" {
 
 /** Buffered step target before starting the RMT stream.
  *  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE.
- *  With coast-mode the RMT never stops once started, so this threshold
- *  only matters for the very first kickStart(). Set to 16 (= 2 × PART_SIZE)
- *  so even low-speed segments with ~4 steps can accumulate enough. */
-#define STEP_STREAM_START_FILL  16U
+ *  Raised from 16 to 128 (16 × PART_SIZE): at low-speed ramp-up, the host
+ *  sends ~4 steps/segment; starting RMT with only 16 entries means the ring
+ *  drains after the second ISR callback, causing underrun before the executor
+ *  can refill.  128 entries = ~16 segments of look-ahead, safe at all speeds. */
+#define STEP_STREAM_START_FILL  128U
 
 /**
  * Minimum steps required to RESTART the RMT stream after an underrun.
  * With coast-mode this is rarely used (RMT stays running), but kept
- * as a safety net.  PART_SIZE = 8 → restart fill = 4.
+ * as a safety net.  2 × PART_SIZE = 16.
  */
-#define STEP_STREAM_RESTART_FILL  (PART_SIZE / 2U)   // = 4
+#define STEP_STREAM_RESTART_FILL  (2U * PART_SIZE)   // = 16
 
 /**
  * Depth of the FreeRTOS step-block queue (per motor).
@@ -2809,9 +2789,14 @@ static const char* TAG = "stepper_driver";
 // PART_SIZE = 8: one callback per 8 symbols.
 
 /** Number of consecutive empty-ring callbacks before auto-stopping.
- *  At worst-case pause symbol duration (~25 µs per symbol × 8 symbols),
- *  6250 callbacks ≈ 1.25 seconds of idle before auto-stop. */
-static constexpr uint32_t COAST_IDLE_LIMIT = 6250;
+ *  At 80 MHz with MIN_CMD_TICKS=400: each coast callback emits 8 symbols of
+ *  50 ticks each = 400 ticks = 5 µs per callback.
+ *  250000 callbacks × 5 µs = 1.25 seconds of idle before auto-stop.
+ *
+ *  The previous value of 6250 was only 31.25 ms — far too short. Any brief
+ *  segment-queue starvation or Python GC pause on the Pi Zero could empty
+ *  the ring for 31 ms and stop the motor mid-move. */
+static constexpr uint32_t COAST_IDLE_LIMIT = 250000;
 
 extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
                                           size_t /*data_size*/,
@@ -3276,20 +3261,29 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
         // Back-pressure: wait until the encoder ISR has consumed at least one
         // chunk and notified this producer task. This avoids a CPU1 spin loop
         // and keeps the task watchdog satisfied.
+        //
+        // B2 FIX: deadlock guard — si startStream() échoue (trans_queue pleine),
+        // l'ISR ne fire jamais et ring_read_ ne progresse pas. Retour d'erreur
+        // explicite après 20 tentatives (20 × 5 ms = 100 ms max).
+        static constexpr uint8_t PUSH_RETRY_MAX = 20;
+        uint8_t push_retry_count = 0;
+
         while (ringFree() == 0) {
-            // The endstop ISR also notifies this task.  If it fires while we
-            // are blocked here, break out immediately instead of spinning.
             if (endstop_active_.load(std::memory_order_acquire)) {
                 return ESP_ERR_INVALID_STATE;
             }
-            // If RMT is not running and ring is full, the encoder callback
-            // will never fire and ring_read_ will never advance.
-            // Kick startStream() directly instead of waiting forever.
             if (!rmt_running_.load(std::memory_order_acquire)) {
                 esp_err_t kick_err = startStream();
                 if (kick_err != ESP_OK) {
                     ESP_LOGW(TAG, "motor%u: pushBlock kick startStream: %s",
                              motor_id_, esp_err_to_name(kick_err));
+                    ++push_retry_count;
+                    if (push_retry_count >= PUSH_RETRY_MAX) {
+                        ESP_LOGE(TAG,
+                                 "motor%u: pushBlock timeout — ring full, RMT won't start",
+                                 motor_id_);
+                        return ESP_ERR_TIMEOUT;
+                    }
                 }
             }
             ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(5));
@@ -3658,7 +3652,13 @@ esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
 
 esp_err_t StepperQueue::kickStart()
 {
-    return maybeStartDriver(driver_, true);
+    esp_err_t err = maybeStartDriver(driver_, true);
+    if (err != ESP_OK) {
+        // B6: log explicite — diagnostique les échecs RMT silencieux
+        ESP_LOGW(TAG, "motor%u: kickStart failed: %s",
+                 motor_id_, esp_err_to_name(err));
+    }
+    return err;
 }
 
 void StepperQueue::gracefulStop()
