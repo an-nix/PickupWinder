@@ -9,7 +9,8 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from motion import AxisMotionConfig, RampConfig, MultiAxisSegmentGenerator, SynchronizedSegmentGenerator, SpindleKinematics, WindingPattern, ScatterEngine, SyncAxisConfig
+from motion import AxisMotionConfig, RampConfig, MultiAxisSegmentGenerator, SpindleKinematics
+from winding import WindingPattern, ScatterEngine, SyncAxisConfig, SynchronizedSegmentGenerator
 from transport import Esp32SpiTransport
 from transport import MultiAxisRampStreamer, StreamAxisConfig
 

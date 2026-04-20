@@ -9,11 +9,6 @@ __all__ = [
     "AxisMotionConfig",
     "MultiAxisSegmentGenerator",
     "SpindleKinematics",
-    "WindingPattern",
-    "ScatterEngine",
-    "SyncAxisConfig",
-    "SynchronizedSegmentGenerator",
-    "WindingEngine",
 ]
 
 
@@ -33,21 +28,6 @@ def __getattr__(name: str):
     if name == "SpindleKinematics":
         from .spindle_kinematics import SpindleKinematics
         return SpindleKinematics
-    if name == "WindingPattern":
-        from .winding_pattern import WindingPattern
-        return WindingPattern
-    if name == "ScatterEngine":
-        from .scatter_engine import ScatterEngine
-        return ScatterEngine
-    if name == "SyncAxisConfig":
-        from .synchronized_segment_generator import SyncAxisConfig
-        return SyncAxisConfig
-    if name == "SynchronizedSegmentGenerator":
-        from .synchronized_segment_generator import SynchronizedSegmentGenerator
-        return SynchronizedSegmentGenerator
-    if name == "WindingEngine":
-        from .engine import WindingEngine
-        return WindingEngine
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

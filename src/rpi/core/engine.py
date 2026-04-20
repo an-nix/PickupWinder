@@ -6,20 +6,23 @@ import time
 from typing import Any, Optional
 
 from motion.axis_state import AxisState
-from motion.move import HomingMove, JogMove, RampMove, RampMoveConfig, WoundMove
+from motion.move import HomingMove, JogMove, RampMove, RampMoveConfig
 from motion.move_queue import MoveQueue
 from motion import (
     AxisMotionConfig,
     RampConfig,
     SpindleKinematics,
-    WindingPattern,
-    ScatterEngine,
-    SyncAxisConfig,
 )
-from motion.ramp_config import compute_ramp_times
 from transport.spi_transport import Esp32SpiTransport
 from core.config import AppConfiguration
 from core.events import EventBus, EventKind
+from winding import (
+    WindingPattern,
+    ScatterEngine,
+    SyncAxisConfig,
+    WoundMove,
+)
+from motion.ramp_config import compute_ramp_times
 from winding.program import WindingProgram
 from core.shared_state import EngineState, SharedState
 

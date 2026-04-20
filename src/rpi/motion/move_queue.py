@@ -6,7 +6,8 @@ from collections import deque
 from typing import Any
 
 from motion.axis_state import AxisState
-from motion.move import BaseMove, CompositeMove, HomingMove, Move, WoundMove
+from motion.move import BaseMove, CompositeMove, HomingMove, Move
+from winding.wound_move import WoundMove
 from transport.messages import (
     LATERAL_ENDSTOP_ABSENT,
     LATERAL_ENDSTOP_PRESENT_CLOSED,

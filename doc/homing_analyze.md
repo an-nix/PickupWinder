@@ -1,214 +1,367 @@
-# PickupWinder — Correctifs homing v2 : analyse des modifications et optimisations restantes
+# PickupWinder — Correctifs homing v3 : analyse des modifications et optimisations restantes
 
 > Document de spécification à destination de GitHub Copilot.
-> Ce document part de l'état **post-correctifs** décrit dans le document de référence v2
-> et identifie ce qui reste incorrect, incomplet ou sous-optimal.
-> Chaque section suit le même format : fichier, méthode, problème, comportement attendu, code cible.
+> Ce document part de l'état **post-correctifs v3** (R1–R10 appliqués).
+> Tous les points ci-dessous sont **nouveaux** — ne pas re-appliquer R1–R10.
 
 ---
 
-## Résumé des correctifs déjà appliqués (ne pas re-appliquer)
+## Résumé des correctifs confirmés dans v3 (ne pas re-appliquer)
 
-Les points suivants sont confirmés comme implémentés dans la v2 :
-
-- `isLateralMovementAllowed` conditionne le blocage à `isEndstopArmed()` ✓
-- `endstop_hit_mask` dans `StatusPayload` firmware et miroir Python ✓
-- `endstop_hit_count_` dans `StepperDriver`, remis à zéro dans `armEndstop()` ✓
-- `RECOVERY` notifie la dernière séquence drainée ✓
-- `_mark_endstop_triggered` utilise `_last_confirmed_motion_seq` ✓
-- `_check_endstop` utilise `endstop_hit_mask` en priorité ✓
-- `_ensure_homing_can_start` refuse explicitement `ABSENT` ✓
-- Pré-dégagement `preclear` si capteur déjà fermé au départ ✓
-- Timeout de backoff dynamique `_compute_backoff_timeout` ✓
-
----
-
-## Problèmes résiduels identifiés
+| Ref | Description | Statut |
+|-----|-------------|:------:|
+| R1  | `disarmEndstop()` remet `endstop_hit_count_` à zéro | ✓ |
+| R2  | `_check_endstop` filtre `endstop_hit_mask` par axe armé | ✓ |
+| R3  | `_last_confirmed_motion_seq` initialisé à `-1`, flush fallback chain | ✓ |
+| R4  | `_compute_backoff_timeout` chaîne de fallback robuste | ✓ |
+| R5  | Debounce 20 ms + relecture finale dans `_clear_closed_endstop_before_homing` | ✓ |
+| R7  | `_check_armed_phase_result` avec diagnostics complets | ✓ |
+| R8  | Timeout `_wait_for_endstop_arm_state` adaptatif `max(0.5, 20×poll)` | ✓ |
+| R9  | Fail-safe ABSENT dans DRAIN : arrêt d'urgence si capteur absent + armé | ✓ |
+| R10 | `clearMultiExecFlags()` appelé avant tout `goto exit_drain` vers RECOVERY | ✓ |
 
 ---
 
-## R1 — `disarmEndstop()` ne remet pas `endstop_hit_count_` à zéro
+## Problèmes résiduels identifiés dans v3
+
+---
+
+## N1 — DRAIN : le fail-safe ABSENT (R9) n'appelle pas `clearMultiExecFlags` avant `emergencyStop`
 
 ### Fichier
-`src/esp32/src/stepper_driver.h`
+`src/esp32/src/comm_interface.cpp`
 
-### Méthode
-`StepperDriver::disarmEndstop`
+### État machine
+`ExecState::DRAIN`
 
 ### Problème
-Le document v2 confirme que `armEndstop()` remet `endstop_hit_count_` à zéro.
-Mais `disarmEndstop()` ne le fait pas.
+Le document v3 section 10 montre l'ordre suivant pour le fail-safe ABSENT :
 
-Si le host désarme entre deux phases (fin `approach`, début `backoff`), puis réarme pour
-`search`, le `endstop_hit_count_` de la phase `approach` est toujours non nul au moment
-de l'armement `search`. `armEndstop()` le remet à zéro à ce moment-là, donc ça fonctionne.
+```cpp
+if (lateral_endstop_armed && lateral_state == ABSENT) {
+    queues_[1]->driver().emergencyStop();
+    clearMultiExecFlags();          // ← appelé APRÈS emergencyStop
+    notifySegmentExecuted(seg.motion_sequence);
+    state = RECOVERY; goto exit_drain;
+}
+```
 
-**Mais** si le host appelle `disarm → mouvements divers → arm`, le `endstop_hit_count_`
-accumulé pendant les mouvements désarmés (ISR inactive, donc impossible) ne pose pas
-de problème. Ce n'est pas un bug actif.
-
-**Le vrai problème** : si le host appelle `disarm` puis lit le status avant le prochain
-`arm`, `endstop_hit_mask` peut encore être à 1 (le bit est mis depuis `endstop_hit_count_ > 0`,
-et `disarm` ne remet pas le compteur à zéro). Le streamer du `backoff` pourrait donc
-voir `endstop_hit_mask` non nul au début du `backoff` et déclencher un faux endstop
-sur la phase désarmée.
+`clearMultiExecFlags()` doit être appelé **avant** `emergencyStop()`, comme R10 le
+spécifie pour le chemin endstop ISR normal. `emergencyStop()` reset le ring RMT et
+peut déclencher l'ISR `on_trans_done` qui réveille les per-axis `executorTask`. Si ces
+tâches commencent à s'exécuter alors que `multi_exec_active_` est encore à `true`,
+elles entrent dans `ulTaskNotifyTake` au lieu de traiter leur queue — elles attendent
+une notification qui ne viendra pas de l'ISR endstop.
 
 ### Comportement attendu
-`disarmEndstop()` doit aussi remettre `endstop_hit_count_` à zéro pour que le status
-suivant reflète un état propre dès le désarmement.
+Ordre strict : `clearMultiExecFlags()` → `emergencyStop()` → `notifySegmentExecuted()`
+→ `state = RECOVERY`.
 
 ### Code cible
 
 ```cpp
-void disarmEndstop() {
-    endstop_armed_.store(false, std::memory_order_release);
-    endstop_active_.store(false, std::memory_order_release);
-    endstop_hit_count_.store(0, std::memory_order_relaxed);  // ← AJOUT
+if (lateral_endstop_armed &&
+    lateral_state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
+    ESP_LOGW(TAG, "lateral endstop ABSENT while armed at seq=%u — fail-safe stop",
+             seg.motion_sequence);
+    clearMultiExecFlags();                          // ← EN PREMIER
+    if (self->queues_[1] != nullptr) {
+        self->queues_[1]->driver().emergencyStop();
+    }
+    self->notifySegmentExecuted(seg.motion_sequence);
+    state = ExecState::RECOVERY;
+    goto exit_drain;
 }
 ```
 
 ---
 
-## R2 — `_check_endstop` utilise `endstop_hit_mask` sans filtre d'axe
+## N2 — DRAIN : la gate `lateral_blocked` est lue après `setMultiExecActive(true)` mais avant `clearMultiExecFlags`
 
 ### Fichier
-`src/rpi/transport/streamer.py`
+`src/esp32/src/comm_interface.cpp`
 
-### Méthode
-`MultiAxisRampStreamer._check_endstop`
+### État machine
+`ExecState::DRAIN`
 
 ### Problème
-Le document v2 montre :
+Le document v3 section 10 montre la structure suivante (résumée) :
 
-```python
-hit_mask = int(getattr(status, "endstop_hit_mask", 0))
-if hit_mask != 0 and (armed_mask != 0 or bool(self._endstop_armed_axes)):
-    self._mark_endstop_triggered()
-    return True
+```
+1. Check endstop ISR       → clearMultiExecFlags + RECOVERY si hit
+2. Lire lateral_state
+3. Fail-safe ABSENT        → clearMultiExecFlags + RECOVERY si absent+armé
+4. setMultiExecActive(true) pour chaque axe du segment  ← DÉBUT de la zone gardée
+5. kickStart si RMT arrêté
+6. executeConstantRateBlock pour chaque axe
+   └─ si ESP_ERR_INVALID_STATE → clearMultiExecFlags + RECOVERY
+7. clearMultiExecFlags()  ← FIN de la zone gardée
 ```
 
-Cette logique déclenche le flag endstop si **n'importe quel** bit de `endstop_hit_mask`
-est non nul, même si ce bit correspond à un axe qui n'est pas dans `self._endstop_armed_axes`.
+Entre les étapes 4 et 6, si `executeConstantRateBlock` retourne une erreur autre que
+`ESP_ERR_INVALID_STATE` (par exemple `ESP_ERR_TIMEOUT` si le ring est plein après 20
+tentatives), le code actuel log un warning (`ESP_LOGW`) et **continue** sans aller en
+RECOVERY. Le flag `multi_exec_active_` reste `true` pour l'axe concerné jusqu'à
+`clearMultiExecFlags()` à l'étape 7.
 
-Exemple : le mouvement homing arme l'axe 1. Si l'axe 0 (bobine) avait un `endstop_hit_count_`
-résiduel non nul (bug R1 ci-dessus, ou test précédent), `hit_mask` serait `0x01`, et le
-homing latéral serait déclenché à tort.
+Ce n'est pas un deadlock (l'étape 7 est atteinte dans tous les chemins non-RECOVERY),
+mais un `ESP_ERR_TIMEOUT` dans `pushBlock` indique que le ring est plein et que le RMT
+ne consomme plus. Dans ce cas, continuer les autres axes et appeler `kickStart` en
+fin de batch peut aggraver l'état au lieu de le corriger.
 
 ### Comportement attendu
-Ne déclencher que si le bit `endstop_hit_mask` correspond à un axe dans
-`self._endstop_armed_axes`.
+Sur `ESP_ERR_TIMEOUT` (ring plein + RMT bloqué) dans `executeConstantRateBlock`,
+déclencher RECOVERY explicitement au lieu de continuer.
 
 ### Code cible
 
-```python
-def _check_endstop(self, status) -> bool:
-    armed_mask   = int(getattr(status, "endstop_armed_mask", 0))
-    lateral_state = int(getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT))
-    running_mask  = int(getattr(status, "running_mask", 0))
-    hit_mask      = int(getattr(status, "endstop_hit_mask", 0))
+```cpp
+esp_err_t err = axis_queue->executeConstantRateBlock(
+    seg.axes[a].direction,
+    seg.axes[a].step_count,
+    seg.duration_us);
 
-    # Signal canonique : endstop_hit_mask, filtré sur les axes réellement armés
-    for axis_id in self._endstop_armed_axes:
-        if hit_mask & (1 << axis_id):
-            self._mark_endstop_triggered()
-            return True
-
-    # Fallback : capteur fermé + axe armé arrêté
-    for axis_id in self._endstop_armed_axes:
-        axis_stopped = (running_mask & (1 << axis_id)) == 0
-        if lateral_state == LATERAL_ENDSTOP_PRESENT_CLOSED and axis_stopped:
-            self._mark_endstop_triggered()
-            return True
-
-    # segments_dropped uniquement si un axe armé est aussi arrêté
-    dropped_now = int(getattr(status, "segments_dropped", 0))
-    if self._endstop_armed_axes and dropped_now > self._last_segments_dropped:
-        any_armed_stopped = any(
-            (running_mask & (1 << a)) == 0
-            for a in self._endstop_armed_axes
-        )
-        if any_armed_stopped:
-            self._mark_endstop_triggered()
-            return True
-        self._last_segments_dropped = dropped_now
-
-    return False
+if (err == ESP_ERR_INVALID_STATE) {
+    // Endstop déclenché pendant le remplissage du ring
+    clearMultiExecFlags();
+    ESP_LOGW(TAG, "axis %u endstop mid-seg seq=%u",
+             axis_id, seg.motion_sequence);
+    axis_queue->driver().emergencyStop();
+    self->notifySegmentExecuted(seg.motion_sequence);
+    state = ExecState::RECOVERY;
+    goto exit_drain;
+} else if (err == ESP_ERR_TIMEOUT) {
+    // Ring plein + RMT bloqué : impossible de continuer proprement
+    clearMultiExecFlags();
+    ESP_LOGE(TAG, "axis %u ring timeout at seq=%u — forcing RECOVERY",
+             axis_id, seg.motion_sequence);
+    self->notifySegmentExecuted(seg.motion_sequence);
+    state = ExecState::RECOVERY;
+    goto exit_drain;
+} else if (err != ESP_OK) {
+    // Autre erreur non fatale : logger et continuer
+    ESP_LOGW(TAG, "axis %u seg %u: %s",
+             axis_id, seg.motion_sequence, esp_err_to_name(err));
+}
 ```
-
-> `self._last_segments_dropped: int = 0` doit être initialisé dans `__init__`
-> et mis à jour à chaque poll même hors déclenchement.
 
 ---
 
-## R3 — `_last_confirmed_motion_seq` initialisé à 0 peut provoquer un FLUSH à seq=0
+## N3 — `_check_armed_phase_result` expose `last_sent_motion_seq` mais l'attribut n'est pas défini
 
 ### Fichier
 `src/rpi/transport/streamer.py`
 
-### Méthode
-`MultiAxisRampStreamer._mark_endstop_triggered` et `__init__`
-
 ### Problème
-Le document v2 montre :
+Le document v3 section 14 indique :
 
-```python
-flush_seq = self._last_confirmed_motion_seq
-if flush_seq < 0:
-    flush_seq = self._last_sent_motion_seq
-if flush_seq < 0:
-    flush_seq = 0xFFFF
-```
+> `last_sent_motion_seq` — Property exposée pour diagnostics (R7)
 
-Si `_last_confirmed_motion_seq` est initialisé à `0` et que l'endstop se déclenche
-avant le premier status confirmé (premier segment très court, capteur déjà en contact),
-le FLUSH sera envoyé avec `flush_sequence=0`.
-
-Le planner firmware va alors filtrer tous les segments avec `motion_sequence > 0`, ce qui
-est potentiellement tous les segments, alors que l'intention est de flusher jusqu'à la
-dernière séquence connue.
+Mais le document ne montre pas l'implémentation de cette property. Si elle n'est pas
+définie, `_check_armed_phase_result` lèvera `AttributeError` en tentant de lire
+`streamer.last_sent_motion_seq` pour construire le message diagnostique.
 
 ### Comportement attendu
-Initialiser `_last_confirmed_motion_seq` à `-1` (sentinel "jamais lu") et utiliser
-`_last_sent_motion_seq` comme fallback si la valeur confirmée n'a pas encore été reçue.
+Exposer `_last_sent_motion_seq` comme property publique en lecture seule.
 
 ### Code cible
 
-Dans `__init__` :
+Dans `MultiAxisRampStreamer` :
+
 ```python
-self._last_confirmed_motion_seq: int = -1
-self._last_segments_dropped: int = 0
+@property
+def last_sent_motion_seq(self) -> int:
+    """Dernière motion_sequence envoyée au firmware (ou -1 si rien envoyé)."""
+    return self._last_sent_motion_seq
 ```
 
-Dans la boucle de poll du status (à chaque réception d'un status firmware) :
+Et s'assurer que `_last_sent_motion_seq` est initialisé dans `__init__` :
+
 ```python
-confirmed = int(getattr(status, "last_executed_sequence", 0xFFFF))
-# 0xFFFF est la valeur initiale firmware "rien exécuté" — ne pas la stocker
-if confirmed != 0xFFFF:
-    self._last_confirmed_motion_seq = confirmed
+self._last_sent_motion_seq: int = -1
 ```
 
-Dans `_mark_endstop_triggered` :
+Mis à jour à chaque envoi d'un bloc `MULTI_AXIS_SEGMENT_BLOCK` :
+
 ```python
-def _mark_endstop_triggered(self) -> None:
-    if self._endstop_triggered:
-        return
-    self._endstop_triggered = True
-    # Priorité : séquence confirmée par le firmware
-    # Fallback : séquence envoyée (garantit cohérence si rien confirmé)
-    # Dernier recours : 0xFFFF (flush total)
-    if self._last_confirmed_motion_seq >= 0:
-        flush_seq = self._last_confirmed_motion_seq
-    elif self._last_sent_motion_seq >= 0:
-        flush_seq = self._last_sent_motion_seq
+# Dans la boucle d'envoi des segments, après chaque send réussi :
+self._last_sent_motion_seq = current_segment.motion_sequence
+```
+
+---
+
+## N4 — `_wait_for_endstop_open` ne met pas à jour `_last_segments_dropped`
+
+### Fichier
+`src/rpi/motion/move_queue.py`
+
+### Méthode
+`MoveQueue._wait_for_endstop_open`
+
+### Problème
+Pendant la phase `backoff`, le streamer est terminé et `_wait_for_endstop_open` poll
+le status SPI via `_read_status`. Chaque appel lit un nouveau `segments_dropped`
+depuis le firmware.
+
+Mais le streamer de la phase `backoff` a déjà terminé (`stream_all()` est revenu).
+Le prochain streamer créé pour la phase `search` initialisera `_last_segments_dropped`
+à `0`. Si le firmware a eu des segments drainés pendant le RECOVERY de la phase
+`approach` (normal), et que ces drops ont été comptabilisés pendant le backoff, le
+nouveau streamer `search` verra une valeur `segments_dropped` > 0 dès son premier
+status, et pourrait le traiter comme un incrément (si le compteur firmware ne s'est
+pas remis à zéro entre-temps).
+
+**Précision :** le compteur `segments_dropped` du firmware (`planner_.segmentsDropped()`)
+est cumulatif et ne se remet à zéro que sur `RESET_STATS`. Le streamer `search`
+commencera avec `_last_segments_dropped=0` et verra une valeur potentiellement élevée
+dès le premier status. Si cette valeur dépasse `0`, et qu'un axe armé est arrêté
+(ce qui est le cas juste après l'armement, avant que le premier segment soit exécuté),
+R2-corrigé `_check_endstop` déclenchera un faux endstop immédiatement.
+
+### Comportement attendu
+Le streamer de chaque phase doit s'initialiser avec la valeur courante de
+`segments_dropped` (baseline), pas avec `0`. Ainsi seuls les incréments survenus
+pendant la phase sont détectés.
+
+### Code cible — option A : passer la baseline au constructeur du streamer
+
+Dans `MoveQueue._stream_homing_sub_move` :
+
+```python
+def _stream_homing_sub_move(self, move, phase_name, sub_move, arm_endstop):
+    # Lire la baseline segments_dropped avant de créer le streamer
+    baseline_status = self._read_status(move.axis_id)
+    baseline_dropped = int(
+        getattr(baseline_status, "segments_dropped", 0)
+    )
+
+    streamer = self._make_streamer(
+        sub_move.axis_configs,
+        keep_enabled_axes={move.axis_id},
+        initial_segments_dropped=baseline_dropped,   # ← nouveau paramètre
+    )
+    ...
+```
+
+Dans `MultiAxisRampStreamer.__init__` :
+
+```python
+def __init__(self, ..., initial_segments_dropped: int = 0):
+    ...
+    self._last_segments_dropped: int = initial_segments_dropped
+```
+
+### Code cible — option B (plus simple) : initialiser dans `note_endstop_armed`
+
+```python
+def note_endstop_armed(self, axis_id: int, arm: bool) -> None:
+    if arm:
+        self._endstop_armed_axes.add(axis_id)
     else:
-        flush_seq = 0xFFFF
-    self.request_stop()
-    self.request_flush(flush_seq)
+        self._endstop_armed_axes.discard(axis_id)
+    # Relever la baseline segments_dropped à chaque changement d'armement
+    # pour éviter les faux positifs dus au compteur cumulatif firmware.
+    # Note : nécessite un accès au transport depuis le streamer.
+    # Préférer l'option A si le streamer n'a pas accès direct au transport.
+```
+
+> **Recommandation : option A.** Elle est explicite, testable et ne couple pas le
+> streamer à un appel SPI supplémentaire dans `note_endstop_armed`.
+
+---
+
+## N5 — `RECOVERY` notifie `last_drained_seq` mais pas les segments déjà dans `defer_*`
+
+### Fichier
+`src/esp32/src/comm_interface.cpp`
+
+### État machine
+`ExecState::RECOVERY`
+
+### Problème
+RECOVERY réinitialise `defer_head = defer_tail = 0` et notifie `last_drained_seq`
+(séquence maximale drainée de `seg_queue_`).
+
+Mais entre le moment où un segment est consommé de `seg_queue_` dans DRAIN et le
+moment où sa notification différée est émise (dans `fireDeferred()` au début du
+prochain tour de boucle), des segments peuvent être présents dans le ring `defer_*`
+avec un `defer_fire_us` déjà dépassé.
+
+En effaçant `defer_head/tail` sans les notifier, ces séquences ne sont jamais
+transmises au host via `notifySegmentExecuted`. Le host voit donc :
+
+- `last_executed_sequence` avancé jusqu'à la séquence du segment qui a déclenché
+  l'endstop (notifié dans DRAIN),
+- puis un saut jusqu'à `last_drained_seq` (notifié dans RECOVERY),
+- avec un "trou" correspondant aux segments déjà dans `defer_*` au moment du reset.
+
+En pratique, ce trou est comblé par le FLUSH que le host envoie, car le FLUSH fait
+avancer `last_executed_sequence` jusqu'à `flush_sequence`. Mais si le host utilise
+`last_executed_sequence` pour calculer le nombre de segments encore en transit
+(lookahead = `last_planned - last_executed`), ce trou peut provoquer un calcul de
+lookahead incorrect immédiatement après l'endstop, avant la réception du status
+post-FLUSH.
+
+### Comportement attendu
+Avant d'effacer `defer_head/tail` dans RECOVERY, notifier toutes les entrées dont
+`defer_fire_us` est déjà passé.
+
+### Code cible
+
+```cpp
+case ExecState::RECOVERY: {
+    // Notifier les entrées différées déjà échues avant de vider le ring
+    {
+        const int64_t now = esp_timer_get_time();
+        while (defer_head != defer_tail) {
+            const int idx = defer_head & (DEFER_DEPTH - 1);
+            if (now >= defer_fire_us[idx]) {
+                self->notifySegmentExecuted(
+                    static_cast<uint16_t>(defer_seqs[idx]));
+                ++defer_head;
+            } else {
+                break;  // Les entrées suivantes ne sont pas encore échues
+            }
+        }
+        // Vider le reste (non échus) sans notifier
+        defer_head = defer_tail = 0;
+    }
+
+    // Drainer seg_queue_ et notifier last_drained_seq (inchangé)
+    planned_segment_t discard;
+    uint32_t  drained          = 0;
+    uint16_t  last_drained_seq = 0;
+    bool      has_seq          = false;
+
+    while (drained < SEGMENT_QUEUE_DEPTH &&
+           xQueueReceive(seg_queue, &discard, 0) == pdTRUE) {
+        if (!discard.is_flush) {
+            last_drained_seq = discard.motion_sequence;
+            has_seq = true;
+        }
+        ++drained;
+    }
+
+    if (has_seq) {
+        self->notifySegmentExecuted(last_drained_seq);
+    }
+
+    ESP_LOGW(TAG,
+             "recovery: drained %lu segments, notified deferred=%d queued=%d",
+             static_cast<unsigned long>(drained),
+             static_cast<int>(defer_head - defer_head),  // 0 après reset
+             static_cast<int>(has_seq));
+
+    batch_count = 0;
+    batch_index = 0;
+    state = ExecState::IDLE;
+    break;
+}
 ```
 
 ---
 
-## R4 — `_compute_backoff_timeout` : le document v2 ne montre pas l'implémentation réelle
+## N6 — `_compute_backoff_timeout` : la chaîne de fallback lit `ramp.total_duration` mais `RampMove` expose `duration_s`
 
 ### Fichier
 `src/rpi/motion/move_queue.py`
@@ -217,436 +370,222 @@ def _mark_endstop_triggered(self) -> None:
 `MoveQueue._compute_backoff_timeout`
 
 ### Problème
-Le document v2 mentionne la méthode mais ne montre pas son code. L'implémentation
-doit couvrir les cas où `RampMove` n'a pas d'attribut `estimated_duration_s`.
+Le document v3 (section 14) documente la chaîne de fallback :
+`estimated_duration_s` → `ramp.total_duration` → `steps/hz` → `2.0`.
 
-La plupart des `RampMove` exposent `ramp.total_duration` (en secondes) via le
-planificateur de trajectoire, mais ce nom d'attribut n'est pas documenté.
+Mais `RampMove` (dans `src/rpi/motion/move.py`) expose très probablement la durée
+totale via `ramp.duration_s` ou directement `move.duration_s`, pas `ramp.total_duration`.
+Le nom exact n'est pas visible dans les documents fournis.
+
+Si l'attribut cherché n'existe pas, la chaîne tombe silencieusement sur le fallback
+suivant sans log, ce qui produit des timeouts incorrects sans indication.
 
 ### Comportement attendu
-Chercher les attributs dans l'ordre de fiabilité décroissante, avec fallback explicite.
+Ajouter un log DEBUG explicite à chaque étape de la chaîne pour faciliter le diagnostic,
+et vérifier le nom réel de l'attribut de durée dans `RampMove`.
 
 ### Code cible
 
 ```python
 @staticmethod
 def _compute_backoff_timeout(sub_move: "Move", margin: float = 1.5) -> float:
-    """Calcule un timeout basé sur la durée estimée du sous-mouvement.
+    import logging
+    _log = logging.getLogger(__name__)
 
-    Cherche les attributs dans l'ordre de priorité suivant :
-      1. sub_move.estimated_duration_s  (attribut ajouté par HomingMove)
-      2. sub_move.ramp.total_duration   (RampMove standard)
-      3. steps / target_hz              (estimation depuis les paramètres bruts)
-      4. 2.0 s                          (fallback de sécurité)
-
-    Args:
-        sub_move: Le Move correspondant au backoff ou preclear.
-        margin:   Facteur multiplicatif de sécurité (défaut 1.5×).
-
-    Returns:
-        Timeout en secondes, minimum 1.0 s.
-    """
     # Priorité 1 : attribut explicite
     estimated = getattr(sub_move, "estimated_duration_s", None)
-    if estimated is not None and estimated > 0:
-        return max(1.0, float(estimated) * margin)
+    if estimated is not None and float(estimated) > 0:
+        t = max(1.0, float(estimated) * margin)
+        _log.debug("backoff timeout from estimated_duration_s: %.2fs", t)
+        return t
 
-    # Priorité 2 : RampMove.ramp.total_duration
-    ramp = getattr(sub_move, "ramp", None)
-    if ramp is not None:
-        total = getattr(ramp, "total_duration", None)
-        if total is not None and total > 0:
-            return max(1.0, float(total) * margin)
+    # Priorité 2 : RampMove.duration_s (nom le plus courant dans le code)
+    for attr in ("duration_s", "total_duration_s", "total_duration"):
+        ramp = getattr(sub_move, "ramp", sub_move)  # sub_move peut être le ramp lui-même
+        total = getattr(ramp, attr, None)
+        if total is not None and float(total) > 0:
+            t = max(1.0, float(total) * margin)
+            _log.debug("backoff timeout from ramp.%s: %.2fs", attr, t)
+            return t
 
-    # Priorité 3 : estimation brute
-    steps = getattr(sub_move, "total_steps", None) or getattr(sub_move, "step_count", None)
-    hz    = getattr(sub_move, "target_hz", None) or getattr(sub_move, "cruise_steps_per_s", None)
-    if steps and hz and steps > 0 and hz > 0:
-        return max(1.0, (float(steps) / float(hz)) * margin)
+    # Priorité 3 : estimation brute steps / hz
+    for steps_attr in ("total_steps", "step_count", "num_steps"):
+        steps = getattr(sub_move, steps_attr, None)
+        if steps is not None and int(steps) > 0:
+            for hz_attr in ("target_hz", "cruise_steps_per_s", "max_steps_per_s"):
+                hz = getattr(sub_move, hz_attr, None)
+                if hz is not None and float(hz) > 0:
+                    t = max(1.0, (float(steps) / float(hz)) * margin)
+                    _log.debug(
+                        "backoff timeout from %s/%s: %.2fs", steps_attr, hz_attr, t
+                    )
+                    return t
 
-    # Fallback
+    _log.warning(
+        "backoff timeout: no duration attribute found on %s, using 2.0s fallback",
+        type(sub_move).__name__,
+    )
     return 2.0
 ```
 
 ---
 
-## R5 — Pas de garde contre un re-arm immédiat si le preclear échoue silencieusement
+## N7 — Pas de limite haute sur `max_approach_steps` en cas de misconfiguration
 
 ### Fichier
-`src/rpi/motion/move_queue.py`
+`src/rpi/motion/engine.py`
 
 ### Méthode
-`MoveQueue._clear_closed_endstop_before_homing`
+`WindingEngine._home_lateral_axis`
 
 ### Problème
-Le document v2 montre :
-
 ```python
-def _clear_closed_endstop_before_homing(self, move: HomingMove) -> None:
-    clearance_move = move._make_backoff_move()
-    self._set_endstop_armed(move.axis_id, arm=False)
-    streamer = self._stream_homing_sub_move(
-        move,
-        phase_name="preclear",
-        sub_move=clearance_move,
-        arm_endstop=False,
-    )
-    if streamer.endstop_triggered:
-        raise RuntimeError(...)
-    self._wait_for_endstop_open(
-        move.axis_id,
-        timeout_s=self._compute_backoff_timeout(clearance_move),
-    )
+max_approach_steps=int(steps_per_rev * 20),
 ```
 
-La vérification `if streamer.endstop_triggered` contrôle que le streamer n'a pas
-interprété autre chose comme un déclenchement.
+`steps_per_rev = lateral_steps_per_revolution * lateral_microstepping`.
+Si `lateral_microstepping` est mal configuré (ex. 256 au lieu de 32), `max_approach_steps`
+peut valoir `200 * 256 * 20 = 1 024 000 steps`. À 100 RPM et 32 µstep cela représente
+~6 400 µs par step → 6.5 secondes de mouvement. À 256 µstep cela représente **52 secondes**
+de mouvement non stoppé avant de détecter l'absence d'endstop.
 
-**Mais** si `_wait_for_endstop_open` réussit, il n'y a pas de nouvelle lecture
-du status pour confirmer que le capteur est stable avant de reprendre.
-Si le moteur a un rebond mécanique et que le capteur repasse brièvement à
-`CLOSED` juste après l'ouverture, `_ensure_homing_can_start` (appelé ensuite
-pour la phase `approach`) rejette le homing.
-
-Ce n'est pas un bug critique mais produit une erreur peu lisible :
-`"homing approach cannot start: lateral_endstop_state=0x01"` alors que le
-préclear avait réussi.
+Le moteur heurte la butée mécanique bien avant, mais sans capteur, aucun arrêt matériel
+ne se produit. Le firmware continue d'envoyer des steps contre la butée mécanique pendant
+toute la durée de `max_approach_steps`.
 
 ### Comportement attendu
-Après `_wait_for_endstop_open`, ajouter une courte attente de stabilisation
-et relire le status une fois de plus avant de continuer.
+Plafonner `max_approach_steps` à une valeur absolue raisonnable indépendante du
+microstepping, par exemple 5 secondes de mouvement à la vitesse d'approche.
 
 ### Code cible
 
 ```python
-def _clear_closed_endstop_before_homing(self, move: HomingMove) -> None:
-    clearance_move = move._make_backoff_move()
-    self._set_endstop_armed(move.axis_id, arm=False)
-
-    streamer = self._stream_homing_sub_move(
-        move,
-        phase_name="preclear",
-        sub_move=clearance_move,
-        arm_endstop=False,
+def _home_lateral_axis(
+    self, *, axis_id, approach_rpm, search_rpm, backoff_steps
+) -> tuple[bool, str | None]:
+    steps_per_rev = (
+        self._config.lateral_steps_per_revolution
+        * self._config.lateral_microstepping
     )
-    if streamer.endstop_triggered:
-        raise RuntimeError(
-            f"preclear failed: unexpected endstop trigger on axis {move.axis_id}"
-        )
+    # Durée max d'approche : 5 secondes à la vitesse demandée
+    # Indépendant du microstepping pour éviter les dérives de config
+    approach_steps_per_s = (approach_rpm / 60.0) * steps_per_rev
+    max_approach_steps_from_time = int(approach_steps_per_s * 5.0)
 
-    self._wait_for_endstop_open(
-        move.axis_id,
-        timeout_s=self._compute_backoff_timeout(clearance_move),
+    # Plafond absolu : 20 tours (comportement actuel), mais aussi plafonné
+    # par la durée pour protéger contre un microstepping mal configuré
+    max_approach_steps = min(
+        int(steps_per_rev * 20),
+        max_approach_steps_from_time,
     )
+    # Minimum garanti : au moins 2 tours pour que l'axe ait une chance d'atteindre la butée
+    max_approach_steps = max(max_approach_steps, int(steps_per_rev * 2))
 
-    # Attente de stabilisation mécanique (debounce)
-    # Durée : 2 cycles SPI minimum pour que le GPIO se stabilise
-    time.sleep(0.020)
-
-    # Relecture finale pour confirmer l'état avant d'armer
-    final_status = self._read_status(move.axis_id)
-    lateral_state = int(
-        getattr(final_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
-    )
-    if lateral_state != LATERAL_ENDSTOP_PRESENT_OPEN:
-        raise RuntimeError(
-            f"preclear did not clear the endstop on axis {move.axis_id}: "
-            f"lateral_endstop_state=0x{lateral_state:02X} after stabilisation wait"
-        )
-```
-
----
-
-## R6 — `endstop_hit_mask` n'est pas remis à zéro côté firmware entre les phases
-
-### Fichier
-`src/esp32/src/stepper_driver.h` et `src/esp32/src/stepper_driver.cpp`
-
-### Méthode
-`StepperDriver::armEndstop` et `StepperDriver::disarmEndstop`
-
-### Problème
-Le document v2 confirme que `armEndstop()` remet `endstop_hit_count_` à zéro.
-Cela signifie que le bit `endstop_hit_mask` dans le status ne s'efface que quand
-le host envoie un nouvel `ENABLE_ENDSTOP arm=1`.
-
-Mais entre `approach` (armé) et `backoff` (désarmé), le host envoie `arm=0`.
-Avec R1 corrigé, `disarm` remet `endstop_hit_count_` à zéro → le status suivant
-montre `endstop_hit_mask=0` dès le désarmement. C'est le comportement voulu.
-
-**Vérification à faire** : s'assurer que `buildStatusFrame` lit `endstop_hit_count_`
-après l'opération atomique de désarmement, pas avant. Comme `disarmEndstop()` est
-appelé depuis le task SPI et que `buildStatusFrame` est aussi dans le task SPI,
-l'ordre d'exécution est séquentiel. Pas de race condition ici.
-
-> Ce point est une vérification, pas une modification.
-> S'assurer que `handleEnableEndstop` appelle `disarmEndstop()` **avant** que
-> `buildStatusFrame` ne soit appelé pour la réponse du même transfert SPI.
-> L'ordre actuel dans `spiTask` est : `handleFrame(...)` → `buildStatusFrame(...)`.
-> C'est correct — le désarmement est appliqué avant la construction du status.
-
-### Action requise
-Aucune modification nécessaire si R1 est appliqué. Ce point est documenté
-pour clarifier l'ordre d'exécution dans `spiTask`.
-
----
-
-## R7 — La validation "approach sans endstop_triggered" ne distingue pas les causes d'échec
-
-### Fichier
-`src/rpi/motion/move_queue.py`
-
-### Méthode
-`MoveQueue._execute_homing` (vérification post-phase)
-
-### Problème
-Le document v2 indique (section 6.4 ancienne version) :
-
-```python
-if phase_name in ("approach", "search") and not streamer.endstop_triggered:
-    ...  # échec
-```
-
-Le message d'erreur générique ne distingue pas :
-- le mouvement s'est terminé normalement sans toucher la butée (max steps atteint),
-- le mouvement a été interrompu par un stall détecté,
-- le firmware a retourné `QUEUE_FULL` sur tous les segments,
-- le streamer a été stoppé par un autre signal.
-
-### Comportement attendu
-Inclure dans le message d'erreur la cause réelle observée : état final du capteur,
-`running_mask`, `last_executed_sequence` vs séquences envoyées.
-
-### Code cible
-
-```python
-def _check_armed_phase_result(
-    self,
-    move: "HomingMove",
-    phase_name: str,
-    streamer: "MultiAxisRampStreamer",
-) -> None:
-    """Vérifie qu'une phase armée s'est bien terminée par un déclenchement endstop.
-
-    Lève RuntimeError avec un message diagnostique si ce n'est pas le cas.
-    """
-    if streamer.endstop_triggered:
-        return  # succès nominal
-
-    # Lire le status pour diagnostiquer
-    status = self._read_status(move.axis_id)
-    lateral_state = int(
-        getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
-    )
-    last_exec = int(getattr(status, "last_executed_sequence", 0xFFFF))
-    last_sent = streamer.last_sent_motion_seq  # exposer cet attribut si nécessaire
-    running   = int(getattr(status, "running_mask", 0))
-
-    state_names = {0x00: "PRESENT_OPEN", 0x01: "PRESENT_CLOSED", 0xFF: "ABSENT"}
-    state_str = state_names.get(lateral_state, f"0x{lateral_state:02X}")
-
-    raise RuntimeError(
-        f"homing phase '{phase_name}' on axis {move.axis_id} ended without "
-        f"endstop trigger. "
-        f"lateral_state={state_str}, "
-        f"running=0x{running:02X}, "
-        f"last_exec={last_exec}, "
-        f"last_sent={last_sent}"
-    )
-```
-
-Appel dans `_execute_homing` :
-
-```python
-if phase_name in ("approach", "search"):
-    self._check_armed_phase_result(move, phase_name, streamer)
-```
-
----
-
-## R8 — `_wait_for_endstop_arm_state` : timeout de 0.5s non justifié
-
-### Fichier
-`src/rpi/motion/move_queue.py`
-
-### Méthode
-`MoveQueue._wait_for_endstop_arm_state`
-
-### Problème
-Le timeout de 0.5 s pour attendre la confirmation de `endstop_armed_mask` est
-arbitraire. Sur un Pi chargé avec un SPI à 1 MHz, un aller-retour SPI prend
-~512 µs + overhead. À `poll_interval_s=0.005` (5 ms), 100 polls = 500 ms.
-
-Le timeout est suffisant dans la pratique, mais si le Pi est très chargé et que
-le transfert SPI prend plus de temps, la confirmation peut arriver juste après
-l'expiration du timeout, causant un échec spurieux.
-
-### Comportement attendu
-Le timeout devrait être au moins `max(0.5, 10 * poll_interval_s * expected_spi_cycles)`.
-En pratique, 3 cycles SPI suffisent (un pour envoyer, un pour que l'ESP32 traite,
-un pour lire le résultat). Le timeout minimum raisonnable est `20 * poll_interval_s`.
-
-### Code cible
-
-```python
-def _wait_for_endstop_arm_state(
-    self,
-    axis_id: int,
-    arm: bool,
-    timeout_s: float | None = None,
-) -> Any:
-    # Timeout par défaut : 20 cycles de poll, minimum 0.5s
-    if timeout_s is None:
-        timeout_s = max(0.5, 20 * self._poll_interval_s)
-
-    deadline = time.monotonic() + timeout_s
-    last_status = None
-    while time.monotonic() < deadline:
-        last_status = self._read_status(axis_id)
-        if self._status_has_endstop_armed(last_status, axis_id, arm):
-            return last_status
-        time.sleep(self._poll_interval_s)
-
-    # Message d'erreur avec état observé
-    armed_mask = int(getattr(last_status, "endstop_armed_mask", 0)) if last_status else -1
-    raise RuntimeError(
-        f"endstop arm state timeout on axis {axis_id}: "
-        f"wanted arm={arm}, "
-        f"endstop_armed_mask=0x{armed_mask:02X} after {timeout_s:.2f}s"
+    move = HomingMove(
+        ...
+        max_approach_steps=max_approach_steps,
+        ...
     )
 ```
 
 ---
 
-## R9 — `lateral_blocked` dans DRAIN ne tient pas compte du cas `ABSENT`
+## N8 — `notifySegmentExecuted` n'est pas thread-safe avec `sequence_is_newer_u16` pour RECOVERY
 
 ### Fichier
 `src/esp32/src/comm_interface.cpp`
 
 ### Méthode
-`CommInterface::multiAxisExecutorTask` — case `ExecState::DRAIN`
+`CommInterface::notifySegmentExecuted`
 
 ### Problème
-Le document v2 (section 17.2) montre :
-
 ```cpp
-const bool lateral_blocked =
-    lateral_endstop_armed
-    && lateral_state != static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+void CommInterface::notifySegmentExecuted(uint16_t motion_seq)
+{
+    uint16_t current = last_executed_sequence_.load(std::memory_order_relaxed);
+    if (sequence_is_newer_u16(motion_seq, current)) {
+        last_executed_sequence_.store(motion_seq, std::memory_order_release);
+    }
+}
 ```
 
-Si `lateral_state == ABSENT` (câble coupé) et que l'endstop est armé, cette condition
-est vraie et les steps de l'axe 1 sont silencieusement ignorés.
+Cette méthode est appelée depuis `multiAxisExecutorTask` (Core 1). Dans RECOVERY,
+elle peut être appelée deux fois en succession rapide :
 
-Le comportement est discutable : si le capteur est absent pendant un homing armé,
-le firmware devrait déclencher un arrêt d'urgence et passer en RECOVERY, pas
-continuer silencieusement en ignorant les steps.
+1. Depuis DRAIN (pour la séquence qui a déclenché l'endstop)
+2. Depuis RECOVERY (pour `last_drained_seq`)
 
-**Note** : l'ISR ne peut pas détecter `ABSENT` car elle lit les GPIO individuellement.
-La détection `ABSENT` (NO==NC) n'est possible que via `readLateralEndstopState()`
-dans le task context.
+Le load/compare/store n'est pas atomique. Si Core 0 lit `last_executed_sequence_`
+entre ces deux stores (dans `buildStatusFrame`), il peut lire une valeur intermédiaire.
+
+**En pratique** : comme `multiAxisExecutorTask` est sur Core 1 et `buildStatusFrame`
+sur Core 0, et que `std::memory_order_release` garantit que Core 0 voit les stores
+dans l'ordre, ce problème est théoriquement possible mais improbable sur ESP32 avec
+le modèle mémoire ARM.
+
+**Le vrai problème** est que le compare-and-store non atomique peut produire une
+régression si `notifySegmentExecuted` est jamais appelé depuis plusieurs tâches.
+Actuellement ce n'est pas le cas, mais le code n'a pas de protection explicite.
 
 ### Comportement attendu
-Si l'endstop est armé et que `readLateralEndstopState()` retourne `ABSENT`,
-déclencher un arrêt d'urgence comme si l'endstop avait été touché.
+Utiliser `compare_exchange_weak` pour rendre l'opération atomique.
 
 ### Code cible
 
-Dans `ExecState::DRAIN`, remplacer le bloc `lateral_blocked` par :
-
 ```cpp
-const uint8_t lateral_state = self->readLateralEndstopState();
-
-// Si l'endstop latéral est armé et que le capteur est absent (câble coupé),
-// traiter comme un déclenchement pour sécurité fail-safe.
-const bool lateral_endstop_armed =
-    self->n_motors_ > 1
-    && self->queues_[1] != nullptr
-    && self->queues_[1]->driver().isEndstopArmed();
-
-if (lateral_endstop_armed &&
-    lateral_state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
-    // Capteur absent + armé = fail-safe : traiter comme hit
-    ESP_LOGW(TAG, "lateral endstop ABSENT while armed at seq=%u — fail-safe stop",
-             seg.motion_sequence);
-    if (self->queues_[1] != nullptr) {
-        self->queues_[1]->driver().emergencyStop();
+void CommInterface::notifySegmentExecuted(uint16_t motion_seq)
+{
+    uint16_t current = last_executed_sequence_.load(std::memory_order_relaxed);
+    // Boucle CAS : avance last_executed_sequence_ seulement si motion_seq est plus récent
+    while (sequence_is_newer_u16(motion_seq, current)) {
+        if (last_executed_sequence_.compare_exchange_weak(
+                current, motion_seq,
+                std::memory_order_release,
+                std::memory_order_relaxed)) {
+            break;  // Store réussi
+        }
+        // current a été mis à jour par compare_exchange_weak en cas d'échec
+        // → re-tester la condition de la boucle avec la nouvelle valeur
     }
-    self->notifySegmentExecuted(seg.motion_sequence);
-    state = ExecState::RECOVERY;
-    goto exit_drain;
 }
-
-const bool lateral_blocked =
-    lateral_endstop_armed
-    && lateral_state != static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
 ```
 
 ---
 
-## R10 — `RECOVERY` dans DRAIN ne nettoie pas les `multi_exec_active_` flags
+## N9 — Pas de guard contre un double-appel à `home_lateral_axis` concurrent
 
 ### Fichier
-`src/esp32/src/comm_interface.cpp`
+`src/rpi/motion/engine.py`
 
 ### Méthode
-`CommInterface::multiAxisExecutorTask` — case `ExecState::DRAIN`
+`WindingEngine._home_lateral_axis`
 
 ### Problème
-Dans DRAIN, quand un endstop est détecté, le code fait :
+`home_lateral` vérifie `engine_state != IDLE` en entrée et passe en `HOMING`.
+Mais `_home_lateral_axis` est appelé directement depuis les tests unitaires sans
+passer par cette garde.
 
-```cpp
-if (endstop_hit) {
-    state = ExecState::RECOVERY;
-    goto exit_drain;
-}
-```
-
-Mais `clearMultiExecFlags()` (le lambda local qui appelle `setMultiExecActive(false)`) n'a
-pas encore été appelé pour ce segment car il est appelé **après** la boucle
-`executeConstantRateBlock`. Le `goto exit_drain` saute par-dessus cet appel.
-
-En conséquence, les axes dont le flag `multi_exec_active_` est encore à `true` vont
-bloquer dans `executorTask` sur `ulTaskNotifyTake` (section de `executorTask` dans
-`stepper_queue.cpp`) jusqu'à la fin de RECOVERY.
+Si un test appelle `_home_lateral_axis` pendant qu'un homing est en cours (ex.
+un thread de monitoring qui lit l'état), la `MoveQueue` peut recevoir deux `HomingMove`
+simultanément. Le second sera exécuté après le premier, remettant le homing en état
+inconnu avec une position home écrasée.
 
 ### Comportement attendu
-Appeler `clearMultiExecFlags()` avant tout `goto exit_drain` dans le path endstop.
+`_home_lateral_axis` doit vérifier que l'engine est bien en `HOMING` (et non `IDLE`
+ou autre) avant de continuer, pour documenter explicitement la précondition.
 
 ### Code cible
 
-Dans DRAIN, dans le bloc de détection endstop par ISR :
-
-```cpp
-bool endstop_hit = false;
-for (uint8_t a = 0; a < seg.axis_count && !endstop_hit; ++a) {
-    const uint8_t eid = seg.axis_ids[a];
-    if (eid >= self->n_motors_ || self->queues_[eid] == nullptr) continue;
-    if (self->queues_[eid]->driver().isEndstopActive()) {
-        self->queues_[eid]->driver().emergencyStop();
-        self->notifySegmentExecuted(seg.motion_sequence);
-        ESP_LOGW(TAG, "endstop on axis %u at seq=%u", eid, seg.motion_sequence);
-        endstop_hit = true;
-    }
-}
-if (endstop_hit) {
-    clearMultiExecFlags();  // ← AJOUT : libérer les axes avant RECOVERY
-    state = ExecState::RECOVERY;
-    goto exit_drain;
-}
-```
-
-De même dans le bloc `ESP_ERR_INVALID_STATE` de `executeConstantRateBlock` :
-
-```cpp
-if (err == ESP_ERR_INVALID_STATE) {
-    clearMultiExecFlags();  // ← déjà présent dans certaines versions, vérifier
-    ESP_LOGW(TAG, "axis %u endstop mid-seg seq=%u", axis_id, seg.motion_sequence);
-    axis_queue->driver().emergencyStop();
-    self->notifySegmentExecuted(seg.motion_sequence);
-    state = ExecState::RECOVERY;
-    goto exit_drain;
-}
+```python
+def _home_lateral_axis(
+    self, *, axis_id, approach_rpm, search_rpm, backoff_steps
+) -> tuple[bool, str | None]:
+    # Précondition : l'appelant doit avoir déjà mis l'engine en HOMING
+    assert self._state.engine_state == EngineState.HOMING, (
+        f"_home_lateral_axis called with engine_state="
+        f"{self._state.engine_state!r}, expected HOMING"
+    )
+    ...
 ```
 
 ---
@@ -655,28 +594,35 @@ if (err == ESP_ERR_INVALID_STATE) {
 
 | Fichier | Priorité | Points | Description |
 |---|---|---|---|
-| `src/esp32/src/stepper_driver.h` | 🔴 Critique | R1 | `disarmEndstop` remet `endstop_hit_count_` à zéro |
-| `src/esp32/src/comm_interface.cpp` | 🔴 Critique | R9, R10 | `ABSENT` = fail-safe en DRAIN, `clearMultiExecFlags` avant RECOVERY |
-| `src/rpi/transport/streamer.py` | 🔴 Critique | R2, R3 | `_check_endstop` filtre par axe, `_last_confirmed_motion_seq` initialisé à -1 |
-| `src/rpi/motion/move_queue.py` | 🟠 Important | R4, R5, R7, R8 | `_compute_backoff_timeout` robuste, debounce preclear, diagnostics d'échec, timeout arm |
+| `src/esp32/src/comm_interface.cpp` | 🔴 Critique | N1, N2, N5 | Ordre clearFlags dans ABSENT fail-safe, RECOVERY sur timeout, defer ring avant reset |
+| `src/rpi/transport/streamer.py` | 🔴 Critique | N3, N4 | Property `last_sent_motion_seq`, baseline `segments_dropped` par phase |
+| `src/rpi/motion/move_queue.py` | 🟠 Important | N4, N6 | Baseline streamer, `_compute_backoff_timeout` robuste avec logs |
+| `src/esp32/src/comm_interface.cpp` | 🟠 Important | N8 | `notifySegmentExecuted` CAS atomique |
+| `src/rpi/motion/engine.py` | 🟡 Robustesse | N7, N9 | Plafond `max_approach_steps`, assert précondition HOMING |
 
 ---
 
 ## Ordre d'application recommandé
 
-1. **R1** + **R2** ensemble : R1 empêche les faux bits dans `endstop_hit_mask`, R2 filtre
-   les bits résiduels. Les deux se complètent.
+1. **N1** : une ligne, risque zero, corrige un ordre d'opération dans le fail-safe ABSENT.
 
-2. **R10** : libération des flags `multi_exec_active_` avant RECOVERY. Risque de deadlock
-   entre le per-axis `executorTask` et `multiAxisExecutorTask` si non corrigé.
+2. **N3** : expose `last_sent_motion_seq` — requis pour que R7 (`_check_armed_phase_result`)
+   ne lève pas `AttributeError` en production.
 
-3. **R9** : fail-safe capteur absent. Correction de sécurité indépendante.
+3. **N4** : baseline `segments_dropped` — corrige les faux positifs au démarrage de la
+   phase `search`. À appliquer avec la modification du constructeur `MultiAxisRampStreamer`
+   et de `_stream_homing_sub_move`.
 
-4. **R3** : sentinel `-1` pour `_last_confirmed_motion_seq`. Évite le FLUSH à seq=0.
+4. **N2** : traiter `ESP_ERR_TIMEOUT` dans DRAIN comme une transition vers RECOVERY.
+   Indépendant des autres.
 
-5. **R5** : debounce dans `_clear_closed_endstop_before_homing`. Robustesse mécanique.
+5. **N5** : notifier les entrées `defer_*` échues avant de vider le ring dans RECOVERY.
+   Améliore la cohérence de `last_executed_sequence` vue par le host.
 
-6. **R7** : message d'erreur diagnostique post-phase. Améliore debuggabilité.
+6. **N8** : CAS atomique dans `notifySegmentExecuted`. Correction de sécurité bas risque.
 
-7. **R4** + **R8** : `_compute_backoff_timeout` robuste et timeout arm adaptatif.
-   Peuvent être appliqués ensemble.
+7. **N6** : `_compute_backoff_timeout` avec logs et recherche multi-attributs.
+   Appliqué en même temps que N4 si possible.
+
+8. **N7** + **N9** : plafond `max_approach_steps` et assert précondition.
+   Peuvent être appliqués indépendamment, faible risque de régression.

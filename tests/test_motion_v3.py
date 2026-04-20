@@ -13,14 +13,12 @@ import pytest
 
 from motion.trapezoidal_profile import TrapezoidalMotionProfile
 from motion.spindle_kinematics import SpindleKinematics
-from motion.winding_pattern import WindingPattern
-from motion.scatter_engine import ScatterEngine
-from motion.move import HomingMove, WoundMove
+from winding import WindingPattern, ScatterEngine, SyncAxisConfig, WoundMove
+from motion.move import HomingMove
 from motion.axis_state import AxisLimits, AxisState
 from motion.ramp_config import RampConfig
 from motion.move_queue import MoveQueue
-from motion.synchronized_segment_generator import SyncAxisConfig
-from motion.engine import WindingEngine
+from core import WindingEngine
 from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
 from transport.messages import (
     LATERAL_ENDSTOP_ABSENT,
@@ -1247,14 +1245,3 @@ def test_from_axis_ids_respects_segment_duration_s_parameter():
     assert streamer._segment_duration_s == pytest.approx(0.003)
 
 
-def test_legacy_syncrhonized_module_emits_deprecation_warning():
-    module_name = "motion.syncrhonized_segment_generator"
-    sys.modules.pop(module_name, None)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always", DeprecationWarning)
-        importlib.import_module(module_name)
-    assert any(
-        isinstance(w.message, DeprecationWarning)
-        and "deprecated" in str(w.message)
-        for w in caught
-    )

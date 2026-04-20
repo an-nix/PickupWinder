@@ -12,12 +12,14 @@ if __package__ in (None, ""):
 from motion import (
     AxisMotionConfig,
     MultiAxisSegmentGenerator,
-    SynchronizedSegmentGenerator,
     SpindleKinematics,
+    RampConfig,
+)
+from winding import (
+    SynchronizedSegmentGenerator,
     WindingPattern,
     ScatterEngine,
     SyncAxisConfig,
-    RampConfig,
 )
 from motion.segment_json import dump_segment_json, load_segment_json
 from transport import Esp32SpiTransport, MockSpiTransport, MultiAxisRampStreamer

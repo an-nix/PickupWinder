@@ -20,7 +20,7 @@ from typing import Any
 from core.shared_state import SharedState
 from jsonrpc.handlers import AppRpcHandler
 from jsonrpc.protocol import JsonRpcError
-from motion.engine import WindingEngine
+from core import WindingEngine
 from winding.program import WindingProgram
 
 
