@@ -228,6 +228,8 @@ struct __attribute__((packed)) StatusPayload {
     uint8_t lateral_endstop_state;
     /** Bit N = 1 means axis N endstop is armed (will stop motion on trigger). */
     uint8_t endstop_armed_mask;
+    /** Bit N = 1 means axis N hit its endstop since the last arm. */
+    uint8_t endstop_hit_mask;
     /**
      * Motion sequence of the most recently fully-executed multi-axis segment.
      * The host uses this to compute how much future motion is still buffered
@@ -250,7 +252,7 @@ struct __attribute__((packed)) StatusPayload {
     uint16_t segments_dropped;
 };
 
-static_assert(sizeof(StatusPayload) == 53, "StatusPayload must be 53 bytes");
+static_assert(sizeof(StatusPayload) == 54, "StatusPayload must be 54 bytes");
 static_assert(sizeof(StatusPayload) <= SPI_MAX_PAYLOAD_SIZE,
               "StatusPayload exceeds SPI_MAX_PAYLOAD_SIZE");
 

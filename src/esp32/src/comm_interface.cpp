@@ -283,6 +283,15 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
         }
     }
 
+    payload->endstop_hit_mask = 0;
+    for (uint8_t axis = 0; axis < SPI_MAX_AXES; ++axis) {
+        if (axis < n_motors_ && queues_[axis] != nullptr) {
+            if (queues_[axis]->driver().getEndstopHitCount() > 0) {
+                payload->endstop_hit_mask |= static_cast<uint8_t>(1U << axis);
+            }
+        }
+    }
+
     // Atomic load of last executed motion sequence (written by Core 1).
     payload->last_executed_sequence = last_executed_sequence_.load(std::memory_order_acquire);
 
@@ -1029,6 +1038,25 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     active_axis_ids[a] = seg.axis_ids[a];
                 }
 
+                // ── Declare guarded axes + clearMultiExecFlags lambda ───────────
+                // Declared here (before endstop check) so the lambda is callable
+                // on any RECOVERY goto path.  At this point guarded_axis_count=0
+                // because setMultiExecActive has not been called yet; calling
+                // clearMultiExecFlags() is therefore a no-op on the early endstop
+                // path, but the explicit call documents intent and is safe for
+                // future code that may set flags earlier.  (R10)
+                uint8_t guarded_axis_ids[MULTI_AXIS_MAX_AXES] = {};
+                uint8_t guarded_axis_count = 0;
+
+                auto clearMultiExecFlags = [&]() {
+                    for (uint8_t i = 0; i < guarded_axis_count; ++i) {
+                        const uint8_t axis_id = guarded_axis_ids[i];
+                        if (axis_id < self->n_motors_ && self->queues_[axis_id] != nullptr) {
+                            self->queues_[axis_id]->setMultiExecActive(false);
+                        }
+                    }
+                };
+
                 // ── Endstop check (per-segment, real-time) ───────────────
                 bool endstop_hit = false;
                 for (uint8_t a = 0; a < seg.axis_count && !endstop_hit; ++a) {
@@ -1045,6 +1073,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     }
                 }
                 if (endstop_hit) {
+                    clearMultiExecFlags();  // R10: libérer avant RECOVERY
                     state = ExecState::RECOVERY;
                     goto exit_drain;
                 }
@@ -1055,13 +1084,28 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     self->n_motors_ > 1
                     && self->queues_[1] != nullptr
                     && self->queues_[1]->driver().isEndstopArmed();
+
+                // R9: capteur absent + armé = fail-safe (câble coupé pendant le homing).
+                // L'ISR ne peut pas détecter ABSENT (elle lit NO/NC individuellement);
+                // la détection ABSENT (NO==NC) n'est possible qu'ici en task context.
+                if (lateral_endstop_armed &&
+                    lateral_state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
+                    ESP_LOGW(TAG, "lateral endstop ABSENT while armed at seq=%u \xe2\x80\x94 fail-safe stop",
+                             seg.motion_sequence);
+                    if (self->queues_[1] != nullptr) {
+                        self->queues_[1]->driver().emergencyStop();
+                    }
+                    clearMultiExecFlags();
+                    self->notifySegmentExecuted(seg.motion_sequence);
+                    state = ExecState::RECOVERY;
+                    goto exit_drain;
+                }
+
                 const bool lateral_blocked =
                     lateral_endstop_armed
                     && lateral_state !=
                     static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
 
-                uint8_t guarded_axis_ids[MULTI_AXIS_MAX_AXES] = {};
-                uint8_t guarded_axis_count = 0;
                 for (uint8_t a = 0; a < seg.axis_count; ++a) {
                     const uint8_t axis_id = seg.axis_ids[a];
                     if (axis_id < self->n_motors_ && self->queues_[axis_id] != nullptr) {
@@ -1071,15 +1115,6 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                         }
                     }
                 }
-
-                auto clearMultiExecFlags = [&]() {
-                    for (uint8_t i = 0; i < guarded_axis_count; ++i) {
-                        const uint8_t axis_id = guarded_axis_ids[i];
-                        if (axis_id < self->n_motors_ && self->queues_[axis_id] != nullptr) {
-                            self->queues_[axis_id]->setMultiExecActive(false);
-                        }
-                    }
-                };
 
                 // Pre-start any stopped RMT streams before pushing more steps.
                 // This prevents pushBlock() from stalling inside DRAIN on the
@@ -1220,16 +1255,27 @@ void CommInterface::multiAxisExecutorTask(void* arg)
             // (bounded drain to avoid spending too long here).
             planned_segment_t discard;
             uint32_t drained = 0;
+            uint16_t last_drained_seq = 0;
+            bool has_seq = false;
             while (drained < SEGMENT_QUEUE_DEPTH &&
                    xQueueReceive(seg_queue, &discard, 0) == pdTRUE) {
+                if (!discard.is_flush) {
+                    last_drained_seq = discard.motion_sequence;
+                    has_seq = true;
+                }
                 ++drained;
+            }
+
+            if (has_seq) {
+                self->notifySegmentExecuted(last_drained_seq);
             }
 
             // Reset deferred notifications.
             defer_head = defer_tail = 0;
 
-            ESP_LOGW(TAG, "recovery: drained %lu remaining segments",
-                     (unsigned long)drained);
+            ESP_LOGW(TAG, "recovery: drained %lu remaining segments (last_seq=%u)",
+                     (unsigned long)drained,
+                     (unsigned)last_drained_seq);
 
             batch_count = 0;
             batch_index = 0;

@@ -67,6 +67,7 @@ class MockSpiTransport:
             running_mask=0,
             lateral_endstop_state=0,
             endstop_armed_mask=0,
+            endstop_hit_mask=0,
             last_executed_sequence=last_executed_sequence,
             multi_axis_queue_free=64,
             planner_queue_free=128,

@@ -25,7 +25,7 @@ _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HHH")
 _STEP_COUNT_STRUCT = struct.Struct("<H")
 _FLUSH_STRUCT = struct.Struct("<H2x")
 _ENABLE_ENDSTOP_STRUCT = struct.Struct("<BB2x")
-_STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBBBHBBHH")
+_STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBBBBHBBHH")
 
 
 class SpiMessageType(IntEnum):  # Must match SpiMessageType in messages.h
@@ -251,6 +251,7 @@ class StatusPayload:
     running_mask: int
     lateral_endstop_state: int
     endstop_armed_mask: int
+    endstop_hit_mask: int
     last_executed_sequence: int
     multi_axis_queue_free: int
     planner_queue_free: int
@@ -273,11 +274,12 @@ class StatusPayload:
             running_mask=values[18],
             lateral_endstop_state=values[19],
             endstop_armed_mask=values[20],
-            last_executed_sequence=values[21],
-            multi_axis_queue_free=values[22],
-            planner_queue_free=values[23],
-            last_planned_sequence=values[24],
-            segments_dropped=values[25],
+            endstop_hit_mask=values[21],
+            last_executed_sequence=values[22],
+            multi_axis_queue_free=values[23],
+            planner_queue_free=values[24],
+            last_planned_sequence=values[25],
+            segments_dropped=values[26],
         )
 
 

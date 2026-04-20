@@ -196,18 +196,24 @@ public:
      * std::atomic for ISR ↔ task safety.
      */
     std::atomic<bool> endstop_active_ {false};
+    std::atomic<uint32_t> endstop_hit_count_ {0};
 
     /** @brief Arm the endstop — ISR will stop motion on trigger. */
     void armEndstop() {
         endstop_active_.store(false, std::memory_order_release);
+        endstop_hit_count_.store(0, std::memory_order_relaxed);
         endstop_armed_.store(true, std::memory_order_release);
     }
 
     /** @brief Disarm the endstop — ISR will not stop motion on trigger.
-     *  Use during intentional clearance moves commanded by the host. */
+     *  Use during intentional clearance moves commanded by the host.
+     *  Also resets endstop_hit_count_ so that the next status frame reports
+     *  endstop_hit_mask=0 immediately after disarm, preventing false endstop
+     *  detection on the following phase. */
     void disarmEndstop() {
         endstop_armed_.store(false, std::memory_order_release);
         endstop_active_.store(false, std::memory_order_release);
+        endstop_hit_count_.store(0, std::memory_order_relaxed);  // R1: clean hit_mask on disarm
     }
 
     /** @brief True if the endstop is currently armed. */
@@ -215,6 +221,14 @@ public:
 
     /** @brief True if the endstop is currently triggered. */
     bool isEndstopActive() const { return endstop_active_.load(std::memory_order_acquire); }
+
+    void clearEndstopHit() {
+        endstop_hit_count_.store(0, std::memory_order_relaxed);
+    }
+
+    uint32_t getEndstopHitCount() const {
+        return endstop_hit_count_.load(std::memory_order_relaxed);
+    }
 
     /**
      * @brief Install GPIO edge-triggered ISR on the NO/NC endstop pins.

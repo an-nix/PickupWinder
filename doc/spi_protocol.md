@@ -27,7 +27,7 @@ Le retour est donc pipeliné d'une transaction.
 `SpiMessageHeader` contient :
 
 - `magic = 0x5057`
-- `version = 2`
+- `version = 3`
 - `msg_type`
 - `sequence`
 - `payload_length`
@@ -60,7 +60,13 @@ Le firmware renvoie notamment :
 - `last_planned_sequence`
 - `segments_dropped`
 - `enabled_mask`, `running_mask`
-- `lateral_endstop_state`, `endstop_armed_mask`
+- `lateral_endstop_state`, `endstop_armed_mask`, `endstop_hit_mask`
+
+`endstop_hit_mask` publie le signal canonique des arrêts endstop : le bit `N`
+reste à `1` après un déclenchement sur l'axe `N` jusqu'au prochain
+réarmement via `ENABLE_ENDSTOP`. Le host l'utilise en priorité pour détecter
+un homing réussi, puis retombe sur des heuristiques plus faibles seulement en
+compatibilité.
 
 Le host doit considérer `last_result` comme l'ACK réel d'une requête seulement après avoir attendu la confirmation du `last_rx_sequence` correspondant.
 

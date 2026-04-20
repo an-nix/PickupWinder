@@ -138,6 +138,7 @@ class WindingEngine:
             "running_mask": status.running_mask,
             "lateral_endstop_state": status.lateral_endstop_state,
             "endstop_armed_mask": status.endstop_armed_mask,
+            "endstop_hit_mask": status.endstop_hit_mask,
             "last_executed_sequence": status.last_executed_sequence,
             "multi_axis_queue_free": status.multi_axis_queue_free,
             "planner_queue_free": status.planner_queue_free,

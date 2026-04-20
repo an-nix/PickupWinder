@@ -1,143 +1,79 @@
-# Homing et endstop — flux complet host / firmware
+# Homing latéral — référence technique v3
 
-Ce document décrit **tout le processus de homing latéral** dans PickupWinder, côté **Python host (Raspberry Pi)** et côté **firmware ESP32**.
+> Généré depuis les sources après application des correctifs R1–R10 (homing_analyze.md).
+> Dernière mise à jour : 2026-04-20.
 
-Il couvre :
+---
 
-- le point d'entrée RPC,
-- l'orchestration moteur,
-- la construction du `HomingMove`,
-- l'armement / désarmement de l'endstop,
-- la détection du contact,
-- le `FLUSH` et le `RECOVERY`,
-- le `backoff`,
-- la mise à jour de l'état applicatif,
-- les statuts SPI utilisés,
-- les actions et méthodes liées au homing et à l'endstop.
+## Table des matières
+
+1. [Vue d'ensemble](#1-vue-densemble)
+2. [Point d'entrée JSON-RPC](#2-point-dentrée-json-rpc)
+3. [Orchestration engine.py](#3-orchestration-enginepy)
+4. [HomingMove — phases et paramètres](#4-homingmove--phases-et-paramètres)
+5. [MoveQueue — exécution phase par phase](#5-movequeue--exécution-phase-par-phase)
+6. [Préconditions : `_ensure_homing_can_start`](#6-préconditions--_ensure_homing_can_start)
+7. [Pré-dégagement : `_clear_closed_endstop_before_homing`](#7-pré-dégagement--_clear_closed_endstop_before_homing)
+8. [Streamer — détection endstop](#8-streamer--détection-endstop)
+9. [Firmware — StatusPayload et endstop_hit_mask](#9-firmware--statuspayload-et-endstop_hit_mask)
+10. [Firmware — DRAIN : gate latérale et fail-safe ABSENT](#10-firmware--drain--gate-latérale-et-fail-safe-absent)
+11. [Firmware — RECOVERY](#11-firmware--recovery)
+12. [Matrice de comportement](#12-matrice-de-comportement)
+13. [Sémantique des états de faute](#13-sémantique-des-états-de-faute)
+14. [Catalogue des méthodes](#14-catalogue-des-méthodes)
+15. [Note de déploiement](#15-note-de-déploiement)
 
 ---
 
 ## 1. Vue d'ensemble
 
-Le homing latéral est un flux en deux parties :
+Le homing latéral est une séquence **host-driven** : le Raspberry Pi orchestre toutes les phases ; l'ESP32 exécute les pas et signale les événements via le status SPI.
 
-- **Host Python** : décide quand lancer le homing, découpe le mouvement en phases, arme/désarmer l'endstop, surveille les statuts et déclare le succès ou l'échec.
-- **ESP32** : reçoit les blocs de segments via SPI, lit l'endstop physique, stoppe le moteur en temps réel si nécessaire, vide les queues et renvoie l'état courant dans `StatusPayload`.
+```
+RPC home_lateral_axis
+  └─ WindingEngine._home_lateral_axis()
+       └─ MoveQueue._execute_homing(HomingMove)
+            ├─ [initial_state == CLOSED] _clear_closed_endstop_before_homing()
+            ├─ approach  (armé)    → endstop_triggered → RECOVERY firmware
+            ├─ backoff   (désarmé) → _wait_for_endstop_open()
+            └─ search    (armé)    → endstop_triggered → position home
+```
 
-Le homing latéral suit trois phases fonctionnelles :
-
-1. **Approach** : avance rapide vers la butée, endstop armé.
-2. **Backoff** : recul pour libérer la butée, endstop désarmé.
-3. **Search** : approche lente pour définir précisément la position home, endstop armé.
-
-Quand les trois phases réussissent, la position Python de l'axe est marquée comme homée.
-
----
-
-## 2. Fichiers impliqués
-
-## 2.1 Host Python
-
-- `src/rpi/jsonrpc/winding_handler.py`
-- `src/rpi/motion/engine.py`
-- `src/rpi/motion/move.py`
-- `src/rpi/motion/move_queue.py`
-- `src/rpi/motion/axis_state.py`
-- `src/rpi/transport/streamer.py`
-- `src/rpi/transport/spi_transport.py`
-- `src/rpi/transport/messages.py`
-
-## 2.2 Firmware ESP32
-
-- `src/esp32/src/messages.h`
-- `src/esp32/src/comm_interface.cpp`
-- `src/esp32/src/stepper_driver.h`
-- `src/esp32/src/stepper_driver.cpp`
-- `src/esp32/src/motion_planner.cpp`
+**Invariants clés :**
+- L'axe ne doit jamais se déplacer quand `lateral_endstop_state == ABSENT` et l'endstop est armé : le firmware déclenche un arrêt fail-safe (R9).
+- `endstop_hit_mask` dans le status est remis à zéro dès le désarmement (R1), ce qui évite les faux déclenchements sur la phase suivante.
+- Le host filtre `endstop_hit_mask` par axe armé localement (R2), évitant les faux positifs dus à des bits résiduels d'un autre axe.
 
 ---
 
-## 3. Point d'entrée côté host
+## 2. Point d'entrée JSON-RPC
 
-Le point d'entrée public du homing est la méthode JSON-RPC `winding.home_lateral`.
-
-### Fichier
-
-`src/rpi/jsonrpc/winding_handler.py`
-
-### Méthode
+**Fichier :** `src/rpi/jsonrpc/winding_handler.py`
 
 ```python
-def home_lateral(
-    self,
-    approach_rpm: float = 100.0,
-    search_rpm: float = 20.0,
-    backoff_steps: int = 3200,
-) -> dict[str, Any]:
-    axis_state = self._engine.home_lateral(
+@rpc_method("winding.home_lateral_axis")
+def home_lateral_axis(self, params):
+    approach_rpm = float(params.get("approach_rpm", 100.0))
+    search_rpm   = float(params.get("search_rpm",   20.0))
+    backoff_steps = int(params.get("backoff_steps", 3200))
+    self._engine.home_lateral_axis(
         approach_rpm=approach_rpm,
         search_rpm=search_rpm,
         backoff_steps=backoff_steps,
     )
-    return {
-        "status": "homed",
-        "axis_state": axis_state,
-    }
 ```
-
-### Rôle
-
-- expose le homing latéral à l'API JSON-RPC,
-- délègue tout le travail à `WindingEngine.home_lateral(...)`.
 
 ---
 
-## 4. Orchestration moteur côté host
+## 3. Orchestration engine.py
 
-### Fichier
-
-`src/rpi/motion/engine.py`
-
-### Méthode publique
-
-```python
-def home_lateral(
-    self,
-    approach_rpm: float = _DEFAULT_HOME_APPROACH_RPM,
-    search_rpm: float = _DEFAULT_HOME_SEARCH_RPM,
-    backoff_steps: int = _DEFAULT_HOME_BACKOFF_STEPS,
-) -> dict[str, Any]:
-    if self._state.engine_state != EngineState.IDLE:
-        raise RuntimeError(...)
-
-    self._state.set_engine_state(EngineState.HOMING)
-    success, reason = self._home_lateral_axis(
-        axis_id=self._config.lateral_axis_id,
-        approach_rpm=approach_rpm,
-        search_rpm=search_rpm,
-        backoff_steps=backoff_steps,
-    )
-    if not success:
-        if reason:
-            raise RuntimeError(f"Lateral homing failed: {reason}")
-        raise RuntimeError("Lateral homing failed")
-
-    self._state.set_engine_state(EngineState.IDLE)
-    return self._require_axis_state(self._config.lateral_axis_id).snapshot()
-```
-
-### Méthode interne réellement utilisée
+**Fichier :** `src/rpi/motion/engine.py`  
+**Méthode :** `WindingEngine._home_lateral_axis`
 
 ```python
 def _home_lateral_axis(
-    self,
-    *,
-    axis_id: int,
-    approach_rpm: float,
-    search_rpm: float,
-    backoff_steps: int,
+    self, *, axis_id, approach_rpm, search_rpm, backoff_steps
 ) -> tuple[bool, str | None]:
-    self._events.publish(EventKind.HOMING_STARTED, axis_id=axis_id)
     steps_per_rev = (
         self._config.lateral_steps_per_revolution
         * self._config.lateral_microstepping
@@ -154,1066 +90,341 @@ def _home_lateral_axis(
     )
     self._move_queue.enqueue(move)
     self._wait_for_move_queue()
-
-    if move.state.name == "COMPLETED":
-        self._events.publish(EventKind.HOMING_COMPLETED, axis_id=axis_id)
-        return True, None
-    else:
-        msg = f"Homing failed: {move.error}"
-        self._state.set_fault(msg)
-        self._events.publish(...)
-        return False, move.error
+    ...
 ```
 
-### Rôle
-
-- construit le `HomingMove`,
-- l'enfile dans `MoveQueue`,
-- attend la fin,
-- convertit le résultat en succès/échec de haut niveau,
-- met le contrôleur en `FAULT` si le homing échoue.
+**Direction du homing :** `reverse_direction=self._config.lateral_invert_direction`.  
+`lateral_invert_direction` (défaut `False`) inverse la direction d'approche ET de recherche.  
+Le backoff utilise automatiquement `not reverse_direction`.
 
 ---
 
-## 5. Définition des phases de homing
+## 4. HomingMove — phases et paramètres
 
-### Fichier
+**Fichier :** `src/rpi/motion/move.py`
 
-`src/rpi/motion/move.py`
+| Phase | Armement endstop | Direction | Critère de fin |
+|-------|:---:|---|---|
+| `approach` | ✅ armé | `reverse_direction` | `endstop_triggered` |
+| `backoff`  | ❌ désarmé | `not reverse_direction` | durée (`backoff_steps`) |
+| `search`   | ✅ armé | `reverse_direction` | `endstop_triggered` |
 
-### Classe concernée
-
-`HomingMove`
-
-### Phases
-
-```python
-def phases(self) -> list[tuple[str, RampMove, bool]]:
-    return [
-        ("approach", self._make_approach_move(), True),
-        ("backoff", self._make_backoff_move(), False),
-        ("search", self._make_search_move(), True),
-    ]
-```
-
-### Méthodes de génération des sous-mouvements
-
-- `_make_approach_move()`
-- `_make_backoff_move()`
-- `_make_search_move()`
-
-### Rôle
-
-- `approach` : va vers la butée à `approach_rpm`, endstop armé,
-- `backoff` : repart en sens inverse à `search_rpm`, endstop désarmé,
-- `search` : revient lentement vers la butée à `search_rpm`, endstop armé.
-
-Le booléen du tuple indique explicitement à `MoveQueue` s'il faut armer ou non l'endstop pour la phase.
+- `max_approach_steps` : butée dure (20 tours par défaut) — si l'endstop n'a pas tiré, homing échoue avec diagnostic complet (R7).
+- `home_position_steps` : position absolue enregistrée dans `AxisState` après la phase search.
 
 ---
 
-## 6. Exécution réelle du homing côté host
+## 5. MoveQueue — exécution phase par phase
 
-### Fichier
+**Fichier :** `src/rpi/motion/move_queue.py`  
+**Méthode :** `MoveQueue._execute_homing`
 
-`src/rpi/motion/move_queue.py`
+```
+1. Lire initial_status → lateral_endstop_state
+2. Si ABSENT  → _ensure_homing_can_start() → RuntimeError → mark_failed
+3. Si CLOSED  → _clear_closed_endstop_before_homing() puis _ensure_homing_can_start()
+4. Si OPEN    → _ensure_homing_can_start() (confirmation)
 
-C'est le fichier central du homing côté Python.
+Pour chaque phase (approach, backoff, search) :
+  a. _ensure_homing_can_start() si la phase est armée
+  b. _set_endstop_armed(arm)  ← envoie ENABLE_ENDSTOP SPI, attend endstop_armed_mask
+  c. _stream_homing_sub_move()  ← crée streamer, stream_all()
+  d. Si approach ou search : _check_armed_phase_result()  ← diagnostics sur échec
+  e. Si backoff : _wait_for_endstop_open()
 
-## 6.1 Vérification préalable du capteur
+5. _set_endstop_armed(arm=False)
+6. axis_state.mark_homed(home_position_steps)
+7. move.mark_completed()
+```
 
-### Méthode
+### 5.1 Confirmation du désarmement : `_set_endstop_armed`
+
+Après envoi du SPI `ENABLE_ENDSTOP`, le host attend que `endstop_armed_mask` reflète
+l'état demandé via `_wait_for_endstop_arm_state` (R8 — timeout adaptatif : `max(0.5, 20 × poll_interval_s)`).
+
+---
+
+## 6. Préconditions : `_ensure_homing_can_start`
 
 ```python
-def _ensure_homing_can_start(self, axis_id: int, phase_name: str) -> None:
+def _ensure_homing_can_start(self, axis_id, phase_name):
     status = self._read_status(axis_id)
-    lateral_state = int(getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT))
-    if lateral_state != LATERAL_ENDSTOP_PRESENT_OPEN:
-        state_name = (
-            "absent" if lateral_state == LATERAL_ENDSTOP_ABSENT else f"0x{lateral_state:02X}"
-        )
-        raise RuntimeError(
-            f"homing {phase_name} cannot start on axis {axis_id}: lateral_endstop_state={state_name}"
-        )
+    lateral_state = int(getattr(status, "lateral_endstop_state", ABSENT))
+    if lateral_state == ABSENT:
+        raise RuntimeError("lateral endstop sensor is ABSENT (cable disconnected)")
+    if lateral_state != PRESENT_OPEN:
+        raise RuntimeError(f"lateral_endstop_state=0x{lateral_state:02X} (expected PRESENT_OPEN)")
 ```
 
-### Rôle
-
-Avant le homing, et avant chaque phase armée (`approach`, `search`), le host exige :
-
-- `lateral_endstop_state == PRESENT_OPEN`
-
-Sinon le homing est refusé proprement.
+Appelée avant chaque phase armée. Refuse explicitement `ABSENT` (capteur débranché).
 
 ---
 
-## 6.2 Armement / désarmement avec vérification
+## 7. Pré-dégagement : `_clear_closed_endstop_before_homing`
 
-### Méthodes
+Déclenchée si `lateral_endstop_state == PRESENT_CLOSED` au démarrage du homing (l'axe
+est déjà en contact avec la butée).
 
-```python
-def _set_endstop_armed(self, axis_id: int, arm: bool) -> Any:
-    sequence, _ = self._transport.enable_endstop_request(axis_id, arm=arm)
-    status = self._transport.wait_for_request_result(
-        sequence,
-        poll_interval_s=self._poll_interval_s,
-    )
-    self._update_axis_endstop_state(axis_id, status)
-    if int(getattr(status, "last_result", SpiMessageResult.OK)) != int(SpiMessageResult.OK):
-        raise RuntimeError(...)
-    return self._wait_for_endstop_arm_state(axis_id, arm)
+```
+1. _set_endstop_armed(arm=False)         ← désarmer avant de bouger
+2. _stream_homing_sub_move(phase="preclear", arm_endstop=False)
+   └─ mouvement backoff sans armement : recule loin de l'endstop
+3. _wait_for_endstop_open(timeout=_compute_backoff_timeout)
+4. time.sleep(0.020)                     ← R5: debounce mécanique (2 cycles SPI)
+5. _read_status() → vérifier lateral_endstop_state == PRESENT_OPEN
+   └─ sinon RuntimeError "preclear did not clear the endstop"
 ```
 
-```python
-def _wait_for_endstop_arm_state(self, axis_id: int, arm: bool, timeout_s: float = 0.5) -> Any:
-    deadline = time.monotonic() + timeout_s
-    last_status = None
-    while time.monotonic() < deadline:
-        last_status = self._read_status(axis_id)
-        if self._status_has_endstop_armed(last_status, axis_id, arm):
-            return last_status
-        time.sleep(self._poll_interval_s)
-    raise RuntimeError(...)
-```
-
-### Rôle
-
-Le host ne se contente pas d'envoyer `ENABLE_ENDSTOP`.
-
-Il fait trois choses :
-
-1. envoie `ENABLE_ENDSTOP arm=0|1`,
-2. attend la confirmation via `wait_for_request_result()`,
-3. vérifie ensuite que `endstop_armed_mask` reflète bien l'état demandé.
+**R5 — debounce mécanique :** après que `_wait_for_endstop_open` confirme l'ouverture,
+une attente de 20 ms est insérée pour stabiliser le GPIO avant de relire l'état. Sans
+cette attente, un rebond mécanique peut repasser brièvement à CLOSED et faire échouer
+`_ensure_homing_can_start` avec un message trompeur.
 
 ---
 
-## 6.3 Attente de libération pendant le backoff
+## 8. Streamer — détection endstop
 
-### Méthode
+**Fichier :** `src/rpi/transport/streamer.py`  
+**Méthode :** `MultiAxisRampStreamer._check_endstop`
 
-```python
-def _wait_for_endstop_open(self, axis_id: int, timeout_s: float = 1.5) -> Any:
-    deadline = time.monotonic() + timeout_s
-    last_status = None
-    while time.monotonic() < deadline:
-        last_status = self._read_status(axis_id)
-        if int(getattr(last_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)) == LATERAL_ENDSTOP_PRESENT_OPEN:
-            return last_status
-        time.sleep(self._poll_interval_s)
-    raise RuntimeError(
-        f"endstop release timeout on axis {axis_id}: state=0x{int(getattr(last_status, 'lateral_endstop_state', 0xFF)):02X}"
-    )
-```
-
-### Rôle
-
-Après le `backoff`, le host attend que le capteur repasse en `PRESENT_OPEN` avant de considérer la phase comme réussie.
-
----
-
-## 6.4 Boucle d'exécution du homing
-
-### Méthode principale
+### 8.1 Priorité de détection (R2)
 
 ```python
-def _execute_homing(self, move: HomingMove) -> None:
-    move.mark_running()
-    axis_state = self._axis_states.get(move.axis_id)
-
-    self._ensure_homing_can_start(move.axis_id, "start")
-
-    for phase_name, sub_move, arm_endstop in move.phases():
-        ...
-        if arm_endstop:
-            self._ensure_homing_can_start(move.axis_id, phase_name)
-
-        self._set_endstop_armed(move.axis_id, arm=arm_endstop)
-
-        streamer = self._make_streamer(
-            sub_move.axis_configs,
-            keep_enabled_axes={move.axis_id},
-        )
-        streamer.note_endstop_armed(move.axis_id, arm_endstop)
-        streamer.set_generator(
-            self._wrap_segment_sequence(
-                sub_move.segments(),
-                self._next_motion_sequence(),
-            )
-        )
-        streamer.stream_all()
-
-        if phase_name in ("approach", "search") and not streamer.endstop_triggered:
-            ...
-
-        if phase_name == "backoff":
-            self._wait_for_endstop_open(move.axis_id)
-
-    self._set_endstop_armed(move.axis_id, arm=False)
-    if axis_state is not None:
-        axis_state.mark_homed(move.home_position_steps)
-    move.mark_completed()
-```
-
-### Ce que fait vraiment cette méthode
-
-Pour chaque phase :
-
-1. vérifie que le homing armé peut commencer,
-2. arme ou désarme l'endstop selon la phase,
-3. crée un `MultiAxisRampStreamer`,
-4. injecte localement l'information `note_endstop_armed(...)`,
-5. envoie les segments de mouvement,
-6. vérifie que `approach` et `search` ont bien été arrêtés par l'endstop,
-7. pour `backoff`, attend la réouverture du contact,
-8. à la fin, désarme définitivement et marque l'axe comme homé.
-
----
-
-## 7. Suivi de l'état logiciel de l'axe
-
-### Fichier
-
-`src/rpi/motion/axis_state.py`
-
-### Méthodes liées au homing/endstop
-
-```python
-def update_endstop_state(self, state: int) -> None:
-    self._endstop_state = state
-```
-
-```python
-@property
-def endstop_triggered(self) -> bool:
-    return self._endstop_state == LATERAL_ENDSTOP_PRESENT_CLOSED
-```
-
-```python
-def mark_homed(self, position_steps: int = 0) -> None:
-    self._position_steps = position_steps
-    self._homed = True
-```
-
-```python
-def invalidate_position(self) -> None:
-    self._position_steps = None
-    self._homed = False
-```
-
-### Rôle
-
-`AxisState` est le miroir applicatif Python de l'état latéral :
-
-- position connue ou inconnue,
-- axe homé ou non,
-- état du capteur,
-- détection logicielle `endstop_triggered`.
-
----
-
-## 8. Transport SPI côté host
-
-### Fichier
-
-`src/rpi/transport/spi_transport.py`
-
-## 8.1 Actions liées à l'endstop
-
-```python
-def arm_endstop(self, axis_id: int) -> StatusPayload:
-    return self.transfer_frame(
-        make_enable_endstop(EnableEndstopPayload(axis_id=axis_id, arm=True), self._next_sequence())
-    )
-```
-
-```python
-def disarm_endstop(self, axis_id: int) -> StatusPayload:
-    return self.transfer_frame(
-        make_enable_endstop(EnableEndstopPayload(axis_id=axis_id, arm=False), self._next_sequence())
-    )
-```
-
-```python
-def enable_endstop_request(self, axis_id: int, arm: bool) -> tuple[int, StatusPayload]:
-    return self.transfer_request(
-        make_enable_endstop(EnableEndstopPayload(axis_id=axis_id, arm=arm), self._next_sequence())
-    )
-```
-
-### Rôle
-
-- construit les trames SPI pour `ENABLE_ENDSTOP`,
-- permet soit un envoi simple, soit un envoi avec confirmation différée.
-
-## 8.2 Action liée au `FLUSH`
-
-```python
-def flush_until(self, sequence: int) -> StatusPayload:
-    transport_sequence, _ = self.transfer_request(
-        make_flush(FlushPayload(flush_sequence=sequence), self._next_sequence())
-    )
-    return self.wait_for_request_result(transport_sequence)
-```
-
-### Rôle
-
-Le host peut demander au firmware de purger les segments encore présents dans les queues au-delà d'une séquence donnée.
-
----
-
-## 9. Streamer host : détection du contact et arrêt
-
-### Fichier
-
-`src/rpi/transport/streamer.py`
-
-Le streamer est la couche qui pousse les blocs multi-axes vers l'ESP32 et décide qu'un mouvement doit s'arrêter.
-
-## 9.1 Marquage local d'une phase armée
-
-```python
-def note_endstop_armed(self, axis_id: int, arm: bool) -> None:
-    if arm:
-        self._endstop_armed_axes.add(axis_id)
-    else:
-        self._endstop_armed_axes.discard(axis_id)
-```
-
-### Rôle
-
-Le `MoveQueue` informe le streamer que la phase courante attend un déclenchement endstop, même si le `status` firmware est en retard d'un transfert SPI.
-
-## 9.2 Détection du déclenchement
-
-```python
-def _check_endstop(self, status) -> bool:
-    armed_mask = int(getattr(status, "endstop_armed_mask", 0))
-    lateral_state = int(getattr(status, "lateral_endstop_state", 0xFF))
-    endstop_expected = armed_mask != 0 or bool(self._endstop_armed_axes)
-    running_mask = int(getattr(status, "running_mask", 0))
-    any_armed_axis_stopped = any(
-        (running_mask & (1 << axis_id)) == 0
-        for axis_id in self._endstop_armed_axes
-    )
-    if (
-        lateral_state == LATERAL_ENDSTOP_PRESENT_CLOSED
-        and endstop_expected
-        and (any_armed_axis_stopped or armed_mask == 0)
-    ):
+# 1. endstop_hit_mask filtré sur les axes armés localement
+for axis_id in self._endstop_armed_axes:
+    if hit_mask & (1 << axis_id):
         self._mark_endstop_triggered()
         return True
-    return False
+
+# 2. Fallback : capteur CLOSED + axe armé arrêté
+for axis_id in self._endstop_armed_axes:
+    axis_stopped = (running_mask & (1 << axis_id)) == 0
+    if lateral_state == PRESENT_CLOSED and axis_stopped:
+        self._mark_endstop_triggered()
+        return True
+
+# 3. segments_dropped + axe armé arrêté (file planner vide ≠ endstop seul)
 ```
 
-### Signaux utilisés
+**R2 — filtrage par axe :** avant ce correctif, tout bit non nul dans `endstop_hit_mask`
+déclenchait le flag, même si le bit correspondait à un axe non armé (e.g. axe 0 avec
+un `endstop_hit_count_` résiduel). Le nouveau code teste uniquement les bits
+correspondant aux axes dans `_endstop_armed_axes`.
 
-Le host considère qu'un endstop s'est déclenché quand :
+**R3 — `_last_segments_dropped` initialisé à `0` :** l'ancienne valeur `None` obligeait
+un guard spécial au premier appel. Maintenant initialisé à `0` dans `__init__`.
 
-- `lateral_endstop_state == PRESENT_CLOSED`,
-- l'endstop était attendu (`endstop_armed_mask != 0` ou tracking local),
-- et soit :
-  - l'axe armé n'est plus `running`,
-  - soit le firmware a déjà auto-nettoyé l'armement.
-
-## 9.3 Que fait le streamer quand il détecte le contact ?
+### 8.2 `_mark_endstop_triggered`
 
 ```python
 def _mark_endstop_triggered(self) -> None:
     if self._endstop_triggered:
         return
     self._endstop_triggered = True
-    flush_seq = self._last_sent_motion_seq
+    if self._last_confirmed_motion_seq >= 0:
+        flush_seq = self._last_confirmed_motion_seq   # confirmé par le firmware
+    elif self._last_sent_motion_seq >= 0:
+        flush_seq = self._last_sent_motion_seq        # fallback : dernier envoyé
+    else:
+        flush_seq = 0xFFFF                            # flush total
     self.request_stop()
     self.request_flush(flush_seq)
 ```
 
-### Rôle
-
-Le streamer :
-
-- marque l'événement,
-- arrête la boucle d'envoi,
-- demande un `FLUSH` jusqu'à la dernière séquence envoyée.
-
-## 9.4 Détection indirecte par `segments_dropped`
-
-```python
-if self._endstop_armed_axes:
-    logger.info(
-        "planner dropped segments while endstop is armed; treating as endstop-triggered recovery"
-    )
-    self._mark_endstop_triggered()
-```
-
-### Rôle
-
-Si le firmware entre en `RECOVERY` et vide sa queue, `segments_dropped` peut augmenter.
-Le host interprète cette situation comme un déclenchement d'endstop lorsqu'une phase armée était en cours.
-
-## 9.5 Boucle principale de streaming
-
-```python
-def stream_all(self) -> int:
-    status = self._transport.get_status()
-    ...
-    self._enable_axes()
-    status = self._transport.get_status()
-
-    self._check_endstop(status)
-    if not self._stop_requested:
-        total_segments, status = self._prefill(status)
-
-    while True:
-        if self._stop_requested:
-            if self._flush_sequence_requested is not None:
-                self.flush_until(self._flush_sequence_requested)
-            break
-
-        self._remove_confirmed_segments(status)
-        self._log_runtime_diagnostics(status)
-        if self._stop_requested:
-            break
-        self._check_premature_completion(status)
-        if self._check_stall(status):
-            break
-
-        if self._check_endstop(status):
-            break
-        ...
-```
-
-### Rôle
-
-- fait un pré-check endstop avant le `prefill`,
-- surveille les signaux de contact pendant le mouvement,
-- déclenche le `FLUSH` si un contact est détecté.
+`_last_confirmed_motion_seq` est initialisé à `-1` ; la valeur `0xFFFF` firmware (rien
+exécuté) est ignorée dans `_update_confirmed_motion_sequence`.
 
 ---
 
-## 10. Miroir de protocole Python
+## 9. Firmware — StatusPayload et endstop_hit_mask
 
-### Fichier
+**Fichiers :** `src/esp32/src/messages.h`, `src/rpi/transport/messages.py`
 
-`src/rpi/transport/messages.py`
-
-### Constantes clés pour le homing
-
-```python
-LATERAL_ENDSTOP_PRESENT_OPEN = 0x00
-LATERAL_ENDSTOP_PRESENT_CLOSED = 0x01
-LATERAL_ENDSTOP_ABSENT = 0xFF
-```
-
-```python
-class SpiMessageType(IntEnum):
-    FLUSH = 0x12
-    MULTI_AXIS_SEGMENT_BLOCK = 0x13
-    ENABLE_ENDSTOP = 0x14
-    STATUS = 0x80
-```
-
-```python
-class SpiMessageResult(IntEnum):
-    OK = 0x00
+```c
+struct StatusPayload {          // 54 bytes
     ...
-    ENDSTOP_BLOCKED = 0x09
-```
-
-### Rôle
-
-Le host utilise ces constantes pour interpréter exactement les mêmes valeurs binaires que le firmware.
-
----
-
-## 11. Protocole firmware : messages et status
-
-### Fichier
-
-`src/esp32/src/messages.h`
-
-## 11.1 Message d'armement endstop
-
-```cpp
-struct __attribute__((packed)) EnableEndstopPayload {
-    uint8_t axis_id;
-    uint8_t arm;
-    uint8_t reserved[2];
-};
-```
-
-## 11.2 Type de message
-
-```cpp
-enum class SpiMessageType : uint8_t {
-    ...
-    ENABLE_ENDSTOP           = 0x14,
+    uint8_t  lateral_endstop_state;  // LateralEndstopState enum
+    uint8_t  endstop_armed_mask;     // bit i = axe i armé
+    uint8_t  endstop_hit_mask;       // bit i = endstop_hit_count_[i] > 0
     ...
 };
 ```
 
-## 11.3 Champs de status utilisés pendant le homing
+### `endstop_hit_mask` côté firmware (R1)
 
-```cpp
-struct __attribute__((packed)) StatusPayload {
-    ...
-    uint8_t  enabled_mask;
-    uint8_t  running_mask;
-    uint8_t  lateral_endstop_state;
-    uint8_t  endstop_armed_mask;
-    uint16_t last_executed_sequence;
-    uint8_t  multi_axis_queue_free;
-    uint8_t  planner_queue_free;
-    uint16_t last_planned_sequence;
-    uint16_t segments_dropped;
-};
-```
+Le bit `i` dans `endstop_hit_mask` est à `1` si `endstop_hit_count_[i] > 0`.
 
-### Signification pour le homing
+`armEndstop()` remet `endstop_hit_count_` à zéro.  
+`disarmEndstop()` remet **aussi** `endstop_hit_count_` à zéro (R1 — correctif).
 
-- `lateral_endstop_state` : état physique du capteur,
-- `endstop_armed_mask` : axes dont la protection endstop est armée,
-- `running_mask` : axes dont le RMT est actif,
-- `last_executed_sequence` : dernière séquence réellement exécutée,
-- `segments_dropped` : segments perdus / purgés côté planner.
+**Pourquoi R1 est critique :**  
+Sans ce correctif, `disarmEndstop()` laissait `endstop_hit_count_` non nul après une
+phase approach. Le premier status SPI émis pendant la phase backoff (désarmée) portait
+encore `endstop_hit_mask=1`. Sans le filtre R2, le streamer aurait déclenché un faux
+endstop sur la phase backoff.
 
 ---
 
-## 12. Firmware : construction du status SPI
+## 10. Firmware — DRAIN : gate latérale et fail-safe ABSENT
 
-### Fichier
+**Fichier :** `src/esp32/src/comm_interface.cpp`  
+**État machine :** `ExecState::DRAIN`
 
-`src/esp32/src/comm_interface.cpp`
-
-### Méthode
-
-`CommInterface::buildStatusFrame(...)`
-
-### Extrait
+### Ordre d'exécution dans DRAIN (restructuré R9+R10)
 
 ```cpp
-payload->last_rx_sequence = last_rx_sequence_;
-payload->last_rx_type     = last_rx_type_;
-payload->last_result      = last_result_;
-payload->protocol_version = SPI_MSG_VERSION;
-payload->lateral_endstop_state = readLateralEndstopState();
+// 1. Déclaration anticipée (R10)
+uint8_t guarded_axis_ids[MULTI_AXIS_MAX_AXES] = {};
+uint8_t guarded_axis_count = 0;
+auto clearMultiExecFlags = [&]() { /* setMultiExecActive(false) pour tous */ };
 
-payload->endstop_armed_mask = 0;
-for (uint8_t axis = 0; axis < SPI_MAX_AXES; ++axis) {
-    if (axis < n_motors_ && queues_[axis] != nullptr) {
-        if (queues_[axis]->driver().isEndstopArmed()) {
-            payload->endstop_armed_mask |= static_cast<uint8_t>(1U << axis);
-        }
-    }
-}
-
-payload->last_executed_sequence = last_executed_sequence_.load(...);
-payload->planner_queue_free = ...;
-payload->last_planned_sequence = planner_.lastPlannedMotionSequence();
-payload->segments_dropped = ...;
-```
-
-### Rôle
-
-À chaque transfert SPI, l'ESP32 renvoie au host une photo de l'état runtime du moteur et du capteur.
-
----
-
-## 13. Firmware : armement / désarmement de l'endstop
-
-### Fichier
-
-`src/esp32/src/comm_interface.cpp`
-
-### Méthode
-
-```cpp
-esp_err_t CommInterface::handleEnableEndstop(const EnableEndstopPayload& payload)
-{
-    if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    StepperDriver& drv = queues_[payload.axis_id]->driver();
-    if (payload.arm) {
-        drv.armEndstop();
-        ESP_LOGI(TAG, "endstop armed on axis %u", payload.axis_id);
-    } else {
-        drv.disarmEndstop();
-        ESP_LOGI(TAG, "endstop disarmed on axis %u", payload.axis_id);
-    }
-    return ESP_OK;
-}
-```
-
-### Rôle
-
-C'est le point de passage firmware pour `ENABLE_ENDSTOP`.
-
----
-
-## 14. Firmware : lecture de l'endstop physique
-
-### Fichier
-
-`src/esp32/src/comm_interface.cpp`
-
-### Méthode
-
-```cpp
-uint8_t CommInterface::readLateralEndstopState() const
-{
-    if (pins_.home_pin_no == GPIO_NUM_NC || pins_.home_pin_nc == GPIO_NUM_NC) {
-        return static_cast<uint8_t>(LateralEndstopState::ABSENT);
-    }
-
-    const int no_state = gpio_get_level(pins_.home_pin_no);
-    const int nc_state = gpio_get_level(pins_.home_pin_nc);
-
-    if (no_state == nc_state) {
-        return static_cast<uint8_t>(LateralEndstopState::ABSENT);
-    }
-    if (no_state == 0 && nc_state == 1) {
-        return static_cast<uint8_t>(LateralEndstopState::PRESENT_CLOSED);
-    }
-    return static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
-}
-```
-
-### Rôle
-
-Le capteur est câblé en **double contact NO/NC**.
-Le firmware renvoie :
-
-- `PRESENT_OPEN` si le capteur est ouvert,
-- `PRESENT_CLOSED` si la butée est contactée,
-- `ABSENT` si le câblage est incohérent ou absent.
-
----
-
-## 15. Firmware : garde passive de mouvement latéral
-
-### Fichier
-
-`src/esp32/src/comm_interface.cpp`
-
-### Méthode
-
-```cpp
-bool CommInterface::isLateralMovementAllowed(uint8_t axis_id) const
-{
-    if (axis_id != 1) {
-        return true;
-    }
-    if (axis_id >= n_motors_ || queues_[axis_id] == nullptr) {
-        return false;
-    }
-    if (!queues_[axis_id]->driver().isEndstopArmed()) {
-        return true;
-    }
-    return readLateralEndstopState() == static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
-}
-```
-
-### Rôle
-
-Cette garde s'applique aux chemins `STEP_BLOCK` et `SEGMENT_BLOCK`, et plus largement au filtrage passif du latéral :
-
-- si l'endstop est **armé**, un mouvement vers un capteur fermé est bloqué,
-- si l'endstop est **désarmé**, le `backoff` est autorisé même si le capteur est encore physiquement fermé.
-
-C'est précisément ce qui permet la phase `backoff` après un contact homing.
-
----
-
-## 16. Firmware : ISR et arrêt temps réel
-
-### Fichiers
-
-- `src/esp32/src/stepper_driver.h`
-- `src/esp32/src/stepper_driver.cpp`
-
-## 16.1 Armement / désarmement dans le driver
-
-```cpp
-void armEndstop() {
-    endstop_active_.store(false, std::memory_order_release);
-    endstop_armed_.store(true, std::memory_order_release);
-}
-
-void disarmEndstop() {
-    endstop_armed_.store(false, std::memory_order_release);
-    endstop_active_.store(false, std::memory_order_release);
-}
-```
-
-### Rôle
-
-- `armEndstop()` arme la protection,
-- `disarmEndstop()` retire la protection et efface aussi `endstop_active_`,
-- ce reset explicite est indispensable pour que le `backoff` puisse repartir proprement.
-
-## 16.2 ISR GPIO du capteur
-
-```cpp
-void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
-{
-    StepperDriver* drv = static_cast<StepperDriver*>(arg);
-
-    if (!drv->isEndstopArmed()) {
-        return;
-    }
-
-    const int no_lvl = gpio_get_level(drv->endstop_no_pin_);
-    const int nc_lvl = gpio_get_level(drv->endstop_nc_pin_);
-
-    const bool triggered = (no_lvl == 0 && nc_lvl == 1) || (no_lvl == nc_lvl);
-
-    if (triggered) {
-        drv->endstop_active_.store(true, std::memory_order_release);
-        ... wake executor task ...
-    } else {
-        drv->endstop_active_.store(false, std::memory_order_release);
-    }
-}
-```
-
-### Rôle
-
-Quand le capteur change d'état pendant une phase armée :
-
-- l'ISR met `endstop_active_ = true`,
-- réveille l'exécuteur,
-- l'arrêt RMT peut alors se faire immédiatement côté temps réel.
-
-## 16.3 Arrêt RMT dans l'encodeur ISR
-
-```cpp
-if (drv->endstop_active_.load(std::memory_order_relaxed)) {
-    drv->rmt_stopped_.store(true, std::memory_order_relaxed);
-    *done = true;
-    return 0;
-}
-```
-
-### Rôle
-
-Le flux RMT s'arrête immédiatement si `endstop_active_` est levé.
-
----
-
-## 17. Firmware : exécution multi-axis et RECOVERY
-
-### Fichier
-
-`src/esp32/src/comm_interface.cpp`
-
-## 17.1 Détection dans la boucle DRAIN
-
-```cpp
-for (uint8_t a = 0; a < seg.axis_count && !endstop_hit; ++a) {
-    const uint8_t eid = seg.axis_ids[a];
-    ...
-    if (self->queues_[eid]->driver().isEndstopActive()) {
-        self->queues_[eid]->driver().emergencyStop();
-        self->notifySegmentExecuted(seg.motion_sequence);
-        ESP_LOGW(TAG, "endstop on axis %u at seq=%u", eid, seg.motion_sequence);
-        endstop_hit = true;
-    }
+// 2. Vérification endstop ISR (avant setMultiExecActive)
+bool endstop_hit = false;
+for (axis in seg.axis_ids) {
+    if (driver.isEndstopActive()) { emergencyStop(); notifySegmentExecuted(); endstop_hit=true; }
 }
 if (endstop_hit) {
-    state = ExecState::RECOVERY;
-    goto exit_drain;
+    clearMultiExecFlags();   // R10 : libérer avant RECOVERY
+    state = RECOVERY; goto exit_drain;
 }
-```
 
-### Rôle
+// 3. Lecture état capteur
+const uint8_t lateral_state = readLateralEndstopState();
+const bool lateral_endstop_armed = (n_motors_>1 && queues_[1]->driver().isEndstopArmed());
 
-Quand l'exécuteur voit `endstop_active_` sur un segment :
-
-- il déclenche `emergencyStop()`,
-- il notifie la dernière séquence exécutée,
-- il bascule en `RECOVERY`.
-
-## 17.2 Garde passive du latéral dans le multi-axis
-
-```cpp
-const bool lateral_endstop_armed =
-    self->n_motors_ > 1
-    && self->queues_[1] != nullptr
-    && self->queues_[1]->driver().isEndstopArmed();
-const bool lateral_blocked =
-    lateral_endstop_armed
-    && lateral_state !=
-    static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
-```
-
-Puis :
-
-```cpp
-if (axis_id == 1 && lateral_blocked) {
-    ESP_LOGD(TAG, "axis1 blocked, skip %u steps", seg.axes[a].step_count);
-    continue;
+// 4. Fail-safe ABSENT (R9)
+if (lateral_endstop_armed && lateral_state == ABSENT) {
+    ESP_LOGW(TAG, "lateral endstop ABSENT while armed — fail-safe stop");
+    queues_[1]->driver().emergencyStop();
+    clearMultiExecFlags();
+    notifySegmentExecuted(seg.motion_sequence);
+    state = RECOVERY; goto exit_drain;
 }
-```
 
-### Rôle
+// 5. Gate latérale normale
+const bool lateral_blocked = lateral_endstop_armed
+ 10 — `clearMultiExecFlags` avant RECOVERY :** la lambda est maintenant déclarée
+*avant* le premier check endstop. À ce point `guarded_axis_count=0` (pas encore de
+`setMultiExecActive`), donc l'appel est un no-op sur le chemin early-endstop, mais il
+sera utile si du code futur appelle `setMultiExecActive` plus tôt.
 
-- si l'endstop latéral est armé et que le capteur n'est pas `OPEN`, les steps latéraux sont ignorés,
-- si l'endstop est désarmé, le `backoff` n'est plus filtré.
+**R9 — fail-safe ABSENT :** si le capteur est absent (câble coupé) pendant qu'un
+homing est armé, le firmware déclenche un arrêt d'urgence. L'ISR GPIO ne peut pas
+détecter ABSENT (elle lit les pins NO/NC individuellement) ; seule la lecture conjointe
+`NO==NC` dans le task context peut l'identifier.
 
-## 17.3 États `FLUSH` et `RECOVERY`
+---
 
-```cpp
-case ExecState::FLUSH: {
-    const planned_segment_t& flush_seg = batch[batch_index];
-    defer_head = defer_tail = 0;
-    self->notifySegmentExecuted(flush_seg.flush_sequence);
-    ...
-    state = ExecState::IDLE;
-    break;
-}
-```
+## 11. Firmware — RECOVERY
+
+**Fichier :** `src/esp32/src/comm_interface.cpp`  
+**État machine :** `ExecState::RECOVERY`
 
 ```cpp
 case ExecState::RECOVERY: {
     planned_segment_t discard;
     uint32_t drained = 0;
+    uint16_t last_drained_seq = 0;
+    bool has_seq = false;
     while (drained < SEGMENT_QUEUE_DEPTH &&
            xQueueReceive(seg_queue, &discard, 0) == pdTRUE) {
+        if (!discard.is_flush) {
+            last_drained_seq = discard.motion_sequence;
+            has_seq = true;
+        }
         ++drained;
     }
+    if (has_seq) {
+        notifySegmentExecuted(last_drained_seq);  // notifie la dernière seq drainée
+    }
     defer_head = defer_tail = 0;
-    ESP_LOGW(TAG, "recovery: drained %lu remaining segments", ...);
+    batch_count = batch_index = 0;
     state = ExecState::IDLE;
-    break;
 }
 ```
 
-### Rôle
-
-- `FLUSH` : purge demandée explicitement par le host,
-- `RECOVERY` : purge déclenchée localement après endstop / erreur.
-
-C'est ce comportement qui explique les `segments_dropped` vus côté host.
+La notification de `last_drained_seq` permet au host de calculer le `flush_sequence`
+correct dans `_mark_endstop_triggered`.
 
 ---
 
-## 18. Firmware : planner et purge
+## 12. Matrice de comportement
 
-### Fichier
+| `lateral_endstop_state` au démarrage | Endstop armé firmware | Action host |
+|---|:---:|---|
+| `PRESENT_OPEN` | non | démarrage normal |
+| `PRESENT_CLOSED` | non | `_clear_closed_endstop_before_homing` + debounce |
+| `ABSENT` | non | `RuntimeError` "ABSENT (cable disconnected)" |
+| `PRESENT_OPEN` | oui | démarrage normal (endstop armé par `_set_endstop_armed`) |
+| `PRESENT_CLOSED` | oui | `isLateralMovementAllowed` refuse → `ENDSTOP_BLOCKED` |
+| `ABSENT` | oui (pendant DRAIN) | fail-safe firmware : `emergencyStop` → RECOVERY |
 
-`src/esp32/src/motion_planner.cpp`
+---
 
-### Méthode liée au `FLUSH`
+## 13. Sémantique des états de faute
 
-```cpp
-void MotionPlanner::handleFlush(const flush_request_t& req)
-{
-    has_pending_block_ = false;
-    pending_segment_idx_ = 0;
-    timeline_us_ = esp_timer_get_time();
-    last_planned_motion_seq_ = req.flush_sequence;
+- **`FAULT`** : homing échoué (ABSENT, timeout, approche sans trigger).  
+  → `winding.clear_fault` requis avant tout mouvement latéral.
+- **`move_lateral_to_mm` refusé tant que `homed=False`** : normal, pas un bug.
+- **Message diagnostique (R7) :** si approach ou search se terminent sans trigger,
+  l'erreur inclut `lateral_state`, `running_mask`, `last_exec`, `last_sent`.
 
-    while (...) {
-        ... drop cmd queue ...
-    }
-    while (...) {
-        ... drop segment queue ...
-    }
+---
 
-    planned_segment_t flush_seg {};
-    flush_seg.is_flush = true;
-    flush_seg.flush_sequence = req.flush_sequence;
-    ...
-}
+## 14. Catalogue des méthodes
+
+### Host — MoveQueue (`src/rpi/motion/move_queue.py`)
+
+| Méthode | Rôle | Correctif |
+|---|---|:---:|
+| `_execute_homing` | Dispatch des phases | — |
+| `_ensure_homing_can_start` | Refuse ABSENT/CLOSED avant phase | — |
+| `_clear_closed_endstop_before_homing` | Pré-dégagement + debounce | R5 |
+| `_stream_homing_sub_move` | Crée streamer + stream_all | — |
+| `_set_endstop_armed` | ENABLE_ENDSTOP SPI + attente mask | — |
+| `_wait_for_endstop_arm_state` | Timeout adaptatif `max(0.5, 20×poll)` | R8 |
+| `_wait_for_endstop_open` | Attend PRESENT_OPEN | — |
+| `_compute_backoff_timeout` | Fallback chain : estimated→ramp→steps/hz | R4 |
+| `_check_armed_phase_result` | Diagnostics si approach/search sans trigger | R7 |
+
+### Host — MultiAxisRampStreamer (`src/rpi/transport/streamer.py`)
+
+| Méthode/attribut | Rôle | Correctif |
+|---|---|:---:|
+| `_check_endstop` | Détection par axe armé (filtre hit_mask) | R2 |
+| `_mark_endstop_triggered` | flush_seq depuis confirmed→sent→0xFFFF | R3 |
+| `_last_confirmed_motion_seq` | Initialisé à `-1` (sentinel) | R3 |
+| `_last_segments_dropped` | Initialisé à `0` (pas `None`) | R3 |
+| `last_sent_motion_seq` | Property exposée pour diagnostics | R7 |
+
+### Firmware — StepperDriver (`src/esp32/src/stepper_driver.h`)
+
+| Méthode | Rôle | Correctif |
+|---|---|:---:|
+| `armEndstop()` | arm=true + reset hit_count | — |
+| `disarmEndstop()` | arm=false + reset hit_count | R1 |
+| `getEndstopHitCount()` | Lu par buildStatusFrame → hit_mask | — |
+
+### Firmware — CommInterface (`src/esp32/src/comm_interface.cpp`)
+
+| Lieu | Rôle | Correctif |
+|---|---|:---:|
+| DRAIN — endstop ISR check | clearMultiExecFlags avant RECOVERY | R10 |
+| DRAIN — gate latérale | ABSENT+armé → fail-safe emergencyStop | R9 |
+| RECOVERY | Drainer + notifier last_drained_seq | — |
+
+---
+
+## 15. Note de déploiement
+
+**Host Python** (Pi) :
+
+```bash
+scp -r src/rpi/* pi@192.168.74.89:/home/pi/winder/
 ```
 
-### Rôle
+**Firmware ESP32** (PlatformIO) : après modification de `stepper_driver.h` ou
+`comm_interface.cpp`, reconstruire et flasher via PlatformIO.
 
-Le planner :
-
-- abandonne le bloc en cours,
-- purge les queues,
-- injecte un segment sentinelle `flush` pour que l'exécuteur accuse réception du `flush_sequence`.
-
----
-
-## 19. Mapping des résultats SPI liés au homing
-
-### Fichier
-
-`src/esp32/src/comm_interface.cpp`
-
-### Mapping dans la boucle SPI
-
-```cpp
-if (err == ESP_OK) {
-    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::OK);
-} else if (err == ESP_ERR_TIMEOUT) {
-    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::QUEUE_FULL);
-} else if (err == ESP_ERR_INVALID_STATE) {
-    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::ENDSTOP_BLOCKED);
-} else {
-    ...
-}
-```
-
-### Rôle
-
-Quand un mouvement est bloqué par la garde d'endstop, le firmware renvoie `ENDSTOP_BLOCKED` au host.
-
----
-
-## 20. Actions / méthodes liées au homing et à l'endstop
-
-## 20.1 Host Python
-
-### API RPC
-
-- `winding.home_lateral(...)`
-- `winding.arm_endstop(axis_id)`
-- `winding.disarm_endstop(axis_id)`
-- `winding.flush_until(sequence)`
-
-### `WindingEngine`
-
-- `home_lateral(...)`
-- `_home_lateral_axis(...)`
-- `arm_endstop(axis_id)`
-- `disarm_endstop(axis_id)`
-- `flush_until(sequence)`
-
-### `MoveQueue`
-
-- `_execute_homing(...)`
-- `_ensure_homing_can_start(...)`
-- `_set_endstop_armed(...)`
-- `_wait_for_endstop_arm_state(...)`
-- `_wait_for_endstop_open(...)`
-- `_update_axis_endstop_state(...)`
-- `_next_motion_sequence()`
-- `_wrap_segment_sequence(...)`
-
-### `AxisState`
-
-- `update_endstop_state(...)`
-- `endstop_triggered`
-- `mark_homed(...)`
-- `invalidate_position()`
-
-### `MultiAxisRampStreamer`
-
-- `stream_all()`
-- `_check_endstop(...)`
-- `_mark_endstop_triggered()`
-- `note_endstop_armed(...)`
-- `request_flush(...)`
-- `flush_until(...)`
-- `arm_endstop(...)`
-- `disarm_endstop(...)`
-
-### `Esp32SpiTransport`
-
-- `enable_endstop_request(...)`
-- `arm_endstop(...)`
-- `disarm_endstop(...)`
-- `flush_until(...)`
-- `wait_for_request_result(...)`
-- `get_status()`
-
-## 20.2 Firmware ESP32
-
-### `CommInterface`
-
-- `handleEnableEndstop(...)`
-- `readLateralEndstopState()`
-- `isLateralMovementAllowed(...)`
-- `buildStatusFrame(...)`
-- `handleFlush(...)`
-- `handleFrame(...)`
-- `notifySegmentExecuted(...)`
-- `multiAxisExecutorTask(...)`
-
-### `StepperDriver`
-
-- `armEndstop()`
-- `disarmEndstop()`
-- `isEndstopArmed()`
-- `isEndstopActive()`
-- `initEndstopIsr(...)`
-- `endstopIsrHandler(...)`
-- `encode_steps(...)`
-- `emergencyStop()`
-
-### `MotionPlanner`
-
-- `handleFlush(...)`
-- `segmentQueueFree()`
-- `resetStats()`
-
----
-
-## 21. Séquence complète résumée
-
-## 21.1 Homing réussi
-
-1. Le client appelle `winding.home_lateral`.
-2. `WindingEngine.home_lateral()` vérifie que l'engine est `IDLE`.
-3. `WindingEngine._home_lateral_axis()` construit un `HomingMove` et l'enfile.
-4. `MoveQueue._execute_homing()` vérifie que l'endstop est `PRESENT_OPEN`.
-5. `MoveQueue` arme l'endstop avec `ENABLE_ENDSTOP arm=1`.
-6. Le host vérifie `endstop_armed_mask`.
-7. Le streamer envoie les `MULTI_AXIS_SEGMENT_BLOCK` de la phase `approach`.
-8. Le firmware reçoit les blocs, les planifie, puis l'exécuteur les pousse dans le ring RMT.
-9. L'ISR endstop détecte le contact et met `endstop_active_=true`.
-10. L'exécuteur stoppe le moteur, notifie la séquence exécutée et passe en `RECOVERY`.
-11. Le host voit le contact via `lateral_endstop_state`, `running_mask`, `segments_dropped` ou `ENDSTOP_BLOCKED`.
-12. Le streamer déclenche `request_stop()` et `request_flush()`.
-13. `MoveQueue` valide que `approach` s'est bien terminé par endstop.
-14. `MoveQueue` désarme l'endstop.
-15. La phase `backoff` recule jusqu'à ce que `lateral_endstop_state == PRESENT_OPEN`.
-16. `MoveQueue` réarme l'endstop.
-17. La phase `search` recommence plus lentement et retouche la butée.
-18. À la fin, `AxisState.mark_homed(...)` fixe la position home.
-19. Le moteur repasse en état `IDLE`.
-
-## 21.2 Cas d'échec typiques
-
-- le capteur est déjà fermé au départ,
-- le capteur est absent,
-- le bit `endstop_armed_mask` ne reflète pas l'armement demandé,
-- la phase `approach` ou `search` se termine sans `endstop_triggered`,
-- le `backoff` ne ré-ouvre jamais le capteur,
-- le firmware entre en `RECOVERY` et le host finit par timeout ou par `FAULT`.
-
----
-
-## 22. Points importants à retenir
-
-- Le **host pilote la sémantique du homing**.
-- Le **firmware pilote l'arrêt temps réel**.
-- `ENABLE_ENDSTOP` ne sert pas seulement à lire le capteur : il active la protection temps réel.
-- Le `backoff` doit se faire **endstop désarmé**.
-- `lateral_endstop_state` décrit le capteur physique, alors que `endstop_armed_mask` décrit la protection firmware.
-- `running_mask`, `last_executed_sequence`, `last_planned_sequence` et `segments_dropped` sont essentiels pour diagnostiquer un homing qui touche la butée mais que le host ne comprend pas correctement.
-- Le `FLUSH` côté host et le `RECOVERY` côté firmware sont deux mécanismes différents mais complémentaires.
-
----
-
-## 23. Fichiers à relire en priorité pour déboguer un homing
-
-### Côté host
-
-1. `src/rpi/motion/move_queue.py`
-2. `src/rpi/transport/streamer.py`
-3. `src/rpi/motion/engine.py`
-4. `src/rpi/transport/spi_transport.py`
-5. `src/rpi/transport/messages.py`
-
-### Côté firmware
-
-1. `src/esp32/src/comm_interface.cpp`
-2. `src/esp32/src/stepper_driver.cpp`
-3. `src/esp32/src/stepper_driver.h`
-4. `src/esp32/src/messages.h`
-5. `src/esp32/src/motion_planner.cpp`
+Les changements R1, R9, R10 (firmware) et R2, R3, R4, R5, R7, R8 (host Python)
+sont indépendants — le firmware peut être flashé séparément du déploiement Python.

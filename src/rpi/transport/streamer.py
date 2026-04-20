@@ -9,6 +9,7 @@ from typing import Any, Iterator
 
 from transport.messages import (
     MULTI_AXIS_SEGMENT_BLOCK_SIZE,
+    LATERAL_ENDSTOP_ABSENT,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
     LATERAL_ENDSTOP_PRESENT_OPEN,
     MultiAxisSegment,
@@ -223,13 +224,15 @@ class MultiAxisRampStreamer:
         self._prefilling = False              # suppresses pressure gate during initial prefill
         # Premature-completion detection
         self._last_confirmed_sequence: int = -1
+        self._last_confirmed_motion_seq: int = -1
         self._premature_notify_count: int = 0
         self._premature_notify_window_start: float = 0.0
         self._last_sequence_advance_time: float = time.time()
         self._last_sequence_advance_value: int = -1
         self._stall_timeout_s: float = 5.0  # stall if no progress for 5s
         self._last_underrun_count: tuple[int, int, int, int] | None = None
-        self._last_segments_dropped: int | None = None
+        self._last_segments_dropped: int = 0   # R3: sentinel 0, not None
+        self._last_logged_segments_dropped: int | None = None
 
         self._sync_with_firmware_status()
         start_sequence = (
@@ -363,10 +366,14 @@ class MultiAxisRampStreamer:
         except Exception:
             return
 
+        self._update_confirmed_motion_sequence(status)
+
+    def _update_confirmed_motion_sequence(self, status) -> None:
         received_sequence = int(getattr(status, "last_executed_sequence", -1))
         if received_sequence == 0xFFFF or received_sequence < 0:
             return
 
+        self._last_confirmed_motion_seq = received_sequence
         self._last_confirmed_sequence = received_sequence
         self._last_sequence_advance_value = received_sequence
         self._last_sequence_advance_time = time.time()
@@ -409,6 +416,7 @@ class MultiAxisRampStreamer:
         return False
 
     def _remove_confirmed_segments(self, status) -> None:
+        self._update_confirmed_motion_sequence(status)
         last_executed = int(getattr(status, "last_executed_sequence", -1))
         while self._inflight:
             segment, _transport_seq = self._inflight[0]
@@ -443,6 +451,7 @@ class MultiAxisRampStreamer:
             received_sequence, self._last_confirmed_sequence
         ):
             self._last_confirmed_sequence = received_sequence
+            self._last_confirmed_motion_seq = received_sequence
 
     def _check_stall(self, status) -> bool:
         """Return True and request stop if last_executed_sequence has not
@@ -513,10 +522,10 @@ class MultiAxisRampStreamer:
             self._last_underrun_count = underrun
 
         segments_dropped = int(getattr(status, "segments_dropped", 0))
-        if self._last_segments_dropped is None:
-            self._last_segments_dropped = segments_dropped
-        elif segments_dropped > self._last_segments_dropped:
-            delta = segments_dropped - self._last_segments_dropped
+        if self._last_logged_segments_dropped is None:
+            self._last_logged_segments_dropped = segments_dropped
+        elif segments_dropped > self._last_logged_segments_dropped:
+            delta = segments_dropped - self._last_logged_segments_dropped
             logger.warning(
                 "planner dropped segments: delta=%s total=%s planner_free=%s inflight=%s last_executed=%s last_planned=%s",
                 delta,
@@ -526,14 +535,9 @@ class MultiAxisRampStreamer:
                 getattr(status, "last_executed_sequence", -1),
                 getattr(status, "last_planned_sequence", -1),
             )
-            if self._endstop_armed_axes:
-                logger.info(
-                    "planner dropped segments while endstop is armed; treating as endstop-triggered recovery"
-                )
-                self._mark_endstop_triggered()
-            self._last_segments_dropped = segments_dropped
-        elif segments_dropped < self._last_segments_dropped:
-            self._last_segments_dropped = segments_dropped
+            self._last_logged_segments_dropped = segments_dropped
+        elif segments_dropped < self._last_logged_segments_dropped:
+            self._last_logged_segments_dropped = segments_dropped
 
         multi_axis_free = int(getattr(status, "multi_axis_queue_free", -1))
         planner_free = int(getattr(status, "planner_queue_free", -1))
@@ -574,27 +578,47 @@ class MultiAxisRampStreamer:
     def _check_endstop(self, status) -> bool:
         """Return True if an endstop was triggered on any armed axis.
 
-        Homing detection follows the recommended host-side sequence:
-        when an axis is armed, a CLOSED lateral endstop plus a stopped RMT
-        on any armed axis is treated as a trigger. We also keep the more
-        permissive CLOSED+armed fallback for firmware paths that auto-disarm
-        or recover before the host polls the exact stopping frame.
+        Detection priority:
+          1. ``endstop_hit_mask`` filtered on axes in ``_endstop_armed_axes``
+             (canonical firmware signal, R2: only match bits for armed axes).
+          2. Fallback: CLOSED lateral state + axis stopped, for armed axes.
+          3. ``segments_dropped`` delta + any armed axis stopped (queue drop
+             can indicate endstop; only fires when correlated with a stopped
+             axis to avoid false positives from planner pressure alone).
         """
-        armed_mask = int(getattr(status, "endstop_armed_mask", 0))
-        lateral_state = int(getattr(status, "lateral_endstop_state", 0xFF))
-        endstop_expected = armed_mask != 0 or bool(self._endstop_armed_axes)
-        running_mask = int(getattr(status, "running_mask", 0))
-        any_armed_axis_stopped = any(
-            (running_mask & (1 << axis_id)) == 0
-            for axis_id in self._endstop_armed_axes
-        )
-        if (
-            lateral_state == LATERAL_ENDSTOP_PRESENT_CLOSED
-            and endstop_expected
-            and (any_armed_axis_stopped or armed_mask == 0)
-        ):
-            self._mark_endstop_triggered()
-            return True
+        armed_mask   = int(getattr(status, "endstop_armed_mask", 0))
+        lateral_state = int(getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT))
+        running_mask  = int(getattr(status, "running_mask", 0))
+        hit_mask      = int(getattr(status, "endstop_hit_mask", 0))
+
+        # R2: signal canonique filtré sur les axes réellement armés côté host.
+        # Un bit résiduel sur un axe non armé (e.g. bug R1 non encore corrigé
+        # sur firmware plus ancien) ne déclenche plus de faux endstop.
+        for axis_id in self._endstop_armed_axes:
+            if hit_mask & (1 << axis_id):
+                self._mark_endstop_triggered()
+                return True
+
+        # Fallback : capteur fermé + axe armé arrêté
+        for axis_id in self._endstop_armed_axes:
+            axis_stopped = (running_mask & (1 << axis_id)) == 0
+            if lateral_state == LATERAL_ENDSTOP_PRESENT_CLOSED and axis_stopped:
+                self._mark_endstop_triggered()
+                return True
+
+        # segments_dropped uniquement si un axe armé est aussi arrêté
+        dropped_now = int(getattr(status, "segments_dropped", 0))
+        if self._endstop_armed_axes and dropped_now > self._last_segments_dropped:
+            any_armed_stopped = any(
+                (running_mask & (1 << a)) == 0
+                for a in self._endstop_armed_axes
+            )
+            if any_armed_stopped:
+                self._mark_endstop_triggered()
+                return True
+        # Toujours mettre à jour _last_segments_dropped, même hors déclenchement
+        self._last_segments_dropped = dropped_now
+
         return False
 
     def note_endstop_armed(self, axis_id: int, arm: bool) -> None:
@@ -607,7 +631,11 @@ class MultiAxisRampStreamer:
         if self._endstop_triggered:
             return
         self._endstop_triggered = True
-        flush_seq = self._last_sent_motion_seq
+        flush_seq = self._last_confirmed_motion_seq
+        if flush_seq < 0:
+            flush_seq = self._last_sent_motion_seq
+        if flush_seq < 0:
+            flush_seq = 0xFFFF
         self.request_stop()
         self.request_flush(flush_seq)
 
@@ -667,6 +695,11 @@ class MultiAxisRampStreamer:
     @property
     def endstop_triggered(self) -> bool:
         return self._endstop_triggered
+
+    @property
+    def last_sent_motion_seq(self) -> int:
+        """Last motion sequence number sent to the firmware (or -1 if none)."""
+        return self._last_sent_motion_seq
 
     # -- Stop / flush ----------------------------------------------------------
 
@@ -749,6 +782,7 @@ class MultiAxisRampStreamer:
             transport_seq,
             poll_interval_s=self._poll_interval_s,
         )
+        self._update_confirmed_motion_sequence(ack_status)
 
         if ack_status.last_result == int(SpiMessageResult.OK):
             self._retry_batch = None
@@ -834,6 +868,7 @@ class MultiAxisRampStreamer:
     def stream_all(self) -> int:
         self._generator_finished = False
         status = self._transport.get_status()
+        self._update_confirmed_motion_sequence(status)
         axes_enabled = False
         total_segments = 0
 
@@ -841,6 +876,7 @@ class MultiAxisRampStreamer:
             self._enable_axes()
             axes_enabled = True
             status = self._transport.get_status()
+            self._update_confirmed_motion_sequence(status)
 
             self._check_endstop(status)
             if not self._stop_requested:

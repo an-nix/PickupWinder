@@ -254,6 +254,7 @@ void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
 
     if (triggered) {
         drv->endstop_active_.store(true, std::memory_order_release);
+        drv->endstop_hit_count_.fetch_add(1, std::memory_order_relaxed);
         // Wake the executor task so it drains the pipeline immediately.
         BaseType_t woken = pdFALSE;
         TaskHandle_t exec = drv->executor_task_.load(std::memory_order_relaxed);
