@@ -9,7 +9,7 @@ from core.config import AppConfiguration
 from core.events import EventBus
 from core.shared_state import SharedState
 from motion.axis_state import AxisLimits, AxisState
-from motion.engine import WindingEngine
+from core import WindingEngine
 from transport.spi_transport import Esp32SpiTransport
 from jsonrpc import AppRpcHandler, JsonRpcServer
 from jsonrpc.winding_handler import WindingRpcHandler
