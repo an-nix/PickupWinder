@@ -110,3 +110,5 @@ Default JSON-RPC socket:
 - Generated plots and segment JSON outputs belong under `doc/generated/`.
 - `resources/` and `migration/` are reference trees, not active runtime code.
 - ESP32 firmware is ESP-IDF (`app_main()`), not Arduino.
+
+# L.É.A. — Logiciel d’Enroulement Automatisé  
