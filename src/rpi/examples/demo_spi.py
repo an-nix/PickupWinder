@@ -108,7 +108,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PickupWinder SPI ramp streaming demo")
     parser.add_argument("--bus", type=int, default=0)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--speed-hz", type=int, default=4_000_000)
+    parser.add_argument("--speed-hz", type=int, default=1_000_000)
     parser.add_argument("--axis", type=int, default=0)
     parser.add_argument(
         "--sync-mode",

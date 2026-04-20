@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -116,9 +117,20 @@ public:
     /** @brief Const access to the bound driver. */
     const StepperDriver& driver() const { return driver_; }
 
+    /** @brief Mark this axis as being actively driven by the multi-axis executor. */
+    void setMultiExecActive(bool active) {
+        multi_exec_active_.store(active, std::memory_order_release);
+    }
+
+    /** @brief True when the multi-axis executor currently owns this driver. */
+    bool isMultiExecActive() const {
+        return multi_exec_active_.load(std::memory_order_acquire);
+    }
+
 private:
     StepperDriver& driver_;
     uint8_t        motor_id_;
+    std::atomic<bool> multi_exec_active_ {false};
 
     QueueHandle_t  queue_  {nullptr};
     TaskHandle_t   task_   {nullptr};

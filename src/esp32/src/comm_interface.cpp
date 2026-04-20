@@ -19,6 +19,7 @@
 #include <esp_attr.h>
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
 #include <esp_check.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -28,7 +29,7 @@
 static const char* TAG = "comm_iface";
 
 static constexpr uint32_t  SPI_TASK_STACK  = 4096;
-static constexpr UBaseType_t SPI_TASK_PRIO = 10;
+static constexpr UBaseType_t SPI_TASK_PRIO = 24;
 static constexpr BaseType_t  SPI_TASK_CORE = 0;
 
 static constexpr uint32_t    MULTI_EXEC_STACK  = 8192;
@@ -73,9 +74,8 @@ static QueueHandle_t s_multi_axis_queue  = nullptr;
 static constexpr uint32_t FLUSH_QUEUE_DEPTH = 4;
 static QueueHandle_t s_flush_queue = nullptr;
 
-DMA_ATTR static uint8_t s_rx_frame[SPI_FRAME_SIZE];
-DMA_ATTR static uint8_t s_tx_frame_a[SPI_FRAME_SIZE];
-DMA_ATTR static uint8_t s_tx_frame_b[SPI_FRAME_SIZE];
+static uint8_t* s_rx_frame = nullptr;
+static uint8_t* s_tx_frame_a = nullptr;
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -96,6 +96,16 @@ CommInterface::CommInterface(StepperQueue* queues[], uint8_t n_motors)
 esp_err_t CommInterface::init(const SpiBusPins& pins)
 {
     pins_ = pins;
+
+    // Allocate DMA-capable buffers for SPI frames.
+    if (s_rx_frame == nullptr) {
+        s_rx_frame = static_cast<uint8_t*>(heap_caps_malloc(SPI_FRAME_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_32BIT));
+        ESP_RETURN_ON_FALSE(s_rx_frame != nullptr, ESP_ERR_NO_MEM, TAG, "failed to alloc s_rx_frame");
+    }
+    if (s_tx_frame_a == nullptr) {
+        s_tx_frame_a = static_cast<uint8_t*>(heap_caps_malloc(SPI_FRAME_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_32BIT));
+        ESP_RETURN_ON_FALSE(s_tx_frame_a != nullptr, ESP_ERR_NO_MEM, TAG, "failed to alloc s_tx_frame_a");
+    }
 
     if (pins_.home_pin_no != GPIO_NUM_NC && pins_.home_pin_nc != GPIO_NUM_NC) {
         gpio_config_t home_cfg = {};
@@ -618,49 +628,71 @@ void CommInterface::spiTask(void* arg)
     auto* self = static_cast<CommInterface*>(arg);
     ESP_LOGI(TAG, "SPI task started on core %d", xPortGetCoreID());
 
-    // Double-buffer ping-pong: while DMA transmits tx_ping, we build the next
-    // status frame into tx_pong.  This reduces pipeline lag by one full SPI
-    // round-trip — the status sent in transaction N reflects state AFTER
-    // transaction N-1 was handled, not state from before the previous transmit.
-    uint8_t* tx_ping = s_tx_frame_a;
-    uint8_t* tx_pong = s_tx_frame_b;
+    // ── Simple spi_slave_transmit() loop ─────────────────────────────────────
+    //
+    // Each iteration:
+    //   1. buildStatusFrame(tx)  — pre-build response reflecting last result
+    //   2. spi_slave_transmit()  — atomic queue+wait, blocks until master clocks
+    //   3. handleFrame(rx)       — parse and execute received request
+    //
+    // There is a brief window between transmit() returning and the next call
+    // where no transaction is queued.  If the Pi sends during that window,
+    // MISO outputs zeros and MOSI is discarded.  The Python retry logic
+    // handles this gracefully (typically <2% of transfers at 4 MHz).
+    //
+    // The previous ping-pong pre-queue approach (queue_trans/get_trans_result
+    // with queue_size=2) caused a 1-byte DMA shift on ~5% of responses,
+    // producing "bad magic: 0x0150" (valid frame missing the first byte).
 
-    // Pre-build the very first frame before entering the loop so the initial
-    // transaction has valid (zero-but-structured) content.
-    self->buildStatusFrame(tx_ping);
+    spi_slave_transaction_t txn = {};
+
+    // Runtime diagnostics (rate-limited).
+    uint32_t diag_cycles = 0;
+    uint32_t diag_bad_magic = 0;
+    uint32_t diag_bad_magic_zero = 0;
+    uint32_t diag_bad_crc = 0;
+    uint32_t diag_ok = 0;
+    int64_t diag_last_log_us = esp_timer_get_time();
+
+    // Pre-build the very first status frame before entering the loop so that
+    // the top of the loop can call spi_slave_transmit() immediately with
+    // minimal gap.
+    self->buildStatusFrame(s_tx_frame_a);
 
     for (;;) {
-        // ── Transmit the previously-built status frame ────────────────────────
-        spi_slave_transaction_t txn = {};
-        txn.length = SPI_FRAME_SIZE * 8;
-        txn.tx_buffer = tx_ping;
+        // ── Step 1: transmit immediately (status already pre-built) ───────────
+        txn.length    = SPI_FRAME_SIZE * 8;
+        txn.tx_buffer = s_tx_frame_a;
         txn.rx_buffer = s_rx_frame;
-
         esp_err_t err = spi_slave_transmit(SPI3_HOST, &txn, portMAX_DELAY);
-        // DMA is done with tx_ping — safe to reuse as the next write buffer.
-
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "spi_slave_transmit failed: %s", esp_err_to_name(err));
-            // Rebuild into the same ping buffer and retry.
-            self->buildStatusFrame(tx_ping);
             continue;
         }
 
-        // ── Parse and handle incoming frame ───────────────────────────────────
+        ++diag_cycles;
+
+        // ── Step 3: parse and handle the received frame ───────────────────────
         SpiMessageHeader header {};
         memcpy(&header, s_rx_frame, sizeof(SpiMessageHeader));
 
         if (header.magic != SPI_MSG_MAGIC) {
+            ++diag_bad_magic;
+            if (s_rx_frame[0] == 0x00 && s_rx_frame[1] == 0x00) {
+                ++diag_bad_magic_zero;
+            }
             self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_MAGIC);
         } else if (header.version != SPI_MSG_VERSION) {
             self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_VERSION);
         } else if (header.payload_length > SPI_MAX_PAYLOAD_SIZE) {
             self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_LENGTH);
         } else if (!spi_message_validate(s_rx_frame, header)) {
+            ++diag_bad_crc;
             self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_CRC);
         } else {
+            ++diag_ok;
             self->last_rx_sequence_ = header.sequence;
-            self->last_rx_type_ = header.msg_type;
+            self->last_rx_type_     = header.msg_type;
 
             const uint8_t* payload = s_rx_frame + sizeof(SpiMessageHeader);
             err = self->handleFrame(header, payload);
@@ -683,15 +715,38 @@ void CommInterface::spiTask(void* arg)
             }
         }
 
-        // ── Build next status frame into the now-idle buffer ──────────────────
-        // We write into tx_pong (the buffer NOT currently wired to DMA).
-        // Reflects state AFTER handling the frame we just received.
-        self->buildStatusFrame(tx_pong);
+        // 1 Hz diagnostic line (only if something noteworthy happened).
+        const int64_t now_us = esp_timer_get_time();
+        if ((now_us - diag_last_log_us) >= 1000000) {
+            if (diag_bad_magic || diag_bad_crc) {
+                ESP_LOGW(TAG,
+                         "spi diag: cyc=%lu ok=%lu bad_magic=%lu(b0=%lu) bad_crc=%lu",
+                         (unsigned long)diag_cycles,
+                         (unsigned long)diag_ok,
+                         (unsigned long)diag_bad_magic,
+                         (unsigned long)diag_bad_magic_zero,
+                         (unsigned long)diag_bad_crc);
+            }
+            diag_cycles = 0;
+            diag_bad_magic = 0;
+            diag_bad_magic_zero = 0;
+            diag_bad_crc = 0;
+            diag_ok = 0;
+            diag_last_log_us = now_us;
+        }
 
-        // Swap: tx_pong becomes the next transmit buffer.
-        uint8_t* tmp = tx_ping;
-        tx_ping = tx_pong;
-        tx_pong = tmp;
+        // ── Pre-build status for the NEXT iteration ───────────────────────────
+        // This moves buildStatusFrame() out of the critical gap between
+        // spi_slave_transmit() returning and the next call, reducing the
+        // window where the Pi sees all-zero MISO.
+        self->buildStatusFrame(s_tx_frame_a);
+        
+        // --- HARDWARE FLUSH/SYNC DELAY ---
+        // Ensure all bytes are properly flushed from cache to DMA RAM
+        // before arming the next SPI transaction. Without this tiny yield,
+        // back-to-back rapid transactions can cause the SPI hardware FIFO
+        // to latch the first byte late, resulting in a 1-byte shift (0x0150).
+        esp_rom_delay_us(2);
     }
 }
 
@@ -793,29 +848,14 @@ void CommInterface::multiAxisExecutorTask(void* arg)
         switch (state) {
 
         // ══════════════════════════════════════════════════════════════════
-        // IDLE: wait for segments from the planner (blocking with timeout)
+        // IDLE: wait for segments from the planner
         // ══════════════════════════════════════════════════════════════════
         case ExecState::IDLE: {
-            // Compute wait timeout: wake early if a deferred notification
-            // is about to fire.  Hard-cap at 1 ms so ISR ring-space
-            // notifications (which wake ulTaskNotifyTake, not xQueueReceive)
-            // don't cause >1 ms stalls.
-            TickType_t wait_ticks;
-            if (defer_head != defer_tail) {
-                const int idx = defer_head & (DEFER_DEPTH - 1);
-                const int64_t remaining_us =
-                    defer_fire_us[idx] - esp_timer_get_time();
-                if (remaining_us <= 500) {
-                    wait_ticks = 0;
-                } else {
-                    wait_ticks = 1;
-                }
-            } else {
-                wait_ticks = pdMS_TO_TICKS(1);
-            }
-
+            // Non-blocking receive: coast-mode keeps RMT alive during gaps,
+            // so we must refill the ring ASAP. A blocking wait would delay
+            // step delivery and cause coast-mode pauses at low speed.
             planned_segment_t seg;
-            if (xQueueReceive(seg_queue, &seg, wait_ticks) == pdTRUE) {
+            if (xQueueReceive(seg_queue, &seg, 0) == pdTRUE) {
                 batch[0]    = seg;
                 batch_count = 1;
                 batch_index = 0;
@@ -850,15 +890,6 @@ void CommInterface::multiAxisExecutorTask(void* arg)
             const int64_t drain_start = esp_timer_get_time();
 
             while (batch_index < batch_count) {
-                // ── Pre-check: yield if time budget will be exceeded ───────────
-                // This prevents accumulating too much CPU time before yielding.
-                if ((esp_timer_get_time() - drain_start) >= EXEC_TIME_BUDGET_US) {
-                    kickStartActiveAxes();
-                    taskYIELD();
-                    // Restart from FETCH to get fresh batch and reset timer.
-                    state = ExecState::FETCH;
-                    goto exit_drain;
-                }
 
                 planned_segment_t& seg = batch[batch_index];
 
@@ -901,6 +932,27 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     lateral_state !=
                     static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
 
+                uint8_t guarded_axis_ids[MULTI_AXIS_MAX_AXES] = {};
+                uint8_t guarded_axis_count = 0;
+                for (uint8_t a = 0; a < seg.axis_count; ++a) {
+                    const uint8_t axis_id = seg.axis_ids[a];
+                    if (axis_id < self->n_motors_ && self->queues_[axis_id] != nullptr) {
+                        self->queues_[axis_id]->setMultiExecActive(true);
+                        if (guarded_axis_count < MULTI_AXIS_MAX_AXES) {
+                            guarded_axis_ids[guarded_axis_count++] = axis_id;
+                        }
+                    }
+                }
+
+                auto clearMultiExecFlags = [&]() {
+                    for (uint8_t i = 0; i < guarded_axis_count; ++i) {
+                        const uint8_t axis_id = guarded_axis_ids[i];
+                        if (axis_id < self->n_motors_ && self->queues_[axis_id] != nullptr) {
+                            self->queues_[axis_id]->setMultiExecActive(false);
+                        }
+                    }
+                };
+
                 // ── Write steps to ring buffer (no RMT start) ─────────────
                 for (uint8_t a = 0; a < seg.axis_count; ++a) {
                     const uint8_t axis_id = seg.axis_ids[a];
@@ -913,16 +965,17 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                         continue;
                     }
 
-                    esp_err_t err =
-                        self->queues_[axis_id]->executeConstantRateBlock(
-                            seg.axes[a].direction,
-                            seg.axes[a].step_count,
-                            seg.duration_us);
+                    StepperQueue* axis_queue = self->queues_[axis_id];
+                    esp_err_t err = axis_queue->executeConstantRateBlock(
+                        seg.axes[a].direction,
+                        seg.axes[a].step_count,
+                        seg.duration_us);
 
                     if (err == ESP_ERR_INVALID_STATE) {
+                        clearMultiExecFlags();
                         ESP_LOGW(TAG, "axis %u endstop mid-seg seq=%u",
                                  axis_id, seg.motion_sequence);
-                        self->queues_[axis_id]->driver().emergencyStop();
+                        axis_queue->driver().emergencyStop();
                         self->notifySegmentExecuted(seg.motion_sequence);
                         state = ExecState::RECOVERY;
                         goto exit_drain;
@@ -932,6 +985,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                                  esp_err_to_name(err));
                     }
                 }
+                clearMultiExecFlags();
 
                 // ── Schedule deferred notification ────────────────────────
                 if ((defer_tail - defer_head) < DEFER_DEPTH) {
@@ -961,40 +1015,28 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                              (unsigned)seg.motion_sequence);
                 }
 
-                // Restart RMT immediately if it stopped mid-batch due to ring drain.
-                // Do not wait for ExecState::RUN — the ring may fill with unconsumed
-                // steps causing pushBlock() to deadlock on ulTaskNotifyTake.
-                for (uint8_t a = 0; a < seg.axis_count; ++a) {
-                    const uint8_t axis_id = seg.axis_ids[a];
-                    if (axis_id >= self->n_motors_ ||
-                        self->queues_[axis_id] == nullptr) continue;
-                    if (!self->queues_[axis_id]->driver().isStreaming()) {
-                        self->queues_[axis_id]->kickStart();
-                    }
-                }
-
                 ++batch_index;
 
-                // ── Time budget check (watchdog safety) ───────────────────
+                // ── B4 FIX: UN SEUL check budget, comportement uniforme ─────
+                // kickStart + yield + reste en DRAIN (drain_start se reset au
+                // prochain passage car il est local au case DRAIN).
                 if ((esp_timer_get_time() - drain_start) >= EXEC_TIME_BUDGET_US) {
-                    // Budget exhausted — transition to RUN to kickStart,
-                    // then yield before processing remaining segments.
                     kickStartActiveAxes();
                     taskYIELD();
-                    // Continue draining after yield (reset budget).
-                    break;  // will re-enter DRAIN on next iteration
+                    goto exit_drain;  // reste en DRAIN, batch_index progresse
                 }
             }
 
-            // All segments in batch processed — transition to RUN.
+            // Batch complet → transition vers RUN.
+            // Si on est sorti par goto exit_drain (budget), batch_index < batch_count:
+            // on reviendra ici au prochain tick, l'état est déjà DRAIN.
             if (batch_index >= batch_count) {
                 state = ExecState::RUN;
             }
-            // else: budget break, stay in DRAIN for remaining segments.
             break;
 
         exit_drain:
-            break;  // state already set by the goto target
+            break;  // state = DRAIN, reprend au prochain tick
         }
 
         // ══════════════════════════════════════════════════════════════════

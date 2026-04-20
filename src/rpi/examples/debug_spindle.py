@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spi-device", default="/dev/spidev0.0")
     parser.add_argument("--bus", type=int, default=None)
     parser.add_argument("--device", type=int, default=None)
-    parser.add_argument("--speed-hz", type=int, default=4_000_000)
+    parser.add_argument("--speed-hz", type=int, default=1_000_000)
     parser.add_argument("--poll-interval", type=float, default=0.1)
     parser.add_argument("--poll-duration", type=float, default=10.0)
     parser.add_argument("--enable-axis", type=int, default=None,

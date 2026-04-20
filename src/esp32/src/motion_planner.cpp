@@ -35,7 +35,7 @@ static const char* TAG = "planner";
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t    PLANNER_STACK = 4096;
-static constexpr UBaseType_t PLANNER_PRIO  = 12;  // Above SPI (10), above idle
+static constexpr UBaseType_t PLANNER_PRIO  = 8;   // Below SPI (10), above idle
 static constexpr BaseType_t  PLANNER_CORE  = 0;   // Same core as SPI task
 
 /** Max blocks drained from cmd_queue_ during a single flush operation. */
@@ -178,9 +178,11 @@ void MotionPlanner::plannerTask(void* arg)
             }
         }
 
-        // 3) If we don't have a pending block, try to pull one non-blocking.
+        // 3) Block on cmd_queue_ until data arrives or CMD_POLL_TIMEOUT (5 ms).
+        //    Previously used timeout=0 (non-blocking) + vTaskDelay(1) which
+        //    caused a 10 ms sleep at 100 Hz tick rate, starving the motor.
         if (!self->has_pending_block_) {
-            if (xQueueReceive(self->cmd_queue_, &block, 0) == pdTRUE) {
+            if (xQueueReceive(self->cmd_queue_, &block, CMD_POLL_TIMEOUT) == pdTRUE) {
                 // Store for incremental expansion.
                 self->pending_block_ = block;
                 self->pending_segment_idx_ = 0;
@@ -240,12 +242,18 @@ void MotionPlanner::plannerTask(void* arg)
             }
         }
 
-        // 5) Yield behavior: if we processed nothing, sleep briefly to let
-        //    IDLE0 and other low-priority tasks run and reset the watchdog.
-        if (processed == 0) {
-            vTaskDelay(1);
-        } else {
+        // 5) Yield so higher-priority tasks (SPI task pri=24, executor pri=20)
+        //    get CPU immediately after any batch of work.
+        //    If nothing was processed AND xQueueReceive returned immediately
+        //    (no pending block and empty cmd_queue), do a minimal 1-tick sleep
+        //    (= 1ms at CONFIG_FREERTOS_HZ=1000) to avoid a busy-loop that
+        //    creates DMA timing jitter on Core 0 and causes 0x0150 bad magic.
+        if (processed > 0) {
             taskYIELD();
+        } else if (!self->has_pending_block_) {
+            // No data arriving — sleep 1 tick rather than spin.
+            // At 1000Hz this is 1ms; short enough to not starve the motor.
+            vTaskDelay(1);
         }
     }
 }

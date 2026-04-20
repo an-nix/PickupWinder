@@ -19,23 +19,34 @@ static const char* TAG = "stepper_driver";
 // encode_steps() — simple_encoder callback, runs in ISR context (IRAM)
 // ---------------------------------------------------------------------------
 //
+// ── COAST MODE ─────────────────────────────────────────────────────────────
+// The RMT transaction is NEVER stopped due to an empty ring buffer.
+// When the ring is empty, the callback emits LOW-level pause symbols
+// ("coasting") and increments a pause counter.  As soon as new data
+// arrives in the ring, the next callback seamlessly resumes emitting
+// step pulses — zero restart overhead.
+//
+// The transaction is only terminated by:
+//   1. An explicit stop request (rmt_stopped_ = true)
+//   2. An endstop trigger
+//   3. An idle timeout (COAST_IDLE_LIMIT consecutive empty callbacks)
+//
+// This eliminates the stop/restart cycle that caused ~200-500 µs gaps
+// between segments at low speed, which was the primary source of
+// underruns and audible stutter.
+//
 // RMT clock: 80 MHz (1 tick = 12.5 ns).
-// Called by the RMT driver whenever it needs more symbols. Reads up to
-// PART_SIZE=16 entries from the ring buffer and converts each to one
-// rmt_symbol_word_t with a FastAccelStepper-style balanced pulse:
-//   HIGH = ticks / 2         (rounded down)
-//   LOW  = ticks − HIGH
-// Both halves are clamped to >= RMT_STEP_PULSE_TICKS (8) = 100 ns,
-// which meets A4988/DRV8825 STEP pulse width requirements.
-//
-// Direction changes:
-//   If a ring entry has toggle_dir=1 and the previous chunk contained steps,
-//   emit a pause chunk first (to meet driver IC setup time), then toggle
-//   DIR on the next callback invocation.
-//
-// On starvation, the callback follows the same conservative policy as
-// FastAccelStepper's ESP32 IDF5 backend: emit one LOW-level pause chunk,
-// arm stop, and let the next callback finish the transaction.
+// PART_SIZE = 8: one callback per 8 symbols.
+
+/** Number of consecutive empty-ring callbacks before auto-stopping.
+ *  At 80 MHz with MIN_CMD_TICKS=400: each coast callback emits 8 symbols of
+ *  50 ticks each = 400 ticks = 5 µs per callback.
+ *  250000 callbacks × 5 µs = 1.25 seconds of idle before auto-stop.
+ *
+ *  The previous value of 6250 was only 31.25 ms — far too short. Any brief
+ *  segment-queue starvation or Python GC pause on the Pi Zero could empty
+ *  the ring for 31 ms and stop the motor mid-move. */
+static constexpr uint32_t COAST_IDLE_LIMIT = 250000;
 
 extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
                                           size_t /*data_size*/,
@@ -51,30 +62,35 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         return 0;  // Wait for more space
     }
 
-    uint32_t rd = drv->ring_read_.load(std::memory_order_acquire);
-    uint32_t wr = drv->ring_write_.load(std::memory_order_acquire);
-
-    // Check for explicit stop request
+    // ── Explicit stop request ────────────────────────────────────────────
     if (drv->rmt_stopped_.load(std::memory_order_relaxed)) {
         *done = true;
         return 0;
     }
 
-    // Check for endstop trigger — stop immediately without emitting any
-    // further step pulses. The ring is NOT reset here; emergencyStop() is
-    // called from the executor task after it detects endstop_active_.
+    // ── Endstop trigger — immediate stop ─────────────────────────────────
     if (drv->endstop_active_.load(std::memory_order_relaxed)) {
         drv->rmt_stopped_.store(true, std::memory_order_relaxed);
         *done = true;
         return 0;
     }
 
-    // Ring empty — emit one LOW-level pause chunk, arm stop, and let the
-    // next callback terminate the transmission.
+    uint32_t rd = drv->ring_read_.load(std::memory_order_acquire);
+    uint32_t wr = drv->ring_write_.load(std::memory_order_acquire);
+
+    // ── Ring empty — COAST: emit pause symbols, keep transaction alive ───
     if (rd == wr) {
         drv->last_chunk_had_steps_ = false;
-        drv->ring_underrun_count_.fetch_add(1, std::memory_order_relaxed);
-        drv->rmt_stopped_.store(true, std::memory_order_relaxed);
+        drv->coast_idle_count_++;
+
+        // After extended idle, auto-stop the transaction to free RMT resources.
+        if (drv->coast_idle_count_ >= COAST_IDLE_LIMIT) {
+            drv->rmt_stopped_.store(true, std::memory_order_relaxed);
+            *done = true;
+            return 0;
+        }
+
+        // Emit pause symbols (LOW level, ~25 µs each).
         uint16_t t = static_cast<uint16_t>((MIN_CMD_TICKS + 2 * PART_SIZE - 1) / (2 * PART_SIZE));
         for (uint32_t i = 0; i < PART_SIZE; i++) {
             symbols[i].level0    = 0;
@@ -82,15 +98,22 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             symbols[i].level1    = 0;
             symbols[i].duration1 = t;
         }
+
+        // Notify producer/executor so they can refill the ring.
+        TaskHandle_t prod = drv->producer_task_.load(std::memory_order_relaxed);
+        TaskHandle_t exec = drv->executor_task_.load(std::memory_order_relaxed);
+        BaseType_t woken = pdFALSE;
+        if (prod != nullptr) vTaskNotifyGiveFromISR(prod, &woken);
+        if (exec != nullptr && exec != prod) vTaskNotifyGiveFromISR(exec, &woken);
+        if (woken == pdTRUE) portYIELD_FROM_ISR();
+
         return PART_SIZE;
     }
 
-    // Data is available after underrun — clear the stop flag so we can continue
-    // encoding. This handles the case where the ring was empty, we emitted a
-    // pause, and now new data has arrived before on_trans_done_isr fires.
-    drv->rmt_stopped_.store(false, std::memory_order_relaxed);
+    // ── Ring has data — reset idle counter ───────────────────────────────
+    drv->coast_idle_count_ = 0;
 
-    // Peek at next entry — check for direction change
+    // ── Direction change handling ────────────────────────────────────────
     ring_entry_t* entry = &drv->ring_[rd & STEP_RING_MASK];
     if (entry->toggle_dir) {
         if (drv->last_chunk_had_steps_) {
@@ -112,7 +135,7 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         entry->toggle_dir = 0;
     }
 
-    // Fill PART_SIZE symbols from ring buffer
+    // ── Fill PART_SIZE symbols from ring buffer ──────────────────────────
     bool has_steps = false;
     for (uint32_t i = 0; i < PART_SIZE; i++) {
         if (rd != wr) {
@@ -151,10 +174,11 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             rd++;
             has_steps = true;
         } else {
-            // Ring exhausted mid-chunk — pad the remainder with a pause chunk,
-            // arm stop, and let the next callback terminate the transaction.
+            // Ring exhausted mid-chunk — pad remainder with pause (coast).
+            // Do NOT set rmt_stopped_. The next callback will coast or
+            // resume from new data.  Count this as a soft underrun for
+            // diagnostics only.
             drv->ring_underrun_count_.fetch_add(1, std::memory_order_relaxed);
-            drv->rmt_stopped_.store(true, std::memory_order_relaxed);
             uint16_t t = static_cast<uint16_t>((MIN_CMD_TICKS + 2 * PART_SIZE - 1) / (2 * PART_SIZE));
             for (uint32_t j = i; j < PART_SIZE; j++) {
                 symbols[j].level0    = 0;
@@ -381,6 +405,7 @@ void StepperDriver::emergencyStop()
     rmt_running_.store(false, std::memory_order_relaxed);
     rmt_stopped_.store(true, std::memory_order_relaxed);
     last_chunk_had_steps_ = false;
+    coast_idle_count_ = 0;
 
     ESP_LOGW(TAG, "motor%u: emergency stop", motor_id_);
 }
@@ -410,6 +435,7 @@ esp_err_t StepperDriver::startStream()
     rmt_running_.store(true, std::memory_order_release);
     rmt_stopped_.store(false, std::memory_order_release);
     last_chunk_had_steps_ = false;
+    coast_idle_count_ = 0;
 
     // `this` is in internal DRAM (static global) — passes esp_ptr_internal()
     // check. sizeof(*this) > 0 passes payload_bytes != 0. The callback ignores
@@ -446,12 +472,6 @@ void StepperDriver::gracefulStop()
 
 esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t caller_task)
 {
-    if (ring_underrun_count_.load(std::memory_order_relaxed) > 0) {
-        ESP_LOGW(TAG, "motor%u: ring underrun x%lu since last pushBlock",
-                 motor_id_, (unsigned long)ring_underrun_count_.load(std::memory_order_relaxed));
-        ring_underrun_count_.store(0, std::memory_order_relaxed);
-    }
-
     if (block.count == 0) {
         return ESP_OK;
     }
@@ -491,20 +511,29 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
         // Back-pressure: wait until the encoder ISR has consumed at least one
         // chunk and notified this producer task. This avoids a CPU1 spin loop
         // and keeps the task watchdog satisfied.
+        //
+        // B2 FIX: deadlock guard — si startStream() échoue (trans_queue pleine),
+        // l'ISR ne fire jamais et ring_read_ ne progresse pas. Retour d'erreur
+        // explicite après 20 tentatives (20 × 5 ms = 100 ms max).
+        static constexpr uint8_t PUSH_RETRY_MAX = 20;
+        uint8_t push_retry_count = 0;
+
         while (ringFree() == 0) {
-            // The endstop ISR also notifies this task.  If it fires while we
-            // are blocked here, break out immediately instead of spinning.
             if (endstop_active_.load(std::memory_order_acquire)) {
                 return ESP_ERR_INVALID_STATE;
             }
-            // If RMT is not running and ring is full, the encoder callback
-            // will never fire and ring_read_ will never advance.
-            // Kick startStream() directly instead of waiting forever.
             if (!rmt_running_.load(std::memory_order_acquire)) {
                 esp_err_t kick_err = startStream();
                 if (kick_err != ESP_OK) {
                     ESP_LOGW(TAG, "motor%u: pushBlock kick startStream: %s",
                              motor_id_, esp_err_to_name(kick_err));
+                    ++push_retry_count;
+                    if (push_retry_count >= PUSH_RETRY_MAX) {
+                        ESP_LOGE(TAG,
+                                 "motor%u: pushBlock timeout — ring full, RMT won't start",
+                                 motor_id_);
+                        return ESP_ERR_TIMEOUT;
+                    }
                 }
             }
             ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(5));

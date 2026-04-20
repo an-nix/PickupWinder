@@ -8,6 +8,8 @@ class AppConfiguration:
 
     rpc_socket_path: str = "/tmp/pickup_winder_rpc.sock"
     spi_device: str = "/dev/spidev0.0"
+    # Protocol target is 4 MHz (mode 0).  1 MHz significantly reduces
+    # effective segment throughput and can starve the executor at higher RPM.
     spi_speed_hz: int = 1_000_000
 
     spindle_axis_id: int = 0

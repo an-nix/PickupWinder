@@ -93,9 +93,19 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Block size     : %d steps   Queue depth : %d blocks",
              STEP_BLOCK_SIZE, STEPPER_QUEUE_DEPTH);
 
-    // ── 1. Initialise RMT drivers ───────────────────────────────────────────
-    ESP_ERROR_CHECK(motor_a.init());
-    ESP_ERROR_CHECK(motor_b.init());
+    // ── 1. Initialise RMT drivers on Core 1 ─────────────────────────────────
+    // RMT interrupts are registered on the core that calls the init function.
+    // By doing this on Core 1, we prevent the 40 kHz RMT ISRs from starving
+    // the SPI task and its hardware interrupts on Core 0.
+    struct InitTask {
+        static void run(void*) {
+            ESP_ERROR_CHECK(motor_a.init());
+            ESP_ERROR_CHECK(motor_b.init());
+            vTaskDelete(nullptr);
+        }
+    };
+    xTaskCreatePinnedToCore(InitTask::run, "rmt_init", 4096, nullptr, 20, nullptr, 1);
+    vTaskDelay(pdMS_TO_TICKS(50)); // Wait for core 1 init to complete
 
     // ── 2. Enable motor drivers ─────────────────────────────────────────────
     //motor_a.enable();

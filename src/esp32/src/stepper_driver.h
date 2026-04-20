@@ -5,24 +5,25 @@
  * Converts pre-timed step_block_t arrays into a gapless RMT symbol stream
  * using a simple_encoder callback (FastAccelStepper-style ping-pong).
  *
- * ── Streaming architecture ─────────────────────────────────────────────────
+ * ── Coast-mode streaming architecture ──────────────────────────────────────
  *   Producer (pushBlock, task context):
  *     1. Convert step_block_t → ring_entry_t[] in the lock-free ring buffer.
  *     2. If the ring is full, block on a task notification from the ISR.
- *     3. If RMT is not streaming, start a new rmt_transmit().
  *
  *   Consumer (encode_steps callback, ISR context):
- *     4. RMT hardware calls encode_steps() when it needs more symbols.
- *     5. Callback reads PART_SIZE entries from the ring buffer, converts
- *        each to one rmt_symbol_word_t (PULSE_TICKS HIGH, remainder LOW).
- *     6. On starvation, callback emits one pause chunk, arms stop, and ends
- *        the transaction on the next callback (FastAccelStepper-style).
+ *     3. RMT hardware calls encode_steps() when it needs more symbols.
+ *     4. Callback reads up to PART_SIZE entries from the ring buffer,
+ *        converts each to one rmt_symbol_word_t (balanced pulse).
+ *     5. On empty ring: emit LOW-level PAUSE symbols (coast) — the RMT
+ *        transaction stays alive. No stop/restart overhead.
+ *     6. After COAST_IDLE_LIMIT consecutive empty callbacks (~1.25 s),
+ *        auto-stop the transaction to free RMT resources.
  *
  *   on_trans_done ISR:
- *     7. Marks rmt_running_ = false so the next pushBlock() restarts.
+ *     7. Marks rmt_running_ = false so the next kickStart() restarts.
  *
- *   This eliminates inter-block gaps in the normal case without task-side
- *   busy-wait loops.
+ *   Coast mode eliminates the ~200-500 µs gaps caused by stop/restart
+ *   cycles that were the primary source of underruns at low speed.
  *
  * ── Direction constraint ───────────────────────────────────────────────────
  *   Direction changes are handled in ISR context via gpio_ll (register-level).
@@ -54,11 +55,11 @@ public:
     //   max_rpm = max_step_rate / (steps_per_rev × microsteps)
     //           = 5 000 000 / (200 × 32) = 781 RPM
     //   At cruise 160 kHz: interval_ticks = 80e6 / 160000 = 500 ticks
-    static constexpr uint32_t RMT_CLK_HZ          = 80000000UL;          // 80 MHz
-    static constexpr uint32_t RMT_TICKS_PER_US_C  = RMT_CLK_HZ / 1000000UL; // 80
-    static constexpr uint32_t RMT_PULSE_TICKS_C   = 8U;   // 8 × 12.5 ns = 100 ns HIGH
-    static constexpr uint32_t RMT_MIN_TICKS_C     = 16U;  // 16 × 12.5 ns = 200 ns → 5 MHz ceiling
-    static constexpr uint32_t RMT_MAX_TICKS_C     = 0xFFFFU;
+    //static constexpr uint32_t RMT_CLK_HZ          = 80000000UL;          // 80 MHz
+    //static constexpr uint32_t RMT_TICKS_PER_US_C  = RMT_CLK_HZ / 1000000UL; // 80
+    //static constexpr uint32_t RMT_PULSE_TICKS_C   = 8U;   // 8 × 12.5 ns = 100 ns HIGH
+    //static constexpr uint32_t RMT_MIN_TICKS_C     = 16U;  // 16 × 12.5 ns = 200 ns → 5 MHz ceiling
+    //static constexpr uint32_t RMT_MAX_TICKS_C     = 0xFFFFU;
     /**
      * @brief Construct a StepperDriver.
      *
@@ -164,6 +165,7 @@ public:
     std::atomic<bool>     rmt_stopped_ {true};
     bool                  last_chunk_had_steps_ {false}; /**< Dir-change safety (ISR only) */
     uint16_t              last_ticks_ {RMT_STEP_DEFAULT_TICKS}; /**< Last step interval (ISR only) */
+    uint32_t              coast_idle_count_ {0}; /**< Consecutive empty-ring callbacks (ISR only, coast mode) */
 
     /**
      * @brief Task handle of the current ring producer.
@@ -274,7 +276,8 @@ private:
  * @brief Simple encoder callback — called from ISR context by the RMT driver.
  *
  * Reads up to PART_SIZE entries from the ring buffer and converts them to
- * RMT symbols.  Handles direction changes with safety pauses.
+ * RMT symbols.  Uses coast-mode: on empty ring, emits pause symbols instead
+ * of stopping the RMT transaction, eliminating restart overhead.
  */
 extern "C" size_t encode_steps(const void* data, size_t data_size,
                                           size_t symbols_written,

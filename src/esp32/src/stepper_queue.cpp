@@ -7,6 +7,7 @@
 
 #include <esp_log.h>
 #include <esp_check.h>
+#include <esp_timer.h>
 
 static const char* TAG = "stepper_queue";
 
@@ -158,7 +159,13 @@ esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
 
 esp_err_t StepperQueue::kickStart()
 {
-    return maybeStartDriver(driver_, true);
+    esp_err_t err = maybeStartDriver(driver_, true);
+    if (err != ESP_OK) {
+        // B6: log explicite — diagnostique les échecs RMT silencieux
+        ESP_LOGW(TAG, "motor%u: kickStart failed: %s",
+                 motor_id_, esp_err_to_name(err));
+    }
+    return err;
 }
 
 void StepperQueue::gracefulStop()
@@ -207,6 +214,9 @@ esp_err_t StepperQueue::maybeStartDriver(StepperDriver& driver, bool force_start
 
 esp_err_t StepperQueue::pushExpandedBlock(StepperDriver& driver, const step_block_t& block)
 {
+    // If RMT is not running AND ring is completely full, we must start
+    // streaming to make room.  This is a safety valve only — normally the
+    // executor calls kickStart() after draining a batch.
     if (!driver.isStreaming() && driver.ringFreeSlots() == 0) {
         esp_err_t err = maybeStartDriver(driver, true);
         if (err != ESP_OK) {
@@ -217,11 +227,12 @@ esp_err_t StepperQueue::pushExpandedBlock(StepperDriver& driver, const step_bloc
     // Pass the current task handle so ISR ring-space notifications wake
     // whichever task is currently blocked on this ring (multiAxisExecutorTask
     // or per-axis executorTask).
-    esp_err_t err = driver.pushBlock(block, xTaskGetCurrentTaskHandle());
-    if (err != ESP_OK) {
-        return err;
-    }
-    return maybeStartDriver(driver, false);
+    return driver.pushBlock(block, xTaskGetCurrentTaskHandle());
+
+    // NOTE: maybeStartDriver() is NOT called here.
+    // The executor task calls kickStart() once after draining all available
+    // segments into the ring.  With coast-mode the RMT never stops between
+    // segments, so no restart is needed during normal streaming.
 }
 
 esp_err_t StepperQueue::executeSegmentBlock(StepperDriver& driver, const segment_block_t& block)
@@ -271,10 +282,9 @@ void StepperQueue::executorTask(void* arg)
 
     ESP_LOGI(TAG, "motor%u: executor task started", self->motor_id_);
 
-    constexpr int WORK_BUDGET = 8;  // nombre de blocks à traiter avant pause
+    constexpr int WORK_BUDGET = 8;
 
     for (;;) {
-        // Bloque jusqu'à avoir du travail (parfait 👍)
         if (xQueueReceive(self->queue_, &block, portMAX_DELAY) != pdTRUE) {
             continue;
         }
@@ -282,6 +292,13 @@ void StepperQueue::executorTask(void* arg)
         int work_done = 0;
 
         do {
+            const int64_t loop_start_us = esp_timer_get_time();
+
+            if (self->isMultiExecActive()) {
+                ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(1));
+                continue;
+            }
+
             esp_err_t err = ESP_OK;
 
             if (block.kind == MOTION_BLOCK_KIND_SEGMENT) {
@@ -297,20 +314,18 @@ void StepperQueue::executorTask(void* arg)
 
             work_done++;
 
-            // 🔥 POINT CLÉ : respiration contrôlée
             if (work_done >= WORK_BUDGET) {
                 work_done = 0;
-
-                // Option 1 (rapide)
-                //taskYIELD();
-
-                // Option 2 (ultra safe watchdog)
-                 vTaskDelay(1);
+                const uint32_t ring_free = driver.ringFreeSlots();
+                if (ring_free > (STEP_RING_SIZE / 2U)) {
+                    taskYIELD();
+                } else if ((esp_timer_get_time() - loop_start_us) > 5000) {
+                    taskYIELD();
+                }
             }
 
         } while (xQueueReceive(self->queue_, &block, 0) == pdTRUE);
 
-        // Start uniquement après batch complet (logique déjà bonne 👍)
         esp_err_t err = maybeStartDriver(driver, true);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "motor%u: startStream error: %s",

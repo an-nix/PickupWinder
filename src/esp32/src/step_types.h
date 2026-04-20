@@ -24,8 +24,8 @@
  *   160 kHz target: interval = 80 000 000 / 160 000 = 500 ticks  (6.25 µs)
  *   100 Hz  min   : interval = 800 000 ticks → clamped to 0xFFFF (65535)
  *
- *   PART_SIZE=16: one encoder callback per 16 steps.
- *     At 160 kHz: callback every 100 µs — well within FreeRTOS tick budget.
+ *   PART_SIZE=8: one encoder callback per 8 steps.
+ *     At 160 kHz: callback every 50 µs — well within FreeRTOS tick budget.
  */
 
 #pragma once
@@ -69,15 +69,27 @@ extern "C" {
 // RMT streaming constants (FastAccelStepper-style ping-pong)
 // ---------------------------------------------------------------------------
 
-/** Symbols per ping-pong half-buffer.  Must divide RMT_MEM_SYMBOLS evenly.
- *  Hardware requires `mem_block_symbols` to be even and at least 64, so the
- *  minimum practical PART_SIZE is 32 (2 × PART_SIZE = 64 symbols per channel).
- *  PART_SIZE=32 gives one encoder callback per 32 steps. */
-#define PART_SIZE               32U
+/**
+ * Symbols per encoder callback chunk.
+ *
+ * Smaller PART_SIZE = finer ring consumption granularity = fewer underruns
+ * at low speed where each segment contributes only a handful of steps.
+ * With coast-mode the ISR emits pause symbols instead of stopping when
+ * the ring empties, but small chunks still help because each callback
+ * consumes fewer entries, giving the executor more time to refill.
+ *
+ * PART_SIZE=8 → one callback per 8 steps.
+ * RMT_MEM_SYMBOLS must be >= 64 for IDF constraints, so we set it to 64
+ * independently (the driver calls the callback multiple times per
+ * half-buffer when PART_SIZE < mem_block_symbols/2).
+ */
+#define PART_SIZE               8U
 
-/** Total RMT hardware memory per channel (2 × PART_SIZE for ping-pong).
- *  Must be >= 64 for IDF RMT driver constraints. */
-#define RMT_MEM_SYMBOLS         (2U * PART_SIZE)
+/** Total RMT hardware memory per channel.
+ *  Must be >= 64 for IDF RMT driver constraints.
+ *  Decoupled from PART_SIZE: the encoder callback is invoked multiple
+ *  times per half-buffer fill when PART_SIZE < RMT_MEM_SYMBOLS/2. */
+#define RMT_MEM_SYMBOLS         64U
 
 /**
  * Minimum command duration in ticks (200 µs at 2 MHz = 400 ticks).
@@ -109,18 +121,20 @@ extern "C" {
 /** Number of compressed motion segments per transport block. */
 #define SEGMENT_BLOCK_SIZE      60
 
-/** Buffered step target before starting/restarting the RMT stream.
- *  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE. For
- *  PART_SIZE=32 the minimum safe value is 64. */
-#define STEP_STREAM_START_FILL  64U
+/** Buffered step target before starting the RMT stream.
+ *  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE.
+ *  Raised from 16 to 128 (16 × PART_SIZE): at low-speed ramp-up, the host
+ *  sends ~4 steps/segment; starting RMT with only 16 entries means the ring
+ *  drains after the second ISR callback, causing underrun before the executor
+ *  can refill.  128 entries = ~16 segments of look-ahead, safe at all speeds. */
+#define STEP_STREAM_START_FILL  128U
 
 /**
  * Minimum steps required to RESTART the RMT stream after an underrun.
- * Lower than STEP_STREAM_START_FILL: at low speed the ring drains faster
- * than the inter-segment gap, so we must restart with fewer steps buffered.
- * PART_SIZE/2 = 16 steps guarantees at least one half-callback of data.
+ * With coast-mode this is rarely used (RMT stays running), but kept
+ * as a safety net.  2 × PART_SIZE = 16.
  */
-#define STEP_STREAM_RESTART_FILL  (PART_SIZE / 2U)   // = 16
+#define STEP_STREAM_RESTART_FILL  (2U * PART_SIZE)   // = 16
 
 /**
  * Depth of the FreeRTOS step-block queue (per motor).

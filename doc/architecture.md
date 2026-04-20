@@ -50,13 +50,14 @@ StepperDriver ring buffer
   │  STEP_RING_SIZE = 4096 entries (lock-free SPSC)
   │  Producer: Core 1 (multiAxisExecutorTask) writes ring_write_
   │  Consumer: ISR (encode_steps) reads ring_read_
-  │  Auto-start threshold: STEP_STREAM_START_FILL = 32 steps
+  │  Auto-start threshold: STEP_STREAM_START_FILL = 16 steps
   ▼
 encode_steps ISR — IRAM_ATTR, RMT clock 80 MHz (12.5 ns/tick)
-  │  PART_SIZE = 16 symbols per callback
+  │  PART_SIZE = 8 symbols per callback
   │  Balanced pulse: HIGH = ticks/2, LOW = ticks − HIGH
   │  Both halves clamped to ≥ RMT_STEP_PULSE_TICKS (8) = 100 ns
-  │  On empty ring: emit pause chunk, set rmt_stopped_=true
+  │  COAST MODE: on empty ring → emit PART_SIZE pause symbols (no stop)
+  │  Auto-stop after COAST_IDLE_LIMIT (6250) consecutive empty callbacks (~1.25 s)
   │  Notifies producer_task_ AND executor_task_ on each callback
   ▼
 RMT hardware → STEP GPIO → motor driver (A4988/DRV8825) → stepper motor
@@ -70,10 +71,13 @@ RMT hardware → STEP GPIO → motor driver (A4988/DRV8825) → stepper motor
 | RMT_STEP_MIN_TICKS | 16 | 200 ns min interval |
 | Max step rate | 5 000 000 steps/sec | 80e6 / 16 |
 | Max RPM (32µstep) | 781 RPM | 5e6 / (200 × 32) |
-| Segment duration | 4000 µs | host configurable |
-| PART_SIZE | 16 | ISR callback size |
+| Segment duration | 2–50 ms | adaptive: ≥32 steps/segment |
+| PART_SIZE | 8 | ISR callback size (was 32) |
+| RMT_MEM_SYMBOLS | 64 | RMT DMA buffer depth |
 | STEP_RING_SIZE | 4096 | ~820 ms at 5 kHz |
-| STEP_STREAM_START_FILL | 32 | = 2 × PART_SIZE |
+| STEP_STREAM_START_FILL | 16 | = 2 × PART_SIZE |
+| STEP_STREAM_RESTART_FILL | 4 | Ring fill to resume after stop |
+| COAST_IDLE_LIMIT | 6250 | ~1.25 s empty callbacks → auto-stop |
 | MULTI_AXIS_BLOCK_SIZE | 60 | segments per frame |
 | MULTI_AXIS_QUEUE_DEPTH | 64 | ~960 ms look-ahead |
 | MAX_INFLIGHT_SEGMENTS | 24 | ~96 ms at 4ms/seg |
@@ -262,14 +266,15 @@ The current ESP32 step-output layer is split into two buffers:
 2. `StepperDriver` expands those packets into a software ring of
   `ring_entry_t`, consumed directly by the RMT `simple_encoder` callback.
 
-At the RMT boundary, the behavior is deliberately matched to
-`resources/FastAccelStepper` on ESP32 IDF5:
+At the RMT boundary, the behavior uses a **coast-mode** architecture:
 
-- one `rmt_transmit()` per continuous run,
-- `simple_encoder` refill in `PART_SIZE` chunks,
+- one `rmt_transmit()` per continuous run (coast mode keeps it alive),
+- `simple_encoder` refill in `PART_SIZE = 8` chunks,
 - `trans_queue_depth = 1`,
 - explicit LOW-level pause chunk before DIR toggles when needed,
-- one LOW-level pause chunk plus stop on queue starvation,
+- **coast mode**: on transient ring starvation, emit LOW-level pause symbols
+  instead of stopping — eliminates the 200–500 µs RMT restart penalty,
+- auto-stop after `COAST_IDLE_LIMIT` (~1.25 s) of sustained empty ring,
 - no task-side busy-spin while waiting for ring space.
 
 The executor task blocks on a task notification from the encoder ISR whenever

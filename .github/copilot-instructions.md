@@ -125,11 +125,18 @@ Status response:
 - `encode_steps()` and `on_trans_done_isr()` must always be `IRAM_ATTR`.
 - `s_rx_frame`, `s_tx_frame_a`, `s_tx_frame_b` must always have `DMA_ATTR`.
 - Ring buffer is lock-free SPSC: **only Core 1 writes `ring_write_`**, **only the ISR writes `ring_read_`**. Never add locks around these.
+- **Coast mode**: `encode_steps()` must NEVER set `rmt_stopped_=true` on transient
+  ring starvation. It emits PART_SIZE pause symbols instead. Only after
+  `COAST_IDLE_LIMIT` (6250) consecutive empty callbacks does it auto-stop.
 - `executeConstantRateBlock()` must **NEVER** call `maybeStartDriver()`.
   The drain loop in `multiAxisExecutorTask` owns the start decision.
+- `pushExpandedBlock()` must **NEVER** call `maybeStartDriver()`.
+  Only `kickStart()` in the drain loop starts the RMT.
 - `kickStart()` inside the drain loop is called **ONCE per batch**, after all available blocks are written to the ring.
 - `STEP_STREAM_START_FILL` must always be `>= 2 * PART_SIZE`.
   The `static_assert` in `stepper_queue.cpp` enforces this at compile time.
+- `PART_SIZE = 8` — each ISR callback consumes at most 8 ring entries.
+  `RMT_MEM_SYMBOLS = 64` is decoupled and must be >= 4 * PART_SIZE.
 
 ### 5.2 Python Application
 
@@ -138,6 +145,11 @@ Status response:
 - Motion planning belongs on host (`ramp.py` / kinematics modules).
 - Host should stream **MULTI_AXIS_SEGMENT_BLOCK** messages for production use.
 - `MAX_INFLIGHT_SEGMENTS = 24` in `streamer.py` — do not raise above 24.
+- Segment generators must use **adaptive duration** (2–50 ms) to guarantee
+  ≥32 steps/segment at any speed. Never use a fixed segment duration.
+- `stream_all()` must NOT call `get_status()` at the top of the main loop.
+  Use the status returned by the last `send_multi_axis_segment_block_request()`
+  or `get_status()` only when no segments were sent in a cycle.
 - For `src/rpi` host code, prefer absolute bare imports such as `from motion import ...`, `from transport import ...`, `from domain import ...`; do not use `rpi.*` or conditional relative imports in this folder.
 
 ### 5.3 Protocol
@@ -245,8 +257,10 @@ Any pin change **must** update `src/esp32/src/main.cpp` + `doc/architecture.md` 
 - Python **never** touches GPIO directly.
 - SPI access must go through `src/rpi/spi_transport.py`.
 - Motion planning belongs on host (`ramp.py` / kinematics modules).
-- Host should stream **segment blocks**, not explicit per-step blocks, for
-  production speed ranges.
+- Host should stream **MULTI_AXIS_SEGMENT_BLOCK** messages for production use.
+- Segment generators use **adaptive duration** (2–50 ms, ≥32 steps/segment).
+- `stream_all()` reuses status from send responses; only polls `get_status()`
+  when no segments were sent in a cycle.
 
 ### 5.3 Protocol
 
@@ -268,8 +282,21 @@ for each segment:
     ticks += add_ticks
 ```
 
-Segments are computed on the host and sent as `SEGMENT_BLOCK` payloads.
+Segments are computed on the host and sent as `MULTI_AXIS_SEGMENT_BLOCK` payloads.
 ESP32 expands to concrete steps and streams them through RMT.
+
+### Adaptive Segment Duration
+
+The host segment generator (`BaseSegmentGenerator`) dynamically adjusts
+segment duration to guarantee at least 32 steps per segment (matching
+firmware `PART_SIZE × 4`). At low RPM, segments stretch up to 50 ms;
+at high RPM they shrink to 2 ms. This prevents the RMT ring from
+draining between tiny segments.
+
+```
+adaptive_duration = max(32 / current_step_rate, 0.002)
+clamped to [0.002, 0.050] seconds
+```
 
 ---
 
@@ -305,9 +332,13 @@ ESP32 expands to concrete steps and streams them through RMT.
 | HX711 scale = 0 | Division by zero in `raw_to_dg()` — always validate before calibrating |
 | Start stream with too little ring fill | high-rate runs underrun before host can refill |
 | `executeConstantRateBlock()` calls `maybeStartDriver()` | Starts RMT too early (after 1 segment = 2-5 steps); causes per-segment underruns at low speed |
+| `pushExpandedBlock()` calls `maybeStartDriver()` | Same issue — only kickStart() in drain loop should start RMT |
 | `kickStart()` inside per-segment loop | Starts RMT before ring is pre-filled; use the post-drain batch kickStart instead |
 | `STEP_STREAM_START_FILL < 2 * PART_SIZE` | Breaks the static_assert in stepper_queue.cpp |
 | `MAX_INFLIGHT_SEGMENTS > 24` on host | Risk of firmware queue overflow and deferred notification backlog |
+| `encode_steps` stops RMT on empty ring | Use coast mode: emit pause symbols, only auto-stop after COAST_IDLE_LIMIT |
+| Fixed segment duration at low RPM | Segments with <8 steps starve the ring; use adaptive duration (≥32 steps/segment) |
+| Redundant get_status() in streamer loop | Wastes ~250 µs per iteration; use status from send response instead |
 
 ## 8b. Debugging with Status Logs
 
@@ -376,7 +407,11 @@ resources/                  Reference code (DO NOT MODIFY)
 | Spindle steps/rev   | 6400               | 200 full × 32 µstep                |
 | Lateral steps/mm    | 3072               | 96 full × 32 µstep, M6 1 mm pitch  |
 | Speed range (Hz)    | 100 – 160 000      | ~0.9 – 1500 RPM at 6400 steps/rev  |
-| RMT resolution      | 2 MHz              | 1 tick = 0.5 µs                    |
+| RMT resolution      | 80 MHz             | 12.5 ns/tick                       |
+| PART_SIZE           | 8                  | ISR callback chunk size             |
+| RMT_MEM_SYMBOLS     | 64                 | RMT DMA buffer (decoupled from PART_SIZE) |
+| COAST_IDLE_LIMIT    | 6250               | ~1.25 s empty → auto-stop          |
+| STEP_STREAM_START_FILL | 16              | = 2 × PART_SIZE                    |
 | HX711 sample rate   | ~80 Hz             | At VCC ≥ 4.8 V (RATE pin = HIGH)   |
 | HX711 output unit   | 0.1 g (decigram)   | int16_t, range ±3276.7 g           |
 | Potentiometer range | 0 – 4095           | 12-bit ADC1_CH0, 32-sample MA      |
