@@ -118,6 +118,29 @@ class WindingEngine:
         self._move_queue.clear()
         self._state.set_engine_state(EngineState.STOPPING)
 
+    def flush_until(self, sequence: int) -> dict[str, Any]:
+        """Send a flush request to the firmware and return the resulting status."""
+        status = self._transport.flush_until(sequence)
+        return {
+            "uptime_ms": status.uptime_ms,
+            "queue_free_slots": list(status.queue_free_slots),
+            "ring_free_slots": list(status.ring_free_slots),
+            "underrun_count": list(status.underrun_count),
+            "last_rx_sequence": status.last_rx_sequence,
+            "last_rx_type": status.last_rx_type,
+            "last_result": status.last_result,
+            "protocol_version": status.protocol_version,
+            "enabled_mask": status.enabled_mask,
+            "running_mask": status.running_mask,
+            "lateral_endstop_state": status.lateral_endstop_state,
+            "endstop_armed_mask": status.endstop_armed_mask,
+            "last_executed_sequence": status.last_executed_sequence,
+            "multi_axis_queue_free": status.multi_axis_queue_free,
+            "planner_queue_free": status.planner_queue_free,
+            "last_planned_sequence": status.last_planned_sequence,
+            "segments_dropped": status.segments_dropped,
+        }
+
     def clear_fault(self) -> None:
         """Clear fault state so a new program can be submitted."""
         self._state.clear_fault()

@@ -53,6 +53,7 @@ class WindingRpcHandler:
         handler.register_method("winding.wound_run", self.wound_run)
         handler.register_method("winding.run_axis", self.run_axis)
         handler.register_method("winding.clear_fault", self.clear_fault)
+        handler.register_method("winding.flush_until", self.flush_until)
         handler.register_method("winding.status", self.status)
         handler.register_method("winding.axis_state", self.axis_state)
         handler.register_method("winding.arm_endstop", self.arm_endstop)
@@ -133,6 +134,17 @@ class WindingRpcHandler:
         """Clear FAULT state so a new program can be submitted."""
         self._engine.clear_fault()
         return {"status": "ok"}
+
+    def flush_until(self, sequence: int) -> dict[str, Any]:
+        """Request the firmware to flush and wait for the given motion sequence."""
+        if sequence < 0 or sequence > 0xFFFF:
+            raise JsonRpcError(-32602, "Invalid params: sequence must be 0-65535")
+        status = self._engine.flush_until(sequence)
+        return {
+            "status": "flushed",
+            "flush_sequence": sequence,
+            "firmware_status": status,
+        }
 
     def status(self, _params: Any | None = None) -> dict[str, Any]:
         """Return combined engine and move-queue status snapshot."""

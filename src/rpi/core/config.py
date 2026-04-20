@@ -18,7 +18,7 @@ class AppConfiguration:
     spindle_invert_direction: bool = False
     spindle_max_speed_rpm: int = 1500
     # Unit: RPM/s (revolutions per minute gained per second).
-    spindle_max_acceleration_rpm: Optional[float] = 10
+    spindle_max_acceleration_rpm: Optional[float] = 100
     # Unit: RPM/s (revolutions per minute lost per second).
     spindle_max_deceleration_rpm: Optional[float] = None
 

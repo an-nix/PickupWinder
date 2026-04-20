@@ -372,6 +372,18 @@ class MultiAxisRampStreamer:
 
     def _disable_axes(self) -> None:
         for axis_id in self._axis_ids:
+            # End each standalone move with a clean driver stop before EN goes high.
+            # Without this, the previous RMT transaction can still be coasting when
+            # the next move starts, which makes consecutive runs non-deterministic.
+            self._transport.stop_axis(axis_id)
+
+            stop_deadline = time.time() + 1.0
+            while time.time() < stop_deadline:
+                status = self._transport.get_status()
+                if (int(status.running_mask) & (1 << axis_id)) == 0:
+                    break
+                time.sleep(self._poll_interval_s)
+
             sequence, status = self._transport.set_axis_enabled_request(axis_id, False)
             status = self._transport.wait_for_request_result(sequence, poll_interval_s=self._poll_interval_s)
             if status.last_result != int(SpiMessageResult.OK):

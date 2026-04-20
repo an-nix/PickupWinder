@@ -30,8 +30,20 @@ The RMT driver uses coast mode to avoid the restart penalty that previously caus
 - Ring temporarily empty: the ISR emits pause symbols instead of stopping the RMT.
 - Ring empty for too long: after `COAST_IDLE_LIMIT`, the driver auto-stops.
 - Mid-chunk exhaustion: the remainder of the chunk is filled with pauses, not a stop.
+- Coast symbol timing is matched to the last step interval, so the ISR callback rate does not spike during transient starvation.
 
 This keeps `rmt_transmit()` to one call per continuous run and removes transient restart jitter from the motion path.
+
+## High-speed pipeline resilience
+
+At high spindle RPMs the ESP32 consumes the step ring very quickly, so the host must keep a deeper planner queue and inflight segment window to tolerate SPI jitter.
+
+- High-speed lookahead is now 32 segments instead of 16.
+- The host target buffer time is increased to ~200ms.
+- High-speed inflight segment cap is increased to 64.
+- The host buffer gate is now based on buffered depth, not the legacy free-space threshold.
+
+This ensures the ESP32 planner queue maintains enough headroom for brief transport hiccups without draining the ring.
 
 ## Runtime rules
 
@@ -52,7 +64,7 @@ This keeps `rmt_transmit()` to one call per continuous run and removes transient
 | `STEP_STREAM_START_FILL` | 128 | Initial buffered steps before first start |
 | `STEP_STREAM_RESTART_FILL` | 16 | Restart threshold after a true stop |
 | `STEP_RING_SIZE` | 4096 | Lock-free SPSC ring capacity |
-| `COAST_IDLE_LIMIT` | 6250 | Empty callbacks before auto-stop |
+| `COAST_IDLE_LIMIT` | 250000 | Empty callbacks before auto-stop |
 | `SEGMENT_QUEUE_DEPTH` | 128 | Planner to executor look-ahead queue |
 
 ## Execution lifecycle

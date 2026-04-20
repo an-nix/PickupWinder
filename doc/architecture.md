@@ -128,7 +128,9 @@ These invariants are intentional and should not be weakened:
 - `pushExpandedBlock()` does not start the driver.
 - `executeConstantRateBlock()` does not start the driver.
 - `kickStart()` runs once after a drain batch, not per segment.
+- Host-side streamer maintains a deeper planner queue at high speed: 32-segment lookahead and up to 200ms of buffered motion.
 - Coast mode emits pause symbols on transient starvation instead of stopping the RMT.
+- Coast pauses are timed to the last step interval so the ISR does not flood the executor at high speed.
 
 ## Sensor model
 
