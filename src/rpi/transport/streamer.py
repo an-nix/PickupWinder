@@ -466,15 +466,22 @@ class MultiAxisRampStreamer:
         elif underrun != self._last_underrun_count:
             deltas = [curr - prev for curr, prev in zip(underrun, self._last_underrun_count)]
             if any(delta > 0 for delta in deltas):
+                last_executed = int(getattr(status, "last_executed_sequence", -1))
+                last_planned = int(getattr(status, "last_planned_sequence", -1))
                 logger.warning(
-                    "firmware underrun counter advanced: delta=%s total=%s queue_free=%s ring_free=%s planner_free=%s inflight=%s buffered=%.1fms",
+                    "firmware underrun counter advanced: delta=%s total=%s queue_free=%s ring_free=%s multi_axis_free=%s planner_free=%s inflight=%s buffered=%.1fms last_executed=%s last_confirmed=%s last_sent=%s last_planned=%s",
                     deltas,
                     underrun,
                     getattr(status, "queue_free_slots", ()),
                     getattr(status, "ring_free_slots", ()),
+                    getattr(status, "multi_axis_queue_free", -1),
                     getattr(status, "planner_queue_free", -1),
                     len(self._inflight),
                     self._buffered_time_s * 1000.0,
+                    last_executed,
+                    self._last_confirmed_sequence,
+                    self._last_sent_motion_seq,
+                    last_planned,
                 )
             self._last_underrun_count = underrun
 
@@ -494,6 +501,30 @@ class MultiAxisRampStreamer:
             self._last_segments_dropped = segments_dropped
         elif segments_dropped < self._last_segments_dropped:
             self._last_segments_dropped = segments_dropped
+
+        multi_axis_free = int(getattr(status, "multi_axis_queue_free", -1))
+        planner_free = int(getattr(status, "planner_queue_free", -1))
+        ring_free = tuple(int(v) for v in getattr(status, "ring_free_slots", (0, 0, 0, 0)))
+        last_executed = int(getattr(status, "last_executed_sequence", -1))
+        if (
+            len(self._inflight) >= 32
+            and self._buffered_time_s >= 0.200
+            and multi_axis_free >= 60
+            and planner_free >= 84
+            and ring_free
+            and min(ring_free[: max(1, len(self._axis_ids))]) >= 2048
+        ):
+            logger.warning(
+                "host/firmware buffer desync suspected: inflight=%s buffered=%.1fms multi_axis_free=%s planner_free=%s ring_free=%s last_executed=%s last_confirmed=%s last_sent=%s",
+                len(self._inflight),
+                self._buffered_time_s * 1000.0,
+                multi_axis_free,
+                planner_free,
+                ring_free,
+                last_executed,
+                self._last_confirmed_sequence,
+                self._last_sent_motion_seq,
+            )
 
     def _check_endstop(self, status) -> bool:
         """Return True if an endstop was triggered on any armed axis.

@@ -185,16 +185,13 @@ esp_err_t StepperQueue::maybeStartDriver(StepperDriver& driver, bool force_start
         return ESP_OK;
     }
 
-    // Guard force_start: never begin streaming with fewer than PART_SIZE steps.
-    // The RMT ping-pong encoder's first callback requests PART_SIZE symbols; if
-    // fewer steps are available it immediately underruns and halts the motor.
-    // At slow speeds (2-9 steps/segment during acceleration) this was causing a
-    // stutter on every segment.  STEP_STREAM_START_FILL and the ring-full case
-    // are unaffected — those scenarios already imply >= PART_SIZE steps buffered.
     const bool is_restart = !driver.isStreaming()
                             && buffered_steps > 0
                             && driver.getUnderrunCount() > 0;
-    const bool should_start = (force_start && buffered_steps >= PART_SIZE)
+    const uint32_t force_start_threshold = is_restart
+        ? STEP_STREAM_RESTART_FILL
+        : STEP_STREAM_START_FILL;
+    const bool should_start = (force_start && buffered_steps >= force_start_threshold)
         || (buffered_steps >= STEP_STREAM_START_FILL)
         || (driver.ringFreeSlots() == 0)
         || (is_restart && buffered_steps >= STEP_STREAM_RESTART_FILL);

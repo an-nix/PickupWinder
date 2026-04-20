@@ -223,6 +223,14 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
                             sizeof(StatusPayload),
                             0);
 
+    // Compute multi_axis_queue_free first so the per-axis underrun log can read it.
+    {
+        const uint32_t maqf = (s_multi_axis_queue != nullptr)
+            ? static_cast<uint32_t>(uxQueueSpacesAvailable(s_multi_axis_queue))
+            : 0u;
+        payload->multi_axis_queue_free = static_cast<uint8_t>(maqf < 255u ? maqf : 255u);
+    }
+
     // Fill basic runtime fields (uptime, per-axis diagnostics, masks).
     payload->uptime_ms = static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS);
     for (uint8_t axis = 0; axis < SPI_MAX_AXES; ++axis) {
@@ -232,13 +240,17 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
             payload->underrun_count[axis] = queues_[axis]->driver().getUnderrunCount();
             if (payload->underrun_count[axis] > s_last_logged_underrun[axis]) {
                 ESP_LOGW(TAG,
-                         "axis %u underrun_count advanced: delta=%lu total=%lu queue_free=%u ring_free=%u planner_free=%lu",
+                         "axis %u underrun_count advanced: delta=%lu total=%lu queue_free=%u ring_free=%u multi_axis_free=%u planner_free=%lu last_exec=%u last_planned=%u streaming=%d",
                          static_cast<unsigned>(axis),
                          static_cast<unsigned long>(payload->underrun_count[axis] - s_last_logged_underrun[axis]),
                          static_cast<unsigned long>(payload->underrun_count[axis]),
                          static_cast<unsigned>(payload->queue_free_slots[axis]),
                          static_cast<unsigned>(payload->ring_free_slots[axis]),
-                         static_cast<unsigned long>(planner_.segmentQueueFree()));
+                         static_cast<unsigned>(payload->multi_axis_queue_free),
+                         static_cast<unsigned long>(planner_.segmentQueueFree()),
+                         static_cast<unsigned>(last_executed_sequence_.load(std::memory_order_relaxed)),
+                         static_cast<unsigned>(planner_.lastPlannedMotionSequence()),
+                         (queues_[axis] != nullptr ? (int)queues_[axis]->driver().isStreaming() : -1));
                 s_last_logged_underrun[axis] = payload->underrun_count[axis];
             } else if (payload->underrun_count[axis] < s_last_logged_underrun[axis]) {
                 s_last_logged_underrun[axis] = payload->underrun_count[axis];

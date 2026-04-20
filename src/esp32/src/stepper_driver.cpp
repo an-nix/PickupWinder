@@ -39,13 +39,11 @@ static const char* TAG = "stepper_driver";
 // PART_SIZE = 8: one callback per 8 symbols.
 
 /** Number of consecutive empty-ring callbacks before auto-stopping.
- *  At 80 MHz with MIN_CMD_TICKS=400: each coast callback emits 8 symbols of
- *  50 ticks each = 400 ticks = 5 µs per callback.
- *  250000 callbacks × 5 µs = 1.25 seconds of idle before auto-stop.
- *
- *  The previous value of 6250 was only 31.25 ms — far too short. Any brief
- *  segment-queue starvation or Python GC pause on the Pi Zero could empty
- *  the ring for 31 ms and stop the motor mid-move. */
+ *  Coast symbols now match the last step rate (last_ticks_ per symbol half),
+ *  so at 1500 rpm (500 ticks/step = 6.25 µs) each coast callback takes ~50 µs.
+ *  250000 callbacks × ~50 µs = ~12.5 seconds of idle before auto-stop.
+ *  At slower speeds the coast period is longer per callback, so the idle time
+ *  is always at least 12.5 s regardless of speed. */
 static constexpr uint32_t COAST_IDLE_LIMIT = 250000;
 
 extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
@@ -90,13 +88,21 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             return 0;
         }
 
-        // Emit pause symbols (LOW level, ~25 µs each).
-        uint16_t t = static_cast<uint16_t>((MIN_CMD_TICKS + 2 * PART_SIZE - 1) / (2 * PART_SIZE));
-        for (uint32_t i = 0; i < PART_SIZE; i++) {
-            symbols[i].level0    = 0;
-            symbols[i].duration0 = t;
-            symbols[i].level1    = 0;
-            symbols[i].duration1 = t;
+        // Emit pause symbols at the same rate as the last step so the ISR
+        // callback frequency does not spike during coast (which would starve
+        // the executor task and extend the coast period in a feedback loop).
+        // last_ticks_/2 per duration0+duration1 ≈ last step interval per symbol.
+        {
+            uint32_t last = drv->last_ticks_;
+            if (last < MIN_CMD_TICKS) last = MIN_CMD_TICKS;
+            uint16_t half = static_cast<uint16_t>(
+                (last >> 1) > 32767u ? 32767u : (last >> 1));
+            for (uint32_t i = 0; i < PART_SIZE; i++) {
+                symbols[i].level0    = 0;
+                symbols[i].duration0 = half;
+                symbols[i].level1    = 0;
+                symbols[i].duration1 = half;
+            }
         }
 
         // Notify producer/executor so they can refill the ring.
@@ -117,14 +123,17 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     ring_entry_t* entry = &drv->ring_[rd & STEP_RING_MASK];
     if (entry->toggle_dir) {
         if (drv->last_chunk_had_steps_) {
-            // Previous chunk had steps — emit a fixed pause chunk so the next
-            // callback can toggle DIR safely at the chunk boundary.
+            // Previous chunk had steps — emit a speed-matched pause chunk so
+            // the next callback can toggle DIR safely at the chunk boundary.
             drv->last_chunk_had_steps_ = false;
-            uint16_t t = static_cast<uint16_t>((MIN_CMD_TICKS + 2 * PART_SIZE - 1) / (2 * PART_SIZE));
+            uint32_t last = drv->last_ticks_;
+            if (last < MIN_CMD_TICKS) last = MIN_CMD_TICKS;
+            uint16_t half = static_cast<uint16_t>(
+                (last >> 1) > 32767u ? 32767u : (last >> 1));
             for (uint32_t i = 0; i < PART_SIZE; i++) {
-                symbols[i].duration0 = t;
+                symbols[i].duration0 = half;
                 symbols[i].level0    = 0;
-                symbols[i].duration1 = t;
+                symbols[i].duration1 = half;
                 symbols[i].level1    = 0;
             }
             return PART_SIZE;
@@ -136,6 +145,7 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     }
 
     // ── Fill PART_SIZE symbols from ring buffer ──────────────────────────
+    // (dir-change pause path below also uses last_ticks_ for speed-matching)
     bool has_steps = false;
     for (uint32_t i = 0; i < PART_SIZE; i++) {
         if (rd != wr) {
@@ -144,11 +154,14 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             // Handle mid-chunk direction changes: stop filling, pad the
             // remainder with a fixed LOW-level pause chunk.
             if (e->toggle_dir && i > 0) {
-                uint16_t t = static_cast<uint16_t>((MIN_CMD_TICKS + 2 * PART_SIZE - 1) / (2 * PART_SIZE));
+                uint32_t last = drv->last_ticks_;
+                if (last < MIN_CMD_TICKS) last = MIN_CMD_TICKS;
+                uint16_t half = static_cast<uint16_t>(
+                    (last >> 1) > 32767u ? 32767u : (last >> 1));
                 for (uint32_t j = i; j < PART_SIZE; j++) {
-                    symbols[j].duration0 = t;
+                    symbols[j].duration0 = half;
                     symbols[j].level0    = 0;
-                    symbols[j].duration1 = t;
+                    symbols[j].duration1 = half;
                     symbols[j].level1    = 0;
                 }
                 break;
@@ -174,17 +187,21 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             rd++;
             has_steps = true;
         } else {
-            // Ring exhausted mid-chunk — pad remainder with pause (coast).
-            // Do NOT set rmt_stopped_. The next callback will coast or
-            // resume from new data.  Count this as a soft underrun for
-            // diagnostics only.
+            // Ring exhausted mid-chunk — pad remainder with speed-matched
+            // pause (coast). Do NOT set rmt_stopped_. The next callback will
+            // coast or resume from new data.  Count this as a soft underrun.
             drv->ring_underrun_count_.fetch_add(1, std::memory_order_relaxed);
-            uint16_t t = static_cast<uint16_t>((MIN_CMD_TICKS + 2 * PART_SIZE - 1) / (2 * PART_SIZE));
-            for (uint32_t j = i; j < PART_SIZE; j++) {
-                symbols[j].level0    = 0;
-                symbols[j].duration0 = t;
-                symbols[j].level1    = 0;
-                symbols[j].duration1 = t;
+            {
+                uint32_t last = drv->last_ticks_;
+                if (last < MIN_CMD_TICKS) last = MIN_CMD_TICKS;
+                uint16_t half = static_cast<uint16_t>(
+                    (last >> 1) > 32767u ? 32767u : (last >> 1));
+                for (uint32_t j = i; j < PART_SIZE; j++) {
+                    symbols[j].level0    = 0;
+                    symbols[j].duration0 = half;
+                    symbols[j].level1    = 0;
+                    symbols[j].duration1 = half;
+                }
             }
             break;
         }

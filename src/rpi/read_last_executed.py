@@ -53,12 +53,13 @@ def main() -> int:
             enabled = getattr(status, "enabled_mask", 0)
             running = getattr(status, "running_mask", 0)
             lateral = getattr(status, "lateral_endstop_state", 0xFF)
+            multi_axis_free = getattr(status, "multi_axis_queue_free", -1)
             planner_free = getattr(status, "planner_queue_free", -1)
 
             print(
                 f"[{fmt(now)}] last_executed={le} last_rx_seq={last_rx_seq} result=0x{last_result:02X} "
                 f"queue_free={list(qfree)} ring_free={list(rfree)} underrun={list(underrun)} "
-                f"planner_free={planner_free} enabled=0x{enabled:02X} running=0x{running:02X} lateral=0x{lateral:02X}"
+                f"multi_axis_free={multi_axis_free} planner_free={planner_free} enabled=0x{enabled:02X} running=0x{running:02X} lateral=0x{lateral:02X}"
             )
             time.sleep(max(0.01, args.interval))
     except KeyboardInterrupt:

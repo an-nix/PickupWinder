@@ -51,6 +51,7 @@ Le firmware renvoie notamment :
 - `queue_free_slots[]`
 - `ring_free_slots[]`
 - `underrun_count[]`
+- `multi_axis_queue_free`
 - `last_rx_sequence`
 - `last_rx_type`
 - `last_result`

@@ -138,11 +138,16 @@ static inline bool sequence_is_stale_or_equal_u16(uint16_t candidate, uint16_t r
 
 /** Buffered step target before starting the RMT stream.
  *  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE.
- *  The stream must start quickly enough for the first ramp segments to reach
- *  the RMT without being held back behind a deep prefill. Two PART_SIZE chunks
- *  is the minimum safe threshold for the first ISR callbacks.
+ *  Startup is more timing-sensitive than steady-state coast mode: if the first
+ *  launch begins with only one or two tiny chunks buffered, the encoder can
+ *  consume them before the executor gets another refill window, causing a
+ *  single underrun right at move start.
+ *
+ *  128 buffered steps gives ~0.8 ms of headroom at 160 ksteps/s, which is
+ *  enough to cover the initial planner/executor/RMT handoff without delaying
+ *  startup noticeably.
  */
-#define STEP_STREAM_START_FILL  16U
+#define STEP_STREAM_START_FILL  128U
 
 /**
  * Minimum steps required to RESTART the RMT stream after an underrun.
