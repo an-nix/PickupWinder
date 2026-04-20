@@ -46,7 +46,7 @@ class MultiAxisRampStreamer:
 
     TARGET_BUFFER_TIME_S = 0.10
     MIN_BUFFER_TIME_S = 0.06
-    MAX_BUFFER_TIME_S = 0.12
+    MAX_BUFFER_TIME_S = 0.25
     MIN_SEGMENT_TIME_S = 0.002
     MAX_SEGMENT_TIME_S = 0.005
     POLL_SLEEP_S = 0.0005
@@ -73,14 +73,18 @@ class MultiAxisRampStreamer:
         Thresholds match firmware EXEC_BATCH_LIMIT tiers:
           < 10  steps → 48 segments (low speed,  ~50 RPM)
           < 50  steps → 32 segments (mid speed)
-          >= 50 steps → 16 segments (high speed, > ~200 RPM)
+          >= 50 steps → 32 segments (high speed, > ~200 RPM)
+
+        At 1500 RPM (640 steps/segment) the firmware consumes ~250 segments/sec.
+        32 segments = 128ms of pipeline depth in the planner queue, which covers
+        the ~50ms worst-case SPI failure window with 78ms margin.
         """
         if steps_per_segment < 10:
             return 48
         elif steps_per_segment < 50:
             return 32
         else:
-            return 16
+            return 32
 
     def __init__(
         self,
@@ -309,16 +313,16 @@ class MultiAxisRampStreamer:
     def _max_inflight_segments(self) -> int:
         """Speed-dependent in-flight segment cap.
 
-        At low speed each segment executes slowly so more can be in-flight
-        simultaneously without risking the host advancing too far ahead
-        of the motor's actual position.
+        Must be >= required_lookahead() so the planner pressure gate can
+        actually be reached before the inflight cap blocks sending.
+        At high speed required_lookahead=32, so cap must be > 32.
         """
         if self._current_steps_per_segment < 10:
             return 96
         elif self._current_steps_per_segment < 50:
             return 48
         else:
-            return 24
+            return 64
 
     def _timestamp(self) -> str:
         now = time.time()
@@ -327,12 +331,12 @@ class MultiAxisRampStreamer:
         return time.strftime(f"%H:%M:%S.{milliseconds:03d}", time.localtime(now))
 
     def _safe_buffer_time_s(self, requested_time_s: float, max_hz: float) -> float:
-        if max_hz <= 0.0:
-            return max(self.MIN_BUFFER_TIME_S, min(self.MAX_BUFFER_TIME_S, requested_time_s))
-        safe_time_s = (self.STEP_RING_CAPACITY * self.RING_BUFFER_HEADROOM) / max_hz
-        # Use the minimum of what was requested and what the ring can hold.
-        # Never go below MIN_BUFFER_TIME_S (needed for SPI pipeline latency).
-        return max(self.MIN_BUFFER_TIME_S, min(requested_time_s, safe_time_s))
+        # Clamp to [MIN_BUFFER_TIME_S, MAX_BUFFER_TIME_S].
+        # The ring-capacity cap was removed: at high step rates the ring holds
+        # only ~25ms but the planner segment_queue holds 512ms, so capping by
+        # ring capacity forced the pipeline to 60ms — too small to sustain
+        # required_lookahead=32 against SPI failure bursts.
+        return max(self.MIN_BUFFER_TIME_S, min(self.MAX_BUFFER_TIME_S, requested_time_s))
 
     def set_generator(self, generator: Iterator[MultiAxisSegment]) -> None:
         """Override the segment generator for this streamer.
@@ -506,13 +510,20 @@ class MultiAxisRampStreamer:
         planner_free = int(getattr(status, "planner_queue_free", -1))
         ring_free = tuple(int(v) for v in getattr(status, "ring_free_slots", (0, 0, 0, 0)))
         last_executed = int(getattr(status, "last_executed_sequence", -1))
+        # Only fire when the ring is nearly empty (>= STEP_RING_CAPACITY - 256 free
+        # slots = fewer than 256 steps = <2ms remaining at 1500 RPM).  The old
+        # threshold of 2048 fired continuously at high speed because the ring is
+        # always ~75% empty — a false positive that flooded the log.
+        ring_nearly_empty = bool(
+            ring_free
+            and min(ring_free[: max(1, len(self._axis_ids))]) >= self.STEP_RING_CAPACITY - 256
+        )
         if (
             len(self._inflight) >= 32
             and self._buffered_time_s >= 0.200
             and multi_axis_free >= 60
             and planner_free >= 84
-            and ring_free
-            and min(ring_free[: max(1, len(self._axis_ids))]) >= 2048
+            and ring_nearly_empty
         ):
             logger.warning(
                 "host/firmware buffer desync suspected: inflight=%s buffered=%.1fms multi_axis_free=%s planner_free=%s ring_free=%s last_executed=%s last_confirmed=%s last_sent=%s",

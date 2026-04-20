@@ -157,7 +157,7 @@ class MoveQueue:
             ],
             poll_interval_s=self._poll_interval_s,
             print_every=self._print_every,
-            target_buffer_time_s=0.150,
+            target_buffer_time_s=0.200,
         )
 
     def _next_motion_sequence(self) -> int:
@@ -239,7 +239,7 @@ class MoveQueue:
             segment_duration_s=move.segment_duration_s,
             poll_interval_s=self._poll_interval_s,
             print_every=self._print_every,
-            target_buffer_time_s=0.150,
+            target_buffer_time_s=0.200,
         )
 
     def _execute_wound_move(self, move: WoundMove) -> None:
