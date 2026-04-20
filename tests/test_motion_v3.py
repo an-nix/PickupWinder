@@ -22,6 +22,8 @@ from motion.move_queue import MoveQueue
 from motion.synchronized_segment_generator import SyncAxisConfig
 from motion.engine import WindingEngine
 from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
+from transport.messages import MultiAxisSegment, SpiMessageResult
+from transport import MockSpiTransport
 from winding.program import WindingProgram
 from core.config import AppConfiguration
 from core.events import EventBus
@@ -55,6 +57,245 @@ def test_streamer_set_generator_replaces_generator_and_resets_finished_state():
     assert streamer._generator is replacement
     assert streamer._generator is not original
     assert streamer._generator_finished is False
+
+
+def test_streamer_collect_batch_uses_confirmed_ack_status():
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.wait_calls: list[int] = []
+            self._send_seq = 7
+
+        def get_status(self):
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                last_result=int(SpiMessageResult.OK),
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0xFF,
+                endstop_armed_mask=0,
+            )
+
+        def send_multi_axis_segment_block_request(self, payload):
+            seq = self._send_seq
+            self._send_seq += 1
+            return seq, SimpleNamespace(last_result=int(SpiMessageResult.QUEUE_FULL))
+
+        def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001, timeout_s: float = 1.5):
+            self.wait_calls.append(sequence)
+            return SimpleNamespace(
+                last_result=int(SpiMessageResult.OK),
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0xFF,
+                endstop_armed_mask=0,
+            )
+
+    transport = FakeTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[StreamAxisConfig(axis_id=0, ramp=RampConfig(target_rpm=300.0))],
+    )
+    streamer.set_generator(iter([
+        MultiAxisSegment(sequence=0, duration_us=4000, steps=[12], directions=[0]),
+    ]))
+
+    sent, _status = streamer._collect_and_send_batch(transport.get_status())
+
+    assert sent == 1
+    assert transport.wait_calls == [7]
+    assert len(streamer._inflight) == 1
+    assert streamer._retry_batch is None
+
+
+def test_streamer_retries_same_batch_after_confirmed_queue_full():
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.wait_calls: list[int] = []
+            self.sent_sequences: list[list[int]] = []
+            self._send_seq = 21
+            self._wait_results = [
+                int(SpiMessageResult.QUEUE_FULL),
+                int(SpiMessageResult.OK),
+            ]
+
+        def get_status(self):
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                last_result=int(SpiMessageResult.OK),
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0xFF,
+                endstop_armed_mask=0,
+            )
+
+        def send_multi_axis_segment_block_request(self, payload):
+            seq = self._send_seq
+            self._send_seq += 1
+            self.sent_sequences.append([segment.sequence for segment in payload.segments])
+            return seq, SimpleNamespace(last_result=int(SpiMessageResult.OK))
+
+        def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001, timeout_s: float = 1.5):
+            self.wait_calls.append(sequence)
+            result = self._wait_results.pop(0)
+            return SimpleNamespace(
+                last_result=result,
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0xFF,
+                endstop_armed_mask=0,
+            )
+
+    transport = FakeTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[StreamAxisConfig(axis_id=0, ramp=RampConfig(target_rpm=300.0))],
+    )
+    streamer.set_generator(iter([
+        MultiAxisSegment(sequence=0, duration_us=4000, steps=[12], directions=[0]),
+    ]))
+
+    first_sent, _first_status = streamer._collect_and_send_batch(transport.get_status())
+    second_sent, _second_status = streamer._collect_and_send_batch(transport.get_status())
+
+    assert first_sent == 0
+    assert second_sent == 1
+    assert transport.wait_calls == [21, 22]
+    assert transport.sent_sequences == [[0], [0]]
+    assert len(streamer._inflight) == 1
+    assert streamer._retry_batch is None
+
+
+def test_streamer_rejects_non_monotonic_sequences_inside_batch():
+    class FakeTransport:
+        def get_status(self):
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                last_result=int(SpiMessageResult.OK),
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0xFF,
+                endstop_armed_mask=0,
+            )
+
+        def send_multi_axis_segment_block_request(self, payload):
+            return 1, SimpleNamespace(last_result=int(SpiMessageResult.OK))
+
+        def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001, timeout_s: float = 1.5):
+            return SimpleNamespace(
+                last_result=int(SpiMessageResult.OK),
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0xFF,
+                endstop_armed_mask=0,
+            )
+
+    streamer = MultiAxisRampStreamer(
+        transport=FakeTransport(),
+        axis_streams=[StreamAxisConfig(axis_id=0, ramp=RampConfig(target_rpm=300.0))],
+    )
+    streamer.set_generator(iter([
+        MultiAxisSegment(sequence=10, duration_us=4000, steps=[12], directions=[0]),
+        MultiAxisSegment(sequence=12, duration_us=4000, steps=[12], directions=[0]),
+        MultiAxisSegment(sequence=11, duration_us=4000, steps=[12], directions=[0]),
+    ]))
+
+    with pytest.raises(RuntimeError, match="motion sequence not strictly increasing"):
+        streamer._collect_and_send_batch(streamer._transport.get_status())
+
+
+def test_streamer_allows_wrapped_sequences_inside_batch():
+    class FakeTransport:
+        def get_status(self):
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFD,
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                last_result=int(SpiMessageResult.OK),
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0xFF,
+                endstop_armed_mask=0,
+            )
+
+        def send_multi_axis_segment_block_request(self, payload):
+            return 1, SimpleNamespace(last_result=int(SpiMessageResult.OK))
+
+        def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001, timeout_s: float = 1.5):
+            return SimpleNamespace(
+                last_result=int(SpiMessageResult.OK),
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0xFF,
+                endstop_armed_mask=0,
+            )
+
+    streamer = MultiAxisRampStreamer(
+        transport=FakeTransport(),
+        axis_streams=[StreamAxisConfig(axis_id=0, ramp=RampConfig(target_rpm=300.0))],
+    )
+    streamer.set_generator(iter([
+        MultiAxisSegment(sequence=0xFFFE, duration_us=4000, steps=[12], directions=[0]),
+        MultiAxisSegment(sequence=0xFFFF, duration_us=4000, steps=[12], directions=[0]),
+        MultiAxisSegment(sequence=0x0000, duration_us=4000, steps=[12], directions=[0]),
+        MultiAxisSegment(sequence=0x0001, duration_us=4000, steps=[12], directions=[0]),
+    ]))
+
+    sent, _status = streamer._collect_and_send_batch(streamer._transport.get_status())
+
+    assert sent == 4
+    assert streamer._last_sent_motion_seq == 0x0001
+
+
+def test_mock_spi_transport_preserves_wrapped_execution_order():
+    transport = MockSpiTransport()
+    payload = SimpleNamespace(
+        segments=[
+            MultiAxisSegment(sequence=0xFFFE, duration_us=4000, steps=[12], directions=[0]),
+            MultiAxisSegment(sequence=0xFFFF, duration_us=4000, steps=[12], directions=[0]),
+            MultiAxisSegment(sequence=0x0000, duration_us=4000, steps=[12], directions=[0]),
+            MultiAxisSegment(sequence=0x0001, duration_us=4000, steps=[12], directions=[0]),
+        ]
+    )
+
+    _seq, first_status = transport.send_multi_axis_segment_block_request(payload)
+    second_status = transport.get_status()
+    third_status = transport.get_status()
+    fourth_status = transport.get_status()
+
+    assert first_status.last_executed_sequence == 0xFFFE
+    assert second_status.last_executed_sequence == 0xFFFF
+    assert third_status.last_executed_sequence == 0x0000
+    assert fourth_status.last_executed_sequence == 0x0001
 
 
 def test_engine_exposes_public_config_property():

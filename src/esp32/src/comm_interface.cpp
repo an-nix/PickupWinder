@@ -26,12 +26,15 @@
 
 #include "motion_planner.h"
 
+// Module log tag used by ESP logging macros throughout this file.
 static const char* TAG = "comm_iface";
 
+// Task configuration: stack size, priority and pinned core for SPI task.
 static constexpr uint32_t  SPI_TASK_STACK  = 4096;
 static constexpr UBaseType_t SPI_TASK_PRIO = 24;
 static constexpr BaseType_t  SPI_TASK_CORE = 0;
 
+// Task configuration for the multi-axis executor (separate core).
 static constexpr uint32_t    MULTI_EXEC_STACK  = 8192;
 static constexpr UBaseType_t MULTI_EXEC_PRIO   = 20;
 static constexpr BaseType_t  MULTI_EXEC_CORE   = 1;
@@ -64,16 +67,20 @@ static constexpr uint32_t MAX_FLUSH_DRAIN        = 8;
  *
  * Depth is sized to hold ~600 ms of motion at 4 ms/segment.
  */
+// Depth for the global multi-axis block queue (holds planned blocks from host).
 static constexpr uint32_t MULTI_AXIS_QUEUE_DEPTH = 64;
+// Global queue handle for multi-axis blocks (produced by spiTask, consumed by executor).
 static QueueHandle_t s_multi_axis_queue  = nullptr;
 
 /**
  * @brief Global queue for flush requests.  Depth 4 is more than enough since
  *        the host can only issue one flush at a time.
  */
+// Flush request queue depth and handle (tiny, host issues at most one in-flight flush).
 static constexpr uint32_t FLUSH_QUEUE_DEPTH = 4;
 static QueueHandle_t s_flush_queue = nullptr;
 
+// DMA-capable frame buffers for SPI transactions (allocated on init()).
 static uint8_t* s_rx_frame = nullptr;
 static uint8_t* s_tx_frame_a = nullptr;
 
@@ -84,6 +91,7 @@ static uint8_t* s_tx_frame_a = nullptr;
 CommInterface::CommInterface(StepperQueue* queues[], uint8_t n_motors)
     : n_motors_(n_motors < SPI_MAX_AXES ? n_motors : SPI_MAX_AXES)
 {
+    // Copy incoming queue pointers into the fixed-size array, null-filling unused entries.
     for (uint8_t i = 0; i < SPI_MAX_AXES; ++i) {
         queues_[i] = (i < n_motors_) ? queues[i] : nullptr;
     }
@@ -96,8 +104,8 @@ CommInterface::CommInterface(StepperQueue* queues[], uint8_t n_motors)
 esp_err_t CommInterface::init(const SpiBusPins& pins)
 {
     pins_ = pins;
-
-    // Allocate DMA-capable buffers for SPI frames.
+    // Copy pin configuration for later use.
+    // Allocate DMA-capable buffers for SPI frames (one RX, one TX buffer).
     if (s_rx_frame == nullptr) {
         s_rx_frame = static_cast<uint8_t*>(heap_caps_malloc(SPI_FRAME_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_32BIT));
         ESP_RETURN_ON_FALSE(s_rx_frame != nullptr, ESP_ERR_NO_MEM, TAG, "failed to alloc s_rx_frame");
@@ -107,6 +115,7 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
         ESP_RETURN_ON_FALSE(s_tx_frame_a != nullptr, ESP_ERR_NO_MEM, TAG, "failed to alloc s_tx_frame_a");
     }
 
+    // Configure lateral endstop pins if both NO and NC pins are provided.
     if (pins_.home_pin_no != GPIO_NUM_NC && pins_.home_pin_nc != GPIO_NUM_NC) {
         gpio_config_t home_cfg = {};
         home_cfg.pin_bit_mask = (1ULL << static_cast<uint32_t>(pins_.home_pin_no))
@@ -118,16 +127,17 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
         ESP_RETURN_ON_ERROR(gpio_config(&home_cfg), TAG, "failed to configure home sensor pins");
     }
 
-    // Create the global multi-axis segment queue.
+    // Create the global multi-axis segment queue (from SPI producer -> executor consumer).
     s_multi_axis_queue = xQueueCreate(MULTI_AXIS_QUEUE_DEPTH, sizeof(multi_axis_block_t));
     ESP_RETURN_ON_FALSE(s_multi_axis_queue != nullptr, ESP_ERR_NO_MEM, TAG,
                         "failed to create multi-axis queue");
 
-    // Create the global flush request queue.
+    // Create the global flush request queue (small, host posts flush requests here).
     s_flush_queue = xQueueCreate(FLUSH_QUEUE_DEPTH, sizeof(flush_request_t));
     ESP_RETURN_ON_FALSE(s_flush_queue != nullptr, ESP_ERR_NO_MEM, TAG,
                         "failed to create flush queue");
 
+    // Configure the SPI bus pins and maximum transfer size for the fixed frame.
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = pins_.mosi;
     bus_cfg.miso_io_num = pins_.miso;
@@ -144,10 +154,12 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     slave_cfg.post_setup_cb = nullptr;
     slave_cfg.post_trans_cb = nullptr;
 
+    // Initialize the SPI slave driver with DMA channel auto-selection.
     ESP_RETURN_ON_ERROR(
         spi_slave_initialize(SPI3_HOST, &bus_cfg, &slave_cfg, SPI_DMA_CH_AUTO),
         TAG, "spi_slave_initialize failed");
 
+    // Spawn the SPI handling task pinned to Core 0.
     BaseType_t rc = xTaskCreatePinnedToCore(
         &CommInterface::spiTask,
         "comm_spi",
@@ -160,10 +172,11 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     ESP_RETURN_ON_FALSE(rc == pdPASS, ESP_ERR_NO_MEM, TAG,
                         "failed to create comm_spi task");
 
-    // ── Planner layer: decomposes multi-axis blocks into planned segments ───
+    // Initialize the planner which consumes s_multi_axis_queue and watches s_flush_queue.
     ESP_RETURN_ON_ERROR(planner_.init(s_multi_axis_queue, s_flush_queue),
                         TAG, "failed to init motion planner");
 
+    // Spawn the multi-axis executor task pinned to Core 1.
     rc = xTaskCreatePinnedToCore(
         &CommInterface::multiAxisExecutorTask,
         "multi_exec",
@@ -185,6 +198,7 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
             TAG, "initEndstopIsr failed");
     }
 
+    // Log configured pins and frame size once initialization completes.
     ESP_LOGI(TAG, "SPI slave ready  MOSI=%d MISO=%d SCLK=%d CS=%d  frame=%uB",
              (int)pins_.mosi, (int)pins_.miso, (int)pins_.sclk, (int)pins_.cs,
              (unsigned)SPI_FRAME_SIZE);
@@ -193,10 +207,13 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
 
 void CommInterface::buildStatusFrame(uint8_t* out_frame) const
 {
+    // Zero the outgoing frame buffer and prepare header/payload overlays.
     spi_message_zero_frame(out_frame);
 
     auto* header = reinterpret_cast<SpiMessageHeader*>(out_frame);
     auto* payload = reinterpret_cast<StatusPayload*>(out_frame + sizeof(SpiMessageHeader));
+
+    // Initialize the SpiMessageHeader fields for a STATUS message.
 
     spi_message_init_header(*header,
                             SpiMessageType::STATUS,
@@ -204,6 +221,7 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
                             sizeof(StatusPayload),
                             0);
 
+    // Fill basic runtime fields (uptime, per-axis diagnostics, masks).
     payload->uptime_ms = static_cast<uint32_t>(xTaskGetTickCount() * portTICK_PERIOD_MS);
     for (uint8_t axis = 0; axis < SPI_MAX_AXES; ++axis) {
         if (axis < n_motors_ && queues_[axis] != nullptr) {
@@ -222,6 +240,7 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
             payload->underrun_count[axis]   = 0;
         }
     }
+    // Copy last RX/result/protocol fields into status payload.
     payload->last_rx_sequence = last_rx_sequence_;
     payload->last_rx_type     = last_rx_type_;
     payload->last_result      = last_result_;
@@ -237,18 +256,22 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
         }
     }
 
-    // Atomic load — lock-free cross-core read (written by Core 1 executor).
+    // Atomic load of last executed motion sequence (written by Core 1).
     payload->last_executed_sequence = last_executed_sequence_.load(std::memory_order_acquire);
 
     // Planner lookahead pressure: how many slots are free in segment_queue_.
     const uint32_t pqf = planner_.segmentQueueFree();
     payload->planner_queue_free = static_cast<uint8_t>(pqf < 255u ? pqf : 255u);
+    payload->last_planned_sequence = planner_.lastPlannedMotionSequence();
+    payload->segments_dropped = static_cast<uint16_t>(planner_.segmentsDropped() & 0xFFFFu);
 
+    // Finalize the frame: compute CRC and pad as needed.
     spi_message_finalize(out_frame);
 }
 
 esp_err_t CommInterface::handleEnableAxis(const EnableAxisPayload& payload)
 {
+    // Validate axis id and presence of a queue for the axis.
     if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -263,6 +286,7 @@ esp_err_t CommInterface::handleEnableAxis(const EnableAxisPayload& payload)
 
 esp_err_t CommInterface::handleEmergencyStop(const EmergencyStopPayload& payload)
 {
+    // Support broadcast emergency stop when axis_id == 0xFF.
     if (payload.axis_id == 0xFF) {
         for (uint8_t axis = 0; axis < n_motors_; ++axis) {
             if (queues_[axis] != nullptr) {
@@ -304,6 +328,7 @@ esp_err_t CommInterface::handleStopAxis(const EmergencyStopPayload& payload)
 
 esp_err_t CommInterface::handleDisableAll()
 {
+    // Disable drivers for all configured axes.
     for (uint8_t axis = 0; axis < n_motors_; ++axis) {
         if (queues_[axis] != nullptr) {
             queues_[axis]->driver().disable();
@@ -314,16 +339,19 @@ esp_err_t CommInterface::handleDisableAll()
 
 esp_err_t CommInterface::handleResetStats()
 {
+    // Reset underrun counters on all axis drivers.
     for (uint8_t axis = 0; axis < n_motors_; ++axis) {
         if (queues_[axis] != nullptr) {
             queues_[axis]->driver().resetUnderrunCount();
         }
     }
+    planner_.resetStats();
     return ESP_OK;
 }
 
 esp_err_t CommInterface::handleEnableEndstop(const EnableEndstopPayload& payload)
 {
+    // Arm or disarm the configured endstop for a specific axis.
     if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -340,6 +368,7 @@ esp_err_t CommInterface::handleEnableEndstop(const EnableEndstopPayload& payload
 
 esp_err_t CommInterface::handleStepBlock(const StepBlockPayload& payload)
 {
+    // Convert incoming StepBlockPayload into an internal motion_block_t and enqueue.
     if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -363,6 +392,7 @@ esp_err_t CommInterface::handleStepBlock(const StepBlockPayload& payload)
 
 esp_err_t CommInterface::handleSegmentBlock(const SegmentBlockPayload& payload)
 {
+    // Convert incoming SegmentBlockPayload into an internal motion_block_t and enqueue.
     if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -404,15 +434,18 @@ esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
      *
      * Total minimum: 4 + axis_count + segment_count * (6 + 2*axis_count)
      */
+    // Basic length validation: must at least contain the header.
     if (payload_length < sizeof(MultiAxisSegmentBlockHeader)) {
         return ESP_ERR_INVALID_SIZE;
     }
 
     MultiAxisSegmentBlockHeader hdr_val;
+    // Copy header out of payload (packed wire format -> local struct).
     memcpy(&hdr_val, payload, sizeof(hdr_val));
     const uint8_t axis_count     = hdr_val.axis_count;
     const uint8_t segment_count  = hdr_val.segment_count;
 
+    // Validate axis_count and segment_count ranges.
     if (axis_count == 0 || axis_count > MULTI_AXIS_MAX_AXES) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -425,8 +458,17 @@ esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
         sizeof(MultiAxisSegmentBlockHeader)
         + static_cast<size_t>(axis_count)
         + static_cast<size_t>(segment_count) * (6u + 2u * axis_count);
-    if (payload_length < static_cast<uint16_t>(expected_length)) {
+    // Verify the provided payload length matches the expected size computed from header fields.
+    if (payload_length != static_cast<uint16_t>(expected_length)) {
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Deduplicate already-accepted blocks using wrap-aware compare on block_seq.
+    if (sequence_is_stale_or_equal_u16(hdr_val.block_seq, last_accepted_block_seq_)) {
+        ESP_LOGW(TAG, "drop stale/duplicate block_seq=%u last=%u",
+                 static_cast<unsigned>(hdr_val.block_seq),
+                 static_cast<unsigned>(last_accepted_block_seq_));
+        return ESP_OK;
     }
 
     // Deserialise.
@@ -434,6 +476,7 @@ esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
     block.axis_count     = axis_count;
     block.segment_count  = segment_count;
 
+    // Deserialize axis ids and segment entries using a cursor pointer.
     const uint8_t* cursor = payload + sizeof(MultiAxisSegmentBlockHeader);
 
     // axis_ids
@@ -443,6 +486,7 @@ esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
     cursor += axis_count;
 
     // segments
+    // For each segment: read motion_sequence, duration_us, direction_mask, then per-axis step counts.
     for (uint8_t s = 0; s < segment_count; ++s) {
         uint16_t motion_seq, duration_us, dir_mask;
         memcpy(&motion_seq,  cursor,     2);
@@ -463,9 +507,11 @@ esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
     }
 
     // Non-blocking enqueue: return QUEUE_FULL immediately if full.
+    // Non-blocking enqueue into the global multi-axis queue; report QUEUE_FULL if unable to enqueue.
     if (xQueueSend(s_multi_axis_queue, &block, 0) != pdTRUE) {
         return ESP_ERR_TIMEOUT; // maps to QUEUE_FULL result code
     }
+    last_accepted_block_seq_ = hdr_val.block_seq;
     return ESP_OK;
 }
 
@@ -478,6 +524,7 @@ esp_err_t CommInterface::handleFlush(const FlushPayload& flush_payload)
      * a flush posted just before new segments arrive is always processed in
      * the correct order.
      */
+    // Post a flush request structure to the flush queue for the executor to consume.
     flush_request_t req { .flush_sequence = flush_payload.flush_sequence };
     if (xQueueSend(s_flush_queue, &req, 0) != pdTRUE) {
         // Flush queue full — this should never happen in normal operation.
@@ -485,6 +532,9 @@ esp_err_t CommInterface::handleFlush(const FlushPayload& flush_payload)
                  (unsigned)flush_payload.flush_sequence);
         return ESP_ERR_TIMEOUT;
     }
+    // Flush sequence is a motion_sequence, not a block_seq.
+    // Reset block deduplication state so the next incoming block is accepted.
+    last_accepted_block_seq_ = 0xFFFFu;
     return ESP_OK;
 }
 
@@ -499,14 +549,16 @@ void CommInterface::notifySegmentExecuted(uint16_t motion_seq)
      * the 16-bit wrap-around case correctly because we only call this in
      * strict execution order.
      */
+    // Atomically advance last_executed_sequence_ if the provided sequence is newer.
     uint16_t current = last_executed_sequence_.load(std::memory_order_relaxed);
-    if (static_cast<int16_t>(motion_seq - current) > 0) {
+    if (sequence_is_newer_u16(motion_seq, current)) {
         last_executed_sequence_.store(motion_seq, std::memory_order_release);
     }
 }
 
 uint8_t CommInterface::readLateralEndstopState() const
 {
+    // Read lateral endstop NO/NC pins and return the encoded LateralEndstopState.
     if (pins_.home_pin_no == GPIO_NUM_NC || pins_.home_pin_nc == GPIO_NUM_NC) {
         return static_cast<uint8_t>(LateralEndstopState::ABSENT);
     }
@@ -525,6 +577,7 @@ uint8_t CommInterface::readLateralEndstopState() const
 
 bool CommInterface::isLateralMovementAllowed(uint8_t axis_id) const
 {
+    // Only axis 1 (lateral) is gated by the endstop; other axes are always allowed.
     if (axis_id != 1) {
         return true;
     }
@@ -533,6 +586,7 @@ bool CommInterface::isLateralMovementAllowed(uint8_t axis_id) const
 
 esp_err_t CommInterface::handleFrame(const SpiMessageHeader& header, const uint8_t* payload)
 {
+    // Dispatch incoming requests by message type; simple size checks performed per-case.
     switch (static_cast<SpiMessageType>(header.msg_type)) {
     case SpiMessageType::NOP:
     case SpiMessageType::GET_STATUS:
@@ -694,24 +748,59 @@ void CommInterface::spiTask(void* arg)
             self->last_rx_sequence_ = header.sequence;
             self->last_rx_type_     = header.msg_type;
 
-            const uint8_t* payload = s_rx_frame + sizeof(SpiMessageHeader);
-            err = self->handleFrame(header, payload);
-            if (err == ESP_OK) {
-                self->last_result_ = static_cast<uint8_t>(SpiMessageResult::OK);
-            } else if (err == ESP_ERR_TIMEOUT) {
-                self->last_result_ = static_cast<uint8_t>(SpiMessageResult::QUEUE_FULL);
-            } else if (err == ESP_ERR_INVALID_ARG) {
-                self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_AXIS);
-            } else if (err == ESP_ERR_INVALID_SIZE) {
-                self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_LENGTH);
-            } else if (err == ESP_ERR_NOT_SUPPORTED) {
-                self->last_result_ = static_cast<uint8_t>(SpiMessageResult::UNKNOWN_TYPE);
-            } else if (err == ESP_ERR_INVALID_STATE) {
-                self->last_result_ = static_cast<uint8_t>(SpiMessageResult::ENDSTOP_BLOCKED);
+            // Detect exact duplicate retries by matching sequence/type/length/crc
+            // against a small cache of recently processed requests.
+            const CommInterface::ProcessedRequestSignature* cached_request = nullptr;
+            for (const auto& cached : self->recent_request_cache_) {
+                if (cached.valid
+                    && header.sequence == cached.sequence
+                    && header.msg_type == cached.msg_type
+                    && header.payload_length == cached.payload_length
+                    && header.crc16 == cached.crc) {
+                    cached_request = &cached;
+                    break;
+                }
+            }
+
+            if (cached_request != nullptr) {
+                // Reuse the previous result for this exact request signature.
+                self->last_result_ = cached_request->result;
+                ESP_LOGD(TAG, "duplicate SPI request seq=%u type=0x%02X ignored",
+                         static_cast<unsigned>(header.sequence),
+                         static_cast<unsigned>(header.msg_type));
             } else {
-                self->last_result_ = static_cast<uint8_t>(SpiMessageResult::INTERNAL_ERROR);
-                ESP_LOGW(TAG, "message 0x%02X failed: %s",
-                         header.msg_type, esp_err_to_name(err));
+                const uint8_t* payload = s_rx_frame + sizeof(SpiMessageHeader);
+                err = self->handleFrame(header, payload);
+                // Map esp_err_t handler return codes to SpiMessageResult values for status reporting.
+                if (err == ESP_OK) {
+                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::OK);
+                } else if (err == ESP_ERR_TIMEOUT) {
+                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::QUEUE_FULL);
+                } else if (err == ESP_ERR_INVALID_ARG) {
+                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_AXIS);
+                } else if (err == ESP_ERR_INVALID_SIZE) {
+                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_LENGTH);
+                } else if (err == ESP_ERR_NOT_SUPPORTED) {
+                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::UNKNOWN_TYPE);
+                } else if (err == ESP_ERR_INVALID_STATE) {
+                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::ENDSTOP_BLOCKED);
+                } else {
+                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::INTERNAL_ERROR);
+                    ESP_LOGW(TAG, "message 0x%02X failed: %s",
+                             header.msg_type, esp_err_to_name(err));
+                }
+
+                auto& cache_slot =
+                    self->recent_request_cache_[self->recent_request_cache_write_index_];
+                cache_slot.valid = true;
+                cache_slot.sequence = header.sequence;
+                cache_slot.msg_type = header.msg_type;
+                cache_slot.payload_length = header.payload_length;
+                cache_slot.crc = header.crc16;
+                cache_slot.result = self->last_result_;
+                self->recent_request_cache_write_index_ = static_cast<uint8_t>(
+                    (self->recent_request_cache_write_index_ + 1)
+                    % RECENT_REQUEST_CACHE_DEPTH);
             }
         }
 
@@ -735,17 +824,13 @@ void CommInterface::spiTask(void* arg)
             diag_last_log_us = now_us;
         }
 
-        // ── Pre-build status for the NEXT iteration ───────────────────────────
-        // This moves buildStatusFrame() out of the critical gap between
-        // spi_slave_transmit() returning and the next call, reducing the
-        // window where the Pi sees all-zero MISO.
+        // Pre-build the next status frame to minimize the window where MISO is all-zero.
+        // This reduces a race where the master might sample an all-zero MISO if it clocks
+        // the bus during the small gap between transactions.
         self->buildStatusFrame(s_tx_frame_a);
         
-        // --- HARDWARE FLUSH/SYNC DELAY ---
-        // Ensure all bytes are properly flushed from cache to DMA RAM
-        // before arming the next SPI transaction. Without this tiny yield,
-        // back-to-back rapid transactions can cause the SPI hardware FIFO
-        // to latch the first byte late, resulting in a 1-byte shift (0x0150).
+        // Tiny delay to ensure CPU caches flush into DMA-capable RAM before the next transaction.
+        // Prevents a 1-byte FIFO alignment glitch on rapid back-to-back transfers.
         esp_rom_delay_us(2);
     }
 }
@@ -767,6 +852,8 @@ void CommInterface::spiTask(void* arg)
 // to the for(;;) top-level loop which naturally yields via xQueueReceive
 // or explicit vTaskDelay(1).
 
+// Multi-axis executor: state-machine that drains planned segments and writes
+// per-axis constant-rate blocks into each StepperQueue without starting RMT.
 void CommInterface::multiAxisExecutorTask(void* arg)
 {
     auto* self = static_cast<CommInterface*>(arg);
@@ -791,9 +878,9 @@ void CommInterface::multiAxisExecutorTask(void* arg)
     QueueHandle_t seg_queue = self->planner_.segmentQueue();
 
     // ── Deferred notification ring ────────────────────────────────────────
-    static constexpr int DEFER_DEPTH = 256;
-    static int64_t  defer_fire_us[DEFER_DEPTH];
-    static uint32_t defer_seqs[DEFER_DEPTH];
+    constexpr int DEFER_DEPTH = 256;
+    int64_t  defer_fire_us[DEFER_DEPTH] = {};
+    uint32_t defer_seqs[DEFER_DEPTH] = {};
     int      defer_head = 0;
     int      defer_tail = 0;
 
@@ -835,8 +922,8 @@ void CommInterface::multiAxisExecutorTask(void* arg)
     };
 
     // ── Main loop ─────────────────────────────────────────────────────────
+    uint32_t wm_iter = 0;
     for (;;) {
-        static uint32_t wm_iter = 0;
         if (++wm_iter % 2000 == 0) {
             ESP_LOGD(TAG, "multi_exec stack watermark: %u bytes free",
                      (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
@@ -953,6 +1040,18 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     }
                 };
 
+                // Pre-start any stopped RMT streams before pushing more steps.
+                // This prevents pushBlock() from stalling inside DRAIN on the
+                // first segment after idle or recovery.
+                for (uint8_t a = 0; a < seg.axis_count; ++a) {
+                    const uint8_t axis_id = seg.axis_ids[a];
+                    if (axis_id < self->n_motors_ &&
+                        self->queues_[axis_id] != nullptr &&
+                        !self->queues_[axis_id]->driver().isStreaming()) {
+                        self->queues_[axis_id]->kickStart();
+                    }
+                }
+
                 // ── Write steps to ring buffer (no RMT start) ─────────────
                 for (uint8_t a = 0; a < seg.axis_count; ++a) {
                     const uint8_t axis_id = seg.axis_ids[a];
@@ -990,7 +1089,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                 // ── Schedule deferred notification ────────────────────────
                 if ((defer_tail - defer_head) < DEFER_DEPTH) {
                     const int idx = defer_tail & (DEFER_DEPTH - 1);
-                    defer_fire_us[idx] = seg.scheduled_time_us
+                    defer_fire_us[idx] = esp_timer_get_time()
                                          + static_cast<int64_t>(seg.duration_us);
                     defer_seqs[idx]    = seg.motion_sequence;
                     ++defer_tail;
@@ -1006,7 +1105,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     ++defer_head;
                     // Enqueue current segment.
                     const int idx = defer_tail & (DEFER_DEPTH - 1);
-                    defer_fire_us[idx] = seg.scheduled_time_us
+                    defer_fire_us[idx] = esp_timer_get_time()
                                          + static_cast<int64_t>(seg.duration_us);
                     defer_seqs[idx]    = seg.motion_sequence;
                     ++defer_tail;

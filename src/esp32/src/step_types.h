@@ -37,6 +37,21 @@
 extern "C" {
 #endif
 
+static inline int16_t sequence_signed_distance_u16(uint16_t lhs, uint16_t rhs)
+{
+    return (int16_t)((uint16_t)(lhs - rhs));
+}
+
+static inline bool sequence_is_newer_u16(uint16_t candidate, uint16_t reference)
+{
+    return sequence_signed_distance_u16(candidate, reference) > 0;
+}
+
+static inline bool sequence_is_stale_or_equal_u16(uint16_t candidate, uint16_t reference)
+{
+    return sequence_signed_distance_u16(candidate, reference) <= 0;
+}
+
 // ---------------------------------------------------------------------------
 // RMT timing constants
 // ---------------------------------------------------------------------------
@@ -123,18 +138,18 @@ extern "C" {
 
 /** Buffered step target before starting the RMT stream.
  *  Must satisfy: STEP_STREAM_START_FILL >= 2 * PART_SIZE.
- *  Raised from 16 to 128 (16 × PART_SIZE): at low-speed ramp-up, the host
- *  sends ~4 steps/segment; starting RMT with only 16 entries means the ring
- *  drains after the second ISR callback, causing underrun before the executor
- *  can refill.  128 entries = ~16 segments of look-ahead, safe at all speeds. */
-#define STEP_STREAM_START_FILL  128U
+ *  The stream must start quickly enough for the first ramp segments to reach
+ *  the RMT without being held back behind a deep prefill. Two PART_SIZE chunks
+ *  is the minimum safe threshold for the first ISR callbacks.
+ */
+#define STEP_STREAM_START_FILL  16U
 
 /**
  * Minimum steps required to RESTART the RMT stream after an underrun.
  * With coast-mode this is rarely used (RMT stays running), but kept
- * as a safety net.  2 × PART_SIZE = 16.
+ * as a safety net. One PART_SIZE chunk is sufficient for restart.
  */
-#define STEP_STREAM_RESTART_FILL  (2U * PART_SIZE)   // = 16
+#define STEP_STREAM_RESTART_FILL  PART_SIZE
 
 /**
  * Depth of the FreeRTOS step-block queue (per motor).
@@ -241,19 +256,6 @@ typedef struct {
     uint8_t  toggle_dir; /**< 1 = toggle DIR pin before this step.                   */
     uint8_t  pad;        /**< Padding for 4-byte alignment.                          */
 } ring_entry_t;
-
-/**
- * @brief Wire packet received from the host over UART/SPI.
- *
- * The comm layer deserialises this from the byte stream and routes it to
- * the appropriate motor queue based on motor_id.
- */
-typedef struct {
-    uint8_t    motor_id;               /**< Target motor: 0 or 1                 */
-    uint8_t    block_seq;              /**< Rolling sequence number (loss detect) */
-    uint32_t   count;                  /**< Number of valid steps in payload      */
-    step_cmd_t steps[STEP_BLOCK_SIZE]; /**< Step payload                          */
-} comm_packet_t;
 
 // ---------------------------------------------------------------------------
 // Multi-axis synchronised segment block (MULTI_AXIS_SEGMENT_BLOCK = 0x13)

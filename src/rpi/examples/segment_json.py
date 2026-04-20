@@ -20,7 +20,7 @@ from motion import (
     RampConfig,
 )
 from motion.segment_json import dump_segment_json, load_segment_json
-from transport import Esp32SpiTransport, MultiAxisRampStreamer
+from transport import Esp32SpiTransport, MockSpiTransport, MultiAxisRampStreamer
 
 
 def build_manual_generator(args: argparse.Namespace):
@@ -124,7 +124,13 @@ def run_segment_json(args: argparse.Namespace) -> None:
         f"Streaming {len(segment_list)} segments from {args.input} "
         f"with target_hz={target_hz:.1f} segment_duration_s={segment_duration_s:.6f}"
     )
-    with Esp32SpiTransport(bus=args.bus, device=args.device, speed_hz=args.speed_hz, mode=0) as transport:
+    if args.simulate:
+        transport = MockSpiTransport()
+        print("Simulation mode enabled: no real SPI access")
+    else:
+        transport = Esp32SpiTransport(bus=args.bus, device=args.device, speed_hz=args.speed_hz, mode=0)
+
+    with transport:
         streamer = MultiAxisRampStreamer.from_axis_ids(
             transport=transport,
             axis_ids=axis_ids,
@@ -136,7 +142,7 @@ def run_segment_json(args: argparse.Namespace) -> None:
         streamer.set_generator(iter(segment_list))
         total = streamer.stream_all()
         print(f"Streamed {total} segments")
-        if args.disable_all:
+        if args.disable_all and not args.simulate:
             print("Disabling all axes")
             transport.disable_all()
 
@@ -178,6 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--poll-interval-s", type=float, default=0.001)
     run_parser.add_argument("--print-every", type=int, default=8)
     run_parser.add_argument("--disable-all", action="store_true")
+    run_parser.add_argument("--simulate", action="store_true", help="Run without real SPI using a mock transport")
 
     return parser
 

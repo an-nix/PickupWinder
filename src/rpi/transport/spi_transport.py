@@ -361,7 +361,10 @@ class Esp32SpiTransport:
         return self.transfer_request(make_multi_axis_segment_block(payload, self._next_sequence()))
 
     def flush_until(self, sequence: int) -> StatusPayload:
-        return self.transfer_frame(make_flush(FlushPayload(flush_sequence=sequence), self._next_sequence()))
+        transport_sequence, _ = self.transfer_request(
+            make_flush(FlushPayload(flush_sequence=sequence), self._next_sequence())
+        )
+        return self.wait_for_request_result(transport_sequence)
 
     def arm_endstop(self, axis_id: int) -> StatusPayload:
         """Send ENABLE_ENDSTOP to arm the hardware endstop ISR on *axis_id*."""

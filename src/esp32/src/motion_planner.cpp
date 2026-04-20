@@ -38,8 +38,8 @@ static constexpr uint32_t    PLANNER_STACK = 4096;
 static constexpr UBaseType_t PLANNER_PRIO  = 8;   // Below SPI (10), above idle
 static constexpr BaseType_t  PLANNER_CORE  = 0;   // Same core as SPI task
 
-/** Max blocks drained from cmd_queue_ during a single flush operation. */
-static constexpr uint32_t MAX_FLUSH_DRAIN = 16;
+/** Current depth of the SPI→planner multi-axis command queue. */
+static constexpr uint32_t CMD_QUEUE_DEPTH = 64;
 
 /** Backpressure timeout: how long the planner waits for segment_queue_ space
  *  before dropping a segment.  10 ms is ~2.5 segments at 4 ms/segment. */
@@ -95,6 +95,12 @@ uint32_t MotionPlanner::segmentQueueFree() const
     return static_cast<uint32_t>(uxQueueSpacesAvailable(segment_queue_));
 }
 
+void MotionPlanner::resetStats()
+{
+    segments_planned_ = 0;
+    segments_dropped_ = 0;
+}
+
 // ---------------------------------------------------------------------------
 // planBlock()
 // ---------------------------------------------------------------------------
@@ -131,13 +137,33 @@ void MotionPlanner::handleFlush(const flush_request_t& req)
     // output queue without blocking; if that fails we remember the flush
     // and retry on the next planner loop iteration.
     has_pending_block_ = false; // drop current pending block
+    pending_segment_idx_ = 0;
     timeline_us_ = esp_timer_get_time();
+    last_planned_motion_seq_ = req.flush_sequence;
+
+    multi_axis_block_t dropped_block {};
+    planned_segment_t dropped_seg {};
+    uint32_t dropped_cmd = 0;
+    uint32_t dropped_planned = 0;
+
+    while (dropped_cmd < CMD_QUEUE_DEPTH &&
+           xQueueReceive(cmd_queue_, &dropped_block, 0) == pdTRUE) {
+        ++dropped_cmd;
+    }
+    while (dropped_planned < SEGMENT_QUEUE_DEPTH &&
+           xQueueReceive(segment_queue_, &dropped_seg, 0) == pdTRUE) {
+        ++dropped_planned;
+    }
+
     planned_segment_t flush_seg {};
     flush_seg.is_flush = true;
     flush_seg.flush_sequence = req.flush_sequence;
     if (xQueueSend(segment_queue_, &flush_seg, 0) == pdTRUE) {
         flush_pending_ = false;
-        ESP_LOGI(TAG, "flush sentinel posted seq=%u", req.flush_sequence);
+        ESP_LOGI(TAG, "flush sentinel posted seq=%u dropped_cmd=%lu dropped_seg=%lu",
+                 req.flush_sequence,
+                 static_cast<unsigned long>(dropped_cmd),
+                 static_cast<unsigned long>(dropped_planned));
     } else {
         // Queue full — remember to retry later.
         flush_pending_ = true;
@@ -211,6 +237,18 @@ void MotionPlanner::plannerTask(void* arg)
 
             const multi_axis_segment_t& src = self->pending_block_.segments[idx];
 
+            if (sequence_is_stale_or_equal_u16(
+                    src.motion_sequence,
+                    self->last_planned_motion_seq_)) {
+                ESP_LOGW(TAG, "drop stale/out-of-order seg seq=%u last=%u",
+                         static_cast<unsigned>(src.motion_sequence),
+                         static_cast<unsigned>(self->last_planned_motion_seq_));
+                ++self->segments_dropped_;
+                ++self->pending_segment_idx_;
+                ++processed;
+                continue;
+            }
+
             planned_segment_t seg {};
             seg.motion_sequence = src.motion_sequence;
             seg.duration_us     = src.duration_us;
@@ -233,6 +271,7 @@ void MotionPlanner::plannerTask(void* arg)
             // planner iteration (natural backpressure, no data loss).
             if (xQueueSend(self->segment_queue_, &seg, 0) == pdTRUE) {
                 self->timeline_us_ += static_cast<int64_t>(src.duration_us);
+                self->last_planned_motion_seq_ = src.motion_sequence;
                 ++self->segments_planned_;
                 ++self->pending_segment_idx_;
                 ++processed;

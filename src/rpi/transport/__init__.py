@@ -41,6 +41,7 @@ from .messages import (
     make_enable_endstop,
 )
 from .spi_transport import Esp32SpiTransport
+from .mock_spi_transport import MockSpiTransport
 
 # Lazy import of streamer to break circular dependency
 def __getattr__(name: str):

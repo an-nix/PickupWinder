@@ -108,15 +108,12 @@ enum class ExecState : uint8_t {
 /** Segment queue: planner → executor.  ~512 ms lookahead at 4 ms/segment. */
 static constexpr uint32_t SEGMENT_QUEUE_DEPTH = 128;
 
-/** Minimum segments buffered before executor begins first RMT kickStart. */
-static constexpr uint32_t SEGMENT_PREFILL_THRESHOLD = 16;
-
 /** Maximum segments the executor fetches per FETCH iteration.
  *  Set to 1 to force frequent yields and allow planner to refill. */
 static constexpr uint32_t EXEC_BATCH_LIMIT = 16;
 
 /** Time budget per executor iteration in microseconds (watchdog safe). */
-static constexpr int64_t  EXEC_TIME_BUDGET_US = 3000;
+static constexpr int64_t  EXEC_TIME_BUDGET_US = 8000;
 
 /** Planner tuning: time budget and per-iteration limit (watchdog-safe).
  *  200 µs budget allows processing 32+ segments per loop iteration at 5-10 µs/segment.
@@ -152,6 +149,8 @@ public:
     // ── Statistics ──────────────────────────────────────────────────────────
     uint32_t segmentsPlanned() const { return segments_planned_; }
     uint32_t segmentsDropped() const { return segments_dropped_; }
+    uint16_t lastPlannedMotionSequence() const { return last_planned_motion_seq_; }
+    void resetStats();
 
 private:
     QueueHandle_t cmd_queue_     {nullptr};  ///< Input: s_multi_axis_queue
@@ -161,6 +160,7 @@ private:
     int64_t  timeline_us_       {0};         ///< Monotonic scheduling timeline
     uint32_t segments_planned_  {0};
     uint32_t segments_dropped_  {0};
+    uint16_t last_planned_motion_seq_ {0xFFFFu};
 
     // ── Incremental planner state (to avoid burst processing) ───────────
     multi_axis_block_t pending_block_ {};   ///< Currently-being-expanded block

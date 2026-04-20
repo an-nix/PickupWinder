@@ -6,7 +6,7 @@ import struct
 from typing import Iterable, List
 
 SPI_MSG_MAGIC = 0x5057
-SPI_MSG_VERSION = 1
+SPI_MSG_VERSION = 2
 SPI_FRAME_SIZE = 512
 SPI_MAX_AXES = 4
 STEP_BLOCK_SIZE = 64
@@ -25,7 +25,7 @@ _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HHH")
 _STEP_COUNT_STRUCT = struct.Struct("<H")
 _FLUSH_STRUCT = struct.Struct("<H2x")
 _ENABLE_ENDSTOP_STRUCT = struct.Struct("<BB2x")
-_STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBBBHB")
+_STATUS_STRUCT = struct.Struct("<I4H4H4IHBBBBBBBHBHH")
 
 
 class SpiMessageType(IntEnum):  # Must match SpiMessageType in messages.h
@@ -253,6 +253,8 @@ class StatusPayload:
     endstop_armed_mask: int
     last_executed_sequence: int
     planner_queue_free: int
+    last_planned_sequence: int
+    segments_dropped: int
 
     @classmethod
     def unpack(cls, payload: bytes) -> "StatusPayload":
@@ -272,6 +274,8 @@ class StatusPayload:
             endstop_armed_mask=values[20],
             last_executed_sequence=values[21],
             planner_queue_free=values[22],
+            last_planned_sequence=values[23],
+            segments_dropped=values[24],
         )
 
 

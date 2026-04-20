@@ -290,10 +290,9 @@ void StepperQueue::executorTask(void* arg)
         }
 
         int work_done = 0;
+        const int64_t batch_start_us = esp_timer_get_time();
 
         do {
-            const int64_t loop_start_us = esp_timer_get_time();
-
             if (self->isMultiExecActive()) {
                 ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(1));
                 continue;
@@ -319,7 +318,7 @@ void StepperQueue::executorTask(void* arg)
                 const uint32_t ring_free = driver.ringFreeSlots();
                 if (ring_free > (STEP_RING_SIZE / 2U)) {
                     taskYIELD();
-                } else if ((esp_timer_get_time() - loop_start_us) > 5000) {
+                } else if ((esp_timer_get_time() - batch_start_us) > 5000) {
                     taskYIELD();
                 }
             }

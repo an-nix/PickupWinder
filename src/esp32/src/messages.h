@@ -27,7 +27,7 @@
 // ---------------------------------------------------------------------------
 
 static constexpr uint16_t SPI_MSG_MAGIC          = 0x5057; // 'P''W'
-static constexpr uint8_t  SPI_MSG_VERSION        = 1;
+static constexpr uint8_t  SPI_MSG_VERSION        = 2;
 static constexpr size_t   SPI_FRAME_SIZE         = 512;
 static constexpr size_t   SPI_MAX_PAYLOAD_SIZE   = SPI_FRAME_SIZE - 12;
 static constexpr uint8_t  SPI_MAX_AXES           = 4;
@@ -243,9 +243,13 @@ struct __attribute__((packed)) StatusPayload {
      *  The host uses this to gate how many blocks it sends ahead.
      *  Replaces the former reserved[1] byte — struct size unchanged. */
     uint8_t  planner_queue_free;
+    /** Most recent motion_sequence successfully planned into segment_queue_. */
+    uint16_t last_planned_sequence;
+    /** Low 16 bits of planner dropped-segment counter for host diagnostics. */
+    uint16_t segments_dropped;
 };
 
-static_assert(sizeof(StatusPayload) == 48, "StatusPayload must be 48 bytes");
+static_assert(sizeof(StatusPayload) == 52, "StatusPayload must be 52 bytes");
 static_assert(sizeof(StatusPayload) <= SPI_MAX_PAYLOAD_SIZE,
               "StatusPayload exceeds SPI_MAX_PAYLOAD_SIZE");
 

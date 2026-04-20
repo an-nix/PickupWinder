@@ -22,6 +22,7 @@
 #include "stepper_queue.h"
 #include "motion_planner.h"
 
+// Pinout bundle for SPI + lateral endstop wiring
 struct SpiBusPins {
     gpio_num_t mosi;
     gpio_num_t miso;
@@ -33,105 +34,70 @@ struct SpiBusPins {
 
 class CommInterface {
 public:
-    /**
-     * @brief Construct the SPI communication interface.
-     *
-     * @param queues   Stepper queues indexed by axis id.
-     * @param n_motors Number of valid queues.
-     */
+    // Construct the SPI communication interface, wiring up per-axis stepper queues.
     CommInterface(StepperQueue* queues[], uint8_t n_motors);
 
-    /**
-     * @brief Initialize the ESP32 SPI slave and start the communication task.
-     */
+    // Initialize SPI slave and start both the SPI task (Core 0) and the executor (Core 1).
     esp_err_t init(const SpiBusPins& pins);
 
 private:
+    // Per-axis StepperQueue pointers. Entries may be null for unused axes.
     StepperQueue*   queues_[SPI_MAX_AXES];
-    uint8_t         n_motors_;
-    SpiBusPins      pins_ {};
-    MotionPlanner   planner_;              ///< Planning layer (SPI → executor)
+    uint8_t         n_motors_;             // Number of valid axes configured
+    SpiBusPins      pins_ {};              // Copied pin configuration
+    MotionPlanner   planner_;              // Planner: converts blocks -> planned segments
 
-    uint16_t        last_rx_sequence_ {0};
-    uint8_t         last_rx_type_ {static_cast<uint8_t>(SpiMessageType::NOP)};
-    uint8_t         last_result_ {static_cast<uint8_t>(SpiMessageResult::OK)};
+    // --- SPI protocol runtime state (for status + dedupe) ---
+    uint16_t        last_rx_sequence_ {0}; // Sequence of last received request
+    uint8_t         last_rx_type_ {static_cast<uint8_t>(SpiMessageType::NOP)}; // Msg type of last received
+    uint8_t         last_result_ {static_cast<uint8_t>(SpiMessageResult::OK)};  // Result code last produced
 
-    /**
-     * @brief Motion sequence of the most recently fully-executed multi-axis
-     *        segment.  Updated by the executor task (Core 1) and read by the
-     *        SPI task (Core 0).  std::atomic provides lock-free cross-core
-     *        visibility without a portMUX spinlock.
-     *        Initialised to 0xFFFF so the host's first segment always
-     *        compares as "not yet executed".
-     */
+    struct ProcessedRequestSignature {
+        uint16_t sequence {0xFFFFu};
+        uint16_t payload_length {0};
+        uint16_t crc {0};
+        uint8_t  msg_type {static_cast<uint8_t>(SpiMessageType::NOP)};
+        uint8_t  result {static_cast<uint8_t>(SpiMessageResult::OK)};
+        bool     valid {false};
+    };
+
+    static constexpr uint8_t RECENT_REQUEST_CACHE_DEPTH = 4;
+    ProcessedRequestSignature recent_request_cache_[RECENT_REQUEST_CACHE_DEPTH] {};
+    uint8_t         recent_request_cache_write_index_ {0};
+
+    // Last accepted multi-axis block sequence (block_seq) for deduplication.
+    uint16_t        last_accepted_block_seq_ {0xFFFFu};
+
+    // Most recently fully executed motion_sequence published by executor (Core 1).
+    // Atomic so Core 0 can read it without locks.
     std::atomic<uint16_t>   last_executed_sequence_ {0xFFFFu};
 
-    /** Build the status payload for the next SPI response frame. */
+    // Build the status payload for the outgoing status frame (called on Core 0).
     void buildStatusFrame(uint8_t* out_frame) const;
 
-    /** Read the current lateral endstop state from the configured pins. */
+    // Read lateral endstop pins and return an encoded LateralEndstopState.
     uint8_t readLateralEndstopState() const;
 
-    /** Return true if the given axis may move given the lateral endstop state. */
+    // Return true if axis movement is permitted given lateral endstop state.
     bool isLateralMovementAllowed(uint8_t axis_id) const;
 
-    /** Parse and execute one validated request frame. */
+    // Validate and dispatch an incoming request frame payload (called from spiTask).
     esp_err_t handleFrame(const SpiMessageHeader& header, const uint8_t* payload);
 
-    esp_err_t handleEnableAxis(const EnableAxisPayload& payload);
-    esp_err_t handleEmergencyStop(const EmergencyStopPayload& payload);
-    esp_err_t handleStopAxis(const EmergencyStopPayload& payload);
-    esp_err_t handleDisableAll();
-    esp_err_t handleResetStats();
-    esp_err_t handleStepBlock(const StepBlockPayload& payload);
-    esp_err_t handleSegmentBlock(const SegmentBlockPayload& payload);
+    // Message handlers (one per supported SpiMessageType).
+    esp_err_t handleEnableAxis(const EnableAxisPayload& payload);      // Enable/disable an axis
+    esp_err_t handleEmergencyStop(const EmergencyStopPayload& payload);// Emergency stop (global or per-axis)
+    esp_err_t handleStopAxis(const EmergencyStopPayload& payload);     // Graceful stop (no ring flush)
+    esp_err_t handleDisableAll();                                     // Disable all axes
+    esp_err_t handleResetStats();                                     // Reset counters/diagnostics
+    esp_err_t handleStepBlock(const StepBlockPayload& payload);        // Legacy per-axis step block
+    esp_err_t handleSegmentBlock(const SegmentBlockPayload& payload);  // Legacy per-axis segment block
+    esp_err_t handleMultiAxisSegmentBlock(const uint8_t* payload, uint16_t payload_length); // Main multi-axis message
+    esp_err_t handleFlush(const FlushPayload& payload);                // Post a flush request
+    void notifySegmentExecuted(uint16_t motion_seq);                   // Called by executor when a segment completes
+    esp_err_t handleEnableEndstop(const EnableEndstopPayload& payload);// Arm/disarm lateral endstop
 
-    /**
-     * @brief Handle a MULTI_AXIS_SEGMENT_BLOCK (0x13) frame.
-     *
-     * Decodes the variable-length multi-axis segment payload and dispatches
-     * one multi_axis_segment_block_t to the global multi-axis queue.
-     */
-    esp_err_t handleMultiAxisSegmentBlock(const uint8_t* payload, uint16_t payload_length);
-
-    /**
-     * @brief Handle a FLUSH (0x12) frame.
-     *
-     * Instructs the executor to discard all queued segments whose
-     * motion_sequence > flush_sequence, allowing the host to inject a
-     * new trajectory without draining the current buffer first.
-     */
-    esp_err_t handleFlush(const FlushPayload& payload);
-
-    /**
-     * @brief Update last_executed_sequence_ under the spinlock.
-     *
-     * Must be called by the executor task whenever it completes a
-     * multi-axis segment.
-     *
-     * @param motion_seq  The motion_sequence of the just-completed segment.
-     */
-    void notifySegmentExecuted(uint16_t motion_seq);
-
-    /**
-     * @brief Handle an ENABLE_ENDSTOP (0x14) frame.
-     */
-    esp_err_t handleEnableEndstop(const EnableEndstopPayload& payload);
-
-    /** Core 0 SPI slave task. */
+    // Tasks: SPI slave loop runs on Core 0; multi-axis executor runs on Core 1.
     static void spiTask(void* arg);
-
-    /**
-     * @brief Core 1 multi-axis segment executor task.
-     *
-     * Consumes multi_axis_block_t objects from the global multi-axis queue,
-     * distributes constant-rate step bursts to each per-axis StepperQueue,
-     * and calls notifySegmentExecuted() after each segment completes.  Also
-     * drains the global flush queue between blocks to support host trajectory
-     * cancellation without draining the entire axis queue first.
-     *
-     * Pinned to Core 1 at priority 24 (same as per-axis executor tasks).
-     * Only one multi-axis executor task is ever launched.
-     */
     static void multiAxisExecutorTask(void* arg);
 };

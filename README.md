@@ -1,62 +1,51 @@
 # PickupWinder — RPi + ESP32 Real-time Winding Controller
 
-Automated/assisted guitar pickup coil winding.
+Automated and assisted guitar pickup winding with a Raspberry Pi host and an ESP32 real-time motion controller.
 
-- **Host**: Raspberry Pi (Python)
-- **MCU**: ESP32 (ESP-IDF / FreeRTOS)
-- **Link**: SPI full-duplex, fixed 512-byte frames
-- **Motion transport**: compressed multi-axis segment blocks (`MULTI_AXIS_SEGMENT_BLOCK`)
+- Host: Python on Raspberry Pi
+- MCU: ESP32 with ESP-IDF and FreeRTOS
+- Link: full-duplex SPI, fixed 512-byte frames
+- Production motion path: `MULTI_AXIS_SEGMENT_BLOCK`
 
-## Architecture overview
+## Active code layout
 
-The host is the motion planner and stream controller. The ESP32 is a deterministic executor.
+The active host entry point is `src/rpi/winding_main.py`. The deprecated `WinderApp` stub in `src/rpi/core/app.py` is not part of the runtime path.
 
-- `src/rpi/main.py`: application entry point launching the JSON-RPC server.
-- `src/rpi/core/app.py`: `WinderApp`, host state, and background streaming session manager.
-- `src/rpi/transport/spi_transport.py`: SPI frame transport wrapper for request/response exchanges.
-- `src/rpi/transport/streamer.py`: deterministic streamer that sends motion segments and maintains a modest look-ahead buffer.
-- `src/rpi/transport/messages.py`: frame and payload packing/unpacking.
-- `src/rpi/motion/ramp.py`: motion segment generation for axis ramps.
+- `src/rpi/winding_main.py`: boots SPI transport, `WindingEngine`, and the JSON-RPC server.
+- `src/rpi/motion/engine.py`: orchestration layer for moves and RPC-triggered actions.
+- `src/rpi/motion/move_queue.py`: serializes moves and aligns motion sequences with firmware state.
+- `src/rpi/transport/messages.py`: Python protocol mirror and 16-bit sequence helpers.
+- `src/rpi/transport/spi_transport.py`: SPI framing, polling, and pipelined ACK confirmation.
+- `src/rpi/transport/streamer.py`: sequence-aware multi-axis streaming and backpressure logic.
+- `src/rpi/motion/`: ramp, winding, scatter, and synchronized segment generators.
+- `src/esp32/src/main.cpp`: pin configuration and firmware startup.
+- `src/esp32/src/comm_interface.cpp`: SPI slave task, request dedupe, block dispatch, and status publishing.
+- `src/esp32/src/motion_planner.cpp`: planner queue, monotonic motion filtering, and flush handling.
+- `src/esp32/src/stepper_queue.cpp`: expansion into ring entries and RMT start policy.
+- `src/esp32/src/stepper_driver.cpp`: RMT streaming, coast mode, and underrun behavior.
 
-## Runtime flow
+## Runtime model
 
-1. The host computes motion segments from `RampConfig`.
-2. The host sends `MULTI_AXIS_SEGMENT_BLOCK` frames over SPI.
-3. The ESP32 receives segments, enqueues them, expands them to step timing, and streams pulses through RMT.
-4. The host polls status and keeps the MCU queue/ring filled without overflowing it.
+1. The host generates synchronized motion segments.
+2. The host sends `MULTI_AXIS_SEGMENT_BLOCK` requests over SPI.
+3. The ESP32 validates CRC, dedupes exact request retries, dedupes accepted block retries by `block_seq`, and queues work for the planner.
+4. The planner drops stale or out-of-order `motion_sequence` values and feeds the executor queue.
+5. The executor expands segments into step timings, fills the RMT ring, then starts motion once the ring is prefed.
+6. The host confirms each request through `wait_for_request_result()` because the SPI status frame is pipelined by one transfer.
 
-## Protocol summary
+## Sequencing and retries
 
-Key points:
+The project now tracks three separate 16-bit sequences:
 
-- Frame size: **512 bytes**
-- Header size: 12 bytes
-- CRC: **CRC16-CCITT** over header + payload
-- Primary production message: `MULTI_AXIS_SEGMENT_BLOCK`
-- Status includes queue/ring free slots, `last_executed_sequence`, `last_rx_sequence`, and execution results
+- `SpiMessageHeader.sequence`: transport request/ACK correlation.
+- `MultiAxisSegmentBlockHeader.block_seq`: accepted block dedupe.
+- `multi_axis_segment_t.motion_sequence`: monotonic execution ordering.
 
-## Streaming semantics
+All ordering comparisons use signed 16-bit wrap-aware helpers. This is overflow-safe as long as compared values never drift by `>= 32768`, which is well above the actual pipeline depth in this project.
 
-The host streamer maintains a small in-flight queue of sent segments and tracks buffered motion time in seconds.
+Authoritative details are in `doc/sequencing.md`.
 
-- Target look-ahead: ~100 ms
-- Minimum look-ahead: ~60 ms
-- Maximum in-flight segments: 24
-- The host stops sending when the MCU reports a full queue/ring or when the in-flight window is reached.
-
-## JSON-RPC client model
-
-There is no session concept in the host application. Multiple JSON-RPC clients share the same `WinderApp` instance and command the same motion pipeline.
-
-Only one motion operation can run at a time; concurrent motion requests are serialized or rejected to protect the motors and the shared SPI/ESP32 state.
-
-The JSON-RPC API exposes the shared operation state and supports graceful stop:
-
-- `winder.operation.status` — query the current shared operation.
-- `winder.operation.stop` — request a graceful stop of the active motion.
-- `winder.session.status` / `winder.session.wait` are compatibility aliases for the shared operation state.
-
-## Build / Flash / Run
+## Build and run
 
 ESP32 firmware:
 
@@ -65,20 +54,20 @@ cd src/esp32
 pio run -t upload
 ```
 
-Host app:
+Host application:
 
 ```bash
 cd src/rpi
-python3 main.py
+python3 winding_main.py
 ```
 
 Default JSON-RPC socket:
 
 ```bash
-/tmp/pickup_winder_rpc.sock
+/tmp/winding.sock
 ```
 
-## Pin assignments (ESP32)
+## ESP32 pin map
 
 | Signal | GPIO |
 |---|---:|
@@ -94,11 +83,15 @@ Default JSON-RPC socket:
 
 ## Documentation
 
-- Architecture: `doc/architecture.md`
-- Stepper runtime details: `doc/stepper_engine.md`
-- Agent instructions: `.github/copilot-instructions.md`
+- `doc/architecture.md`: current architecture and runtime flow.
+- `doc/spi_protocol.md`: wire protocol, ACK semantics, and payload rules.
+- `doc/stepper_engine.md`: RMT/ring/executor behavior.
+- `doc/sequencing.md`: retry, dedupe, flush, and wrap-around review.
+- `doc/async_streaming_refactoring.md`: historical refactoring note kept as background material.
+- `.github/copilot-instructions.md`: repository-specific coding rules.
 
-## Notes
+## Repository hygiene
 
-- ESP32 firmware is **ESP-IDF** (`app_main()`), not Arduino.
-- `resources/` is reference-only.
+- Generated plots and segment JSON outputs belong under `doc/generated/`.
+- `resources/` and `migration/` are reference trees, not active runtime code.
+- ESP32 firmware is ESP-IDF (`app_main()`), not Arduino.

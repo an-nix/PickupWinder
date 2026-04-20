@@ -187,6 +187,7 @@ class MultiAxisRampStreamer:
 
         self._inflight: deque[tuple[MultiAxisSegment, int]] = deque()
         self._buffered_time_s = 0.0
+        self._retry_batch: list[MultiAxisSegment] | None = None
         self._last_sent_motion_seq = -1
         self._last_sent_transport_seq = -1
         self._planner_under_pressure = False  # True while planner_queue_free < threshold
@@ -339,6 +340,7 @@ class MultiAxisRampStreamer:
         """
         self._generator = generator
         self._generator_finished = False
+        self._retry_batch = None
 
     def _sync_with_firmware_status(self) -> None:
         """Synchronize stream state with the ESP32's last executed sequence."""
@@ -547,6 +549,7 @@ class MultiAxisRampStreamer:
         status = self._transport.flush_until(sequence)
         self._inflight.clear()
         self._buffered_time_s = 0.0
+        self._retry_batch = None
         return status
 
     # -- Core streaming primitives ---------------------------------------------
@@ -562,34 +565,42 @@ class MultiAxisRampStreamer:
         the firmware drain loop processes all queued frames before starting
         the RMT, so more segments per frame = deeper ring buffer at startup.
         """
-        if self._generator_finished:
+        if self._generator_finished and self._retry_batch is None:
             return None
 
-        batch: list[MultiAxisSegment] = []
-        while (
-            len(batch) < MULTI_AXIS_SEGMENT_BLOCK_SIZE
-            and self._buffered_time_s < self._target_buffer_time_s
-            and len(self._inflight) < self._max_inflight_segments()
-            and not self._queue_full(status)
-            and not self._check_planner_pressure(status)
-        ):
-            try:
-                segment = next(self._generator)
-            except StopIteration:
-                self._generator_finished = True
-                break
-
-            if self._last_sent_motion_seq >= 0 and not sequence_is_greater(
-                segment.sequence, self._last_sent_motion_seq
+        if self._retry_batch is not None:
+            batch = list(self._retry_batch)
+        else:
+            batch = []
+            while (
+                len(batch) < MULTI_AXIS_SEGMENT_BLOCK_SIZE
+                and self._buffered_time_s < self._target_buffer_time_s
+                and len(self._inflight) < self._max_inflight_segments()
+                and not self._queue_full(status)
+                and not self._check_planner_pressure(status)
             ):
-                raise RuntimeError(
-                    f"motion sequence not strictly increasing: "
-                    f"got {segment.sequence}, last was {self._last_sent_motion_seq}"
+                try:
+                    segment = next(self._generator)
+                except StopIteration:
+                    self._generator_finished = True
+                    break
+
+                reference_sequence = (
+                    batch[-1].sequence
+                    if batch
+                    else self._last_sent_motion_seq
                 )
-            batch.append(segment)
-            # Keep speed estimate current so required_lookahead() uses fresh data.
-            if segment.steps:
-                self._current_steps_per_segment = sum(segment.steps)
+                if reference_sequence >= 0 and not sequence_is_greater(
+                    segment.sequence, reference_sequence
+                ):
+                    raise RuntimeError(
+                        f"motion sequence not strictly increasing: "
+                        f"got {segment.sequence}, last was {reference_sequence}"
+                    )
+                batch.append(segment)
+                # Keep speed estimate current so required_lookahead() uses fresh data.
+                if segment.steps:
+                    self._current_steps_per_segment = sum(segment.steps)
 
         if not batch:
             return None
@@ -599,22 +610,29 @@ class MultiAxisRampStreamer:
             block_seq=batch[0].sequence,
             segments=batch,
         )
-        transport_seq, send_status = self._transport.send_multi_axis_segment_block_request(payload)
+        transport_seq, _send_status = self._transport.send_multi_axis_segment_block_request(payload)
+        ack_status = self._transport.wait_for_request_result(
+            transport_seq,
+            poll_interval_s=self._poll_interval_s,
+        )
 
-        if send_status.last_result == int(SpiMessageResult.OK):
+        if ack_status.last_result == int(SpiMessageResult.OK):
+            self._retry_batch = None
             for seg in batch:
                 self._inflight.append((seg, transport_seq))
                 self._buffered_time_s += seg.duration_us / 1_000_000.0
                 self._last_sent_motion_seq = seg.sequence
-                self._record_send_event(seg, transport_seq, send_status)
+                self._record_send_event(seg, transport_seq, ack_status)
             self._last_sent_transport_seq = transport_seq
-            return len(batch), send_status
-        elif send_status.last_result == int(SpiMessageResult.QUEUE_FULL):
-            return 0, send_status
+            return len(batch), ack_status
+        elif ack_status.last_result == int(SpiMessageResult.QUEUE_FULL):
+            if self._retry_batch is None:
+                self._retry_batch = list(batch)
+            return 0, ack_status
         else:
             raise RuntimeError(
                 f"segment batch starting motion_seq={batch[0].sequence} "
-                f"failed with result=0x{send_status.last_result:02X}"
+                f"failed with result=0x{ack_status.last_result:02X}"
             )
 
     def _prefill(self, status) -> tuple[int, Any]:
@@ -732,7 +750,7 @@ class MultiAxisRampStreamer:
                     self.flush_until(self._flush_sequence_requested)
                     self._flush_sequence_requested = None
 
-                if self._generator_finished and not self._inflight:
+                if self._generator_finished and not self._inflight and self._retry_batch is None:
                     break
 
                 # If no segments were sent this cycle, we have no fresh status
