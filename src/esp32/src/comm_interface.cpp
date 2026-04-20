@@ -207,6 +207,8 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
 
 void CommInterface::buildStatusFrame(uint8_t* out_frame) const
 {
+    static uint32_t s_last_logged_underrun[SPI_MAX_AXES] = {0, 0, 0, 0};
+
     // Zero the outgoing frame buffer and prepare header/payload overlays.
     spi_message_zero_frame(out_frame);
 
@@ -228,6 +230,19 @@ void CommInterface::buildStatusFrame(uint8_t* out_frame) const
             payload->queue_free_slots[axis] = static_cast<uint16_t>(queues_[axis]->available());
             payload->ring_free_slots[axis] = static_cast<uint16_t>(queues_[axis]->driver().ringFreeSlots());
             payload->underrun_count[axis] = queues_[axis]->driver().getUnderrunCount();
+            if (payload->underrun_count[axis] > s_last_logged_underrun[axis]) {
+                ESP_LOGW(TAG,
+                         "axis %u underrun_count advanced: delta=%lu total=%lu queue_free=%u ring_free=%u planner_free=%lu",
+                         static_cast<unsigned>(axis),
+                         static_cast<unsigned long>(payload->underrun_count[axis] - s_last_logged_underrun[axis]),
+                         static_cast<unsigned long>(payload->underrun_count[axis]),
+                         static_cast<unsigned>(payload->queue_free_slots[axis]),
+                         static_cast<unsigned>(payload->ring_free_slots[axis]),
+                         static_cast<unsigned long>(planner_.segmentQueueFree()));
+                s_last_logged_underrun[axis] = payload->underrun_count[axis];
+            } else if (payload->underrun_count[axis] < s_last_logged_underrun[axis]) {
+                s_last_logged_underrun[axis] = payload->underrun_count[axis];
+            }
             if (queues_[axis]->driver().isStreaming()) {
                 payload->running_mask |= static_cast<uint8_t>(1U << axis);
             }

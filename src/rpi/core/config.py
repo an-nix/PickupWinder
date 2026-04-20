@@ -10,7 +10,7 @@ class AppConfiguration:
     spi_device: str = "/dev/spidev0.0"
     # Protocol target is 4 MHz (mode 0).  1 MHz significantly reduces
     # effective segment throughput and can starve the executor at higher RPM.
-    spi_speed_hz: int = 1_000_000
+    spi_speed_hz: int = 4_000_000
 
     spindle_axis_id: int = 0
     spindle_steps_per_revolution: int = 200

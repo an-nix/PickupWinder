@@ -216,6 +216,8 @@ class MultiAxisRampStreamer:
         self._last_sequence_advance_time: float = time.time()
         self._last_sequence_advance_value: int = -1
         self._stall_timeout_s: float = 5.0  # stall if no progress for 5s
+        self._last_underrun_count: tuple[int, int, int, int] | None = None
+        self._last_segments_dropped: int | None = None
 
         self._sync_with_firmware_status()
         start_sequence = (
@@ -456,6 +458,42 @@ class MultiAxisRampStreamer:
             self.request_flush(self._last_sent_motion_seq)
             return True
         return False
+
+    def _log_runtime_diagnostics(self, status) -> None:
+        underrun = tuple(int(v) for v in getattr(status, "underrun_count", (0, 0, 0, 0)))
+        if self._last_underrun_count is None:
+            self._last_underrun_count = underrun
+        elif underrun != self._last_underrun_count:
+            deltas = [curr - prev for curr, prev in zip(underrun, self._last_underrun_count)]
+            if any(delta > 0 for delta in deltas):
+                logger.warning(
+                    "firmware underrun counter advanced: delta=%s total=%s queue_free=%s ring_free=%s planner_free=%s inflight=%s buffered=%.1fms",
+                    deltas,
+                    underrun,
+                    getattr(status, "queue_free_slots", ()),
+                    getattr(status, "ring_free_slots", ()),
+                    getattr(status, "planner_queue_free", -1),
+                    len(self._inflight),
+                    self._buffered_time_s * 1000.0,
+                )
+            self._last_underrun_count = underrun
+
+        segments_dropped = int(getattr(status, "segments_dropped", 0))
+        if self._last_segments_dropped is None:
+            self._last_segments_dropped = segments_dropped
+        elif segments_dropped > self._last_segments_dropped:
+            logger.warning(
+                "planner dropped segments: delta=%s total=%s planner_free=%s inflight=%s last_executed=%s last_planned=%s",
+                segments_dropped - self._last_segments_dropped,
+                segments_dropped,
+                getattr(status, "planner_queue_free", -1),
+                len(self._inflight),
+                getattr(status, "last_executed_sequence", -1),
+                getattr(status, "last_planned_sequence", -1),
+            )
+            self._last_segments_dropped = segments_dropped
+        elif segments_dropped < self._last_segments_dropped:
+            self._last_segments_dropped = segments_dropped
 
     def _check_endstop(self, status) -> bool:
         """Return True if an endstop was triggered on any armed axis.
@@ -712,6 +750,7 @@ class MultiAxisRampStreamer:
                 # fresh status, so an extra round-trip would waste ~250 µs per
                 # iteration and halve the effective SPI bandwidth.
                 self._remove_confirmed_segments(status)
+                self._log_runtime_diagnostics(status)
                 self._check_premature_completion(status)
                 if self._check_stall(status):
                     break
