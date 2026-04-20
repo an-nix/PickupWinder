@@ -23,7 +23,9 @@ from motion.synchronized_segment_generator import SyncAxisConfig
 from motion.engine import WindingEngine
 from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
 from transport.messages import (
+    LATERAL_ENDSTOP_ABSENT,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
+    LATERAL_ENDSTOP_PRESENT_OPEN,
     MultiAxisSegment,
     SpiMessageResult,
 )
@@ -304,6 +306,26 @@ def test_streamer_detects_closed_endstop_when_local_arm_tracking_is_set():
     assert triggered is True
     assert streamer.endstop_triggered is True
     assert streamer.has_stop_been_requested() is True
+
+
+def test_streamer_detects_endstop_when_closed_and_running_mask_drops():
+    transport = MockSpiTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[StreamAxisConfig(axis_id=1, ramp=RampConfig(axis_id=1, target_rpm=300.0))],
+    )
+    streamer.note_endstop_armed(1, True)
+
+    triggered = streamer._check_endstop(
+        SimpleNamespace(
+            lateral_endstop_state=LATERAL_ENDSTOP_PRESENT_CLOSED,
+            endstop_armed_mask=1 << 1,
+            running_mask=0,
+        )
+    )
+
+    assert triggered is True
+    assert streamer.endstop_triggered is True
 
 
 def test_streamer_treats_planner_drops_during_armed_move_as_endstop_recovery():
@@ -784,24 +806,38 @@ def test_execute_homing_waits_for_endstop_request_confirmation(monkeypatch):
         def __init__(self) -> None:
             self._seq = 0
             self.wait_calls: list[int] = []
+            self.arm_state = False
+            self.endstop_state = LATERAL_ENDSTOP_PRESENT_OPEN
 
         def get_status(self):
-            return SimpleNamespace(last_executed_sequence=0xFFFF)
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+            )
 
         def enable_endstop_request(self, axis_id: int, arm: bool):
             self._seq += 1
+            self.arm_state = arm
             return self._seq, SimpleNamespace()
 
         def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001):
             self.wait_calls.append(sequence)
-            return SimpleNamespace(last_result=0)
+            return SimpleNamespace(
+                last_result=0,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+            )
 
     class FakeStreamer:
-        endstop_triggered = True
-
         def __init__(self) -> None:
+            self.endstop_triggered = True
             self._generator = None
             self._generator_finished = False
+            self.note_calls: list[tuple[int, bool]] = []
+
+        def note_endstop_armed(self, axis_id: int, arm: bool) -> None:
+            self.note_calls.append((axis_id, arm))
 
         def set_generator(self, generator) -> None:
             self._generator = generator
@@ -839,6 +875,135 @@ def test_execute_homing_waits_for_endstop_request_confirmation(monkeypatch):
     assert move.state.name == "COMPLETED"
     # approach arm + backoff disarm + search arm + final disarm
     assert len(transport.wait_calls) == 4
+
+
+def test_execute_homing_fails_when_endstop_not_open_before_start(monkeypatch):
+    class FakeTransport:
+        def get_status(self):
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                lateral_endstop_state=LATERAL_ENDSTOP_PRESENT_CLOSED,
+                endstop_armed_mask=0,
+            )
+
+        def enable_endstop_request(self, axis_id: int, arm: bool):
+            raise AssertionError("homing must not arm when endstop is already closed")
+
+    queue = MoveQueue(
+        transport=FakeTransport(),
+        axis_states={1: AxisState(axis_id=1)},
+        poll_interval_s=0.001,
+        print_every=1,
+    )
+    monkeypatch.setattr(
+        queue,
+        "_make_streamer",
+        lambda axis_configs, keep_enabled_axes=None: (_ for _ in ()).throw(AssertionError("streamer must not be created")),
+    )
+
+    move = HomingMove(
+        name="home_closed",
+        axis_id=1,
+        steps_per_rev=6400,
+        approach_rpm=100.0,
+        search_rpm=20.0,
+        backoff_steps=3200,
+        max_approach_steps=6400,
+    )
+
+    queue._execute_homing(move)
+
+    assert move.state.name == "FAILED"
+    assert move.error is not None
+    assert "cannot start" in move.error
+
+
+def test_execute_homing_disarms_before_backoff_and_waits_for_release(monkeypatch):
+    class FakeTransport:
+        def __init__(self) -> None:
+            self._seq = 0
+            self.arm_state = False
+            self.endstop_state = LATERAL_ENDSTOP_PRESENT_OPEN
+            self.arm_history: list[bool] = []
+
+        def get_status(self):
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+            )
+
+        def enable_endstop_request(self, axis_id: int, arm: bool):
+            self._seq += 1
+            self.arm_state = arm
+            self.arm_history.append(arm)
+            return self._seq, SimpleNamespace()
+
+        def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001):
+            return SimpleNamespace(
+                last_result=0,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+            )
+
+    class FakeStreamer:
+        def __init__(self, transport: FakeTransport, phase_name: str) -> None:
+            self._generator = None
+            self._generator_finished = False
+            self.endstop_triggered = phase_name in ("approach", "search")
+            self._transport = transport
+            self._phase_name = phase_name
+
+        def note_endstop_armed(self, axis_id: int, arm: bool) -> None:
+            return None
+
+        def set_generator(self, generator) -> None:
+            self._generator = generator
+            self._generator_finished = False
+
+        def stream_all(self) -> int:
+            if self._phase_name == "approach":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_CLOSED
+            elif self._phase_name == "backoff":
+                assert self._transport.arm_state is False
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_OPEN
+            elif self._phase_name == "search":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_CLOSED
+            return 0
+
+    transport = FakeTransport()
+    queue = MoveQueue(
+        transport=transport,
+        axis_states={1: AxisState(axis_id=1)},
+        poll_interval_s=0.001,
+        print_every=1,
+    )
+
+    def make_streamer(axis_configs, keep_enabled_axes=None):
+        phase_name = axis_configs[0].ramp.name.split(":")[-1] if hasattr(axis_configs[0].ramp, "name") else ""
+        return FakeStreamer(transport, phase_name)
+
+    phase_order = iter(["approach", "backoff", "search"])
+    monkeypatch.setattr(
+        queue,
+        "_make_streamer",
+        lambda axis_configs, keep_enabled_axes=None: FakeStreamer(transport, next(phase_order)),
+    )
+
+    move = HomingMove(
+        name="home_backoff",
+        axis_id=1,
+        steps_per_rev=6400,
+        approach_rpm=100.0,
+        search_rpm=20.0,
+        backoff_steps=3200,
+        max_approach_steps=6400,
+    )
+
+    queue._execute_homing(move)
+
+    assert move.state.name == "COMPLETED"
+    assert transport.arm_history == [True, False, True, False]
 
 
 def test_execute_wound_move_invalidates_positions_on_stop_requested(monkeypatch):

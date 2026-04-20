@@ -608,6 +608,15 @@ bool CommInterface::isLateralMovementAllowed(uint8_t axis_id) const
     if (axis_id != 1) {
         return true;
     }
+    // Backoff after a homing hit must be allowed while the physical contact is
+    // still closed, provided the host has explicitly DISARMED the endstop.
+    // The passive gate therefore applies only when the firmware protection is armed.
+    if (axis_id >= n_motors_ || queues_[axis_id] == nullptr) {
+        return false;
+    }
+    if (!queues_[axis_id]->driver().isEndstopArmed()) {
+        return true;
+    }
     return readLateralEndstopState() == static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
 }
 
@@ -1042,8 +1051,13 @@ void CommInterface::multiAxisExecutorTask(void* arg)
 
                 // ── Lateral endstop gate (read once per segment) ──────────
                 const uint8_t lateral_state = self->readLateralEndstopState();
+                const bool lateral_endstop_armed =
+                    self->n_motors_ > 1
+                    && self->queues_[1] != nullptr
+                    && self->queues_[1]->driver().isEndstopArmed();
                 const bool lateral_blocked =
-                    lateral_state !=
+                    lateral_endstop_armed
+                    && lateral_state !=
                     static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
 
                 uint8_t guarded_axis_ids[MULTI_AXIS_MAX_AXES] = {};

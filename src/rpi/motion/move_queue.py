@@ -7,10 +7,17 @@ from typing import Any
 
 from motion.axis_state import AxisState
 from motion.move import BaseMove, CompositeMove, HomingMove, Move, WoundMove
+from transport.messages import (
+    LATERAL_ENDSTOP_ABSENT,
+    LATERAL_ENDSTOP_PRESENT_OPEN,
+    SpiMessageResult,
+)
 from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
 from transport.spi_transport import Esp32SpiTransport
 
 _MAX_HISTORY = 50
+_ENDSTOP_VERIFY_TIMEOUT_S = 0.5
+_ENDSTOP_RELEASE_TIMEOUT_S = 1.5
 
 
 class MoveQueue:
@@ -176,12 +183,76 @@ class MoveQueue:
             return 0
         return (last_executed + 1) & 0xFFFF
 
-    def _set_endstop_armed(self, axis_id: int, arm: bool) -> None:
+    def _update_axis_endstop_state(self, axis_id: int, status: Any) -> None:
+        axis_state = self._axis_states.get(axis_id)
+        if axis_state is None:
+            return
+        endstop_state = getattr(status, "lateral_endstop_state", None)
+        if endstop_state is None:
+            return
+        axis_state.update_endstop_state(int(endstop_state))
+
+    def _axis_mask(self, axis_id: int) -> int:
+        return 1 << axis_id
+
+    def _status_has_endstop_armed(self, status: Any, axis_id: int, arm: bool) -> bool:
+        armed_mask = int(getattr(status, "endstop_armed_mask", 0))
+        return bool(armed_mask & self._axis_mask(axis_id)) is arm
+
+    def _read_status(self, axis_id: int | None = None) -> Any:
+        status = self._transport.get_status()
+        if axis_id is not None:
+            self._update_axis_endstop_state(axis_id, status)
+        return status
+
+    def _ensure_homing_can_start(self, axis_id: int, phase_name: str) -> None:
+        status = self._read_status(axis_id)
+        lateral_state = int(getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT))
+        if lateral_state != LATERAL_ENDSTOP_PRESENT_OPEN:
+            state_name = (
+                "absent" if lateral_state == LATERAL_ENDSTOP_ABSENT else f"0x{lateral_state:02X}"
+            )
+            raise RuntimeError(
+                f"homing {phase_name} cannot start on axis {axis_id}: lateral_endstop_state={state_name}"
+            )
+
+    def _wait_for_endstop_arm_state(self, axis_id: int, arm: bool, timeout_s: float = _ENDSTOP_VERIFY_TIMEOUT_S) -> Any:
+        deadline = time.monotonic() + timeout_s
+        last_status = None
+        while time.monotonic() < deadline:
+            last_status = self._read_status(axis_id)
+            if self._status_has_endstop_armed(last_status, axis_id, arm):
+                return last_status
+            time.sleep(self._poll_interval_s)
+        raise RuntimeError(
+            f"endstop arm verification failed on axis {axis_id}: arm={int(arm)} "
+            f"last_mask=0x{int(getattr(last_status, 'endstop_armed_mask', 0)):02X}"
+        )
+
+    def _wait_for_endstop_open(self, axis_id: int, timeout_s: float = _ENDSTOP_RELEASE_TIMEOUT_S) -> Any:
+        deadline = time.monotonic() + timeout_s
+        last_status = None
+        while time.monotonic() < deadline:
+            last_status = self._read_status(axis_id)
+            if int(getattr(last_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)) == LATERAL_ENDSTOP_PRESENT_OPEN:
+                return last_status
+            time.sleep(self._poll_interval_s)
+        raise RuntimeError(
+            f"endstop release timeout on axis {axis_id}: state=0x{int(getattr(last_status, 'lateral_endstop_state', 0xFF)):02X}"
+        )
+
+    def _set_endstop_armed(self, axis_id: int, arm: bool) -> Any:
         sequence, _ = self._transport.enable_endstop_request(axis_id, arm=arm)
-        self._transport.wait_for_request_result(
+        status = self._transport.wait_for_request_result(
             sequence,
             poll_interval_s=self._poll_interval_s,
         )
+        self._update_axis_endstop_state(axis_id, status)
+        if int(getattr(status, "last_result", SpiMessageResult.OK)) != int(SpiMessageResult.OK):
+            raise RuntimeError(
+                f"enable_endstop axis {axis_id} arm={int(arm)} failed with result=0x{int(status.last_result):02X}"
+            )
+        return self._wait_for_endstop_arm_state(axis_id, arm)
 
     def _wrap_segment_sequence(self, generator: Any, start_sequence: int):
         sequence = start_sequence & 0xFFFF
@@ -309,14 +380,31 @@ class MoveQueue:
         move.mark_running()
         axis_state = self._axis_states.get(move.axis_id)
 
+        try:
+            self._ensure_homing_can_start(move.axis_id, "start")
+        except Exception as exc:
+            move.mark_failed(str(exc))
+            return
+
         for phase_name, sub_move, arm_endstop in move.phases():
             if self._stop_requested:
                 self._set_endstop_armed(move.axis_id, arm=False)
                 move.mark_aborted("stop requested during homing")
                 return
 
-            # Arm or disarm endstop for this phase.
-            self._set_endstop_armed(move.axis_id, arm=arm_endstop)
+            if arm_endstop:
+                try:
+                    self._ensure_homing_can_start(move.axis_id, phase_name)
+                except Exception as exc:
+                    move.mark_failed(str(exc))
+                    return
+
+            # Arm or disarm endstop for this phase and verify the mask in status.
+            try:
+                self._set_endstop_armed(move.axis_id, arm=arm_endstop)
+            except Exception as exc:
+                move.mark_failed(str(exc))
+                return
 
             # Execute the sub-move.
             sub_move_axis_configs = sub_move.axis_configs
@@ -338,7 +426,12 @@ class MoveQueue:
                     self._next_motion_sequence(),
                 )
             )
-            streamer.stream_all()
+            try:
+                streamer.stream_all()
+            except Exception as exc:
+                self._set_endstop_armed(move.axis_id, arm=False)
+                move.mark_failed(str(exc))
+                return
 
             if phase_name in ("approach", "search") and not streamer.endstop_triggered:
                 # Endstop did not fire — homing failed.
@@ -348,6 +441,14 @@ class MoveQueue:
                     f"endstop trigger on axis {move.axis_id}"
                 )
                 return
+
+            if phase_name == "backoff":
+                try:
+                    self._wait_for_endstop_open(move.axis_id)
+                except Exception as exc:
+                    self._set_endstop_armed(move.axis_id, arm=False)
+                    move.mark_failed(str(exc))
+                    return
 
             if self._stop_requested:
                 self._set_endstop_armed(move.axis_id, arm=False)

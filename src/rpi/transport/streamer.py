@@ -10,6 +10,7 @@ from typing import Any, Iterator
 from transport.messages import (
     MULTI_AXIS_SEGMENT_BLOCK_SIZE,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
+    LATERAL_ENDSTOP_PRESENT_OPEN,
     MultiAxisSegment,
     MultiAxisSegmentBlockPayload,
     SpiMessageResult,
@@ -573,13 +574,25 @@ class MultiAxisRampStreamer:
     def _check_endstop(self, status) -> bool:
         """Return True if an endstop was triggered on any armed axis.
 
-        Reads endstop_armed_mask from the status frame. Sets
-        _endstop_triggered and requests a stop + flush when triggered.
+        Homing detection follows the recommended host-side sequence:
+        when an axis is armed, a CLOSED lateral endstop plus a stopped RMT
+        on any armed axis is treated as a trigger. We also keep the more
+        permissive CLOSED+armed fallback for firmware paths that auto-disarm
+        or recover before the host polls the exact stopping frame.
         """
         armed_mask = int(getattr(status, "endstop_armed_mask", 0))
         lateral_state = int(getattr(status, "lateral_endstop_state", 0xFF))
         endstop_expected = armed_mask != 0 or bool(self._endstop_armed_axes)
-        if lateral_state == LATERAL_ENDSTOP_PRESENT_CLOSED and endstop_expected:
+        running_mask = int(getattr(status, "running_mask", 0))
+        any_armed_axis_stopped = any(
+            (running_mask & (1 << axis_id)) == 0
+            for axis_id in self._endstop_armed_axes
+        )
+        if (
+            lateral_state == LATERAL_ENDSTOP_PRESENT_CLOSED
+            and endstop_expected
+            and (any_armed_axis_stopped or armed_mask == 0)
+        ):
             self._mark_endstop_triggered()
             return True
         return False
@@ -822,13 +835,16 @@ class MultiAxisRampStreamer:
         self._generator_finished = False
         status = self._transport.get_status()
         axes_enabled = False
+        total_segments = 0
 
         try:
             self._enable_axes()
             axes_enabled = True
             status = self._transport.get_status()
 
-            total_segments, status = self._prefill(status)
+            self._check_endstop(status)
+            if not self._stop_requested:
+                total_segments, status = self._prefill(status)
 
             while True:
                 if self._stop_requested:
@@ -842,6 +858,8 @@ class MultiAxisRampStreamer:
                 # iteration and halve the effective SPI bandwidth.
                 self._remove_confirmed_segments(status)
                 self._log_runtime_diagnostics(status)
+                if self._stop_requested:
+                    break
                 self._check_premature_completion(status)
                 if self._check_stall(status):
                     break
@@ -853,6 +871,8 @@ class MultiAxisRampStreamer:
                 # prevent burst-after-throttle that overflows the ESP32 defer ring.
                 cycle_segments_sent = 0
                 while not self._generator_finished:
+                    if self._stop_requested or self._endstop_triggered:
+                        break
                     if cycle_segments_sent >= self._max_segments_per_cycle():
                         break
                     result = self._collect_and_send_batch(status)

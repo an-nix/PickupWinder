@@ -205,7 +205,10 @@ public:
 
     /** @brief Disarm the endstop — ISR will not stop motion on trigger.
      *  Use during intentional clearance moves commanded by the host. */
-    void disarmEndstop() { endstop_armed_.store(false, std::memory_order_release); }
+    void disarmEndstop() {
+        endstop_armed_.store(false, std::memory_order_release);
+        endstop_active_.store(false, std::memory_order_release);
+    }
 
     /** @brief True if the endstop is currently armed. */
     bool isEndstopArmed() const { return endstop_armed_.load(std::memory_order_acquire); }
