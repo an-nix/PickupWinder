@@ -51,6 +51,9 @@ class MockSpiTransport:
 
     def _make_status(self, last_rx_sequence: int) -> StatusPayload:
         last_executed_sequence = self._advance_executed()
+        enabled_mask = 0
+        for axis_id in self._enabled_axes:
+            enabled_mask |= 1 << int(axis_id)
         return StatusPayload(
             uptime_ms=int(time.time() * 1000) & 0xFFFFFFFF,
             queue_free_slots=(128, 128, 128, 128),
@@ -60,7 +63,7 @@ class MockSpiTransport:
             last_rx_type=int(SpiMessageType.STATUS),
             last_result=int(SpiMessageResult.OK),
             protocol_version=SPI_MSG_VERSION,
-            enabled_mask=0,
+            enabled_mask=enabled_mask,
             running_mask=0,
             lateral_endstop_state=0,
             endstop_armed_mask=0,
@@ -102,6 +105,15 @@ class MockSpiTransport:
         self._enabled_axes.clear()
         self._status = self._make_status(self._next_sequence())
         return self._status
+
+    def stop_axis(self, axis_id: int = 0xFF) -> StatusPayload:
+        self._status = self._make_status(self._next_sequence())
+        return self._status
+
+    def enable_endstop_request(self, axis_id: int, arm: bool) -> tuple[int, StatusPayload]:
+        seq = self._next_sequence()
+        self._status = self._make_status(seq)
+        return seq, self._status
 
     def send_multi_axis_segment_block_request(self, payload) -> tuple[int, StatusPayload]:
         seq = self._next_sequence()

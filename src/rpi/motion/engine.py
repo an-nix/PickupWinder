@@ -26,6 +26,10 @@ from core.shared_state import EngineState, SharedState
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_HOME_APPROACH_RPM = 100.0
+_DEFAULT_HOME_SEARCH_RPM = 20.0
+_DEFAULT_HOME_BACKOFF_STEPS = 3200
+
 
 class WindingEngine:
     """
@@ -155,6 +159,73 @@ class WindingEngine:
         sequence, _ = self._transport.enable_endstop_request(axis_id, arm=False)
         self._transport.wait_for_request_result(sequence)
 
+    def home_lateral(
+        self,
+        approach_rpm: float = _DEFAULT_HOME_APPROACH_RPM,
+        search_rpm: float = _DEFAULT_HOME_SEARCH_RPM,
+        backoff_steps: int = _DEFAULT_HOME_BACKOFF_STEPS,
+    ) -> dict[str, Any]:
+        """Synchronously home the lateral axis and keep its driver enabled."""
+        if self._state.engine_state != EngineState.IDLE:
+            raise RuntimeError(
+                "home_lateral only allowed when engine is IDLE; if a FAULT occurred, acknowledge it with winding.clear_fault first"
+            )
+
+        self._state.set_engine_state(EngineState.HOMING)
+        success, reason = self._home_lateral_axis(
+            axis_id=self._config.lateral_axis_id,
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
+        )
+        if not success:
+            if reason:
+                raise RuntimeError(f"Lateral homing failed: {reason}")
+            raise RuntimeError("Lateral homing failed")
+
+        self._state.set_engine_state(EngineState.IDLE)
+        return self._require_axis_state(self._config.lateral_axis_id).snapshot()
+
+    def move_lateral_to_mm(
+        self,
+        position_mm: float,
+        rpm: float,
+    ) -> dict[str, Any]:
+        """Queue a lateral move to an absolute position in mm from home zero."""
+        if self._state.engine_state != EngineState.IDLE:
+            if self._state.engine_state == EngineState.FAULT:
+                raise RuntimeError(
+                    "move_lateral_to_mm not allowed while controller is in FAULT; acknowledge it with winding.clear_fault before retrying"
+                )
+            raise RuntimeError("move_lateral_to_mm only allowed when engine is IDLE")
+
+        axis_state = self._require_lateral_homed()
+        current_steps = axis_state.position_steps
+        if current_steps is None:
+            raise RuntimeError("Lateral axis position is unknown; home the axis first")
+
+        target_steps = self._mm_to_lateral_steps(position_mm)
+        delta_steps = target_steps - current_steps
+        self._ensure_lateral_delta_allowed(delta_steps)
+
+        if delta_steps == 0:
+            return {
+                "status": "already_at_position",
+                "position_mm": position_mm,
+            }
+
+        self.jog(
+            axis_id=self._config.lateral_axis_id,
+            steps=abs(delta_steps),
+            rpm=rpm,
+            reverse=(delta_steps < 0),
+        )
+        return {
+            "status": "queued",
+            "target_position_mm": position_mm,
+            "target_position_steps": target_steps,
+        }
+
     def wound_run(
         self,
         spindle_axis_id: int,
@@ -178,6 +249,11 @@ class WindingEngine:
         """
         if self._state.engine_state != EngineState.IDLE:
             raise RuntimeError("Winding run only allowed when engine is IDLE")
+        if (
+            traverse_axis_id == self._config.lateral_axis_id
+            and traverse_axis_id in self._state.axis_states
+        ):
+            self._require_lateral_homed()
 
         if accel_s is None or cruise_s is None or decel_s is None:
             total_turns = 2.0 * bobbin_width_mm * turns_per_mm
@@ -314,17 +390,27 @@ class WindingEngine:
                 steps_per_rev=steps_per_rev,
             )
 
+            ramp = RampConfig(
+                axis_id=axis_id,
+                steps_per_rev=steps_per_rev,
+                target_rpm=target_rpm,
+                accel_s=accel_s,
+                cruise_s=cruise_s,
+                decel_s=decel_s,
+                reverse_direction=reverse,
+            )
+
+            if (
+                axis_id == self._config.lateral_axis_id
+                and axis_id in self._state.axis_states
+            ):
+                self._require_lateral_homed()
+                self._ensure_lateral_delta_allowed(self._ramp_delta_steps(ramp))
+
             axis_configs.append(
                 AxisMotionConfig(
                     axis_id=axis_id,
-                    ramp=RampConfig(
-                        axis_id=axis_id,
-                        target_rpm=target_rpm,
-                        accel_s=accel_s,
-                        cruise_s=cruise_s,
-                        decel_s=decel_s,
-                        reverse_direction=reverse,
-                    ),
+                    ramp=ramp,
                 )
             )
 
@@ -347,6 +433,8 @@ class WindingEngine:
         """
         if self._state.engine_state != EngineState.IDLE:
             raise RuntimeError("Jog only allowed when engine is IDLE")
+        if steps <= 0:
+            raise ValueError("steps must be positive")
 
         if axis_id == self._config.spindle_axis_id:
             steps_per_rev = (
@@ -358,6 +446,10 @@ class WindingEngine:
                 self._config.lateral_steps_per_revolution
                 * self._config.lateral_microstepping
             )
+            if axis_id in self._state.axis_states:
+                self._require_lateral_homed()
+                delta_steps = -steps if reverse else steps
+                self._ensure_lateral_delta_allowed(delta_steps)
         else:
             raise ValueError(f"jog: unsupported axis_id {axis_id}")
 
@@ -411,10 +503,17 @@ class WindingEngine:
 
         # ── Phase 1: homing ────────────────────────────────────────────────
         if program.home_before_start:
-            success = self._home_lateral(program)
+            success = self._home_lateral_axis(
+                axis_id=program.lateral_axis_id,
+                approach_rpm=program.home_approach_rpm,
+                search_rpm=program.home_search_rpm,
+                backoff_steps=program.home_backoff_steps,
+            )
             if not success:
                 return
             self._state.set_engine_state(EngineState.RUNNING)
+        else:
+            self._require_lateral_homed(program.lateral_axis_id)
 
         # ── Phase 2: winding layers ────────────────────────────────────────
         for layer_index in range(program.num_layers):
@@ -441,42 +540,48 @@ class WindingEngine:
         self._state.set_program(None)
         self._events.publish(EventKind.PROGRAM_COMPLETED, program=program.snapshot())
 
-    def _home_lateral(self, program: WindingProgram) -> bool:
+    def _home_lateral_axis(
+        self,
+        *,
+        axis_id: int,
+        approach_rpm: float,
+        search_rpm: float,
+        backoff_steps: int,
+    ) -> tuple[bool, str | None]:
         """
-        Home the lateral axis. Returns True on success, False on failure.
+        Home the lateral axis. Returns (success, error_message).
         Sets FAULT state and publishes event on failure.
         """
-        self._events.publish(EventKind.HOMING_STARTED, axis_id=program.lateral_axis_id)
+        self._events.publish(EventKind.HOMING_STARTED, axis_id=axis_id)
         steps_per_rev = (
             self._config.lateral_steps_per_revolution
             * self._config.lateral_microstepping
         )
         move = HomingMove(
             name="home_lateral",
-            axis_id=program.lateral_axis_id,
+            axis_id=axis_id,
             steps_per_rev=steps_per_rev,
-            approach_rpm=program.home_approach_rpm,
-            search_rpm=program.home_search_rpm,
-            backoff_steps=program.home_backoff_steps,
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
             max_approach_steps=int(steps_per_rev * 20),
+            reverse_direction=self._config.lateral_invert_direction,
         )
         self._move_queue.enqueue(move)
         self._wait_for_move_queue()
 
         if move.state.name == "COMPLETED":
-            self._events.publish(
-                EventKind.HOMING_COMPLETED, axis_id=program.lateral_axis_id
-            )
-            return True
+            self._events.publish(EventKind.HOMING_COMPLETED, axis_id=axis_id)
+            return True, None
         else:
             msg = f"Homing failed: {move.error}"
             self._state.set_fault(msg)
             self._events.publish(
                 EventKind.HOMING_FAILED,
-                axis_id=program.lateral_axis_id,
+                axis_id=axis_id,
                 error=msg,
             )
-            return False
+            return False, move.error
 
     def _run_layer(
         self,
@@ -557,10 +662,65 @@ class WindingEngine:
 
     def status(self) -> dict[str, Any]:
         """Return a combined shared state and move queue status snapshot."""
+        self._refresh_lateral_home_state()
         return {
             "shared_state": self._state.snapshot(),
             "move_queue": self._move_queue.status(),
         }
+
+    def _require_axis_state(self, axis_id: int) -> AxisState:
+        axis_state = self._state.axis_states.get(axis_id)
+        if axis_state is None:
+            raise RuntimeError(f"Unknown axis_id {axis_id}")
+        return axis_state
+
+    def _refresh_lateral_home_state(self) -> None:
+        axis_state = self._state.axis_states.get(self._config.lateral_axis_id)
+        if axis_state is None or not axis_state.homed:
+            return
+        try:
+            status = self._transport.get_status()
+        except Exception:
+            return
+
+        enabled_mask = int(getattr(status, "enabled_mask", 0))
+        if (enabled_mask & (1 << self._config.lateral_axis_id)) == 0:
+            logger.warning(
+                "Lateral axis enable lost; invalidating homing state and position"
+            )
+            axis_state.invalidate_position()
+
+    def _require_lateral_homed(self, axis_id: int | None = None) -> AxisState:
+        lateral_axis_id = self._config.lateral_axis_id if axis_id is None else axis_id
+        if lateral_axis_id != self._config.lateral_axis_id:
+            return self._require_axis_state(lateral_axis_id)
+
+        self._refresh_lateral_home_state()
+        axis_state = self._require_axis_state(lateral_axis_id)
+        if not axis_state.homed or axis_state.position_steps is None:
+            raise RuntimeError("Lateral axis must be homed before motion")
+        return axis_state
+
+    def _ensure_lateral_delta_allowed(self, delta_steps: int) -> None:
+        axis_state = self._require_lateral_homed()
+        if axis_state.check_move(delta_steps):
+            return
+        target_steps = (axis_state.position_steps or 0) + delta_steps
+        target_mm = self._lateral_steps_to_mm(target_steps)
+        raise ValueError(
+            f"Lateral target {target_mm:.3f} mm is outside configured soft limits"
+        )
+
+    def _mm_to_lateral_steps(self, position_mm: float) -> int:
+        return int(round(float(position_mm) * self._config.lateral_steps_per_mm))
+
+    def _lateral_steps_to_mm(self, position_steps: int) -> float:
+        return float(position_steps) / float(self._config.lateral_steps_per_mm)
+
+    @staticmethod
+    def _ramp_delta_steps(ramp: RampConfig) -> int:
+        total_steps = int(round(ramp.steps_at(ramp.total_duration)))
+        return -total_steps if ramp.reverse_direction else total_steps
 
     def _wait_for_move_queue(
         self,

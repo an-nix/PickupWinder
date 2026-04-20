@@ -16,9 +16,9 @@ class AppConfiguration:
     spindle_steps_per_revolution: int = 200
     spindle_microstepping: int = 32
     spindle_invert_direction: bool = False
-    spindle_max_speed_rpm: int = 1500
+    spindle_max_speed_rpm: int = 1750
     # Unit: RPM/s (revolutions per minute gained per second).
-    spindle_max_acceleration_rpm: Optional[float] = 100
+    spindle_max_acceleration_rpm: Optional[float] = 500
     # Unit: RPM/s (revolutions per minute lost per second).
     spindle_max_deceleration_rpm: Optional[float] = None
 
@@ -38,6 +38,10 @@ class AppConfiguration:
     # Optional explicit override for lateral steps-per-mm. If set, this
     # value takes precedence over the computed value.
     lateral_steps_per_mm_override: Optional[float] = None
+    # Soft travel window for the lateral axis relative to the homing zero.
+    # ``None`` disables the corresponding bound.
+    lateral_soft_limit_min_mm: Optional[float] = 0.0
+    lateral_soft_limit_max_mm: Optional[float] = None
 
     @property
     def lateral_steps_per_mm(self) -> float:
@@ -49,6 +53,18 @@ class AppConfiguration:
         if self.lateral_steps_per_mm_override is not None:
             return float(self.lateral_steps_per_mm_override)
         return (self.lateral_steps_per_revolution * self.lateral_microstepping) / float(self.lateral_traverse_pitch_mm)
+
+    @property
+    def lateral_soft_limit_min_steps(self) -> Optional[int]:
+        if self.lateral_soft_limit_min_mm is None:
+            return None
+        return int(round(float(self.lateral_soft_limit_min_mm) * self.lateral_steps_per_mm))
+
+    @property
+    def lateral_soft_limit_max_steps(self) -> Optional[int]:
+        if self.lateral_soft_limit_max_mm is None:
+            return None
+        return int(round(float(self.lateral_soft_limit_max_mm) * self.lateral_steps_per_mm))
 
     @property
     def spindle_max_acceleration_steps_per_s2(self) -> float:

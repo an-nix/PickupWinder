@@ -90,6 +90,7 @@ The host owns all high-level motion semantics.
 - RPC session control,
 - flush/retry policy,
 - transport sequencing.
+- lateral homing state and host-side soft-limit enforcement.
 
 The winding path follows an electronic gearing model:
 
@@ -99,6 +100,13 @@ The winding path follows an electronic gearing model:
 - `SynchronizedSegmentGenerator` samples the time domain and emits synchronized multi-axis segments.
 
 Manual moves and jogs use `MultiAxisSegmentGenerator`, but they still produce the same `MultiAxisSegment` objects consumed by the streamer.
+
+### Lateral axis state model
+
+- The lateral axis home position is volatile and is treated as lost after a restart.
+- The host refuses lateral free-motion commands until homing completes.
+- Soft travel limits are enforced on the host before a lateral move is enqueued, so queue serialization and SPI block delivery remain unchanged.
+- After homing, the host streamer keeps the lateral enable pin asserted across later moves; if firmware status shows the enable bit dropped, the host invalidates the stored home state.
 
 ## Firmware architecture
 

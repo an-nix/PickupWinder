@@ -147,7 +147,15 @@ class MoveQueue:
         except Exception as exc:
             move.mark_failed(str(exc))
 
-    def _make_streamer(self, axis_configs) -> MultiAxisRampStreamer:
+    def _axes_to_keep_enabled(self, axis_ids: list[int]) -> set[int]:
+        keep_enabled: set[int] = set()
+        for axis_id in axis_ids:
+            axis_state = self._axis_states.get(axis_id)
+            if axis_state is not None and axis_state.homed:
+                keep_enabled.add(axis_id)
+        return keep_enabled
+
+    def _make_streamer(self, axis_configs, *, keep_enabled_axes: set[int] | None = None) -> MultiAxisRampStreamer:
         """Create a fresh streamer for a list of AxisMotionConfig."""
         return MultiAxisRampStreamer(
             self._transport,
@@ -158,6 +166,7 @@ class MoveQueue:
             poll_interval_s=self._poll_interval_s,
             print_every=self._print_every,
             target_buffer_time_s=0.200,
+            keep_enabled_axes=keep_enabled_axes,
         )
 
     def _next_motion_sequence(self) -> int:
@@ -192,7 +201,10 @@ class MoveQueue:
             return
         axis_ids = move.axis_ids
 
-        streamer = self._make_streamer(axis_configs)
+        streamer = self._make_streamer(
+            axis_configs,
+            keep_enabled_axes=self._axes_to_keep_enabled(axis_ids),
+        )
         # Override the generator to use the move's segments() method, but align
         # motion_sequence values with the ESP32 last_executed_sequence.
         streamer.set_generator(
@@ -227,7 +239,7 @@ class MoveQueue:
 
         move.mark_completed()
 
-    def _make_wound_streamer(self, move: WoundMove) -> MultiAxisRampStreamer:
+    def _make_wound_streamer(self, move: WoundMove, *, keep_enabled_axes: set[int] | None = None) -> MultiAxisRampStreamer:
         target_hz = (
             max(move.kinematics.target_rpm, 1.0) / 60.0
             * float(move.spindle_cfg.steps_per_unit)
@@ -240,6 +252,7 @@ class MoveQueue:
             poll_interval_s=self._poll_interval_s,
             print_every=self._print_every,
             target_buffer_time_s=0.200,
+            keep_enabled_axes=keep_enabled_axes,
         )
 
     def _execute_wound_move(self, move: WoundMove) -> None:
@@ -247,7 +260,10 @@ class MoveQueue:
         move.mark_running()
         axis_ids = move.axis_ids
 
-        streamer = self._make_wound_streamer(move)
+        streamer = self._make_wound_streamer(
+            move,
+            keep_enabled_axes=self._axes_to_keep_enabled(axis_ids),
+        )
         streamer.set_generator(
             self._wrap_segment_sequence(
                 move.segments(),
@@ -310,7 +326,12 @@ class MoveQueue:
                     f"homing sub-move {phase_name} has no public axis_configs"
                 )
                 return
-            streamer = self._make_streamer(sub_move_axis_configs)
+            streamer = self._make_streamer(
+                sub_move_axis_configs,
+                keep_enabled_axes={move.axis_id},
+            )
+            if hasattr(streamer, "note_endstop_armed"):
+                streamer.note_endstop_armed(move.axis_id, arm_endstop)
             streamer.set_generator(
                 self._wrap_segment_sequence(
                     sub_move.segments(),

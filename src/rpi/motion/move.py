@@ -209,9 +209,11 @@ class RampMove(Move):
         return self._config.axis_configs
 
     def expected_delta_steps(self, axis_id: int) -> int | None:
-        # Total steps = integral of hz over time. For position tracking
-        # this is an estimate — return None to avoid false precision.
-        # Subclass and override if exact step count is needed.
+        for axis_config in self._config.axis_configs:
+            if axis_config.axis_id != axis_id:
+                continue
+            total_steps = int(round(axis_config.ramp.steps_at(axis_config.ramp.total_duration)))
+            return -total_steps if axis_config.ramp.reverse_direction else total_steps
         return None
 
 

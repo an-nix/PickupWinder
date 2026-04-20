@@ -54,6 +54,7 @@ This ensures the ESP32 planner queue maintains enough headroom for brief transpo
 - `pushExpandedBlock()` must not start the driver.
 - `kickStart()` is owned by the post-drain batch decision, not by per-segment code.
 - Host-side send confirmation only counts after `wait_for_request_result()` returns `OK`.
+- Host-side enable teardown can now be suppressed per axis so a homed lateral axis keeps its driver enabled between moves.
 
 ## Key constants
 

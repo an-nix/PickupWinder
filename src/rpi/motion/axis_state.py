@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from transport.messages import LATERAL_ENDSTOP_PRESENT_CLOSED
 from threading import Lock
 from typing import Optional
 
@@ -28,10 +30,12 @@ class AxisState:
         self,
         axis_id: int,
         steps_per_rev: int = 200 * 32,
+        steps_per_mm: float | None = None,
         limits: AxisLimits | None = None,
     ) -> None:
         self.axis_id = axis_id
         self.steps_per_rev = steps_per_rev
+        self.steps_per_mm = steps_per_mm
         self.limits = limits or AxisLimits()
         self._lock = Lock()
         self._position_steps: int | None = None  # None = unknown (needs homing)
@@ -47,14 +51,11 @@ class AxisState:
 
     @property
     def position_mm(self) -> float | None:
-        """
-        Returns position in mm if steps_per_mm is known.
-        Override or subclass for machines with a known pitch.
-        """
+        """Return position in mm when ``steps_per_mm`` is configured."""
         with self._lock:
-            if self._position_steps is None:
+            if self._position_steps is None or self.steps_per_mm is None:
                 return None
-            return float(self._position_steps) / float(self.steps_per_rev)
+            return float(self._position_steps) / float(self.steps_per_mm)
 
     def set_position(self, steps: int) -> None:
         """Set known position. Called after homing or on explicit reset."""
@@ -111,16 +112,23 @@ class AxisState:
 
     @property
     def endstop_triggered(self) -> bool:
-        """True if endstop is in PRESENT_CLOSED state (value 2)."""
+        """True if endstop is in PRESENT_CLOSED state (value 0x01)."""
         with self._lock:
-            return self._endstop_state == 2
+            return self._endstop_state == LATERAL_ENDSTOP_PRESENT_CLOSED
 
     def snapshot(self) -> dict:
         with self._lock:
             return {
                 "axis_id": self.axis_id,
                 "position_steps": self._position_steps,
+                "position_mm": (
+                    None
+                    if self._position_steps is None or self.steps_per_mm is None
+                    else float(self._position_steps) / float(self.steps_per_mm)
+                ),
                 "homed": self._homed,
                 "endstop_state": self._endstop_state,
-                "endstop_triggered": self._endstop_state == 2,
+                "endstop_triggered": self._endstop_state == LATERAL_ENDSTOP_PRESENT_CLOSED,
+                "soft_limit_min_steps": self.limits.min_steps,
+                "soft_limit_max_steps": self.limits.max_steps,
             }

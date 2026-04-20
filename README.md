@@ -33,6 +33,21 @@ The active host entry point is `src/rpi/winding_main.py`. The deprecated `Winder
 5. The executor expands segments into step timings, fills the RMT ring, then starts motion once the ring is prefed.
 6. The host confirms each request through `wait_for_request_result()` because the SPI status frame is pipelined by one transfer.
 
+## Lateral axis rules
+
+- The lateral axis starts with an unknown position after every host or controller restart.
+- Any free lateral motion now requires a successful homing cycle first.
+- Host-side soft limits are configured in `src/rpi/core/config.py` through `lateral_soft_limit_min_mm` and `lateral_soft_limit_max_mm`.
+- Once the lateral axis is homed, the host keeps its enable line asserted across subsequent moves so the zero reference is not lost.
+- If the controller reports that the lateral enable bit dropped, the host invalidates the home state and requires a new homing cycle.
+
+Manual simulation example:
+
+```bash
+cd src/rpi
+python3 examples/simulate_lateral_rpc.py --position-a-mm 0 --position-b-mm 10 --rpm 60 --cycles 3
+```
+
 ## Sequencing and retries
 
 The project now tracks three separate 16-bit sequences:

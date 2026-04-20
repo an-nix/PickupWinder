@@ -16,13 +16,17 @@ from motion.spindle_kinematics import SpindleKinematics
 from motion.winding_pattern import WindingPattern
 from motion.scatter_engine import ScatterEngine
 from motion.move import HomingMove, WoundMove
-from motion.axis_state import AxisState
+from motion.axis_state import AxisLimits, AxisState
 from motion.ramp_config import RampConfig
 from motion.move_queue import MoveQueue
 from motion.synchronized_segment_generator import SyncAxisConfig
 from motion.engine import WindingEngine
 from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
-from transport.messages import MultiAxisSegment, SpiMessageResult
+from transport.messages import (
+    LATERAL_ENDSTOP_PRESENT_CLOSED,
+    MultiAxisSegment,
+    SpiMessageResult,
+)
 from transport import MockSpiTransport
 from winding.program import WindingProgram
 from core.config import AppConfiguration
@@ -57,6 +61,26 @@ def test_streamer_set_generator_replaces_generator_and_resets_finished_state():
     assert streamer._generator is replacement
     assert streamer._generator is not original
     assert streamer._generator_finished is False
+
+
+def test_streamer_keep_enabled_axes_preserves_axis_enable_state():
+    transport = MockSpiTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[
+            StreamAxisConfig(axis_id=1, ramp=RampConfig(axis_id=1, target_rpm=300.0))
+        ],
+        keep_enabled_axes={1},
+    )
+    streamer.set_generator(
+        iter([
+            MultiAxisSegment(sequence=0, duration_us=4000, steps=[0, 12], directions=[0, 0]),
+        ])
+    )
+
+    streamer.stream_all()
+
+    assert 1 in transport._enabled_axes
 
 
 def test_streamer_collect_batch_uses_confirmed_ack_status():
@@ -111,6 +135,28 @@ def test_streamer_collect_batch_uses_confirmed_ack_status():
 
     assert sent == 1
     assert transport.wait_calls == [7]
+    assert len(streamer._inflight) == 1
+    assert streamer._retry_batch is None
+
+
+def test_streamer_single_axis_id_one_generates_one_axis_segment():
+    transport = MockSpiTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[StreamAxisConfig(axis_id=1, ramp=RampConfig(axis_id=1, target_rpm=300.0))],
+    )
+    streamer.set_generator(iter([
+        MultiAxisSegment(sequence=0, duration_us=4000, steps=[12], directions=[0]),
+    ]))
+
+    sent, _status = streamer._collect_and_send_batch(transport.get_status())
+
+    assert sent == 1
+    assert transport.sent_payloads
+    payload = transport.sent_payloads[-1]
+    assert payload.axis_ids == [1]
+    assert payload.segments[0].steps == [12]
+    assert payload.segments[0].directions == [0]
     assert len(streamer._inflight) == 1
     assert streamer._retry_batch is None
 
@@ -179,6 +225,122 @@ def test_streamer_retries_same_batch_after_confirmed_queue_full():
     assert transport.sent_sequences == [[0], [0]]
     assert len(streamer._inflight) == 1
     assert streamer._retry_batch is None
+
+
+def test_streamer_treats_endstop_blocked_ack_as_triggered():
+    class FakeTransport:
+        def __init__(self) -> None:
+            self.wait_calls: list[int] = []
+            self._send_seq = 41
+
+        def get_status(self):
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                last_result=int(SpiMessageResult.OK),
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0x00,
+                endstop_armed_mask=0,
+            )
+
+        def send_multi_axis_segment_block_request(self, payload):
+            seq = self._send_seq
+            self._send_seq += 1
+            return seq, SimpleNamespace(last_result=int(SpiMessageResult.OK))
+
+        def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001, timeout_s: float = 1.5):
+            self.wait_calls.append(sequence)
+            return SimpleNamespace(
+                last_result=int(SpiMessageResult.ENDSTOP_BLOCKED),
+                queue_free_slots=(128, 128, 128, 128),
+                ring_free_slots=(4096, 4096, 4096, 4096),
+                underrun_count=(0, 0, 0, 0),
+                planner_queue_free=128,
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=LATERAL_ENDSTOP_PRESENT_CLOSED,
+                endstop_armed_mask=1 << 1,
+            )
+
+        def flush_until(self, sequence: int):
+            return self.get_status()
+
+    transport = FakeTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[StreamAxisConfig(axis_id=1, ramp=RampConfig(axis_id=1, target_rpm=300.0))],
+    )
+    streamer.set_generator(
+        iter([MultiAxisSegment(sequence=0, duration_us=4000, steps=[12], directions=[0])])
+    )
+
+    sent, status = streamer._collect_and_send_batch(transport.get_status())
+
+    assert sent == 0
+    assert status.last_result == int(SpiMessageResult.ENDSTOP_BLOCKED)
+    assert streamer.endstop_triggered is True
+    assert streamer.has_stop_been_requested() is True
+
+
+def test_streamer_detects_closed_endstop_when_local_arm_tracking_is_set():
+    transport = MockSpiTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[StreamAxisConfig(axis_id=1, ramp=RampConfig(axis_id=1, target_rpm=300.0))],
+    )
+    streamer.note_endstop_armed(1, True)
+
+    triggered = streamer._check_endstop(
+        SimpleNamespace(
+            lateral_endstop_state=LATERAL_ENDSTOP_PRESENT_CLOSED,
+            endstop_armed_mask=0,
+        )
+    )
+
+    assert triggered is True
+    assert streamer.endstop_triggered is True
+    assert streamer.has_stop_been_requested() is True
+
+
+def test_streamer_treats_planner_drops_during_armed_move_as_endstop_recovery():
+    transport = MockSpiTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[StreamAxisConfig(axis_id=1, ramp=RampConfig(axis_id=1, target_rpm=300.0))],
+    )
+    streamer.note_endstop_armed(1, True)
+    streamer._inflight.append(
+        (MultiAxisSegment(sequence=12, duration_us=4000, steps=[12], directions=[0]), 99)
+    )
+    streamer._last_segments_dropped = 4
+
+    streamer._log_runtime_diagnostics(
+        SimpleNamespace(
+            underrun_count=(0, 0, 0, 0),
+            segments_dropped=6,
+            planner_queue_free=128,
+            multi_axis_queue_free=64,
+            ring_free_slots=(4096, 4096, 4096, 4096),
+            last_executed_sequence=12,
+            last_planned_sequence=12,
+        )
+    )
+
+    assert streamer.endstop_triggered is True
+    assert streamer.has_stop_been_requested() is True
+
+
+def test_axis_state_reports_closed_endstop_from_protocol_value():
+    axis_state = AxisState(axis_id=1)
+
+    axis_state.update_endstop_state(LATERAL_ENDSTOP_PRESENT_CLOSED)
+
+    assert axis_state.endstop_triggered is True
+    assert axis_state.snapshot()["endstop_triggered"] is True
 
 
 def test_streamer_rejects_non_monotonic_sequences_inside_batch():
@@ -308,6 +470,137 @@ def test_engine_exposes_public_config_property():
     )
 
     assert engine.config is config
+
+
+def test_engine_jog_rejects_unhomed_lateral_axis():
+    config = AppConfiguration()
+    lateral_state = AxisState(
+        axis_id=config.lateral_axis_id,
+        steps_per_mm=config.lateral_steps_per_mm,
+        limits=AxisLimits(
+            min_steps=config.lateral_soft_limit_min_steps,
+            max_steps=config.lateral_soft_limit_max_steps,
+        ),
+    )
+    engine = WindingEngine(
+        transport=SimpleNamespace(),
+        shared_state=SharedState(axis_states={config.lateral_axis_id: lateral_state}),
+        event_bus=EventBus(),
+        config=config,
+    )
+
+    with pytest.raises(RuntimeError, match="must be homed"):
+        engine.jog(axis_id=config.lateral_axis_id, steps=100, rpm=50.0)
+
+
+def test_engine_home_lateral_requires_clear_fault_after_fault():
+    config = AppConfiguration()
+    engine = WindingEngine(
+        transport=SimpleNamespace(),
+        shared_state=SharedState(axis_states={}),
+        event_bus=EventBus(),
+        config=config,
+    )
+    engine._state.set_fault("motor error")
+
+    with pytest.raises(RuntimeError, match="winding.clear_fault"):
+        engine.home_lateral()
+
+
+def test_engine_move_lateral_to_mm_queues_signed_jog():
+    config = AppConfiguration(lateral_soft_limit_max_mm=12.0)
+    lateral_state = AxisState(
+        axis_id=config.lateral_axis_id,
+        steps_per_mm=config.lateral_steps_per_mm,
+        limits=AxisLimits(
+            min_steps=config.lateral_soft_limit_min_steps,
+            max_steps=config.lateral_soft_limit_max_steps,
+        ),
+    )
+    lateral_state.mark_homed(0)
+    engine = WindingEngine(
+        transport=SimpleNamespace(
+            get_status=lambda: SimpleNamespace(enabled_mask=(1 << config.lateral_axis_id))
+        ),
+        shared_state=SharedState(axis_states={config.lateral_axis_id: lateral_state}),
+        event_bus=EventBus(),
+        config=config,
+    )
+
+    captured: list[tuple[int, int, float, bool]] = []
+
+    def _capture(move) -> None:
+        captured.append(
+            (
+                move.axis_id,
+                move._steps,
+                move._config.axis_configs[0].ramp.target_rpm,
+                move._reverse,
+            )
+        )
+
+    engine._move_queue.enqueue = _capture  # type: ignore[assignment]
+
+    result = engine.move_lateral_to_mm(position_mm=5.0, rpm=40.0)
+
+    assert result["status"] == "queued"
+    assert captured == [
+        (
+            config.lateral_axis_id,
+            int(round(5.0 * config.lateral_steps_per_mm)),
+            40.0,
+            False,
+        )
+    ]
+
+
+def test_engine_run_axis_rejects_lateral_target_beyond_soft_limit():
+    config = AppConfiguration(
+        lateral_soft_limit_max_mm=0.1,
+        lateral_max_rpm=60,
+    )
+    lateral_state = AxisState(
+        axis_id=config.lateral_axis_id,
+        steps_per_mm=config.lateral_steps_per_mm,
+        limits=AxisLimits(
+            min_steps=config.lateral_soft_limit_min_steps,
+            max_steps=config.lateral_soft_limit_max_steps,
+        ),
+    )
+    lateral_state.mark_homed(0)
+    engine = WindingEngine(
+        transport=SimpleNamespace(
+            get_status=lambda: SimpleNamespace(enabled_mask=(1 << config.lateral_axis_id))
+        ),
+        shared_state=SharedState(axis_states={config.lateral_axis_id: lateral_state}),
+        event_bus=EventBus(),
+        config=config,
+    )
+
+    with pytest.raises(ValueError, match="outside configured soft limits"):
+        engine.run_axis(
+            duration_s=2.0,
+            targets=[{"axis_id": config.lateral_axis_id, "rpm": 60.0}],
+        )
+
+
+def test_engine_refresh_lateral_home_state_invalidates_after_enable_loss():
+    config = AppConfiguration()
+    lateral_state = AxisState(
+        axis_id=config.lateral_axis_id,
+        steps_per_mm=config.lateral_steps_per_mm,
+    )
+    lateral_state.mark_homed(0)
+    engine = WindingEngine(
+        transport=SimpleNamespace(get_status=lambda: SimpleNamespace(enabled_mask=0)),
+        shared_state=SharedState(axis_states={config.lateral_axis_id: lateral_state}),
+        event_bus=EventBus(),
+        config=config,
+    )
+
+    status = engine.status()
+
+    assert status["shared_state"]["axis_states"][config.lateral_axis_id]["homed"] is False
 
 
 @pytest.mark.parametrize(
@@ -525,7 +818,11 @@ def test_execute_homing_waits_for_endstop_request_confirmation(monkeypatch):
         poll_interval_s=0.001,
         print_every=1,
     )
-    monkeypatch.setattr(queue, "_make_streamer", lambda axis_configs: FakeStreamer())
+    monkeypatch.setattr(
+        queue,
+        "_make_streamer",
+        lambda axis_configs, keep_enabled_axes=None: FakeStreamer(),
+    )
 
     move = HomingMove(
         name="home_test",
@@ -575,7 +872,11 @@ def test_execute_wound_move_invalidates_positions_on_stop_requested(monkeypatch)
         poll_interval_s=0.001,
         print_every=1,
     )
-    monkeypatch.setattr(queue, "_make_wound_streamer", lambda move: FakeStreamer(queue))
+    monkeypatch.setattr(
+        queue,
+        "_make_wound_streamer",
+        lambda move, keep_enabled_axes=None: FakeStreamer(queue),
+    )
 
     move = WoundMove(
         name="wound_stop",

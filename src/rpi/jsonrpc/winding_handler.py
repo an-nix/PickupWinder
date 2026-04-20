@@ -52,6 +52,8 @@ class WindingRpcHandler:
         handler.register_method("winding.jog", self.jog)
         handler.register_method("winding.wound_run", self.wound_run)
         handler.register_method("winding.run_axis", self.run_axis)
+        handler.register_method("winding.home_lateral", self.home_lateral)
+        handler.register_method("winding.move_lateral_mm", self.move_lateral_mm)
         handler.register_method("winding.clear_fault", self.clear_fault)
         handler.register_method("winding.flush_until", self.flush_until)
         handler.register_method("winding.status", self.status)
@@ -129,6 +131,27 @@ class WindingRpcHandler:
         """Queue a config-limited trapezoidal ramp for one or two axes."""
         self._engine.run_axis(duration_s=duration_s, targets=targets)
         return {"status": "queued"}
+
+    def home_lateral(
+        self,
+        approach_rpm: float = 100.0,
+        search_rpm: float = 20.0,
+        backoff_steps: int = 3200,
+    ) -> dict[str, Any]:
+        """Home the lateral axis immediately."""
+        axis_state = self._engine.home_lateral(
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
+        )
+        return {
+            "status": "homed",
+            "axis_state": axis_state,
+        }
+
+    def move_lateral_mm(self, position_mm: float, rpm: float) -> dict[str, Any]:
+        """Move the lateral axis to an absolute mm position from home zero."""
+        return self._engine.move_lateral_to_mm(position_mm=position_mm, rpm=rpm)
 
     def clear_fault(self, _params: Any | None = None) -> dict[str, str]:
         """Clear FAULT state so a new program can be submitted."""

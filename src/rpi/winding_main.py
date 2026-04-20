@@ -8,7 +8,7 @@ import time
 from core.config import AppConfiguration
 from core.events import EventBus
 from core.shared_state import SharedState
-from motion.axis_state import AxisState
+from motion.axis_state import AxisLimits, AxisState
 from motion.engine import WindingEngine
 from transport.spi_transport import Esp32SpiTransport
 from jsonrpc import AppRpcHandler, JsonRpcServer
@@ -50,6 +50,11 @@ def main() -> None:
         config.lateral_axis_id: AxisState(
             axis_id=config.lateral_axis_id,
             steps_per_rev=config.lateral_steps_per_revolution * config.lateral_microstepping,
+            steps_per_mm=config.lateral_steps_per_mm,
+            limits=AxisLimits(
+                min_steps=config.lateral_soft_limit_min_steps,
+                max_steps=config.lateral_soft_limit_max_steps,
+            ),
         ),
     }
 

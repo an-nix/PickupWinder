@@ -90,9 +90,8 @@ class StepProfileSegmentGenerator(BaseSegmentGenerator):
         self.overall_duration = max((profile.total_duration for profile in axis_profiles), default=0.0)
 
     def _compute_segment(self, time_start: float, time_end: float) -> Tuple[list[int], list[int]]:
-        max_axis = max((profile.axis_index for profile in self.axis_profiles), default=-1)
-        steps = [0] * (max_axis + 1)
-        directions = [0] * (max_axis + 1)
+        steps = [0] * len(self.axis_profiles)
+        directions = [0] * len(self.axis_profiles)
 
         for index, profile in enumerate(self.axis_profiles):
             target_steps = profile.step_at(time_end)
@@ -104,7 +103,7 @@ class StepProfileSegmentGenerator(BaseSegmentGenerator):
             is_negative = count < 0
             if is_negative:
                 count = abs(count)
-            directions[profile.axis_index] = 1 if is_negative ^ profile.reverse_direction else 0
-            steps[profile.axis_index] = count
+            directions[index] = 1 if is_negative ^ profile.reverse_direction else 0
+            steps[index] = count
 
         return steps, directions

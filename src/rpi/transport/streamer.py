@@ -9,6 +9,7 @@ from typing import Any, Iterator
 
 from transport.messages import (
     MULTI_AXIS_SEGMENT_BLOCK_SIZE,
+    LATERAL_ENDSTOP_PRESENT_CLOSED,
     MultiAxisSegment,
     MultiAxisSegmentBlockPayload,
     SpiMessageResult,
@@ -97,6 +98,7 @@ class MultiAxisRampStreamer:
         print_every: int = 1,
         log_each_send: bool = False,
         send_log_path: str | None = None,
+        keep_enabled_axes: set[int] | None = None,
     ):
         self._initialize_streamer_state(
             transport=transport,
@@ -109,6 +111,7 @@ class MultiAxisRampStreamer:
             log_each_send=log_each_send,
             send_log_path=send_log_path,
             explicit_target_hz=None,
+            keep_enabled_axes=keep_enabled_axes,
         )
 
     @classmethod
@@ -122,6 +125,7 @@ class MultiAxisRampStreamer:
         poll_interval_s: float = 0.001,
         print_every: int = 1,
         target_buffer_time_s: float = 0.150,
+        keep_enabled_axes: set[int] | None = None,
     ) -> "MultiAxisRampStreamer":
         """Build a streamer from explicit axis IDs and a known target frequency.
 
@@ -149,6 +153,7 @@ class MultiAxisRampStreamer:
             log_each_send=False,
             send_log_path=None,
             explicit_target_hz=target_hz,
+            keep_enabled_axes=keep_enabled_axes,
         )
         return streamer
 
@@ -165,6 +170,7 @@ class MultiAxisRampStreamer:
         log_each_send: bool,
         send_log_path: str | None,
         explicit_target_hz: float | None,
+        keep_enabled_axes: set[int] | None,
     ) -> None:
         self._transport = transport
         self._poll_interval_s = poll_interval_s
@@ -176,6 +182,7 @@ class MultiAxisRampStreamer:
         self._flush_sequence_requested: int | None = None
         self._endstop_triggered = False
         self._endstop_armed_axes: set[int] = set()
+        self._keep_enabled_axes = set(keep_enabled_axes or ())
 
         self._axis_configs = axis_configs
         self._axis_ids = list(axis_ids)
@@ -384,6 +391,9 @@ class MultiAxisRampStreamer:
                     break
                 time.sleep(self._poll_interval_s)
 
+            if axis_id in self._keep_enabled_axes:
+                continue
+
             sequence, status = self._transport.set_axis_enabled_request(axis_id, False)
             status = self._transport.wait_for_request_result(sequence, poll_interval_s=self._poll_interval_s)
             if status.last_result != int(SpiMessageResult.OK):
@@ -505,15 +515,21 @@ class MultiAxisRampStreamer:
         if self._last_segments_dropped is None:
             self._last_segments_dropped = segments_dropped
         elif segments_dropped > self._last_segments_dropped:
+            delta = segments_dropped - self._last_segments_dropped
             logger.warning(
                 "planner dropped segments: delta=%s total=%s planner_free=%s inflight=%s last_executed=%s last_planned=%s",
-                segments_dropped - self._last_segments_dropped,
+                delta,
                 segments_dropped,
                 getattr(status, "planner_queue_free", -1),
                 len(self._inflight),
                 getattr(status, "last_executed_sequence", -1),
                 getattr(status, "last_planned_sequence", -1),
             )
+            if self._endstop_armed_axes:
+                logger.info(
+                    "planner dropped segments while endstop is armed; treating as endstop-triggered recovery"
+                )
+                self._mark_endstop_triggered()
             self._last_segments_dropped = segments_dropped
         elif segments_dropped < self._last_segments_dropped:
             self._last_segments_dropped = segments_dropped
@@ -522,13 +538,18 @@ class MultiAxisRampStreamer:
         planner_free = int(getattr(status, "planner_queue_free", -1))
         ring_free = tuple(int(v) for v in getattr(status, "ring_free_slots", (0, 0, 0, 0)))
         last_executed = int(getattr(status, "last_executed_sequence", -1))
+        tracked_ring_free = [
+            ring_free[axis_id]
+            for axis_id in self._axis_ids
+            if 0 <= axis_id < len(ring_free)
+        ]
         # Only fire when the ring is nearly empty (>= STEP_RING_CAPACITY - 256 free
         # slots = fewer than 256 steps = <2ms remaining at 1500 RPM).  The old
         # threshold of 2048 fired continuously at high speed because the ring is
         # always ~75% empty — a false positive that flooded the log.
         ring_nearly_empty = bool(
-            ring_free
-            and min(ring_free[: max(1, len(self._axis_ids))]) >= self.STEP_RING_CAPACITY - 256
+            tracked_ring_free
+            and min(tracked_ring_free) >= self.STEP_RING_CAPACITY - 256
         )
         if (
             len(self._inflight) >= 32
@@ -557,17 +578,25 @@ class MultiAxisRampStreamer:
         """
         armed_mask = int(getattr(status, "endstop_armed_mask", 0))
         lateral_state = int(getattr(status, "lateral_endstop_state", 0xFF))
-        # lateral_endstop_state values (from firmware LateralEndstopState):
-        #   0x00 = PRESENT_OPEN, 0x01 = PRESENT_CLOSED, 0xFF = ABSENT
-        PRESENT_CLOSED = 0x01
-        if lateral_state == PRESENT_CLOSED and armed_mask != 0:
-            if not self._endstop_triggered:
-                self._endstop_triggered = True
-                flush_seq = self._last_sent_motion_seq
-                self.request_stop()
-                self.request_flush(flush_seq)
+        endstop_expected = armed_mask != 0 or bool(self._endstop_armed_axes)
+        if lateral_state == LATERAL_ENDSTOP_PRESENT_CLOSED and endstop_expected:
+            self._mark_endstop_triggered()
             return True
         return False
+
+    def note_endstop_armed(self, axis_id: int, arm: bool) -> None:
+        if arm:
+            self._endstop_armed_axes.add(axis_id)
+        else:
+            self._endstop_armed_axes.discard(axis_id)
+
+    def _mark_endstop_triggered(self) -> None:
+        if self._endstop_triggered:
+            return
+        self._endstop_triggered = True
+        flush_seq = self._last_sent_motion_seq
+        self.request_stop()
+        self.request_flush(flush_seq)
 
     def _record_send_event(self, segment: MultiAxisSegment, transport_seq: int, status) -> None:
         event = {
@@ -720,6 +749,14 @@ class MultiAxisRampStreamer:
         elif ack_status.last_result == int(SpiMessageResult.QUEUE_FULL):
             if self._retry_batch is None:
                 self._retry_batch = list(batch)
+            return 0, ack_status
+        elif ack_status.last_result == int(SpiMessageResult.ENDSTOP_BLOCKED):
+            logger.info(
+                "endstop blocked batch motion_seq=%s transport_seq=%s",
+                batch[0].sequence,
+                transport_seq,
+            )
+            self._mark_endstop_triggered()
             return 0, ack_status
         else:
             raise RuntimeError(
