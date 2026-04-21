@@ -27,8 +27,8 @@ class EventKind(Enum):
 
 @dataclass(slots=True)
 class Event:
-    version: int = 1
     kind: EventKind
+    version: int = 1
     data: dict[str, Any] = field(default_factory=dict)
 
 
