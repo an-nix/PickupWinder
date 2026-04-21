@@ -5,11 +5,8 @@ from typing import Optional
 class AppConfiguration:
     """Configuration parameters for the PickupWinder host application."""
 
-
     rpc_socket_path: str = "/tmp/pickup_winder_rpc.sock"
     spi_device: str = "/dev/spidev0.0"
-    # Protocol target is 4 MHz (mode 0).  1 MHz significantly reduces
-    # effective segment throughput and can starve the executor at higher RPM.
     spi_speed_hz: int = 4_000_000
 
     spindle_axis_id: int = 0
@@ -26,7 +23,7 @@ class AppConfiguration:
     lateral_steps_per_revolution: int = 200
     lateral_microstepping: int = 32
     lateral_invert_direction: bool = False
-    lateral_max_rpm: int = 1000
+    lateral_max_rpm: int = 1000     
     # Unit: mm/s² on traverse axis.
     lateral_max_acceleration_mm_per_s2: Optional[float] = None
     # Unit: mm/s² on traverse axis.
@@ -111,3 +108,31 @@ class AppConfiguration:
         if self.lateral_max_deceleration_mm_per_s2 is not None:
             return float(self.lateral_max_deceleration_mm_per_s2) * self.lateral_steps_per_mm
         return self.lateral_max_acceleration_steps_per_s2
+
+
+class ConfigurationManager:
+    
+    def __init__(self,config_file_path):
+        self._config_file_path = config_file_path
+        self.active_configuration = AppConfiguration()
+
+
+    def load_configuration(self):
+        pass
+
+    def save_configration(self):
+        pass
+
+    def get_saved_configuration(self):
+        pass
+
+    def get_activate_configuration(self):
+        pass
+
+    # Return RPC Socket path
+    def get_rpc_socket_path(self) -> str:
+        return self.active_configuration.rpc_socket_path
+
+    # Return SPI Config Tuples (dev, speed)
+    def get_spi_device(self) -> str:
+        return (self.active_configuration.spi_device,self.active_configuration.spi_speed_hz)
