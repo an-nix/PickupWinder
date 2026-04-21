@@ -1,4 +1,14 @@
 from winding.program import WindingProgram
+from winding.adaptive import (
+    AdaptiveChunkPlan,
+    AdaptivePlanningSnapshot,
+    AdaptiveWindingMove,
+    AdaptiveWindingRuntime,
+    AdaptiveWindingSessionConfig,
+    WindingWindow,
+    awg_to_diameter_mm,
+    plan_next_chunk,
+)
 from winding.winding_pattern import WindingPattern
 from winding.scatter_engine import ScatterEngine
 from winding.synchronized_segment_generator import (
@@ -9,9 +19,17 @@ from winding.wound_move import WoundMove
 
 __all__ = [
     "WindingProgram",
+    "AdaptiveChunkPlan",
+    "AdaptivePlanningSnapshot",
+    "AdaptiveWindingMove",
+    "AdaptiveWindingRuntime",
+    "AdaptiveWindingSessionConfig",
     "WindingPattern",
+    "WindingWindow",
     "ScatterEngine",
     "SyncAxisConfig",
     "SynchronizedSegmentGenerator",
     "WoundMove",
+    "awg_to_diameter_mm",
+    "plan_next_chunk",
 ]

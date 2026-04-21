@@ -4,6 +4,7 @@ import logging
 import re
 import threading
 import time
+from typing import Iterable
 
 
 from transport.messages import (
@@ -74,10 +75,19 @@ class Esp32SpiTransport:
         self._diag_bad_crc: int = 0
         self._diag_zero_rx: int = 0
         self._diag_reopens: int = 0
+        self._diag_lifetime_total_xfers: int = 0
+        self._diag_lifetime_bad_magic: int = 0
+        self._diag_lifetime_bad_crc: int = 0
+        self._diag_lifetime_zero_rx: int = 0
+        self._diag_lifetime_reopens: int = 0
         self._diag_last_log_ts: float = time.monotonic()
 
     def close(self) -> None:
         self._spi.close()
+
+    @staticmethod
+    def _axes_from_mask(mask: int, axis_ids: Iterable[int]) -> list[int]:
+        return [axis_id for axis_id in axis_ids if mask & (1 << axis_id)]
 
     def _open_spi(self) -> None:
         if self._open_device_path is not None:
@@ -118,6 +128,7 @@ class Esp32SpiTransport:
         self._spi = self._spidev_module.SpiDev()
         self._open_spi()
         self._diag_reopens += 1
+        self._diag_lifetime_reopens += 1
 
     def _xfer(self, frame: bytes) -> bytes:
         """Perform one full-duplex SPI frame transfer with explicit params.
@@ -181,6 +192,7 @@ class Esp32SpiTransport:
             with self._io_lock:
                 response = self._xfer(frame)
             self._diag_total_xfers += 1
+            self._diag_lifetime_total_xfers += 1
             try:
                 self._consecutive_zero_frames = 0
                 status = parse_status_frame(response)
@@ -194,10 +206,13 @@ class Esp32SpiTransport:
                     is_zero = response[:32] == b"\x00" * 32
                     if "bad magic" in str(exc):
                         self._diag_bad_magic += 1
+                        self._diag_lifetime_bad_magic += 1
                     else:
                         self._diag_bad_crc += 1
+                        self._diag_lifetime_bad_crc += 1
                     if is_zero:
                         self._diag_zero_rx += 1
+                        self._diag_lifetime_zero_rx += 1
                     # Zero-frame = ESP32 between spi_slave_transmit() calls
                     # (~50 µs gap).  Retry immediately — no sleep.
                     # Non-zero bad magic/CRC = real corruption — short sleep.
@@ -258,6 +273,7 @@ class Esp32SpiTransport:
                 with self._io_lock:
                     response = self._xfer(frame)
                 self._diag_total_xfers += 1
+                self._diag_lifetime_total_xfers += 1
             except Exception as exc:
                 last_exc = exc
                 time.sleep(0.001)
@@ -290,10 +306,13 @@ class Esp32SpiTransport:
                     is_zero = response[:32] == b"\x00" * 32
                     if "bad magic" in str(exc):
                         self._diag_bad_magic += 1
+                        self._diag_lifetime_bad_magic += 1
                     else:
                         self._diag_bad_crc += 1
+                        self._diag_lifetime_bad_crc += 1
                     if is_zero:
                         self._diag_zero_rx += 1
+                        self._diag_lifetime_zero_rx += 1
                     # Zero-frame: retry immediately (ESP gap is ~50 µs).
                     # Non-zero corruption: short sleep.
                     time.sleep(0.001)
@@ -324,6 +343,19 @@ class Esp32SpiTransport:
     def get_status(self, *, timeout_s: float = 1.0, allow_stale: bool = True) -> StatusPayload:
         return self.poll_status(timeout_s=timeout_s, allow_stale=allow_stale)
 
+    def transport_diagnostics(self) -> dict[str, int | float | None]:
+        last_status_age_s: float | None = None
+        if self._last_status is not None:
+            last_status_age_s = round(time.monotonic() - self._last_status_ts, 3)
+        return {
+            "total_xfers": self._diag_lifetime_total_xfers,
+            "bad_magic": self._diag_lifetime_bad_magic,
+            "bad_crc": self._diag_lifetime_bad_crc,
+            "zero_rx": self._diag_lifetime_zero_rx,
+            "reopens": self._diag_lifetime_reopens,
+            "last_status_age_s": last_status_age_s,
+        }
+
     def set_axis_enabled(self, axis_id: int, enable: bool) -> StatusPayload:
         return self.transfer_frame(make_enable_axis(axis_id, enable, self._next_sequence()))
 
@@ -338,6 +370,86 @@ class Esp32SpiTransport:
 
     def disable_all(self) -> StatusPayload:
         return self.transfer_frame(make_disable_all(self._next_sequence()))
+
+    def safe_shutdown(
+        self,
+        *,
+        axis_ids: Iterable[int],
+        keep_enabled_axes: Iterable[int] = (),
+        timeout_s: float = 1.0,
+        emergency_on_failure: bool = True,
+    ) -> StatusPayload | None:
+        resolved_axis_ids = tuple(dict.fromkeys(int(axis_id) for axis_id in axis_ids))
+        keep_enabled = frozenset(int(axis_id) for axis_id in keep_enabled_axes)
+        last_status: StatusPayload | None = None
+        errors: list[str] = []
+
+        def verify_status(label: str) -> None:
+            nonlocal last_status
+            try:
+                last_status = self.get_status(timeout_s=timeout_s, allow_stale=False)
+            except Exception as exc:
+                errors.append(f"{label} status verification failed: {exc}")
+                return
+
+            unexpected_running = self._axes_from_mask(
+                last_status.running_mask,
+                resolved_axis_ids,
+            )
+            unexpected_enabled = [
+                axis_id
+                for axis_id in self._axes_from_mask(last_status.enabled_mask, resolved_axis_ids)
+                if axis_id not in keep_enabled
+            ]
+            if unexpected_running:
+                errors.append(
+                    f"{label} running axes remain active: {unexpected_running}"
+                )
+            if unexpected_enabled:
+                errors.append(
+                    f"{label} enabled axes remain active: {unexpected_enabled}"
+                )
+
+        try:
+            self.stop_axis()
+        except Exception as exc:
+            errors.append(f"stop_axis failed: {exc}")
+
+        for axis_id in resolved_axis_ids:
+            if axis_id in keep_enabled:
+                continue
+            try:
+                self.set_axis_enabled(axis_id, False)
+            except Exception as exc:
+                errors.append(f"disable axis {axis_id} failed: {exc}")
+
+        verify_status("safe_shutdown")
+
+        if errors and emergency_on_failure:
+            initial_errors = list(errors)
+            errors.clear()
+            try:
+                self.emergency_stop()
+            except Exception as exc:
+                errors.append(f"emergency_stop failed: {exc}")
+            if not keep_enabled:
+                try:
+                    self.disable_all()
+                except Exception as exc:
+                    errors.append(f"disable_all failed: {exc}")
+            verify_status("post_emergency_stop")
+            if errors:
+                raise RuntimeError("; ".join(initial_errors + errors))
+            logger.error(
+                "Transport safe_shutdown escalated to emergency stop after: %s",
+                "; ".join(initial_errors),
+            )
+            return last_status
+
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+        return last_status
 
     def reset_stats(self) -> StatusPayload:
         return self.transfer_frame(make_reset_stats(self._next_sequence()))

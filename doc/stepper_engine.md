@@ -83,4 +83,5 @@ This ensures the ESP32 planner queue maintains enough headroom for brief transpo
 
 - `STEP_BLOCK` and `SEGMENT_BLOCK` still exist for debug and legacy tooling.
 - The production path is `MULTI_AXIS_SEGMENT_BLOCK` end-to-end.
+- Host-side `clear()` and `stop()` must propagate `request_stop()` to the active streamer; interrupted streamers are treated as aborted host moves, not as successful completion.
 - `resources/FastAccelStepper` remains reference-only and is not linked into the firmware.

@@ -97,6 +97,7 @@ class MultiAxisRampStreamer:
         segment_duration_s: float = 0.004,
         target_buffer_time_s: float = TARGET_BUFFER_TIME_S,
         poll_interval_s: float = 0.001,
+        stall_timeout_s: float = 5.0,
         print_every: int = 1,
         log_each_send: bool = False,
         send_log_path: str | None = None,
@@ -109,6 +110,7 @@ class MultiAxisRampStreamer:
             segment_duration_s=segment_duration_s,
             target_buffer_time_s=target_buffer_time_s,
             poll_interval_s=poll_interval_s,
+            stall_timeout_s=stall_timeout_s,
             print_every=print_every,
             log_each_send=log_each_send,
             send_log_path=send_log_path,
@@ -127,6 +129,7 @@ class MultiAxisRampStreamer:
         poll_interval_s: float = 0.001,
         print_every: int = 1,
         target_buffer_time_s: float = 0.150,
+        stall_timeout_s: float = 5.0,
         keep_enabled_axes: set[int] | None = None,
     ) -> "MultiAxisRampStreamer":
         """Build a streamer from explicit axis IDs and a known target frequency.
@@ -151,6 +154,7 @@ class MultiAxisRampStreamer:
             segment_duration_s=segment_duration_s,
             target_buffer_time_s=target_buffer_time_s,
             poll_interval_s=poll_interval_s,
+            stall_timeout_s=stall_timeout_s,
             print_every=print_every,
             log_each_send=False,
             send_log_path=None,
@@ -168,6 +172,7 @@ class MultiAxisRampStreamer:
         segment_duration_s: float,
         target_buffer_time_s: float,
         poll_interval_s: float,
+        stall_timeout_s: float,
         print_every: int,
         log_each_send: bool,
         send_log_path: str | None,
@@ -229,7 +234,7 @@ class MultiAxisRampStreamer:
         self._premature_notify_window_start: float = 0.0
         self._last_sequence_advance_time: float = time.time()
         self._last_sequence_advance_value: int = -1
-        self._stall_timeout_s: float = 5.0  # stall if no progress for 5s
+        self._stall_timeout_s: float = max(1.0, float(stall_timeout_s))
         self._last_underrun_count: tuple[int, int, int, int] | None = None
         self._last_segments_dropped: int = 0   # R3: sentinel 0, not None
         self._last_logged_segments_dropped: int | None = None
@@ -703,7 +708,9 @@ class MultiAxisRampStreamer:
 
     # -- Stop / flush ----------------------------------------------------------
 
-    def request_stop(self) -> None:
+    def request_stop(self, *, keep_enabled_axes: set[int] | None = None) -> None:
+        if keep_enabled_axes is not None:
+            self._keep_enabled_axes = set(keep_enabled_axes)
         self._stop_requested = True
 
     def has_stop_been_requested(self) -> bool:
@@ -871,6 +878,7 @@ class MultiAxisRampStreamer:
         self._update_confirmed_motion_sequence(status)
         axes_enabled = False
         total_segments = 0
+        stream_error: Exception | None = None
 
         try:
             self._enable_axes()
@@ -948,12 +956,19 @@ class MultiAxisRampStreamer:
                 sleep_s = self._should_sleep()
                 if sleep_s > 0.0:
                     time.sleep(sleep_s)
+        except Exception as exc:
+            stream_error = exc
+            raise
         finally:
+            cleanup_error: Exception | None = None
             if axes_enabled:
                 try:
                     self._disable_axes()
                 except Exception as exc:
-                    logger.error("failed to disable axes: %s", exc)
+                    cleanup_error = exc
+                    logger.exception("failed to disable axes")
+            if cleanup_error is not None and stream_error is None:
+                raise RuntimeError(f"stream cleanup failed: {cleanup_error}") from cleanup_error
 
         self._write_send_log()
         return total_segments

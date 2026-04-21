@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-import dataclasses
+import inspect
 import time
-from typing import Any, Callable, Dict
+from typing import Any, Callable
 
-from .protocol import JsonRpcMethodNotFoundError
+from core.status import RuntimeStatusService, serialize_configuration
 
-MethodCallback = Callable[[Any | None], Any]
+from .protocol import JsonRpcInvalidParamsError, JsonRpcMethodNotFoundError
+
+MethodCallback = Callable[..., Any]
 
 
 class RpcHandler:
     def __init__(self) -> None:
-        self._methods: Dict[str, MethodCallback] = {}
+        self._methods: dict[str, MethodCallback] = {}
 
     def register_method(self, method: str, callback: MethodCallback) -> None:
         self._methods[method] = callback
@@ -20,23 +22,34 @@ class RpcHandler:
         callback = self._methods.get(method)
         if callback is None:
             raise JsonRpcMethodNotFoundError(method)
-        if params is None:
-            return callback()
-        if isinstance(params, list):
-            return callback(*params)
-        if isinstance(params, dict):
-            try:
+        signature = inspect.signature(callback)
+        try:
+            if params is None:
+                signature.bind()
+                return callback()
+            if isinstance(params, list):
+                signature.bind(*params)
+                return callback(*params)
+            if isinstance(params, dict):
+                signature.bind(**params)
                 return callback(**params)
-            except TypeError:
-                return callback(params)
-        return callback(params)
+            signature.bind(params)
+            return callback(params)
+        except TypeError as exc:
+            raise JsonRpcInvalidParamsError(str(exc)) from exc
 
 
-class AppRpcHandler(RpcHandler):
-    def __init__(self, app: Any | None = None) -> None:
+class SystemRpcHandler(RpcHandler):
+    def __init__(
+        self,
+        *,
+        status_service: RuntimeStatusService | None = None,
+        app: Any | None = None,
+    ) -> None:
         super().__init__()
-        self.app = app
-        self.started_at = time.time()
+        self._status_service = status_service
+        self._app = app
+        self._started_at = time.monotonic()
         self.register_method("winder.ping", self._rpc_ping)
         self.register_method("winder.status", self._rpc_status)
         self.register_method("winder.shutdown", self._rpc_shutdown)
@@ -58,41 +71,24 @@ class AppRpcHandler(RpcHandler):
         return {"message": "pong"}
 
     def status(self) -> dict[str, Any]:
+        if self._status_service is not None:
+            return self._status_service.application_status()
         return {
-            "uptime_s": round(time.time() - self.started_at, 2),
-            "configured": bool(self.app is not None),
+            "uptime_s": round(time.monotonic() - self._started_at, 2),
+            "configured": bool(self._app is not None),
         }
 
     def shutdown(self) -> dict[str, str]:
         return {"message": "shutdown-not-implemented"}
 
     def config(self) -> dict[str, Any]:
-        if self.app is None:
+        if self._status_service is not None:
+            return self._status_service.configuration_status()
+        if self._app is None:
             return {}
-        cfg = getattr(self.app, "config", None) or getattr(self.app, "_config", None)
-        if cfg is None:
+
+        config = getattr(self._app, "config", None) or getattr(self._app, "_config", None)
+        if config is None:
             return {}
-
-        if dataclasses.is_dataclass(cfg):
-            cfg_dict = dataclasses.asdict(cfg)
-            return {k: v for k, v in cfg_dict.items() if not k.startswith("_")}
-
-        if hasattr(cfg, "__dict__"):
-            return {
-                k: v for k, v in vars(cfg).items()
-                if not k.startswith("_")
-            }
-
-        result: dict[str, Any] = {}
-        for attr in dir(cfg):
-            if attr.startswith("_"):
-                continue
-            try:
-                value = getattr(cfg, attr)
-            except Exception:
-                continue
-            if callable(value):
-                continue
-            result[attr] = value
-        return result
+        return serialize_configuration(config)
 

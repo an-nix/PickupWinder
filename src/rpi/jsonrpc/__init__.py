@@ -1,7 +1,7 @@
 """Unix socket JSON-RPC support for the PickupWinder host application."""
 
 from .client import UnixJsonRpcClient
-from .handlers import AppRpcHandler, RpcHandler
+from .handlers import RpcHandler, SystemRpcHandler
 from .protocol import (
     JSONRPC_VERSION,
     JsonRpcError,
@@ -20,7 +20,7 @@ __all__ = [
     "JsonRpcServer",
     "UnixJsonRpcClient",
     "RpcHandler",
-    "AppRpcHandler",
+    "SystemRpcHandler",
     "JSONRPC_VERSION",
     "JsonRpcError",
     "JsonRpcInvalidRequestError",

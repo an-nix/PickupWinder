@@ -88,14 +88,18 @@ class AxisState:
 
     # ── Soft limits ─────────────────────────────────────────────────────
 
-    def check_move(self, delta_steps: int) -> bool:
+    def check_move(self, delta_steps: int, *, strict: bool = False) -> bool:
         """
         Returns True if moving delta_steps from current position is within
-        soft limits. Returns True if position is unknown (limit not checkable).
+        soft limits.
+
+        If the current position is unknown:
+          - strict=False: returns True because limits cannot be checked.
+          - strict=True: returns False and the move is refused.
         """
         with self._lock:
             if self._position_steps is None:
-                return True
+                return not strict
             target = self._position_steps + delta_steps
             if self.limits.min_steps is not None and target < self.limits.min_steps:
                 return False

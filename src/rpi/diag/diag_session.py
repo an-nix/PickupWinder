@@ -35,7 +35,7 @@ def send_jsonrpc_request(socket_path: str, method: str, params: dict | None = No
 
 
 def main() -> int:
-    socket_path = "/tmp/pickup_winder_rpc.sock"
+    socket_path = "/tmp/winding.sock"
     
     if len(sys.argv) < 2:
         print("Usage: python diag_session.py <session_id>")

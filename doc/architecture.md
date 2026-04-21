@@ -12,7 +12,10 @@ The split is deliberate. Geometry, winding strategy, retry policy, and session l
 ### Host
 
 - `src/rpi/winding_main.py`: process entry point.
-- `src/rpi/motion/engine.py`: runtime orchestration for moves and winding programs.
+- `src/rpi/app/runtime.py`: runtime composition and lifecycle.
+- `src/rpi/core/engine.py`: runtime orchestration for moves and winding programs.
+- `src/rpi/core/lateral.py`: traverse-axis homing, home-state, and soft-limit rules.
+- `src/rpi/core/status.py`: explicit snapshots for `winder.*` and `winding.status`.
 - `src/rpi/motion/move_queue.py`: move serialization, flush coordination, sequence seeding.
 - `src/rpi/motion/segment_generator.py`: host-side segment generation utilities.
 - `src/rpi/motion/multi_axis_segment_generator.py`: general multi-axis move generator.
@@ -92,6 +95,16 @@ The host owns all high-level motion semantics.
 - transport sequencing.
 - lateral homing state and host-side soft-limit enforcement.
 
+The host runtime is now split by responsibility rather than by startup order:
+
+- `winding_main.py` only handles process startup and signals.
+- `app/runtime.py` wires transport, shared state, engine, and RPC.
+- `core/engine.py` owns program orchestration and command entry points.
+- `core/lateral.py` owns traverse-specific rules.
+- `core/status.py` builds explicit status/config payloads instead of relying on generic object introspection.
+- `winding/adaptive.py` defines the adaptive winding session model, chunk planner, and tracked synchronized winding move.
+- `winding/service.py` owns the live winding session thread: homing, chunk planning, controlled pause/resume, window retargeting, and progress tracking.
+
 The winding path follows an electronic gearing model:
 
 - `SpindleKinematics` computes bobbin turns over time.
@@ -100,6 +113,14 @@ The winding path follows an electronic gearing model:
 - `SynchronizedSegmentGenerator` samples the time domain and emits synchronized multi-axis segments.
 
 Manual moves and jogs use `MultiAxisSegmentGenerator`, but they still produce the same `MultiAxisSegment` objects consumed by the streamer.
+
+The adaptive winding path is host-driven and chunked on purpose:
+
+- spindle turns remain the primary progress unit,
+- traverse window low/high bounds can be updated while the session is paused or while the next chunk is being planned,
+- target RPM can be changed live and a target RPM of zero is treated as a controlled pause request,
+- the host tracks turns completed, turns remaining, guide position, and active window in shared state,
+- near a traverse edge the planner brakes the spindle to zero before reversing the guide so lateral inversion time is explicit rather than implicit.
 
 ### Lateral axis state model
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
 from typing import Any
 
+from core.coordinator import MotionStopPlan
+from core.events import EventBus, EventKind
 from motion.axis_state import AxisState
 from motion.move import BaseMove, CompositeMove, HomingMove, Move
 from winding.wound_move import WoundMove
@@ -20,6 +23,9 @@ from transport.spi_transport import Esp32SpiTransport
 _MAX_HISTORY = 50
 _ENDSTOP_VERIFY_TIMEOUT_S = 0.5
 _ENDSTOP_RELEASE_TIMEOUT_S = 1.5
+
+
+logger = logging.getLogger(__name__)
 
 
 class MoveQueue:
@@ -42,11 +48,13 @@ class MoveQueue:
         transport: Esp32SpiTransport,
         axis_states: dict[int, AxisState],
         *,
+        event_bus: EventBus | None = None,
         poll_interval_s: float = 0.001,
         print_every: int = 1,
     ) -> None:
         self._transport = transport
         self._axis_states = axis_states
+        self._events = event_bus
         self._poll_interval_s = poll_interval_s
         self._print_every = print_every
 
@@ -57,7 +65,10 @@ class MoveQueue:
         self._stop_requested = False
         self._thread: threading.Thread | None = None
         self._current_move: BaseMove | None = None
+        self._current_streamer: MultiAxisRampStreamer | None = None
         self._history: list[BaseMove] = []
+        self._active_stop_plan: MotionStopPlan | None = None
+        self._last_worker_error: str | None = None
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -70,6 +81,7 @@ class MoveQueue:
     def start(self) -> None:
         """Start the execution thread."""
         self._stop_requested = False
+        self._last_worker_error = None
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="move_queue"
         )
@@ -81,14 +93,38 @@ class MoveQueue:
         Blocks until the execution thread exits.
         """
         self._stop_requested = True
+        self._request_current_streamer_stop(
+            MotionStopPlan.stop(
+                self._axis_states,
+                self._current_move.axis_ids if self._current_move is not None else None,
+                reason="move queue stop requested",
+            )
+        )
         self._queue_event.set()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=timeout_s)
+        if self._thread is not None and self._thread.is_alive():
+            self._last_worker_error = (
+                f"move queue worker did not stop within {timeout_s:.1f}s"
+            )
+            raise RuntimeError(self._last_worker_error)
 
-    def clear(self) -> None:
+    def clear(self, stop_plan: MotionStopPlan | None = None) -> None:
         """Remove all pending moves from the queue without stopping."""
+        cleared_moves: list[BaseMove] = []
+        effective_plan = stop_plan or self._active_stop_plan
         with self._queue_lock:
+            cleared_moves = list(self._queue)
             self._queue.clear()
+        for move in cleared_moves:
+            if not move.done:
+                reason = "queue cleared"
+                if effective_plan is not None:
+                    reason = f"{effective_plan.mode.value} requested before execution"
+                move.mark_aborted(reason)
+            self._append_history(move)
+        self._active_stop_plan = effective_plan
+        self._request_current_streamer_stop(effective_plan)
 
     @property
     def current_move(self) -> BaseMove | None:
@@ -104,40 +140,84 @@ class MoveQueue:
             queue_snapshot = [m.snapshot() for m in self._queue]
         return {
             "running": self._thread is not None and self._thread.is_alive(),
+            "worker_faulted": self._last_worker_error is not None,
+            "worker_error": self._last_worker_error,
             "current_move": (
                 self._current_move.snapshot() if self._current_move else None
             ),
             "pending_moves": queue_snapshot,
             "history": [m.snapshot() for m in self._history[-10:]],
+            "active_stop_plan": (
+                None if self._active_stop_plan is None else self._active_stop_plan.snapshot()
+            ),
             "axis_states": {
                 ax_id: state.snapshot()
                 for ax_id, state in self._axis_states.items()
             },
         }
 
+    def worker_health(self) -> dict[str, Any]:
+        return {
+            "name": "move_queue",
+            "thread_alive": self._thread is not None and self._thread.is_alive(),
+            "thread_faulted": self._last_worker_error is not None,
+            "last_error": self._last_worker_error,
+        }
+
+    def wait_until_idle(
+        self,
+        *,
+        poll_interval_s: float | None = None,
+        timeout_s: float = 60.0,
+    ) -> None:
+        """Block until no move is running and no move remains queued."""
+        poll_interval = self._poll_interval_s if poll_interval_s is None else poll_interval_s
+        deadline = time.monotonic() + timeout_s
+        while self.current_move is not None or self.pending_count > 0:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"move queue did not drain after {timeout_s:.1f} s"
+                )
+            time.sleep(poll_interval)
+
     # ── Execution thread ─────────────────────────────────────────────────
 
     def _run(self) -> None:
-        while not self._stop_requested:
-            self._queue_event.wait(timeout=1.0)
-            self._queue_event.clear()
-
+        try:
             while not self._stop_requested:
-                with self._queue_lock:
-                    if not self._queue:
-                        break
-                    move = self._queue.popleft()
+                self._queue_event.wait(timeout=1.0)
+                self._queue_event.clear()
 
-                self._current_move = move
-                try:
-                    self._execute_move(move)
-                finally:
-                    # Always clear current_move, even if execution failed
-                    self._current_move = None
-                
-                self._history.append(move)
-                if len(self._history) > _MAX_HISTORY:
-                    self._history = self._history[-_MAX_HISTORY:]
+                while not self._stop_requested:
+                    with self._queue_lock:
+                        if not self._queue:
+                            break
+                        move = self._queue.popleft()
+
+                    self._current_move = move
+                    try:
+                        self._execute_move(move)
+                    finally:
+                        self._current_move = None
+                        self._active_stop_plan = None
+
+                    self._append_history(move)
+        except Exception as exc:
+            self._last_worker_error = str(exc)
+            logger.exception("move queue worker failed")
+            if self._current_move is not None and not self._current_move.done:
+                self._current_move.mark_failed(self._last_worker_error)
+            if self._events is not None:
+                self._events.publish(
+                    EventKind.WORKER_FAILED,
+                    worker="move_queue",
+                    error=self._last_worker_error,
+                )
+
+    def _append_history(self, move: BaseMove) -> None:
+        self._history.append(move)
+        if len(self._history) > _MAX_HISTORY:
+            self._history = self._history[-_MAX_HISTORY:]
 
     def _execute_move(self, move: BaseMove) -> None:
         """Dispatch to the correct executor based on move type."""
@@ -147,7 +227,7 @@ class MoveQueue:
         try:
             if isinstance(move, CompositeMove):
                 self._execute_homing(move)  # type: ignore[arg-type]
-            elif isinstance(move, WoundMove):
+            elif isinstance(move, WoundMove) or getattr(move, "is_synchronized_move", False):
                 self._execute_wound_move(move)
             elif isinstance(move, Move):
                 self._execute_ramp_move(move)
@@ -163,6 +243,29 @@ class MoveQueue:
             if axis_state is not None and axis_state.homed:
                 keep_enabled.add(axis_id)
         return keep_enabled
+
+    def _request_current_streamer_stop(
+        self,
+        stop_plan: MotionStopPlan | None = None,
+    ) -> None:
+        streamer = self._current_streamer
+        if streamer is not None:
+            if stop_plan is not None:
+                self._active_stop_plan = stop_plan
+                streamer.request_stop(keep_enabled_axes=set(stop_plan.keep_enabled_axes))
+                return
+            streamer.request_stop()
+
+    def _apply_stop_plan(self, axis_ids: list[int], stop_plan: MotionStopPlan) -> None:
+        for axis_id in axis_ids:
+            if axis_id not in stop_plan.invalidate_positions:
+                continue
+            axis_state = self._axis_states.get(axis_id)
+            if axis_state is not None:
+                axis_state.invalidate_position()
+
+    def _default_stop_plan(self, axis_ids: list[int], reason: str) -> MotionStopPlan:
+        return MotionStopPlan.stop(self._axis_states, axis_ids, reason=reason)
 
     def _make_streamer(self, axis_configs, *, keep_enabled_axes: set[int] | None = None) -> MultiAxisRampStreamer:
         """Create a fresh streamer for a list of AxisMotionConfig."""
@@ -318,6 +421,7 @@ class MoveQueue:
             sub_move_axis_configs,
             keep_enabled_axes={move.axis_id},
         )
+        self._current_streamer = streamer
         if hasattr(streamer, "note_endstop_armed"):
             streamer.note_endstop_armed(move.axis_id, arm_endstop)
         streamer.set_generator(
@@ -326,7 +430,10 @@ class MoveQueue:
                 self._next_motion_sequence(),
             )
         )
-        streamer.stream_all()
+        try:
+            streamer.stream_all()
+        finally:
+            self._current_streamer = None
         return streamer
 
     def _clear_closed_endstop_before_homing(self, move: HomingMove) -> None:
@@ -433,6 +540,7 @@ class MoveQueue:
             axis_configs,
             keep_enabled_axes=self._axes_to_keep_enabled(axis_ids),
         )
+        self._current_streamer = streamer
         # Override the generator to use the move's segments() method, but align
         # motion_sequence values with the ESP32 last_executed_sequence.
         streamer.set_generator(
@@ -447,6 +555,8 @@ class MoveQueue:
         except Exception as exc:
             move.mark_failed(str(exc))
             return
+        finally:
+            self._current_streamer = None
 
         if streamer.endstop_triggered:
             for ax_id in axis_ids:
@@ -455,8 +565,13 @@ class MoveQueue:
             move.mark_aborted("endstop triggered", by_endstop=True)
             return
 
-        if self._stop_requested:
-            move.mark_aborted("stop requested")
+        if self._stop_requested or streamer.has_stop_been_requested():
+            stop_plan = self._active_stop_plan or self._default_stop_plan(
+                axis_ids,
+                "stop requested",
+            )
+            self._apply_stop_plan(axis_ids, stop_plan)
+            move.mark_aborted(f"{stop_plan.mode.value} requested")
             return
 
         # Update position for axes with known delta.
@@ -472,12 +587,14 @@ class MoveQueue:
             max(move.kinematics.target_rpm, 1.0) / 60.0
             * float(move.spindle_cfg.steps_per_unit)
         )
+        stall_timeout_s = max(5.0, move.kinematics.total_duration * 2.0)
         return MultiAxisRampStreamer.from_axis_ids(
             self._transport,
             move.axis_ids,
             target_hz=max(target_hz, 1.0),
             segment_duration_s=move.segment_duration_s,
             poll_interval_s=self._poll_interval_s,
+            stall_timeout_s=stall_timeout_s,
             print_every=self._print_every,
             target_buffer_time_s=0.200,
             keep_enabled_axes=keep_enabled_axes,
@@ -492,6 +609,7 @@ class MoveQueue:
             move,
             keep_enabled_axes=self._axes_to_keep_enabled(axis_ids),
         )
+        self._current_streamer = streamer
         streamer.set_generator(
             self._wrap_segment_sequence(
                 move.segments(),
@@ -504,6 +622,8 @@ class MoveQueue:
         except Exception as exc:
             move.mark_failed(str(exc))
             return
+        finally:
+            self._current_streamer = None
 
         if streamer.endstop_triggered:
             for ax_id in axis_ids:
@@ -512,16 +632,23 @@ class MoveQueue:
             move.mark_aborted("endstop triggered", by_endstop=True)
             return
 
-        if self._stop_requested:
-            for ax_id in axis_ids:
-                if ax_id in self._axis_states:
-                    self._axis_states[ax_id].invalidate_position()
-            move.mark_aborted("stop requested")
+        if self._stop_requested or streamer.has_stop_been_requested():
+            stop_plan = self._active_stop_plan or self._default_stop_plan(
+                axis_ids,
+                "stop requested",
+            )
+            self._apply_stop_plan(axis_ids, stop_plan)
+            move.mark_aborted(f"{stop_plan.mode.value} requested")
             return
 
         for ax_id in move.axis_ids:
-            if ax_id in self._axis_states:
+            if ax_id not in self._axis_states:
+                continue
+            delta = move.expected_delta_steps(ax_id)
+            if delta is None:
                 self._axis_states[ax_id].invalidate_position()
+                continue
+            self._axis_states[ax_id].advance_position(delta)
         move.mark_completed()
 
     def _execute_homing(self, move: HomingMove) -> None:
@@ -556,7 +683,12 @@ class MoveQueue:
         for phase_name, sub_move, arm_endstop in move.phases():
             if self._stop_requested:
                 self._set_endstop_armed(move.axis_id, arm=False)
-                move.mark_aborted("stop requested during homing")
+                stop_plan = self._active_stop_plan or self._default_stop_plan(
+                    [move.axis_id],
+                    "stop requested during homing",
+                )
+                self._apply_stop_plan([move.axis_id], stop_plan)
+                move.mark_aborted(f"{stop_plan.mode.value} requested during homing")
                 return
 
             if arm_endstop:
@@ -585,6 +717,16 @@ class MoveQueue:
                 move.mark_failed(str(exc))
                 return
 
+            if self._stop_requested or streamer.has_stop_been_requested():
+                self._set_endstop_armed(move.axis_id, arm=False)
+                stop_plan = self._active_stop_plan or self._default_stop_plan(
+                    [move.axis_id],
+                    "stop requested during homing",
+                )
+                self._apply_stop_plan([move.axis_id], stop_plan)
+                move.mark_aborted(f"{stop_plan.mode.value} requested during homing")
+                return
+
             if phase_name in ("approach", "search"):
                 try:
                     self._check_armed_phase_result(move, phase_name, streamer)
@@ -607,7 +749,12 @@ class MoveQueue:
 
             if self._stop_requested:
                 self._set_endstop_armed(move.axis_id, arm=False)
-                move.mark_aborted("stop requested during homing")
+                stop_plan = self._active_stop_plan or self._default_stop_plan(
+                    [move.axis_id],
+                    "stop requested during homing",
+                )
+                self._apply_stop_plan([move.axis_id], stop_plan)
+                move.mark_aborted(f"{stop_plan.mode.value} requested during homing")
                 return
 
         # All phases complete — disarm endstop and set home position.

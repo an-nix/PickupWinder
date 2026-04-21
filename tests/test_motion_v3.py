@@ -563,6 +563,89 @@ def test_engine_exposes_public_config_property():
     assert engine.config is config
 
 
+def test_engine_request_stop_keeps_worker_thread_alive(monkeypatch):
+    class FakeMoveQueue:
+        def __init__(self, transport, axis_states, poll_interval_s, print_every):
+            self._current_move = None
+
+        def start(self) -> None:
+            pass
+
+        def stop(self, timeout_s: float = 5.0) -> None:
+            pass
+
+        def clear(self) -> None:
+            pass
+
+        @property
+        def pending_count(self) -> int:
+            return 0
+
+        @property
+        def current_move(self):
+            return self._current_move
+
+        def status(self) -> dict[str, object]:
+            return {
+                "running": False,
+                "current_move": None,
+                "pending_moves": [],
+                "history": [],
+                "axis_states": {},
+            }
+
+    monkeypatch.setattr("core.engine.MoveQueue", FakeMoveQueue)
+
+    engine = WindingEngine(
+        transport=SimpleNamespace(),
+        shared_state=SharedState(axis_states={}),
+        event_bus=EventBus(),
+        config=AppConfiguration(),
+    )
+
+    engine.start()
+    engine.request_stop()
+    engine._program_event.set()
+    engine._thread.join(timeout=0.2)
+
+    assert engine._thread is not None
+    assert engine._thread.is_alive() is True
+
+    engine.stop(timeout_s=0.2)
+
+
+def test_execute_program_returns_early_after_homing_failure(monkeypatch):
+    engine = WindingEngine(
+        transport=SimpleNamespace(),
+        shared_state=SharedState(axis_states={}),
+        event_bus=EventBus(),
+        config=AppConfiguration(),
+    )
+    program = WindingProgram(
+        name="failing_home",
+        num_layers=1,
+        spindle_rpm=120.0,
+        layer_pitch_mm=0.1,
+        wire_diameter_mm=0.05,
+        home_before_start=True,
+    )
+
+    monkeypatch.setattr(
+        engine,
+        "_home_lateral_axis",
+        lambda **kwargs: (False, "simulated homing failure"),
+    )
+
+    def _unexpected_run_layer(*args, **kwargs):
+        raise AssertionError("_run_layer must not be called when homing fails")
+
+    monkeypatch.setattr(engine, "_run_layer", _unexpected_run_layer)
+
+    engine._execute_program(program)
+
+    assert engine._state.engine_state.name == "HOMING"
+
+
 def test_engine_jog_rejects_unhomed_lateral_axis():
     config = AppConfiguration()
     lateral_state = AxisState(
