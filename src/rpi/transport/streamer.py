@@ -740,6 +740,15 @@ class MultiAxisRampStreamer:
         self._retry_batch = None
         return status
 
+    def _flush_requested_stop(self) -> None:
+        if self._flush_sequence_requested is None:
+            return
+        # Let the firmware finish publishing the stop/endstop status before
+        # sending the explicit flush request on the same SPI link.
+        time.sleep(self._poll_interval_s * 2.0)
+        self.flush_until(self._flush_sequence_requested)
+        self._flush_sequence_requested = None
+
     # -- Core streaming primitives ---------------------------------------------
 
     def _collect_and_send_batch(self, status) -> tuple[int, Any] | None:
@@ -928,8 +937,7 @@ class MultiAxisRampStreamer:
 
             while True:
                 if self._stop_requested:
-                    if self._flush_sequence_requested is not None:
-                        self.flush_until(self._flush_sequence_requested)
+                    self._flush_requested_stop()
                     break
 
                 # Reuse status from the last send/prefill instead of a dedicated
@@ -939,12 +947,15 @@ class MultiAxisRampStreamer:
                 self._remove_confirmed_segments(status)
                 self._log_runtime_diagnostics(status)
                 if self._stop_requested:
+                    self._flush_requested_stop()
                     break
                 self._check_premature_completion(status)
                 if self._check_stall(status):
+                    self._flush_requested_stop()
                     break
 
                 if self._check_endstop(status):
+                    self._flush_requested_stop()
                     break
 
                 # Rate-limit sends to MAX_SEGMENTS_PER_CYCLE per polling iteration to
@@ -977,8 +988,7 @@ class MultiAxisRampStreamer:
                     # before sending the next batch in this tight loop.
 
                 if self._flush_sequence_requested is not None:
-                    self.flush_until(self._flush_sequence_requested)
-                    self._flush_sequence_requested = None
+                    self._flush_requested_stop()
 
                 if self._generator_finished and not self._inflight and self._retry_batch is None:
                     break

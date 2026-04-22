@@ -421,6 +421,43 @@ def test_streamer_flushes_to_last_confirmed_sequence_on_endstop():
     assert streamer._flush_sequence_requested == 12
 
 
+def test_streamer_flushes_when_endstop_is_detected_on_status_poll(monkeypatch):
+    class TrackingTransport(MockSpiTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flush_calls: list[int] = []
+
+        def flush_until(self, sequence: int):
+            self.flush_calls.append(sequence)
+            return super().flush_until(sequence)
+
+    transport = TrackingTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[StreamAxisConfig(axis_id=1, ramp=RampConfig(axis_id=1, target_rpm=300.0))],
+    )
+    streamer.note_endstop_armed(1, True)
+    streamer.set_generator(iter(()))
+    streamer._last_confirmed_motion_seq = 21
+
+    endstop_checks = {"count": 0}
+
+    def fake_check_endstop(_status):
+        endstop_checks["count"] += 1
+        if endstop_checks["count"] == 2:
+            streamer._mark_endstop_triggered()
+            return True
+        return False
+
+    monkeypatch.setattr(streamer, "_check_endstop", fake_check_endstop)
+
+    total_segments = streamer.stream_all()
+
+    assert total_segments == 0
+    assert transport.flush_calls == [21]
+    assert streamer._flush_sequence_requested is None
+
+
 def test_axis_state_reports_closed_endstop_from_protocol_value():
     axis_state = AxisState(axis_id=1)
 

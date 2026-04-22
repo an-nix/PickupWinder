@@ -46,6 +46,11 @@ static constexpr uint32_t  SPI_TASK_STACK  = 4096;
 static constexpr UBaseType_t SPI_TASK_PRIO = 24;
 static constexpr BaseType_t  SPI_TASK_CORE = 0;
 
+// Experimental SPI slave mode: keeps one extra transaction pre-queued to
+// reduce the dead time between slave transactions. This is disabled by
+// default because it changes response pipelining and needs bench validation.
+static constexpr bool SPI_EXPERIMENTAL_PREQUEUE = false;
+
 // Task configuration for the multi-axis executor (separate core).
 static constexpr uint32_t    MULTI_EXEC_STACK  = 8192;
 static constexpr UBaseType_t MULTI_EXEC_PRIO   = 20;
@@ -94,7 +99,9 @@ static QueueHandle_t s_flush_queue = nullptr;
 
 // DMA-capable frame buffers for SPI transactions (allocated on init()).
 static uint8_t* s_rx_frame = nullptr;
+static uint8_t* s_rx_frame_b = nullptr;
 static uint8_t* s_tx_frame_a = nullptr;
+static uint8_t* s_tx_frame_b = nullptr;
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -125,6 +132,14 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     if (s_tx_frame_a == nullptr) {
         s_tx_frame_a = static_cast<uint8_t*>(heap_caps_malloc(SPI_FRAME_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_32BIT));
         ESP_RETURN_ON_FALSE(s_tx_frame_a != nullptr, ESP_ERR_NO_MEM, TAG, "failed to alloc s_tx_frame_a");
+    }
+    if (SPI_EXPERIMENTAL_PREQUEUE && s_rx_frame_b == nullptr) {
+        s_rx_frame_b = static_cast<uint8_t*>(heap_caps_malloc(SPI_FRAME_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_32BIT));
+        ESP_RETURN_ON_FALSE(s_rx_frame_b != nullptr, ESP_ERR_NO_MEM, TAG, "failed to alloc s_rx_frame_b");
+    }
+    if (SPI_EXPERIMENTAL_PREQUEUE && s_tx_frame_b == nullptr) {
+        s_tx_frame_b = static_cast<uint8_t*>(heap_caps_malloc(SPI_FRAME_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_32BIT));
+        ESP_RETURN_ON_FALSE(s_tx_frame_b != nullptr, ESP_ERR_NO_MEM, TAG, "failed to alloc s_tx_frame_b");
     }
 
     // Configure lateral endstop pins if both NO and NC pins are provided.
@@ -161,7 +176,7 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     spi_slave_interface_config_t slave_cfg = {};
     slave_cfg.mode = 0;
     slave_cfg.spics_io_num = pins_.cs;
-    slave_cfg.queue_size = 1;
+    slave_cfg.queue_size = SPI_EXPERIMENTAL_PREQUEUE ? 2 : 1;
     slave_cfg.flags = 0;
     slave_cfg.post_setup_cb = nullptr;
     slave_cfg.post_trans_cb = nullptr;
@@ -214,6 +229,10 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     ESP_LOGI(TAG, "SPI slave ready  MOSI=%d MISO=%d SCLK=%d CS=%d  frame=%uB",
              (int)pins_.mosi, (int)pins_.miso, (int)pins_.sclk, (int)pins_.cs,
              (unsigned)SPI_FRAME_SIZE);
+    if (SPI_EXPERIMENTAL_PREQUEUE) {
+        ESP_LOGW(TAG,
+                 "SPI experimental prequeue mode enabled (queue_size=2): status ACK latency may increase by one extra transfer");
+    }
     return ESP_OK;
 }
 
@@ -757,9 +776,9 @@ void CommInterface::spiTask(void* arg)
     // MISO outputs zeros and MOSI is discarded.  The Python retry logic
     // handles this gracefully (typically <2% of transfers at 4 MHz).
     //
-    // The previous ping-pong pre-queue approach (queue_trans/get_trans_result
-    // with queue_size=2) caused a 1-byte DMA shift on ~5% of responses,
-    // producing "bad magic: 0x0150" (valid frame missing the first byte).
+    // A ping-pong pre-queue approach (queue_trans/get_trans_result with
+    // queue_size=2) is available below as an experiment, but any claim that it
+    // deterministically causes a DMA byte shift remains unproven in this repo.
 
     spi_slave_transaction_t txn = {};
 
@@ -771,43 +790,25 @@ void CommInterface::spiTask(void* arg)
     uint32_t diag_ok = 0;
     int64_t diag_last_log_us = esp_timer_get_time();
 
-    // Pre-build the very first status frame before entering the loop so that
-    // the top of the loop can call spi_slave_transmit() immediately with
-    // minimal gap.
-    self->buildStatusFrame(s_tx_frame_a);
-
-    for (;;) {
-        // ── Step 1: transmit immediately (status already pre-built) ───────────
-        txn.length    = SPI_FRAME_SIZE * 8;
-        txn.tx_buffer = s_tx_frame_a;
-        txn.rx_buffer = s_rx_frame;
-        esp_err_t err = spi_slave_transmit(SPI3_HOST, &txn, portMAX_DELAY);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "spi_slave_transmit failed: %s", esp_err_to_name(err));
-            continue;
-        }
-
+    auto process_rx_frame = [&](uint8_t* rx_frame) {
         ++diag_cycles;
 
-        // ── Step 3: parse and handle the received frame ───────────────────────
         SpiMessageHeader header {};
-        memcpy(&header, s_rx_frame, sizeof(SpiMessageHeader));
+        memcpy(&header, rx_frame, sizeof(SpiMessageHeader));
 
         if (header.magic != SPI_MSG_MAGIC) {
             ++diag_bad_magic;
-            if (s_rx_frame[0] == 0x00 && s_rx_frame[1] == 0x00) {
+            if (rx_frame[0] == 0x00 && rx_frame[1] == 0x00) {
                 ++diag_bad_magic_zero;
             }
         } else if (header.version != SPI_MSG_VERSION) {
         } else if (header.payload_length > SPI_MAX_PAYLOAD_SIZE) {
-        } else if (!spi_message_validate(s_rx_frame, header)) {
+        } else if (!spi_message_validate(rx_frame, header)) {
             ++diag_bad_crc;
         } else {
             ++diag_ok;
             const bool publish_ack = shouldPublishAckForMessageType(header.msg_type);
 
-            // Detect exact duplicate retries by matching sequence/type/length/crc
-            // against a small cache of recently processed requests.
             const CommInterface::ProcessedRequestSignature* cached_request = nullptr;
             for (const auto& cached : self->recent_request_cache_) {
                 if (cached.valid
@@ -821,7 +822,6 @@ void CommInterface::spiTask(void* arg)
             }
 
             if (cached_request != nullptr) {
-                // Reuse the previous result for this exact request signature.
                 if (publish_ack) {
                     self->last_rx_sequence_ = header.sequence;
                     self->last_rx_type_     = header.msg_type;
@@ -831,10 +831,9 @@ void CommInterface::spiTask(void* arg)
                          static_cast<unsigned>(header.sequence),
                          static_cast<unsigned>(header.msg_type));
             } else {
-                const uint8_t* payload = s_rx_frame + sizeof(SpiMessageHeader);
-                err = self->handleFrame(header, payload);
+                const uint8_t* payload = rx_frame + sizeof(SpiMessageHeader);
+                esp_err_t err = self->handleFrame(header, payload);
                 uint8_t request_result = static_cast<uint8_t>(SpiMessageResult::INTERNAL_ERROR);
-                // Map esp_err_t handler return codes to SpiMessageResult values for status reporting.
                 if (err == ESP_OK) {
                     request_result = static_cast<uint8_t>(SpiMessageResult::OK);
                 } else if (err == ESP_ERR_TIMEOUT) {
@@ -871,8 +870,9 @@ void CommInterface::spiTask(void* arg)
                     % RECENT_REQUEST_CACHE_DEPTH);
             }
         }
+    };
 
-        // 1 Hz diagnostic line (only if something noteworthy happened).
+    auto maybe_log_diag = [&]() {
         const int64_t now_us = esp_timer_get_time();
         if ((now_us - diag_last_log_us) >= 1000000) {
             if (diag_bad_magic || diag_bad_crc) {
@@ -891,6 +891,96 @@ void CommInterface::spiTask(void* arg)
             diag_ok = 0;
             diag_last_log_us = now_us;
         }
+    };
+
+    if (SPI_EXPERIMENTAL_PREQUEUE) {
+        // Experimental mode: keep a second transaction pre-queued. This does
+        // not prove a DMA issue; it is a bench-only attempt to reduce the idle
+        // window between transactions. Trade-off: STATUS/ACK visibility can be
+        // delayed by an extra transfer compared to the production path.
+        spi_slave_transaction_t txn_a = {};
+        spi_slave_transaction_t txn_b = {};
+
+        self->buildStatusFrame(s_tx_frame_a);
+        self->buildStatusFrame(s_tx_frame_b);
+
+        txn_a.length    = SPI_FRAME_SIZE * 8;
+        txn_a.tx_buffer = s_tx_frame_a;
+        txn_a.rx_buffer = s_rx_frame;
+        txn_b.length    = SPI_FRAME_SIZE * 8;
+        txn_b.tx_buffer = s_tx_frame_b;
+        txn_b.rx_buffer = s_rx_frame_b;
+
+        esp_err_t err = spi_slave_queue_trans(SPI3_HOST, &txn_a, portMAX_DELAY);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "spi_slave_queue_trans(txn_a) failed: %s", esp_err_to_name(err));
+            return;
+        }
+        err = spi_slave_queue_trans(SPI3_HOST, &txn_b, portMAX_DELAY);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "spi_slave_queue_trans(txn_b) failed: %s", esp_err_to_name(err));
+            return;
+        }
+
+        for (;;) {
+            spi_slave_transaction_t* done_txn = nullptr;
+            err = spi_slave_get_trans_result(SPI3_HOST, &done_txn, portMAX_DELAY);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "spi_slave_get_trans_result failed: %s", esp_err_to_name(err));
+                continue;
+            }
+
+            uint8_t* completed_rx = nullptr;
+            uint8_t* completed_tx = nullptr;
+            spi_slave_transaction_t* recycle_txn = nullptr;
+
+            if (done_txn == &txn_a) {
+                completed_rx = s_rx_frame;
+                completed_tx = s_tx_frame_a;
+                recycle_txn = &txn_a;
+            } else if (done_txn == &txn_b) {
+                completed_rx = s_rx_frame_b;
+                completed_tx = s_tx_frame_b;
+                recycle_txn = &txn_b;
+            } else {
+                ESP_LOGW(TAG, "unexpected completed SPI transaction pointer %p", done_txn);
+                continue;
+            }
+
+            process_rx_frame(completed_rx);
+            maybe_log_diag();
+
+            self->buildStatusFrame(completed_tx);
+            // Flush CPU cache into DMA-capable DRAM before the hardware reads
+            // the rebuilt frame.  Same rationale as the production-path delay:
+            // without this, the DMA engine may read stale bytes from the cache,
+            // which is the most likely mechanism behind any "1-byte shift" seen
+            // in practice.
+            esp_rom_delay_us(2);
+            err = spi_slave_queue_trans(SPI3_HOST, recycle_txn, portMAX_DELAY);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "spi_slave_queue_trans(recycle) failed: %s", esp_err_to_name(err));
+            }
+        }
+    }
+
+    // Pre-build the very first status frame before entering the loop so that
+    // the top of the loop can call spi_slave_transmit() immediately with
+    // minimal gap.
+    self->buildStatusFrame(s_tx_frame_a);
+
+    for (;;) {
+        // ── Step 1: transmit immediately (status already pre-built) ───────────
+        txn.length    = SPI_FRAME_SIZE * 8;
+        txn.tx_buffer = s_tx_frame_a;
+        txn.rx_buffer = s_rx_frame;
+        esp_err_t err = spi_slave_transmit(SPI3_HOST, &txn, portMAX_DELAY);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "spi_slave_transmit failed: %s", esp_err_to_name(err));
+            continue;
+        }
+        process_rx_frame(s_rx_frame);
+        maybe_log_diag();
 
         // Pre-build the next status frame to minimize the window where MISO is all-zero.
         // This reduces a race where the master might sample an all-zero MISO if it clocks
