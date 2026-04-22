@@ -16,6 +16,7 @@ from transport.messages import (
     LATERAL_ENDSTOP_PRESENT_CLOSED,
     LATERAL_ENDSTOP_PRESENT_OPEN,
     SpiMessageResult,
+    sequence_is_greater,
 )
 from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
 from transport.spi_transport import Esp32SpiTransport
@@ -23,6 +24,8 @@ from transport.spi_transport import Esp32SpiTransport
 _MAX_HISTORY = 50
 _ENDSTOP_VERIFY_TIMEOUT_S = 0.5
 _ENDSTOP_RELEASE_TIMEOUT_S = 1.5
+_INITIAL_ENDSTOP_CONFIRM_SAMPLES = 3
+_INITIAL_ENDSTOP_CONFIRM_INTERVAL_S = 0.01
 
 
 logger = logging.getLogger(__name__)
@@ -267,7 +270,13 @@ class MoveQueue:
     def _default_stop_plan(self, axis_ids: list[int], reason: str) -> MotionStopPlan:
         return MotionStopPlan.stop(self._axis_states, axis_ids, reason=reason)
 
-    def _make_streamer(self, axis_configs, *, keep_enabled_axes: set[int] | None = None) -> MultiAxisRampStreamer:
+    def _make_streamer(
+        self,
+        axis_configs,
+        *,
+        keep_enabled_axes: set[int] | None = None,
+        initial_segments_dropped: int = 0,
+    ) -> MultiAxisRampStreamer:
         """Create a fresh streamer for a list of AxisMotionConfig."""
         return MultiAxisRampStreamer(
             self._transport,
@@ -279,6 +288,7 @@ class MoveQueue:
             print_every=self._print_every,
             target_buffer_time_s=0.200,
             keep_enabled_axes=keep_enabled_axes,
+            initial_segments_dropped=initial_segments_dropped,
         )
 
     def _next_motion_sequence(self) -> int:
@@ -309,6 +319,30 @@ class MoveQueue:
         if axis_id is not None:
             self._update_axis_endstop_state(axis_id, status)
         return status
+
+    def _confirm_initial_closed_endstop(self, axis_id: int) -> int:
+        """Confirm a startup CLOSED reading before launching preclear.
+
+        A single stale or noisy status snapshot at homing start should not send the
+        axis into preclear. Require a few consecutive CLOSED reads; otherwise treat
+        the startup state as the most recent non-CLOSED observation.
+        """
+        confirmed_state = LATERAL_ENDSTOP_PRESENT_CLOSED
+        for _ in range(_INITIAL_ENDSTOP_CONFIRM_SAMPLES - 1):
+            time.sleep(_INITIAL_ENDSTOP_CONFIRM_INTERVAL_S)
+            status = self._read_status(axis_id)
+            state = int(
+                getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
+            )
+            if state != LATERAL_ENDSTOP_PRESENT_CLOSED:
+                logger.warning(
+                    "homing axis %s: startup CLOSED state was not stable; using latest state 0x%02X",
+                    axis_id,
+                    state,
+                )
+                confirmed_state = state
+                break
+        return confirmed_state
 
     def _ensure_homing_can_start(self, axis_id: int, phase_name: str) -> None:
         status = self._read_status(axis_id)
@@ -410,6 +444,7 @@ class MoveQueue:
         phase_name: str,
         sub_move: Move,
         arm_endstop: bool,
+        start_sequence: int,
     ) -> MultiAxisRampStreamer:
         sub_move_axis_configs = sub_move.axis_configs
         if not sub_move_axis_configs:
@@ -417,9 +452,15 @@ class MoveQueue:
                 f"homing sub-move {phase_name} has no public axis_configs"
             )
 
+        baseline_status = self._read_status(move.axis_id)
+        baseline_segments_dropped = int(
+            getattr(baseline_status, "segments_dropped", 0)
+        )
+
         streamer = self._make_streamer(
             sub_move_axis_configs,
             keep_enabled_axes={move.axis_id},
+            initial_segments_dropped=baseline_segments_dropped,
         )
         self._current_streamer = streamer
         if hasattr(streamer, "note_endstop_armed"):
@@ -427,7 +468,7 @@ class MoveQueue:
         streamer.set_generator(
             self._wrap_segment_sequence(
                 sub_move.segments(),
-                self._next_motion_sequence(),
+                start_sequence,
             )
         )
         try:
@@ -435,6 +476,16 @@ class MoveQueue:
         finally:
             self._current_streamer = None
         return streamer
+
+    def _next_sequence_after_streamer(self, streamer: Any) -> int:
+        next_from_status = self._next_motion_sequence()
+        flush_floor = int(getattr(streamer, "flush_floor_sequence", -1))
+        if flush_floor < 0:
+            return next_from_status
+        candidate = (flush_floor + 1) & 0xFFFF
+        if next_from_status < 0 or sequence_is_greater(candidate, next_from_status):
+            return candidate
+        return next_from_status
 
     @staticmethod
     def _streamer_stop_requested(streamer: Any) -> bool:
@@ -527,6 +578,8 @@ class MoveQueue:
             raise RuntimeError(
                 f"enable_endstop axis {axis_id} arm={int(arm)} failed with result=0x{int(status.last_result):02X}"
             )
+        if self._status_has_endstop_armed(status, axis_id, arm):
+            return status
         return self._wait_for_endstop_arm_state(axis_id, arm)
 
     def _wrap_segment_sequence(self, generator: Any, start_sequence: int):
@@ -680,6 +733,8 @@ class MoveQueue:
             initial_state = int(
                 getattr(initial_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
             )
+            if initial_state == LATERAL_ENDSTOP_PRESENT_CLOSED:
+                initial_state = self._confirm_initial_closed_endstop(move.axis_id)
             if initial_state == LATERAL_ENDSTOP_ABSENT:
                 self._ensure_homing_can_start(move.axis_id, "start")
             elif initial_state == LATERAL_ENDSTOP_PRESENT_CLOSED:
@@ -690,6 +745,8 @@ class MoveQueue:
         except Exception as exc:
             move.mark_failed(str(exc))
             return
+
+        next_sequence = self._next_motion_sequence()
 
         for phase_name, sub_move, arm_endstop in move.phases():
             if self._stop_requested:
@@ -722,11 +779,14 @@ class MoveQueue:
                     phase_name=phase_name,
                     sub_move=sub_move,
                     arm_endstop=arm_endstop,
+                    start_sequence=next_sequence,
                 )
             except Exception as exc:
                 self._set_endstop_armed(move.axis_id, arm=False)
                 move.mark_failed(str(exc))
                 return
+
+            next_sequence = self._next_sequence_after_streamer(streamer)
 
             phase_completed_on_expected_endstop = arm_endstop and streamer.endstop_triggered
             if self._stop_requested or (

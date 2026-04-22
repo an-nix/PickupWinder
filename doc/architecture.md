@@ -179,7 +179,7 @@ The Raspberry Pi consumes normalized state and owns higher-level policy such as 
 | Bobbin STEP / DIR / EN | 26 / 27 / 14 |
 | Lateral STEP / DIR / EN | 32 / 33 / 25 |
 | Tensioner STEP / DIR / EN | 16 / 17 / 4 |
-| Lateral home NO / NC | 21 / 22 |
+| Lateral home NO / NC | 22 / 21 |
 | SPI MOSI / MISO / SCLK / CS | 23 / 19 / 18 / 5 |
 | HX711 #0 SCK / DOUT | 13 / 34 |
 | HX711 #1 SCK / DOUT | 12 / 39 |

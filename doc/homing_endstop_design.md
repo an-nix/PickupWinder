@@ -124,6 +124,14 @@ Relevant code areas:
 - `src/rpi/motion/move_queue.py`
 - `src/rpi/jsonrpc/winding_handler.py`
 
+Current hardware mapping for the dual-contact lateral home sensor is:
+
+- `GPIO22` = NO contact
+- `GPIO21` = NC contact
+
+The firmware interprets the NO/NC levels explicitly, so these semantic labels
+must stay aligned with the real wiring.
+
 ### Firmware responsibilities
 
 The ESP32 should own:

@@ -103,6 +103,7 @@ class MultiAxisRampStreamer:
         log_each_send: bool = False,
         send_log_path: str | None = None,
         keep_enabled_axes: set[int] | None = None,
+        initial_segments_dropped: int = 0,
     ):
         self._initialize_streamer_state(
             transport=transport,
@@ -117,6 +118,7 @@ class MultiAxisRampStreamer:
             send_log_path=send_log_path,
             explicit_target_hz=None,
             keep_enabled_axes=keep_enabled_axes,
+            initial_segments_dropped=initial_segments_dropped,
         )
 
     @classmethod
@@ -132,6 +134,7 @@ class MultiAxisRampStreamer:
         target_buffer_time_s: float = 0.150,
         stall_timeout_s: float = 5.0,
         keep_enabled_axes: set[int] | None = None,
+        initial_segments_dropped: int = 0,
     ) -> "MultiAxisRampStreamer":
         """Build a streamer from explicit axis IDs and a known target frequency.
 
@@ -161,6 +164,7 @@ class MultiAxisRampStreamer:
             send_log_path=None,
             explicit_target_hz=target_hz,
             keep_enabled_axes=keep_enabled_axes,
+            initial_segments_dropped=initial_segments_dropped,
         )
         return streamer
 
@@ -179,6 +183,7 @@ class MultiAxisRampStreamer:
         send_log_path: str | None,
         explicit_target_hz: float | None,
         keep_enabled_axes: set[int] | None,
+        initial_segments_dropped: int,
     ) -> None:
         self._transport = transport
         self._poll_interval_s = poll_interval_s
@@ -188,6 +193,7 @@ class MultiAxisRampStreamer:
         self._send_events: list[dict] = []
         self._stop_requested = False
         self._flush_sequence_requested: int | None = None
+        self._flush_floor_sequence: int = -1
         self._endstop_triggered = False
         self._endstop_armed_axes: set[int] = set()
         self._keep_enabled_axes = set(keep_enabled_axes or ())
@@ -238,8 +244,8 @@ class MultiAxisRampStreamer:
         self._last_sequence_advance_value: int = -1
         self._stall_timeout_s: float = max(1.0, float(stall_timeout_s))
         self._last_underrun_count: tuple[int, int, int, int] | None = None
-        self._last_segments_dropped: int = 0   # R3: sentinel 0, not None
-        self._last_logged_segments_dropped: int | None = None
+        self._last_segments_dropped: int = max(0, int(initial_segments_dropped))
+        self._last_logged_segments_dropped: int | None = self._last_segments_dropped
 
         self._sync_with_firmware_status()
         start_sequence = (
@@ -643,6 +649,7 @@ class MultiAxisRampStreamer:
             flush_seq = self._last_sent_motion_seq
         if flush_seq < 0:
             flush_seq = 0xFFFF
+        self._flush_floor_sequence = int(flush_seq) & 0xFFFF
         self.request_stop()
         self.request_flush(flush_seq)
 
@@ -707,6 +714,11 @@ class MultiAxisRampStreamer:
     def last_sent_motion_seq(self) -> int:
         """Last motion sequence number sent to the firmware (or -1 if none)."""
         return self._last_sent_motion_seq
+
+    @property
+    def flush_floor_sequence(self) -> int:
+        """Last flush floor requested by this streamer, or -1 if none."""
+        return self._flush_floor_sequence
 
     # -- Stop / flush ----------------------------------------------------------
 

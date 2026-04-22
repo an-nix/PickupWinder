@@ -19,6 +19,7 @@ status_module = import_module("core.status")
 winding_handler_module = import_module("jsonrpc.winding_handler")
 axis_state_module = import_module("motion.axis_state")
 command_service_module = import_module("motion.command_service")
+move_queue_module = import_module("motion.move_queue")
 segment_json_module = import_module("motion.segment_json")
 messages_module = import_module("transport.messages")
 mock_transport_module = import_module("transport.mock_spi_transport")
@@ -293,6 +294,94 @@ def test_wait_for_request_result_ignores_transient_protocol_error_after_matching
 
     assert status.last_rx_sequence == 42
     assert status.last_result == int(SpiMessageResult.OK)
+
+
+def test_streamer_does_not_false_trigger_on_initial_segments_dropped_baseline() -> None:
+    streamer = MultiAxisRampStreamer.from_axis_ids(
+        transport=SimpleNamespace(get_status=lambda: SimpleNamespace(last_executed_sequence=0xFFFF)),
+        axis_ids=[1],
+        target_hz=100.0,
+        initial_segments_dropped=7,
+    )
+    streamer.note_endstop_armed(1, True)
+
+    status = SimpleNamespace(
+        endstop_armed_mask=1 << 1,
+        lateral_endstop_state=messages_module.LATERAL_ENDSTOP_PRESENT_OPEN,
+        running_mask=0,
+        endstop_hit_mask=0,
+        segments_dropped=7,
+    )
+
+    assert streamer._check_endstop(status) is False
+    assert streamer.endstop_triggered is False
+
+
+def test_move_queue_set_endstop_armed_uses_ack_mask_without_extra_poll() -> None:
+    status = SimpleNamespace(
+        last_result=int(SpiMessageResult.OK),
+        endstop_armed_mask=1 << 1,
+        lateral_endstop_state=messages_module.LATERAL_ENDSTOP_PRESENT_OPEN,
+    )
+
+    class FakeTransport:
+        def enable_endstop_request(self, axis_id: int, arm: bool):
+            assert axis_id == 1
+            assert arm is True
+            return 123, status
+
+        def wait_for_request_result(self, sequence: int, *, poll_interval_s: float = 0.001):
+            assert sequence == 123
+            return status
+
+    queue = move_queue_module.MoveQueue(
+        transport=FakeTransport(),
+        axis_states={},
+        poll_interval_s=0.0,
+    )
+
+    def _unexpected_wait(*_args, **_kwargs):
+        raise AssertionError("_wait_for_endstop_arm_state should not be called")
+
+    queue._wait_for_endstop_arm_state = _unexpected_wait
+
+    returned = queue._set_endstop_armed(1, arm=True)
+
+    assert returned is status
+
+
+def test_move_queue_resumes_after_expected_endstop_from_flush_floor() -> None:
+    class FakeTransport:
+        def get_status(self):
+            return SimpleNamespace(last_executed_sequence=9)
+
+    queue = move_queue_module.MoveQueue(
+        transport=FakeTransport(),
+        axis_states={},
+        poll_interval_s=0.0,
+    )
+
+    streamer = SimpleNamespace(flush_floor_sequence=20)
+
+    assert queue._next_sequence_after_streamer(streamer) == 21
+
+
+def test_move_queue_does_not_preclear_on_unstable_initial_closed_state(monkeypatch) -> None:
+    closed = SimpleNamespace(lateral_endstop_state=messages_module.LATERAL_ENDSTOP_PRESENT_CLOSED)
+    open_state = SimpleNamespace(lateral_endstop_state=messages_module.LATERAL_ENDSTOP_PRESENT_OPEN)
+    statuses = iter([closed, open_state])
+
+    queue = move_queue_module.MoveQueue(
+        transport=SimpleNamespace(get_status=lambda: next(statuses)),
+        axis_states={},
+        poll_interval_s=0.0,
+    )
+
+    monkeypatch.setattr(move_queue_module.time, "sleep", lambda _s: None)
+
+    state = queue._confirm_initial_closed_endstop(1)
+
+    assert state == messages_module.LATERAL_ENDSTOP_PRESENT_OPEN
 
 
 def test_segment_json_load_segments_round_trip(tmp_path) -> None:
