@@ -202,3 +202,7 @@ La raison est simple : changer le mode SPI et supprimer en meme temps plusieurs 
 ## Conclusion
 
 Le vrai correctif de fond est la coherence host/firmware en SPI mode `1`. Les autres correctifs presents dans le code ne doivent pas etre vus comme des erreurs a supprimer d'urgence : plusieurs sont des protections de pipeline ou de robustesse transport qui restent defendables meme apres la migration.
+
+Flasher le firmware et relever les compteurs bad_magic, bad_crc et zero_rx avec le lien en mode 1.
+Si les compteurs restent propres, réduire le délai host de 700 vers 300 puis 100.
+Ensuite seulement, tester la suppression des deux esp_rom_delay_us(2).
