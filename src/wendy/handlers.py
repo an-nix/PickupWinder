@@ -116,6 +116,39 @@ class WindingRunAxisHandler(tornado.web.RequestHandler):
         self.write(json.dumps(response.get("result", response)))
 
 
+class WindingHomeHandler(tornado.web.RequestHandler):
+    def get(self) -> None:
+        try:
+            approach_rpm = float(self.get_query_argument("approach_rpm", default="100.0"))
+            search_rpm = float(self.get_query_argument("search_rpm", default="20.0"))
+            backoff_steps = int(self.get_query_argument("backoff_steps", default="3200"))
+        except ValueError as exc:
+            self.set_status(400)
+            self.write(json.dumps({"error": f"Invalid parameter: {exc}"}))
+            return
+
+        request_id = int(time.time() * 1000)
+        request_payload = make_request(
+            "winding.home_lateral",
+            params={
+                "approach_rpm": approach_rpm,
+                "search_rpm": search_rpm,
+                "backoff_steps": backoff_steps,
+            },
+            request_id=request_id,
+        )
+        response = self.application.rpc_client.send_raw(request_payload)
+        if response is None:
+            self.set_status(204)
+            return
+        if "error" in response:
+            self.set_status(502)
+            self.write(json.dumps(response))
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps(response.get("result", response)))
+
+
 class WindingStatusHandler(tornado.web.RequestHandler):
     def get(self) -> None:
         request_payload = make_request("winding.status", params=None, request_id=1)
@@ -163,6 +196,7 @@ def make_application(
             (r"/rpc", JsonRpcHttpHandler, dict(rpc_client=rpc_client)),
             (r"/ws", JsonRpcWebSocketHandler),
             (r"/run_axis", WindingRunAxisHandler),
+            (r"/home", WindingHomeHandler),
             (r"/status", WindingStatusHandler),
             (r"/openapi.json", OpenApiHandler),
             (r"/docs", ReDocHandler),

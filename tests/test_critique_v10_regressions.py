@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -20,6 +21,8 @@ axis_state_module = import_module("motion.axis_state")
 command_service_module = import_module("motion.command_service")
 segment_json_module = import_module("motion.segment_json")
 messages_module = import_module("transport.messages")
+mock_transport_module = import_module("transport.mock_spi_transport")
+spi_transport_module = import_module("transport.spi_transport")
 streamer_module = import_module("transport.streamer")
 program_module = import_module("winding.program")
 adaptive_service_module = import_module("winding.service")
@@ -37,9 +40,14 @@ MotionCommandService = command_service_module.MotionCommandService
 dump_segment_json = segment_json_module.dump_segment_json
 load_segments = segment_json_module.load_segments
 MultiAxisSegment = messages_module.MultiAxisSegment
+MockSpiTransport = mock_transport_module.MockSpiTransport
+Esp32SpiTransport = spi_transport_module.Esp32SpiTransport
 MultiAxisRampStreamer = streamer_module.MultiAxisRampStreamer
 WindingProgram = program_module.WindingProgram
 AdaptiveWindingService = adaptive_service_module.AdaptiveWindingService
+SpiMessageResult = messages_module.SpiMessageResult
+StatusPayload = messages_module.StatusPayload
+SPI_MSG_VERSION = messages_module.SPI_MSG_VERSION
 
 
 def test_winding_rpc_stop_routes_through_coordinator() -> None:
@@ -117,6 +125,174 @@ def test_motion_command_wound_run_uses_lateral_steps_per_mm() -> None:
     assert captured_moves
     move = captured_moves[0]
     assert move.traverse_cfg.steps_per_unit == pytest.approx(config.lateral_steps_per_mm)
+
+
+def test_motion_command_home_lateral_returns_immediately_and_completes_async() -> None:
+    class FakeMove:
+        def __init__(self, axis_id: int) -> None:
+            self.axis_id = axis_id
+            self.done = False
+
+    config = AppConfiguration()
+    state = SharedState(axis_states={})
+    move = FakeMove(config.lateral_axis_id)
+    finalized: list[FakeMove] = []
+
+    def _start_home(**_kwargs):
+        return move
+
+    def _finalize_home_move(completed_move):
+        finalized.append(completed_move)
+        return True, None
+
+    commands = MotionCommandService(
+        transport=SimpleNamespace(),
+        shared_state=state,
+        move_queue=SimpleNamespace(),
+        lateral_controller=SimpleNamespace(
+            start_home=_start_home,
+            finalize_home_move=_finalize_home_move,
+        ),
+        config=config,
+    )
+
+    result = commands.home_lateral(approach_rpm=20.0, search_rpm=10.0, backoff_steps=3200)
+
+    assert result == {
+        "status": "started",
+        "axis_id": config.lateral_axis_id,
+        "approach_rpm": 20.0,
+        "search_rpm": 10.0,
+        "backoff_steps": 3200,
+    }
+    assert state.engine_state.name == "HOMING"
+
+    move.done = True
+    deadline = time.monotonic() + 1.0
+    while not finalized and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert finalized == [move]
+    assert state.engine_state.name == "IDLE"
+
+
+def test_winding_rpc_home_lateral_returns_started_response() -> None:
+    config = AppConfiguration()
+    handler = WindingRpcHandler(
+        engine=SimpleNamespace(),
+        commands=SimpleNamespace(
+            home_lateral=lambda **kwargs: {
+                "status": "started",
+                "axis_id": config.lateral_axis_id,
+                **kwargs,
+            }
+        ),
+        adaptive_winding=SimpleNamespace(),
+        status_service=SimpleNamespace(),
+        coordinator=SimpleNamespace(),
+    )
+
+    response = handler.home_lateral(approach_rpm=20.0, search_rpm=10.0, backoff_steps=3200)
+
+    assert response == {
+        "status": "started",
+        "axis_id": config.lateral_axis_id,
+        "approach_rpm": 20.0,
+        "search_rpm": 10.0,
+        "backoff_steps": 3200,
+    }
+
+
+def test_streamer_prefill_caps_long_segment_batch_size() -> None:
+    transport = MockSpiTransport()
+    streamer = MultiAxisRampStreamer.from_axis_ids(
+        transport,
+        [1],
+        target_hz=1066.0,
+        target_buffer_time_s=0.2,
+    )
+    streamer._prefilling = True
+    streamer.set_generator(
+        iter(
+            [
+                MultiAxisSegment(
+                    sequence=index,
+                    duration_us=30_000,
+                    steps=[32],
+                    directions=[0],
+                )
+                for index in range(60)
+            ]
+        )
+    )
+
+    count, _status = streamer._collect_and_send_batch(transport.get_status())
+
+    assert 1 <= count <= 17
+    assert transport.sent_payloads
+    assert len(transport.sent_payloads[0].segments) == count
+    assert count < 60
+
+
+def test_wait_for_request_result_ignores_transient_protocol_error_after_matching_sequence() -> None:
+    transport = Esp32SpiTransport.__new__(Esp32SpiTransport)
+
+    statuses = iter(
+        [
+            StatusPayload(
+                uptime_ms=0,
+                queue_free_slots=(0, 0, 0, 0),
+                ring_free_slots=(0, 0, 0, 0),
+                underrun_count=(0, 0, 0, 0),
+                last_rx_sequence=42,
+                last_rx_type=0,
+                last_result=int(SpiMessageResult.BAD_MAGIC),
+                protocol_version=SPI_MSG_VERSION,
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0,
+                endstop_armed_mask=0,
+                endstop_hit_mask=0,
+                last_executed_sequence=0,
+                multi_axis_queue_free=0,
+                planner_queue_free=0,
+                last_planned_sequence=0,
+                segments_dropped=0,
+            ),
+            StatusPayload(
+                uptime_ms=0,
+                queue_free_slots=(0, 0, 0, 0),
+                ring_free_slots=(0, 0, 0, 0),
+                underrun_count=(0, 0, 0, 0),
+                last_rx_sequence=42,
+                last_rx_type=0,
+                last_result=int(SpiMessageResult.OK),
+                protocol_version=SPI_MSG_VERSION,
+                enabled_mask=0,
+                running_mask=0,
+                lateral_endstop_state=0,
+                endstop_armed_mask=0,
+                endstop_hit_mask=0,
+                last_executed_sequence=0,
+                multi_axis_queue_free=0,
+                planner_queue_free=0,
+                last_planned_sequence=0,
+                segments_dropped=0,
+            ),
+        ]
+    )
+
+    transport.get_status = lambda timeout_s=1.0, allow_stale=False: next(statuses)
+
+    status = Esp32SpiTransport.wait_for_request_result(
+        transport,
+        42,
+        poll_interval_s=0.0,
+        timeout_s=0.1,
+    )
+
+    assert status.last_rx_sequence == 42
+    assert status.last_result == int(SpiMessageResult.OK)
 
 
 def test_segment_json_load_segments_round_trip(tmp_path) -> None:

@@ -13,6 +13,8 @@ creating a circular dependency.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from typing import Any
 
 from core.config import AppConfiguration
@@ -134,7 +136,7 @@ class MotionCommandService:
         search_rpm: float = 10.0,
         backoff_steps: int = 400,
     ) -> dict[str, Any]:
-        """Synchronously home the lateral axis and keep its driver enabled."""
+        """Start lateral homing asynchronously and return immediately."""
         if self._state.engine_state != EngineState.IDLE:
             raise RuntimeError(
                 "home_lateral only allowed when engine is IDLE; if a FAULT occurred, "
@@ -142,20 +144,36 @@ class MotionCommandService:
             )
 
         self._state.set_engine_state(EngineState.HOMING)
-        try:
-            success, reason = self._lateral.home(
-                axis_id=self._config.lateral_axis_id,
-                approach_rpm=approach_rpm,
-                search_rpm=search_rpm,
-                backoff_steps=backoff_steps,
-            )
-            if not success:
-                raise RuntimeError(f"Lateral homing failed: {reason or 'Unknown error'}")
+        move = self._lateral.start_home(
+            axis_id=self._config.lateral_axis_id,
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
+        )
 
-            return self._lateral.require_axis_state(self._config.lateral_axis_id).snapshot()
-        finally:
-            if self._state.engine_state == EngineState.HOMING:
-                self._state.set_engine_state(EngineState.IDLE)
+        monitor = threading.Thread(
+            target=self._wait_for_lateral_home_completion,
+            args=(move,),
+            daemon=True,
+            name="manual_home_monitor",
+        )
+        monitor.start()
+
+        return {
+            "status": "started",
+            "axis_id": self._config.lateral_axis_id,
+            "approach_rpm": approach_rpm,
+            "search_rpm": search_rpm,
+            "backoff_steps": backoff_steps,
+        }
+
+    def _wait_for_lateral_home_completion(self, move: Any) -> None:
+        while not move.done:
+            time.sleep(0.05)
+
+        success, _reason = self._lateral.finalize_home_move(move)
+        if success and self._state.engine_state == EngineState.HOMING:
+            self._state.set_engine_state(EngineState.IDLE)
 
 
     def move_lateral_to_mm(

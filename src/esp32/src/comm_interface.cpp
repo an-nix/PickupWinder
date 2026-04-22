@@ -29,6 +29,18 @@
 // Module log tag used by ESP logging macros throughout this file.
 static const char* TAG = "comm_iface";
 
+static bool shouldPublishAckForMessageType(uint8_t msg_type)
+{
+    switch (static_cast<SpiMessageType>(msg_type)) {
+    case SpiMessageType::NOP:
+    case SpiMessageType::GET_STATUS:
+    case SpiMessageType::PING:
+        return false;
+    default:
+        return true;
+    }
+}
+
 // Task configuration: stack size, priority and pinned core for SPI task.
 static constexpr uint32_t  SPI_TASK_STACK  = 4096;
 static constexpr UBaseType_t SPI_TASK_PRIO = 24;
@@ -518,6 +530,12 @@ esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
     // axis_ids
     for (uint8_t a = 0; a < axis_count; ++a) {
         block.axis_ids[a] = cursor[a];
+        if (block.axis_ids[a] >= n_motors_ || queues_[block.axis_ids[a]] == nullptr) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (!isLateralMovementAllowed(block.axis_ids[a])) {
+            return ESP_ERR_INVALID_STATE;
+        }
     }
     cursor += axis_count;
 
@@ -780,18 +798,13 @@ void CommInterface::spiTask(void* arg)
             if (s_rx_frame[0] == 0x00 && s_rx_frame[1] == 0x00) {
                 ++diag_bad_magic_zero;
             }
-            self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_MAGIC);
         } else if (header.version != SPI_MSG_VERSION) {
-            self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_VERSION);
         } else if (header.payload_length > SPI_MAX_PAYLOAD_SIZE) {
-            self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_LENGTH);
         } else if (!spi_message_validate(s_rx_frame, header)) {
             ++diag_bad_crc;
-            self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_CRC);
         } else {
             ++diag_ok;
-            self->last_rx_sequence_ = header.sequence;
-            self->last_rx_type_     = header.msg_type;
+            const bool publish_ack = shouldPublishAckForMessageType(header.msg_type);
 
             // Detect exact duplicate retries by matching sequence/type/length/crc
             // against a small cache of recently processed requests.
@@ -809,30 +822,40 @@ void CommInterface::spiTask(void* arg)
 
             if (cached_request != nullptr) {
                 // Reuse the previous result for this exact request signature.
-                self->last_result_ = cached_request->result;
+                if (publish_ack) {
+                    self->last_rx_sequence_ = header.sequence;
+                    self->last_rx_type_     = header.msg_type;
+                    self->last_result_      = cached_request->result;
+                }
                 ESP_LOGD(TAG, "duplicate SPI request seq=%u type=0x%02X ignored",
                          static_cast<unsigned>(header.sequence),
                          static_cast<unsigned>(header.msg_type));
             } else {
                 const uint8_t* payload = s_rx_frame + sizeof(SpiMessageHeader);
                 err = self->handleFrame(header, payload);
+                uint8_t request_result = static_cast<uint8_t>(SpiMessageResult::INTERNAL_ERROR);
                 // Map esp_err_t handler return codes to SpiMessageResult values for status reporting.
                 if (err == ESP_OK) {
-                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::OK);
+                    request_result = static_cast<uint8_t>(SpiMessageResult::OK);
                 } else if (err == ESP_ERR_TIMEOUT) {
-                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::QUEUE_FULL);
+                    request_result = static_cast<uint8_t>(SpiMessageResult::QUEUE_FULL);
                 } else if (err == ESP_ERR_INVALID_ARG) {
-                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_AXIS);
+                    request_result = static_cast<uint8_t>(SpiMessageResult::BAD_AXIS);
                 } else if (err == ESP_ERR_INVALID_SIZE) {
-                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::BAD_LENGTH);
+                    request_result = static_cast<uint8_t>(SpiMessageResult::BAD_LENGTH);
                 } else if (err == ESP_ERR_NOT_SUPPORTED) {
-                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::UNKNOWN_TYPE);
+                    request_result = static_cast<uint8_t>(SpiMessageResult::UNKNOWN_TYPE);
                 } else if (err == ESP_ERR_INVALID_STATE) {
-                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::ENDSTOP_BLOCKED);
+                    request_result = static_cast<uint8_t>(SpiMessageResult::ENDSTOP_BLOCKED);
                 } else {
-                    self->last_result_ = static_cast<uint8_t>(SpiMessageResult::INTERNAL_ERROR);
                     ESP_LOGW(TAG, "message 0x%02X failed: %s",
                              header.msg_type, esp_err_to_name(err));
+                }
+
+                if (publish_ack) {
+                    self->last_rx_sequence_ = header.sequence;
+                    self->last_rx_type_     = header.msg_type;
+                    self->last_result_      = request_result;
                 }
 
                 auto& cache_slot =
@@ -842,7 +865,7 @@ void CommInterface::spiTask(void* arg)
                 cache_slot.msg_type = header.msg_type;
                 cache_slot.payload_length = header.payload_length;
                 cache_slot.crc = header.crc16;
-                cache_slot.result = self->last_result_;
+                cache_slot.result = request_result;
                 self->recent_request_cache_write_index_ = static_cast<uint8_t>(
                     (self->recent_request_cache_write_index_ + 1)
                     % RECENT_REQUEST_CACHE_DEPTH);
@@ -1064,9 +1087,8 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     if (eid >= self->n_motors_ ||
                         self->queues_[eid] == nullptr) continue;
                     if (self->queues_[eid]->driver().isEndstopActive()) {
-                        // Drain remaining batch, e-stop, notify host.
+                        // Drain remaining batch and stop immediately.
                         self->queues_[eid]->driver().emergencyStop();
-                        self->notifySegmentExecuted(seg.motion_sequence);
                         ESP_LOGW(TAG, "endstop on axis %u at seq=%u",
                                  eid, seg.motion_sequence);
                         endstop_hit = true;
@@ -1096,7 +1118,6 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                         self->queues_[1]->driver().emergencyStop();
                     }
                     clearMultiExecFlags();
-                    self->notifySegmentExecuted(seg.motion_sequence);
                     state = ExecState::RECOVERY;
                     goto exit_drain;
                 }
@@ -1151,7 +1172,6 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                         ESP_LOGW(TAG, "axis %u endstop mid-seg seq=%u",
                                  axis_id, seg.motion_sequence);
                         axis_queue->driver().emergencyStop();
-                        self->notifySegmentExecuted(seg.motion_sequence);
                         state = ExecState::RECOVERY;
                         goto exit_drain;
                     } else if (err != ESP_OK) {
@@ -1256,18 +1276,12 @@ void CommInterface::multiAxisExecutorTask(void* arg)
             planned_segment_t discard;
             uint32_t drained = 0;
             uint16_t last_drained_seq = 0;
-            bool has_seq = false;
             while (drained < SEGMENT_QUEUE_DEPTH &&
                    xQueueReceive(seg_queue, &discard, 0) == pdTRUE) {
                 if (!discard.is_flush) {
                     last_drained_seq = discard.motion_sequence;
-                    has_seq = true;
                 }
                 ++drained;
-            }
-
-            if (has_seq) {
-                self->notifySegmentExecuted(last_drained_seq);
             }
 
             // Reset deferred notifications.

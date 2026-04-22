@@ -15,6 +15,10 @@ The runtime uses three distinct 16-bit sequence spaces.
 
 This is not a motion sequence. It only answers: "which request did the ESP32 actually process?"
 
+Important detail: the published ACK tuple only advances for non-telemetry control
+requests. `GET_STATUS`, `PING`, `NOP`, and transient SPI parse faults do not replace
+the last confirmed control ACK.
+
 ### 2. Motion block sequence
 
 - Field: `MultiAxisSegmentBlockHeader.block_seq`
@@ -73,6 +77,10 @@ This prevents a block already consumed by the firmware from being injected twice
 ### Executor completion state
 
 `last_executed_sequence_` is published back to the host through `StatusPayload` so the streamer can retire confirmed in-flight segments.
+
+This value must advance only for segments that were actually executed. Segments blocked
+by endstop gating, aborted before enqueue, or drained during recovery are intentionally
+excluded so the host buffer model stays aligned with the real machine state.
 
 ## Flush semantics
 

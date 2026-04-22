@@ -7,7 +7,7 @@ from core.events import EventBus, EventKind
 from core.shared_state import SharedState
 from motion import RampConfig
 from motion.axis_state import AxisState
-from motion.move import HomingMove
+from motion.move import HomingMove, MoveState
 from motion.move_queue import MoveQueue
 from transport.spi_transport import Esp32SpiTransport
 
@@ -33,20 +33,19 @@ class LateralAxisController:
         self._events = event_bus
         self._config = config
 
-    def home(
+    def _create_home_move(
         self,
         *,
         axis_id: int,
         approach_rpm: float,
         search_rpm: float,
         backoff_steps: int,
-    ) -> tuple[bool, str | None]:
-        self._events.publish(EventKind.HOMING_STARTED, axis_id=axis_id)
+    ) -> HomingMove:
         steps_per_rev = (
             self._config.lateral_steps_per_revolution
             * self._config.lateral_microstepping
         )
-        move = HomingMove(
+        return HomingMove(
             name="home_lateral",
             axis_id=axis_id,
             steps_per_rev=steps_per_rev,
@@ -56,21 +55,68 @@ class LateralAxisController:
             max_approach_steps=int(steps_per_rev * 20),
             reverse_direction=self._config.lateral_invert_direction,
         )
-        self._move_queue.enqueue(move)
-        self._move_queue.wait_until_idle()
 
-        if move.state.name == "COMPLETED":
-            self._events.publish(EventKind.HOMING_COMPLETED, axis_id=axis_id)
+    def start_home(
+        self,
+        *,
+        axis_id: int,
+        approach_rpm: float,
+        search_rpm: float,
+        backoff_steps: int,
+    ) -> HomingMove:
+        self._events.publish(
+            EventKind.HOMING_STARTED,
+            axis_id=axis_id,
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
+        )
+        move = self._create_home_move(
+            axis_id=axis_id,
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
+        )
+        self._move_queue.enqueue(move)
+        return move
+
+    def finalize_home_move(self, move: HomingMove) -> tuple[bool, str | None]:
+        axis_id = move.axis_id
+        if move.state is MoveState.COMPLETED:
+            axis_state = self.require_axis_state(axis_id).snapshot()
+            self._events.publish(
+                EventKind.HOMING_COMPLETED,
+                axis_id=axis_id,
+                axis_state=axis_state,
+            )
             return True, None
 
-        message = f"Homing failed: {move.error}"
+        message = f"Homing failed: {move.error or move.state.name}"
         self._state.set_fault(message)
         self._events.publish(
             EventKind.HOMING_FAILED,
             axis_id=axis_id,
             error=message,
+            move_state=move.state.name,
         )
         return False, move.error
+
+    def home(
+        self,
+        *,
+        axis_id: int,
+        approach_rpm: float,
+        search_rpm: float,
+        backoff_steps: int,
+    ) -> tuple[bool, str | None]:
+        move = self.start_home(
+            axis_id=axis_id,
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
+        )
+        self._move_queue.wait_until_idle()
+        return self.finalize_home_move(move)
 
     def require_axis_state(self, axis_id: int) -> AxisState:
         axis_state = self._state.axis_states.get(axis_id)

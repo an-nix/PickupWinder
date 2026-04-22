@@ -48,6 +48,7 @@ class MultiAxisRampStreamer:
     """
 
     TARGET_BUFFER_TIME_S = 0.10
+    PREFILL_MAX_BUFFER_TIME_S = 0.50
     MIN_BUFFER_TIME_S = 0.06
     MAX_BUFFER_TIME_S = 0.25
     MIN_SEGMENT_TIME_S = 0.002
@@ -206,6 +207,7 @@ class MultiAxisRampStreamer:
         self._inflight: deque[tuple[MultiAxisSegment, int]] = deque()
         self._buffered_time_s = 0.0
         self._retry_batch: list[MultiAxisSegment] | None = None
+        self._pending_segment: MultiAxisSegment | None = None
         self._last_sent_motion_seq = -1
         self._last_sent_transport_seq = -1
         self._planner_under_pressure = False  # True while planner_queue_free < threshold
@@ -742,21 +744,42 @@ class MultiAxisRampStreamer:
         if self._generator_finished and self._retry_batch is None:
             return None
 
+        effective_buffer_target_s = self._target_buffer_time_s
+        if self._prefilling:
+            effective_buffer_target_s = max(
+                self._target_buffer_time_s,
+                self.PREFILL_MAX_BUFFER_TIME_S,
+            )
+
         if self._retry_batch is not None:
             batch = list(self._retry_batch)
+            batch_duration_s = sum(seg.duration_us for seg in batch) / 1_000_000.0
         else:
             batch = []
+            batch_duration_s = 0.0
             while (
                 len(batch) < MULTI_AXIS_SEGMENT_BLOCK_SIZE
-                and self._buffered_time_s < self._target_buffer_time_s
+                and self._buffered_time_s + batch_duration_s < effective_buffer_target_s
                 and len(self._inflight) < self._max_inflight_segments()
                 and not self._queue_full(status)
                 and not self._check_planner_pressure(status)
             ):
-                try:
-                    segment = next(self._generator)
-                except StopIteration:
-                    self._generator_finished = True
+                if self._pending_segment is not None:
+                    segment = self._pending_segment
+                    self._pending_segment = None
+                else:
+                    try:
+                        segment = next(self._generator)
+                    except StopIteration:
+                        self._generator_finished = True
+                        break
+
+                segment_duration_s = segment.duration_us / 1_000_000.0
+                projected_buffer_s = (
+                    self._buffered_time_s + batch_duration_s + segment_duration_s
+                )
+                if batch and projected_buffer_s > effective_buffer_target_s:
+                    self._pending_segment = segment
                     break
 
                 reference_sequence = (
@@ -772,6 +795,7 @@ class MultiAxisRampStreamer:
                         f"got {segment.sequence}, last was {reference_sequence}"
                     )
                 batch.append(segment)
+                batch_duration_s += segment_duration_s
                 # Keep speed estimate current so required_lookahead() uses fresh data.
                 if segment.steps:
                     self._current_steps_per_segment = sum(segment.steps)

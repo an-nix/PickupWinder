@@ -67,7 +67,7 @@ def make_openapi_schema(
             "/run_axis": {
                 "get": {
                     "summary": "Run axis for a duration",
-                    "description": "Compute steps from RPM and duration, then call winding.jog on the backend.",
+                    "description": "Compute steps from RPM and duration, then call winding.run_axis on the backend.",
                     "parameters": [
                         {
                             "name": "axis_id",
@@ -94,6 +94,53 @@ def make_openapi_schema(
                     "responses": {
                         "200": {
                             "description": "Run axis command result",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object"
+                                    }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Invalid request parameters"
+                        },
+                        "502": {
+                            "description": "Backend RPC error"
+                        }
+                    }
+                }
+            },
+            "/home": {
+                "get": {
+                    "summary": "Home the lateral axis",
+                    "description": "Invoke winding.home_lateral on the backend to run the lateral homing procedure.",
+                    "parameters": [
+                        {
+                            "name": "approach_rpm",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "number", "default": 100.0},
+                            "description": "Approach speed in RPM.",
+                        },
+                        {
+                            "name": "search_rpm",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "number", "default": 20.0},
+                            "description": "Search speed in RPM.",
+                        },
+                        {
+                            "name": "backoff_steps",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "integer", "default": 3200},
+                            "description": "Backoff steps after endstop trigger.",
+                        },
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Homing command result",
                             "content": {
                                 "application/json": {
                                     "schema": {

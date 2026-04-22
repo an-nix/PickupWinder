@@ -236,6 +236,12 @@ class Esp32SpiTransport:
         poll_interval_s: float = 0.001,
         timeout_s: float = 1.5,
     ) -> StatusPayload:
+        transient_protocol_results = {
+            int(SpiMessageResult.BAD_MAGIC),
+            int(SpiMessageResult.BAD_VERSION),
+            int(SpiMessageResult.BAD_LENGTH),
+            int(SpiMessageResult.BAD_CRC),
+        }
         deadline = time.monotonic() + max(timeout_s, 0.05)
         last_exc: Exception | None = None
         while True:
@@ -257,6 +263,13 @@ class Esp32SpiTransport:
                 time.sleep(poll_interval_s)
                 continue
             if status.last_rx_sequence == (sequence & 0xFFFF):
+                if int(status.last_result) in transient_protocol_results:
+                    last_exc = RuntimeError(
+                        "transient SPI protocol error observed after matching ack "
+                        f"for seq={sequence}: result=0x{int(status.last_result):02X}"
+                    )
+                    time.sleep(poll_interval_s)
+                    continue
                 return status
             time.sleep(poll_interval_s)
 

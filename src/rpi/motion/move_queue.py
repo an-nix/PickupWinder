@@ -436,7 +436,18 @@ class MoveQueue:
             self._current_streamer = None
         return streamer
 
+    @staticmethod
+    def _streamer_stop_requested(streamer: Any) -> bool:
+        callback = getattr(streamer, "has_stop_been_requested", None)
+        if not callable(callback):
+            return False
+        return bool(callback())
+
     def _clear_closed_endstop_before_homing(self, move: HomingMove) -> None:
+        logger.info(
+            "homing axis %s: endstop already closed at start, running preclear",
+            move.axis_id,
+        )
         clearance_move = move._make_backoff_move()
         self._set_endstop_armed(move.axis_id, arm=False)
         streamer = self._stream_homing_sub_move(
@@ -717,7 +728,11 @@ class MoveQueue:
                 move.mark_failed(str(exc))
                 return
 
-            if self._stop_requested or streamer.has_stop_been_requested():
+            phase_completed_on_expected_endstop = arm_endstop and streamer.endstop_triggered
+            if self._stop_requested or (
+                self._streamer_stop_requested(streamer)
+                and not phase_completed_on_expected_endstop
+            ):
                 self._set_endstop_armed(move.axis_id, arm=False)
                 stop_plan = self._active_stop_plan or self._default_stop_plan(
                     [move.axis_id],

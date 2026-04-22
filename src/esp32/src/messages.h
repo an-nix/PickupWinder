@@ -219,6 +219,11 @@ struct __attribute__((packed)) StatusPayload {
     uint16_t queue_free_slots[SPI_MAX_AXES];
     uint16_t ring_free_slots[SPI_MAX_AXES];
     uint32_t underrun_count[SPI_MAX_AXES];
+    /**
+     * Last non-telemetry request durably acknowledged by firmware.
+     * `GET_STATUS`, `PING`, `NOP`, and transient parse failures do not
+     * advance this published ACK tuple.
+     */
     uint16_t last_rx_sequence;
     uint8_t  last_rx_type;
     uint8_t  last_result;
@@ -231,11 +236,14 @@ struct __attribute__((packed)) StatusPayload {
     /** Bit N = 1 means axis N hit its endstop since the last arm. */
     uint8_t endstop_hit_mask;
     /**
-     * Motion sequence of the most recently fully-executed multi-axis segment.
+    * Motion sequence of the most recently fully-executed multi-axis segment.
      * The host uses this to compute how much future motion is still buffered
      * on the MCU.  Initialised to 0xFFFF ("nothing executed yet") so that the
      * host's starting condition (segment.sequence > last_executed_sequence)
      * is always true before the first segment completes.
+    *
+    * Segments rejected by endstop gating or drained during recovery must not
+    * advance this field.
      *
      * This field is updated by the executor task (Core 1) under a spinlock
      * and read by the SPI task (Core 0) — both must access it atomically.

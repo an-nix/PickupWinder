@@ -191,16 +191,13 @@ class WindingRpcHandler:
         search_rpm: float = 20.0,
         backoff_steps: int = 3200,
     ) -> dict[str, Any]:
-        """Home the lateral axis immediately."""
-        axis_state = self._commands.home_lateral(
+        """Start the lateral homing sequence and return immediately."""
+        result = self._commands.home_lateral(
             approach_rpm=approach_rpm,
             search_rpm=search_rpm,
             backoff_steps=backoff_steps,
         )
-        return {
-            "status": "homed",
-            "axis_state": axis_state,
-        }
+        return result
 
     def move_lateral_mm(self, position_mm: float, rpm: float) -> dict[str, Any]:
         """Move the lateral axis to an absolute mm position from home zero."""
