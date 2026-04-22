@@ -1088,6 +1088,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                         self->queues_[eid] == nullptr) continue;
                     if (self->queues_[eid]->driver().isEndstopActive()) {
                         // Drain remaining batch and stop immediately.
+                        clearMultiExecFlags();
                         self->queues_[eid]->driver().emergencyStop();
                         ESP_LOGW(TAG, "endstop on axis %u at seq=%u",
                                  eid, seg.motion_sequence);
@@ -1095,7 +1096,6 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     }
                 }
                 if (endstop_hit) {
-                    clearMultiExecFlags();  // R10: libérer avant RECOVERY
                     state = ExecState::RECOVERY;
                     goto exit_drain;
                 }
@@ -1114,10 +1114,10 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     lateral_state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
                     ESP_LOGW(TAG, "lateral endstop ABSENT while armed at seq=%u \xe2\x80\x94 fail-safe stop",
                              seg.motion_sequence);
+                    clearMultiExecFlags();
                     if (self->queues_[1] != nullptr) {
                         self->queues_[1]->driver().emergencyStop();
                     }
-                    clearMultiExecFlags();
                     state = ExecState::RECOVERY;
                     goto exit_drain;
                 }
@@ -1156,9 +1156,12 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                         self->queues_[axis_id] == nullptr) continue;
                     if (seg.axes[a].step_count == 0) continue;
                     if (axis_id == 1 && lateral_blocked) {
-                        ESP_LOGD(TAG, "axis1 blocked, skip %u steps",
-                                 seg.axes[a].step_count);
-                        continue;
+                        clearMultiExecFlags();
+                        ESP_LOGW(TAG, "axis1 blocked while armed at seq=%u",
+                                 seg.motion_sequence);
+                        self->queues_[axis_id]->driver().emergencyStop();
+                        state = ExecState::RECOVERY;
+                        goto exit_drain;
                     }
 
                     StepperQueue* axis_queue = self->queues_[axis_id];
@@ -1170,6 +1173,13 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     if (err == ESP_ERR_INVALID_STATE) {
                         clearMultiExecFlags();
                         ESP_LOGW(TAG, "axis %u endstop mid-seg seq=%u",
+                                 axis_id, seg.motion_sequence);
+                        axis_queue->driver().emergencyStop();
+                        state = ExecState::RECOVERY;
+                        goto exit_drain;
+                    } else if (err == ESP_ERR_TIMEOUT) {
+                        clearMultiExecFlags();
+                        ESP_LOGE(TAG, "axis %u ring timeout at seq=%u — forcing RECOVERY",
                                  axis_id, seg.motion_sequence);
                         axis_queue->driver().emergencyStop();
                         state = ExecState::RECOVERY;
