@@ -63,6 +63,7 @@ The SPI link is full-duplex and fixed size.
 - CRC: `CRC16-CCITT-FALSE`
 - Endianness: little-endian
 - Electrical mode: SPI mode 1 on both the Raspberry Pi host and the ESP32 slave
+- ESP32 uses IO_MUX-native SPI pins and supports an optional extra `ready` GPIO for handshake, as recommended by ESP-IDF for reliable slave timing
 
 The production motion message is `MULTI_AXIS_SEGMENT_BLOCK`. `STEP_BLOCK` and `SEGMENT_BLOCK` remain for debug and legacy tooling only.
 

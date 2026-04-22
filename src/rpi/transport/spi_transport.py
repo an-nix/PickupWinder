@@ -44,7 +44,7 @@ class Esp32SpiTransport:
         device: int | None = None,
         *,
         device_path: str | None = None,
-        speed_hz: int = 1_000_000,
+        speed_hz: int = 8_000_000,
         mode: int = 1,
     ):
         try:
@@ -70,6 +70,16 @@ class Esp32SpiTransport:
         self._last_status: StatusPayload | None = None
         self._last_status_ts: float = 0.0
         self._last_stale_log_ts: float = 0.0
+        # Real wall-clock gap enforced between completed SPI calls.
+        # On Raspberry Pi spidev, delay_usecs is a controller-side transfer
+        # delay and does not reliably create a slave-visible re-arm window
+        # between two separate Python xfer calls. Without a ready GPIO, the
+        # ESP32 slave needs a small host-side gap so spi_slave_transmit() can
+        # rebuild and re-arm the next DMA descriptor before CS is asserted
+        # again. Empirically, 500 µs removes the recurring short-frame pattern
+        # while keeping enough throughput for 1500 RPM tests at 8 MHz.
+        self._inter_transfer_guard_s: float = 0.0005
+        self._last_xfer_end_ts: float = 0.0
         self._diag_total_xfers: int = 0
         self._diag_bad_magic: int = 0
         self._diag_bad_crc: int = 0
@@ -136,15 +146,23 @@ class Esp32SpiTransport:
         Uses explicit speed/mode-compatible arguments on every call to avoid
         hidden defaults. Prefers xfer3 when available.
         """
+        now = time.monotonic()
+        if self._last_xfer_end_ts > 0.0:
+            remaining_gap_s = self._inter_transfer_guard_s - (now - self._last_xfer_end_ts)
+            if remaining_gap_s > 0.0:
+                time.sleep(remaining_gap_s)
+
         tx = list(frame)
-        # delay_usecs=700 keeps margin while the ESP32 parses the received
-        # frame, rebuilds the next STATUS payload, and re-arms the slave DMA
-        # transaction. This guard was introduced during the mode-0
-        # investigation and is retained after the move to mode 1 until bench
-        # data shows it can be reduced safely.
+        # Keep the spidev transfer itself simple and rely on the explicit host
+        # inter-transfer guard above. delay_usecs does not reliably translate
+        # into a slave-visible idle gap between separate xfer() calls.
         if hasattr(self._spi, "xfer3"):
-            return bytes(self._spi.xfer3(tx, self._speed_hz, 700, 8))
-        return bytes(self._spi.xfer2(tx, self._speed_hz, 700, 8))
+            response = bytes(self._spi.xfer3(tx, self._speed_hz, 0, 8))
+        else:
+            response = bytes(self._spi.xfer2(tx, self._speed_hz, 0, 8))
+
+        self._last_xfer_end_ts = time.monotonic()
+        return response
 
     def _diag_maybe_log(self) -> None:
         now = time.monotonic()
@@ -181,7 +199,7 @@ class Esp32SpiTransport:
 
         Retries up to 15 times on transient bad-magic / bad-CRC frames.  When
         the SPI slave returns all-zeros it means the ESP32 had no transaction
-        queued (SPI task was briefly between spi_slave_transmit() calls).  In
+        queued yet when the master asserted CS. In
         that case the slave also discarded MOSI, so resending is safe.
         """
         if len(frame) != SPI_FRAME_SIZE:
@@ -212,7 +230,8 @@ class Esp32SpiTransport:
                     if is_zero:
                         self._diag_zero_rx += 1
                         self._diag_lifetime_zero_rx += 1
-                    # Zero-frame = ESP32 between spi_slave_transmit() calls.
+                    # Zero-frame = ESP32 was not armed with a valid queued
+                    # descriptor when the transfer started.
                     # Retry with a shorter backoff than for non-zero
                     # corruption so the host keeps pace without busy-spinning.
                     if attempt < 14:
@@ -232,15 +251,35 @@ class Esp32SpiTransport:
         self,
         sequence: int,
         *,
-        poll_interval_s: float = 0.001,
+        hint_status: StatusPayload | None = None,
+        poll_interval_s: float = 0.0001,
         timeout_s: float = 1.5,
     ) -> StatusPayload:
+        """Wait until the ESP32 acknowledges *sequence* via last_rx_sequence.
+
+        ``hint_status`` is the status payload returned by the preceding
+        transfer_frame / transfer_request call.  With prequeue=2 the pipeline
+        depth is two frames, so the hint rarely carries the matching ACK, but
+        checking it is free and eliminates one poll on any early-delivery edge
+        case (e.g. slow master, fast firmware processing).
+
+        ``poll_interval_s`` defaults to 0.1 ms — tight enough to catch the
+        ACK in the second poll without busy-spinning.  The old 1 ms default
+        added unnecessary latency equal to the entire SPI task rebuild cycle.
+        """
         transient_protocol_results = {
             int(SpiMessageResult.BAD_MAGIC),
             int(SpiMessageResult.BAD_VERSION),
             int(SpiMessageResult.BAD_LENGTH),
             int(SpiMessageResult.BAD_CRC),
         }
+        target_seq = sequence & 0xFFFF
+        # Free first check: the caller already holds a status response from the
+        # preceding send.  If it carries the matching ACK we skip all polls.
+        if hint_status is not None:
+            if hint_status.last_rx_sequence == target_seq:
+                if int(hint_status.last_result) not in transient_protocol_results:
+                    return hint_status
         deadline = time.monotonic() + max(timeout_s, 0.05)
         last_exc: Exception | None = None
         while True:
@@ -261,7 +300,7 @@ class Esp32SpiTransport:
                 last_exc = exc
                 time.sleep(poll_interval_s)
                 continue
-            if status.last_rx_sequence == (sequence & 0xFFFF):
+            if status.last_rx_sequence == target_seq:
                 if int(status.last_result) in transient_protocol_results:
                     last_exc = RuntimeError(
                         "transient SPI protocol error observed after matching ack "
@@ -530,14 +569,14 @@ class Esp32SpiTransport:
     ) -> StatusPayload:
         self.wait_for_queue_space(payload.axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
 
-        sequence, _ = self.send_step_block_request(payload)
-        status = self.wait_for_request_result(sequence, poll_interval_s=poll_interval_s)
+        sequence, send_status = self.send_step_block_request(payload)
+        status = self.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=poll_interval_s)
 
         while status.last_result == int(SpiMessageResult.QUEUE_FULL):
             time.sleep(poll_interval_s)
             self.wait_for_queue_space(payload.axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
-            sequence, _ = self.send_step_block_request(payload)
-            status = self.wait_for_request_result(sequence, poll_interval_s=poll_interval_s)
+            sequence, send_status = self.send_step_block_request(payload)
+            status = self.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=poll_interval_s)
 
         if status.last_result != int(SpiMessageResult.OK):
             raise RuntimeError(
@@ -558,14 +597,14 @@ class Esp32SpiTransport:
         axis_id = payload.axis_ids[0]
         self.wait_for_queue_space(axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
 
-        sequence, _ = self.send_multi_axis_segment_block_request(payload)
-        status = self.wait_for_request_result(sequence, poll_interval_s=poll_interval_s)
+        sequence, send_status = self.send_multi_axis_segment_block_request(payload)
+        status = self.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=poll_interval_s)
 
         while status.last_result == int(SpiMessageResult.QUEUE_FULL):
             time.sleep(poll_interval_s)
             self.wait_for_queue_space(axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
-            sequence, _ = self.send_multi_axis_segment_block_request(payload)
-            status = self.wait_for_request_result(sequence, poll_interval_s=poll_interval_s)
+            sequence, send_status = self.send_multi_axis_segment_block_request(payload)
+            status = self.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=poll_interval_s)
 
         if status.last_result != int(SpiMessageResult.OK):
             raise RuntimeError(

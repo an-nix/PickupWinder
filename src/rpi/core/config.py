@@ -10,7 +10,7 @@ class AppConfiguration:
 
     rpc_socket_path: str = "/tmp/winding.sock"
     spi_device: str = "/dev/spidev0.0"
-    spi_speed_hz: int = 4_000_000
+    spi_speed_hz: int = 8_000_000
 
     spindle_axis_id: int = 0
     spindle_steps_per_revolution: int = 200

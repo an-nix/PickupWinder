@@ -393,8 +393,8 @@ class MultiAxisRampStreamer:
 
     def _enable_axes(self) -> None:
         for axis_id in self._axis_ids:
-            sequence, status = self._transport.set_axis_enabled_request(axis_id, True)
-            status = self._transport.wait_for_request_result(sequence, poll_interval_s=self._poll_interval_s)
+            sequence, send_status = self._transport.set_axis_enabled_request(axis_id, True)
+            status = self._transport.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=self._poll_interval_s)
             if status.last_result != int(SpiMessageResult.OK):
                 raise RuntimeError(f"enable axis {axis_id} failed with result=0x{status.last_result:02X}")
 
@@ -415,8 +415,8 @@ class MultiAxisRampStreamer:
             if axis_id in self._keep_enabled_axes:
                 continue
 
-            sequence, status = self._transport.set_axis_enabled_request(axis_id, False)
-            status = self._transport.wait_for_request_result(sequence, poll_interval_s=self._poll_interval_s)
+            sequence, send_status = self._transport.set_axis_enabled_request(axis_id, False)
+            status = self._transport.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=self._poll_interval_s)
             if status.last_result != int(SpiMessageResult.OK):
                 raise RuntimeError(f"disable axis {axis_id} failed with result=0x{status.last_result:02X}")
 
@@ -693,8 +693,8 @@ class MultiAxisRampStreamer:
 
         Call before starting a move that should stop on endstop contact.
         """
-        sequence, _ = self._transport.enable_endstop_request(axis_id, arm=True)
-        self._transport.wait_for_request_result(sequence, poll_interval_s=self._poll_interval_s)
+        sequence, send_status = self._transport.enable_endstop_request(axis_id, arm=True)
+        self._transport.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=self._poll_interval_s)
         self._endstop_armed_axes.add(axis_id)
 
     def disarm_endstop(self, axis_id: int) -> None:
@@ -702,8 +702,8 @@ class MultiAxisRampStreamer:
 
         Call before a clearance move that must pass through the endstop.
         """
-        sequence, _ = self._transport.enable_endstop_request(axis_id, arm=False)
-        self._transport.wait_for_request_result(sequence, poll_interval_s=self._poll_interval_s)
+        sequence, send_status = self._transport.enable_endstop_request(axis_id, arm=False)
+        self._transport.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=self._poll_interval_s)
         self._endstop_armed_axes.discard(axis_id)
 
     @property
@@ -829,9 +829,10 @@ class MultiAxisRampStreamer:
             block_seq=batch[0].sequence,
             segments=batch,
         )
-        transport_seq, _send_status = self._transport.send_multi_axis_segment_block_request(payload)
+        transport_seq, send_status = self._transport.send_multi_axis_segment_block_request(payload)
         ack_status = self._transport.wait_for_request_result(
             transport_seq,
+            hint_status=send_status,
             poll_interval_s=self._poll_interval_s,
         )
         self._update_confirmed_motion_sequence(ack_status)

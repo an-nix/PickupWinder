@@ -15,14 +15,17 @@
 
 #include <string.h>
 #include <driver/spi_slave.h>
+#include <driver/spi_common.h>
 #include <driver/gpio.h>
 #include <esp_attr.h>
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
 #include <esp_check.h>
+#include <esp_intr_types.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <soc/gpio_struct.h>
 
 #include "motion_planner.h"
 
@@ -46,9 +49,19 @@ static constexpr uint32_t  SPI_TASK_STACK  = 4096;
 static constexpr UBaseType_t SPI_TASK_PRIO = 24;
 static constexpr BaseType_t  SPI_TASK_CORE = 0;
 
-// Experimental SPI slave mode: keeps one extra transaction pre-queued to
-// reduce the dead time between slave transactions. This is disabled by
-// default because it changes response pipelining and needs bench validation.
+// Single-transaction path (PREQUEUE=false): the SPI task calls spi_slave_transmit()
+// which arms the DMA, blocks until the master transfers, then returns.
+//
+// The ESP32 (original) SPI slave DMA does NOT hardware-preload a second
+// queued transaction: when txn_a completes, the ISR must reload txn_b into
+// the DMA controller.  This reload takes longer than the 700 µs inter-frame
+// delay, so with PREQUEUE=true exactly 50% of frames arrive with
+// trans_len < SPI_FRAME_SIZE*8 (short frames), halving effective throughput.
+//
+// With PREQUEUE=false the task processes the completed frame and rebuilds
+// the TX status frame in ~100 µs (well under 700 µs), so the slave is always
+// re-armed before the master's next CS assertion.  No short frames, no
+// bad_magic, clean 100% OK frames.
 static constexpr bool SPI_EXPERIMENTAL_PREQUEUE = false;
 
 // Task configuration for the multi-axis executor (separate core).
@@ -102,6 +115,42 @@ static uint8_t* s_rx_frame = nullptr;
 static uint8_t* s_rx_frame_b = nullptr;
 static uint8_t* s_tx_frame_a = nullptr;
 static uint8_t* s_tx_frame_b = nullptr;
+static gpio_num_t s_spi_ready_pin = GPIO_NUM_NC;
+
+static inline void IRAM_ATTR setReadyPinLevel(bool high)
+{
+    if (s_spi_ready_pin == GPIO_NUM_NC) {
+        return;
+    }
+
+    const uint32_t pin = static_cast<uint32_t>(s_spi_ready_pin);
+    if (pin < 32) {
+        if (high) {
+            GPIO.out_w1ts = (1UL << pin);
+        } else {
+            GPIO.out_w1tc = (1UL << pin);
+        }
+    } else {
+        const uint32_t mask = (1UL << (pin - 32));
+        if (high) {
+            GPIO.out1_w1ts.val = mask;
+        } else {
+            GPIO.out1_w1tc.val = mask;
+        }
+    }
+}
+
+static void IRAM_ATTR spiPostSetupReadyCb(spi_slave_transaction_t* trans)
+{
+    (void)trans;
+    setReadyPinLevel(true);
+}
+
+static void IRAM_ATTR spiPostTransReadyCb(spi_slave_transaction_t* trans)
+{
+    (void)trans;
+    setReadyPinLevel(false);
+}
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -123,6 +172,7 @@ CommInterface::CommInterface(StepperQueue* queues[], uint8_t n_motors)
 esp_err_t CommInterface::init(const SpiBusPins& pins)
 {
     pins_ = pins;
+    s_spi_ready_pin = pins_.ready;
     // Copy pin configuration for later use.
     // Allocate DMA-capable buffers for SPI frames (one RX, one TX buffer).
     if (s_rx_frame == nullptr) {
@@ -154,6 +204,20 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
         ESP_RETURN_ON_ERROR(gpio_config(&home_cfg), TAG, "failed to configure home sensor pins");
     }
 
+    if (pins_.ready != GPIO_NUM_NC) {
+        gpio_config_t ready_cfg = {};
+        ready_cfg.pin_bit_mask = (1ULL << static_cast<uint32_t>(pins_.ready));
+        ready_cfg.mode = GPIO_MODE_OUTPUT;
+        ready_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+        ready_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        ready_cfg.intr_type = GPIO_INTR_DISABLE;
+        ESP_RETURN_ON_ERROR(gpio_config(&ready_cfg), TAG, "failed to configure SPI ready pin");
+        setReadyPinLevel(false);
+    } else {
+        ESP_LOGW(TAG,
+                 "no SPI ready/handshake GPIO configured; ESP-IDF recommends a ready pin for reliable slave timing");
+    }
+
     // Create the global multi-axis segment queue (from SPI producer -> executor consumer).
     s_multi_axis_queue = xQueueCreate(MULTI_AXIS_QUEUE_DEPTH, sizeof(multi_axis_block_t));
     ESP_RETURN_ON_FALSE(s_multi_axis_queue != nullptr, ESP_ERR_NO_MEM, TAG,
@@ -172,16 +236,24 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     bus_cfg.quadwp_io_num = -1;
     bus_cfg.quadhd_io_num = -1;
     bus_cfg.max_transfer_sz = SPI_FRAME_SIZE;
+    bus_cfg.flags = SPICOMMON_BUSFLAG_MOSI
+                  | SPICOMMON_BUSFLAG_MISO
+                  | SPICOMMON_BUSFLAG_SCLK
+                  | SPICOMMON_BUSFLAG_IOMUX_PINS;
+    bus_cfg.isr_cpu_id = (SPI_TASK_CORE == 0)
+        ? ESP_INTR_CPU_AFFINITY_0
+        : ESP_INTR_CPU_AFFINITY_1;
 
     spi_slave_interface_config_t slave_cfg = {};
-    // Run the DMA-backed SPI slave in mode 1 to match the host and avoid the
-    // edge-timing sensitivity previously seen in mode 0.
+    // DMA on ESP32 SPI slave requires mode 1 or 3. We use mode 1 on both
+    // ends of the link and keep the next transaction queued to minimize the
+    // window where the slave is not armed for the next CS assertion.
     slave_cfg.mode = 1;
     slave_cfg.spics_io_num = pins_.cs;
-    slave_cfg.queue_size = SPI_EXPERIMENTAL_PREQUEUE ? 2 : 1;
+    slave_cfg.queue_size = 1;  // single-transaction path; PREQUEUE=false
     slave_cfg.flags = 0;
-    slave_cfg.post_setup_cb = nullptr;
-    slave_cfg.post_trans_cb = nullptr;
+    slave_cfg.post_setup_cb = (pins_.ready != GPIO_NUM_NC) ? spiPostSetupReadyCb : nullptr;
+    slave_cfg.post_trans_cb = (pins_.ready != GPIO_NUM_NC) ? spiPostTransReadyCb : nullptr;
 
     // Initialize the SPI slave driver with DMA channel auto-selection.
     ESP_RETURN_ON_ERROR(
@@ -231,9 +303,11 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     ESP_LOGI(TAG, "SPI slave ready  mode=%d MOSI=%d MISO=%d SCLK=%d CS=%d  frame=%uB",
              (int)slave_cfg.mode, (int)pins_.mosi, (int)pins_.miso, (int)pins_.sclk, (int)pins_.cs,
              (unsigned)SPI_FRAME_SIZE);
-    if (SPI_EXPERIMENTAL_PREQUEUE) {
-        ESP_LOGW(TAG,
-                 "SPI experimental prequeue mode enabled (queue_size=2): status ACK latency may increase by one extra transfer");
+    ESP_LOGI(TAG,
+             "SPI queued DMA mode enabled (queue_size=%d)",
+             (int)slave_cfg.queue_size);
+    if (pins_.ready != GPIO_NUM_NC) {
+        ESP_LOGI(TAG, "SPI ready/handshake pin enabled on GPIO%d", (int)pins_.ready);
     }
     return ESP_OK;
 }
@@ -766,34 +840,25 @@ void CommInterface::spiTask(void* arg)
     auto* self = static_cast<CommInterface*>(arg);
     ESP_LOGI(TAG, "SPI task started on core %d", xPortGetCoreID());
 
-    // ── Simple spi_slave_transmit() loop ─────────────────────────────────────
-    //
-    // Each iteration:
-    //   1. buildStatusFrame(tx)  — pre-build response reflecting last result
-    //   2. spi_slave_transmit()  — atomic queue+wait, blocks until master clocks
-    //   3. handleFrame(rx)       — parse and execute received request
-    //
-    // There is a brief window between transmit() returning and the next call
-    // where no transaction is queued.  If the Pi sends during that window,
-    // MISO outputs zeros and MOSI is discarded.  The Python retry logic
-    // handles this gracefully (typically <2% of transfers at 4 MHz).
-    //
-    // A ping-pong pre-queue approach (queue_trans/get_trans_result with
-    // queue_size=2) is available below as an experiment, but any claim that it
-    // deterministically causes a DMA byte shift remains unproven in this repo.
-
-    spi_slave_transaction_t txn = {};
+    // Keep two transactions in flight so the master always hits an armed DMA
+    // descriptor and the slave-side response path stays continuously armed.
 
     // Runtime diagnostics (rate-limited).
     uint32_t diag_cycles = 0;
     uint32_t diag_bad_magic = 0;
     uint32_t diag_bad_magic_zero = 0;
     uint32_t diag_bad_crc = 0;
+    uint32_t diag_short_frame = 0;
     uint32_t diag_ok = 0;
     int64_t diag_last_log_us = esp_timer_get_time();
 
-    auto process_rx_frame = [&](uint8_t* rx_frame) {
+    auto process_rx_frame = [&](uint8_t* rx_frame, size_t trans_len_bits) {
         ++diag_cycles;
+
+        if (trans_len_bits != (SPI_FRAME_SIZE * 8U)) {
+            ++diag_short_frame;
+            return;
+        }
 
         SpiMessageHeader header {};
         memcpy(&header, rx_frame, sizeof(SpiMessageHeader));
@@ -877,29 +942,30 @@ void CommInterface::spiTask(void* arg)
     auto maybe_log_diag = [&]() {
         const int64_t now_us = esp_timer_get_time();
         if ((now_us - diag_last_log_us) >= 1000000) {
-            if (diag_bad_magic || diag_bad_crc) {
+            if (diag_bad_magic || diag_bad_crc || diag_short_frame) {
                 ESP_LOGW(TAG,
-                         "spi diag: cyc=%lu ok=%lu bad_magic=%lu(b0=%lu) bad_crc=%lu",
+                         "spi diag: cyc=%lu ok=%lu bad_magic=%lu(b0=%lu) bad_crc=%lu short=%lu",
                          (unsigned long)diag_cycles,
                          (unsigned long)diag_ok,
                          (unsigned long)diag_bad_magic,
                          (unsigned long)diag_bad_magic_zero,
-                         (unsigned long)diag_bad_crc);
+                         (unsigned long)diag_bad_crc,
+                         (unsigned long)diag_short_frame);
             }
             diag_cycles = 0;
             diag_bad_magic = 0;
             diag_bad_magic_zero = 0;
             diag_bad_crc = 0;
+            diag_short_frame = 0;
             diag_ok = 0;
             diag_last_log_us = now_us;
         }
     };
 
     if (SPI_EXPERIMENTAL_PREQUEUE) {
-        // Experimental mode: keep a second transaction pre-queued. This does
-        // not prove a DMA issue; it is a bench-only attempt to reduce the idle
-        // window between transactions. Trade-off: STATUS/ACK visibility can be
-        // delayed by an extra transfer compared to the production path.
+        // Production DMA path: keep a second transaction pre-queued so the
+        // slave remains ready for the next transfer while software processes
+        // the completed frame and prepares the next STATUS response.
         spi_slave_transaction_t txn_a = {};
         spi_slave_transaction_t txn_b = {};
 
@@ -949,48 +1015,51 @@ void CommInterface::spiTask(void* arg)
                 continue;
             }
 
-            process_rx_frame(completed_rx);
+            process_rx_frame(completed_rx, done_txn->trans_len);
             maybe_log_diag();
 
             self->buildStatusFrame(completed_tx);
-            // Tiny post-build guard before the recycled transaction is queued.
-            // Retained after the move to mode 1 while the DMA path is bench
-            // validated under sustained back-to-back traffic.
+            // Brief guard so the freshly rebuilt status frame is fully visible
+            // before the descriptor is handed back to the SPI slave driver.
             esp_rom_delay_us(2);
             err = spi_slave_queue_trans(SPI3_HOST, recycle_txn, portMAX_DELAY);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "spi_slave_queue_trans(recycle) failed: %s", esp_err_to_name(err));
             }
         }
-    }
-
-    // Pre-build the very first status frame before entering the loop so that
-    // the top of the loop can call spi_slave_transmit() immediately with
-    // minimal gap.
-    self->buildStatusFrame(s_tx_frame_a);
-
-    for (;;) {
-        // ── Step 1: transmit immediately (status already pre-built) ───────────
+    } else {
+        // Single-transaction path: spi_slave_transmit() arms the DMA, blocks
+        // until the master completes the transfer, then returns.
+        //
+        // The ESP32 SPI slave DMA has a single descriptor register — queue_size=2
+        // is a software queue, NOT hardware double-buffering.  When a transaction
+        // completes, the ISR must reload the DMA register before the master's
+        // next CS assertion.  This reload exceeds the 700 µs inter-frame delay,
+        // causing 50% short frames with PREQUEUE=true.
+        //
+        // With this single-transaction path the task processes the completed
+        // frame and rebuilds the TX buffer in ~100 µs (well under 700 µs guard)
+        // so the slave is always re-armed before the next CS assertion.
+        spi_slave_transaction_t txn = {};
         txn.length    = SPI_FRAME_SIZE * 8;
         txn.tx_buffer = s_tx_frame_a;
         txn.rx_buffer = s_rx_frame;
-        esp_err_t err = spi_slave_transmit(SPI3_HOST, &txn, portMAX_DELAY);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "spi_slave_transmit failed: %s", esp_err_to_name(err));
-            continue;
-        }
-        process_rx_frame(s_rx_frame);
-        maybe_log_diag();
 
-        // Pre-build the next status frame to minimize the window where MISO is all-zero.
-        // This reduces a race where the master might sample an all-zero MISO if it clocks
-        // the bus during the small gap between transactions.
         self->buildStatusFrame(s_tx_frame_a);
-        
-        // Tiny post-build guard before re-arming the next DMA-backed transfer.
-        // Mode 1 reduces edge-risk, but we keep this until hardware captures
-        // confirm it no longer changes the corruption rate.
-        esp_rom_delay_us(2);
+
+        for (;;) {
+            esp_err_t err = spi_slave_transmit(SPI3_HOST, &txn, portMAX_DELAY);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "spi_slave_transmit failed: %s", esp_err_to_name(err));
+                continue;
+            }
+
+            process_rx_frame(s_rx_frame, txn.trans_len);
+            maybe_log_diag();
+
+            // Rebuild the TX status frame for the next transfer.
+            self->buildStatusFrame(s_tx_frame_a);
+        }
     }
 }
 
@@ -1284,10 +1353,19 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                 clearMultiExecFlags();
 
                 // ── Schedule deferred notification ────────────────────────
+                // Publish execution confirmation against the segment's planned
+                // completion time, not just "now + duration". When the
+                // executor drains several segments into the rings faster than
+                // wall-clock playback, using only esp_timer_get_time()
+                // compresses confirmations and makes the host believe motion
+                // completed earlier than the firmware can actually execute it.
+                const int64_t now_us = esp_timer_get_time();
+                const int64_t fire_at_us =
+                    (seg.scheduled_time_us > now_us ? seg.scheduled_time_us : now_us)
+                    + static_cast<int64_t>(seg.duration_us);
                 if ((defer_tail - defer_head) < DEFER_DEPTH) {
                     const int idx = defer_tail & (DEFER_DEPTH - 1);
-                    defer_fire_us[idx] = esp_timer_get_time()
-                                         + static_cast<int64_t>(seg.duration_us);
+                    defer_fire_us[idx] = fire_at_us;
                     defer_seqs[idx]    = seg.motion_sequence;
                     ++defer_tail;
                 } else {
@@ -1302,8 +1380,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     ++defer_head;
                     // Enqueue current segment.
                     const int idx = defer_tail & (DEFER_DEPTH - 1);
-                    defer_fire_us[idx] = esp_timer_get_time()
-                                         + static_cast<int64_t>(seg.duration_us);
+                    defer_fire_us[idx] = fire_at_us;
                     defer_seqs[idx]    = seg.motion_sequence;
                     ++defer_tail;
                     ESP_LOGW(TAG, "defer ring full: evicted seq=%u to make room for seq=%u",

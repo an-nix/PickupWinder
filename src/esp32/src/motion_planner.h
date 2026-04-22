@@ -189,7 +189,7 @@ private:
      * @brief Planner task body.
      *
      * Pinned to Core 0, priority 8 (below SPI task at 10, above idle).
-     * Runs in SPI task's idle time between spi_slave_transmit() calls.
+     * Runs opportunistically alongside the SPI task on Core 0.
      */
     static void plannerTask(void* arg);
 };

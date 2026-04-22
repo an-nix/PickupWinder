@@ -59,6 +59,7 @@ static constexpr gpio_num_t SPI_MOSI = GPIO_NUM_23;
 static constexpr gpio_num_t SPI_MISO = GPIO_NUM_19;
 static constexpr gpio_num_t SPI_SCLK = GPIO_NUM_18;
 static constexpr gpio_num_t SPI_CS   = GPIO_NUM_5;
+static constexpr gpio_num_t SPI_READY = GPIO_NUM_NC;
 
 // Lateral home sensor (2-contact)
 static constexpr gpio_num_t HOME_NO = GPIO_NUM_21;
@@ -116,7 +117,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(queue_b.init());
 
     // ── 4. Start SPI communication interface (Core 0, priority 10) ────────
-    ESP_ERROR_CHECK(comm.init({SPI_MOSI, SPI_MISO, SPI_SCLK, SPI_CS, HOME_NO, HOME_NC}));
+    ESP_ERROR_CHECK(comm.init({SPI_MOSI, SPI_MISO, SPI_SCLK, SPI_CS, SPI_READY, HOME_NO, HOME_NC}));
 
     // app_main may return — FreeRTOS scheduler continues running the tasks.
     ESP_LOGI(TAG, "Scheduler running — app_main exiting.");

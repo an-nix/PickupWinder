@@ -568,9 +568,10 @@ class MoveQueue:
         )
 
     def _set_endstop_armed(self, axis_id: int, arm: bool) -> Any:
-        sequence, _ = self._transport.enable_endstop_request(axis_id, arm=arm)
+        sequence, send_status = self._transport.enable_endstop_request(axis_id, arm=arm)
         status = self._transport.wait_for_request_result(
             sequence,
+            hint_status=send_status,
             poll_interval_s=self._poll_interval_s,
         )
         self._update_axis_endstop_state(axis_id, status)
