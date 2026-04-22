@@ -984,8 +984,10 @@ class MultiAxisRampStreamer:
                             status.ring_free_slots,
                             status.underrun_count,
                         )
-                    # Give the ESP32's spiTask time to re-arm spi_slave_transmit()
-                    # before sending the next batch in this tight loop.
+                    # Tight-loop pacing is provided by the per-transfer guard
+                    # in spi_transport plus the outer-loop sleep policy. Avoid
+                    # inserting another ad hoc per-batch sleep here unless a
+                    # new bench run shows the mode-1 link still needs it.
 
                 if self._flush_sequence_requested is not None:
                     self._flush_requested_stop()

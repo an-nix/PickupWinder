@@ -285,8 +285,8 @@ void MotionPlanner::plannerTask(void* arg)
         //    get CPU immediately after any batch of work.
         //    If nothing was processed AND xQueueReceive returned immediately
         //    (no pending block and empty cmd_queue), do a minimal 1-tick sleep
-        //    (= 1ms at CONFIG_FREERTOS_HZ=1000) to avoid a busy-loop that
-        //    creates DMA timing jitter on Core 0 and causes 0x0150 bad magic.
+        //    (= 1ms at CONFIG_FREERTOS_HZ=1000) to avoid a busy-loop that can
+        //    starve Core 0 and aggravate SPI timing sensitivity.
         if (processed > 0) {
             taskYIELD();
         } else if (!self->has_pending_block_) {

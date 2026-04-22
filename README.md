@@ -5,6 +5,7 @@ Automated and assisted guitar pickup winding with a Raspberry Pi host and an ESP
 - Host: Python on Raspberry Pi
 - MCU: ESP32 with ESP-IDF and FreeRTOS
 - Link: full-duplex SPI, fixed 512-byte frames
+- Active SPI mode: 1 (CPOL=0, CPHA=1)
 - Production motion path: `MULTI_AXIS_SEGMENT_BLOCK`
 
 ## Active code layout

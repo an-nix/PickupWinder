@@ -130,7 +130,7 @@ def run_segment_json(args: argparse.Namespace) -> None:
         transport = MockSpiTransport()
         print("Simulation mode enabled: no real SPI access")
     else:
-        transport = Esp32SpiTransport(bus=args.bus, device=args.device, speed_hz=args.speed_hz, mode=0)
+        transport = Esp32SpiTransport(bus=args.bus, device=args.device, speed_hz=args.speed_hz, mode=1)
 
     with transport:
         streamer = MultiAxisRampStreamer.from_axis_ids(

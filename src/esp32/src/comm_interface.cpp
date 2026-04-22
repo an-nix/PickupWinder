@@ -174,7 +174,9 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     bus_cfg.max_transfer_sz = SPI_FRAME_SIZE;
 
     spi_slave_interface_config_t slave_cfg = {};
-    slave_cfg.mode = 0;
+    // Run the DMA-backed SPI slave in mode 1 to match the host and avoid the
+    // edge-timing sensitivity previously seen in mode 0.
+    slave_cfg.mode = 1;
     slave_cfg.spics_io_num = pins_.cs;
     slave_cfg.queue_size = SPI_EXPERIMENTAL_PREQUEUE ? 2 : 1;
     slave_cfg.flags = 0;
@@ -226,8 +228,8 @@ esp_err_t CommInterface::init(const SpiBusPins& pins)
     }
 
     // Log configured pins and frame size once initialization completes.
-    ESP_LOGI(TAG, "SPI slave ready  MOSI=%d MISO=%d SCLK=%d CS=%d  frame=%uB",
-             (int)pins_.mosi, (int)pins_.miso, (int)pins_.sclk, (int)pins_.cs,
+    ESP_LOGI(TAG, "SPI slave ready  mode=%d MOSI=%d MISO=%d SCLK=%d CS=%d  frame=%uB",
+             (int)slave_cfg.mode, (int)pins_.mosi, (int)pins_.miso, (int)pins_.sclk, (int)pins_.cs,
              (unsigned)SPI_FRAME_SIZE);
     if (SPI_EXPERIMENTAL_PREQUEUE) {
         ESP_LOGW(TAG,
@@ -951,11 +953,9 @@ void CommInterface::spiTask(void* arg)
             maybe_log_diag();
 
             self->buildStatusFrame(completed_tx);
-            // Flush CPU cache into DMA-capable DRAM before the hardware reads
-            // the rebuilt frame.  Same rationale as the production-path delay:
-            // without this, the DMA engine may read stale bytes from the cache,
-            // which is the most likely mechanism behind any "1-byte shift" seen
-            // in practice.
+            // Tiny post-build guard before the recycled transaction is queued.
+            // Retained after the move to mode 1 while the DMA path is bench
+            // validated under sustained back-to-back traffic.
             esp_rom_delay_us(2);
             err = spi_slave_queue_trans(SPI3_HOST, recycle_txn, portMAX_DELAY);
             if (err != ESP_OK) {
@@ -987,8 +987,9 @@ void CommInterface::spiTask(void* arg)
         // the bus during the small gap between transactions.
         self->buildStatusFrame(s_tx_frame_a);
         
-        // Tiny delay to ensure CPU caches flush into DMA-capable RAM before the next transaction.
-        // Prevents a 1-byte FIFO alignment glitch on rapid back-to-back transfers.
+        // Tiny post-build guard before re-arming the next DMA-backed transfer.
+        // Mode 1 reduces edge-risk, but we keep this until hardware captures
+        // confirm it no longer changes the corruption rate.
         esp_rom_delay_us(2);
     }
 }

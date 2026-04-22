@@ -83,7 +83,7 @@ def run_demo(args: argparse.Namespace) -> DemoSummary:
         bus=args.bus,
         device=args.device,
         speed_hz=args.speed_hz,
-        mode=0,
+        mode=1,
     ) as transport:
         print("Initial status:", transport.get_status())
         print("Reset stats:", transport.reset_stats())

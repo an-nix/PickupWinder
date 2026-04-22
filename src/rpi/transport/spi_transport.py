@@ -45,7 +45,7 @@ class Esp32SpiTransport:
         *,
         device_path: str | None = None,
         speed_hz: int = 1_000_000,
-        mode: int = 0,
+        mode: int = 1,
     ):
         try:
             import spidev  # type: ignore
@@ -137,12 +137,11 @@ class Esp32SpiTransport:
         hidden defaults. Prefers xfer3 when available.
         """
         tx = list(frame)
-        # delay_usecs=700: the ESP32 needs ~0.5 ms to process a received frame
-        # (handleFrame + buildStatusFrame) and re-arm spi_slave_transmit().
-        # 15 µs was too short — the DMA TX buffer was not armed when the Pi
-        # sent the next frame, causing a 1-byte shift (bad magic: 0x0150).
-        # 700 µs gives comfortable margin with negligible throughput impact
-        # (700 µs vs 4096 µs transfer time = <15% overhead at 1 MHz).
+        # delay_usecs=700 keeps margin while the ESP32 parses the received
+        # frame, rebuilds the next STATUS payload, and re-arms the slave DMA
+        # transaction. This guard was introduced during the mode-0
+        # investigation and is retained after the move to mode 1 until bench
+        # data shows it can be reduced safely.
         if hasattr(self._spi, "xfer3"):
             return bytes(self._spi.xfer3(tx, self._speed_hz, 700, 8))
         return bytes(self._spi.xfer2(tx, self._speed_hz, 700, 8))
@@ -180,7 +179,7 @@ class Esp32SpiTransport:
     def transfer_frame(self, frame: bytes) -> StatusPayload:
         """Perform one SPI full-duplex transfer and parse the status response.
 
-        Retries up to 4 times on transient bad-magic / bad-CRC frames.  When
+        Retries up to 15 times on transient bad-magic / bad-CRC frames.  When
         the SPI slave returns all-zeros it means the ESP32 had no transaction
         queued (SPI task was briefly between spi_slave_transmit() calls).  In
         that case the slave also discarded MOSI, so resending is safe.
@@ -213,9 +212,9 @@ class Esp32SpiTransport:
                     if is_zero:
                         self._diag_zero_rx += 1
                         self._diag_lifetime_zero_rx += 1
-                    # Zero-frame = ESP32 between spi_slave_transmit() calls
-                    # (~50 µs gap).  Retry immediately — no sleep.
-                    # Non-zero bad magic/CRC = real corruption — short sleep.
+                    # Zero-frame = ESP32 between spi_slave_transmit() calls.
+                    # Retry with a shorter backoff than for non-zero
+                    # corruption so the host keeps pace without busy-spinning.
                     if attempt < 14:
                         if is_zero:
                             time.sleep(0.0005)
@@ -326,8 +325,10 @@ class Esp32SpiTransport:
                     if is_zero:
                         self._diag_zero_rx += 1
                         self._diag_lifetime_zero_rx += 1
-                    # Zero-frame: retry immediately (ESP gap is ~50 µs).
-                    # Non-zero corruption: short sleep.
+                    # Retry corrupted polls with a short backoff. Zero-frames
+                    # get the same treatment here because this path is
+                    # telemetry-only and does not need the tighter request
+                    # retry behavior used by transfer_frame().
                     time.sleep(0.001)
                     self._diag_maybe_log()
                     continue

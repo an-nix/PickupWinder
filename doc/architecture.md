@@ -62,6 +62,7 @@ The SPI link is full-duplex and fixed size.
 - Header size: `12` bytes
 - CRC: `CRC16-CCITT-FALSE`
 - Endianness: little-endian
+- Electrical mode: SPI mode 1 on both the Raspberry Pi host and the ESP32 slave
 
 The production motion message is `MULTI_AXIS_SEGMENT_BLOCK`. `STEP_BLOCK` and `SEGMENT_BLOCK` remain for debug and legacy tooling only.
 

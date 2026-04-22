@@ -15,6 +15,8 @@ Ce document décrit le format des trames SPI, la sémantique d'ACK pipelinée, e
 
 Une transaction SPI échange toujours une trame complète dans chaque sens.
 
+Mode électrique actif : SPI mode `1` (`CPOL=0`, `CPHA=1`) sur le Raspberry Pi et sur l'ESP32. Cette symétrie est requise ; mélanger les modes ou revenir en mode `0` réintroduit une zone de timing déjà observée comme fragile avec le slave DMA ESP32.
+
 ```text
 Host TX request N   ---> ESP32 parses request N
 Host RX status N   <--- ESP32 returns status built after request N-1

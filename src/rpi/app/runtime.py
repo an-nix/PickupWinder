@@ -54,7 +54,7 @@ def _build_axis_states(config: AppConfiguration) -> dict[int, AxisState]:
 def _create_transport(config: AppConfiguration) -> Esp32SpiTransport:
     bus, device = _parse_spi_device(config.spi_device)
     logger.info(
-        "Opening SPI transport on %s @ %d Hz",
+        "Opening SPI transport on %s @ %d Hz (mode 1)",
         config.spi_device,
         config.spi_speed_hz,
     )
@@ -62,7 +62,7 @@ def _create_transport(config: AppConfiguration) -> Esp32SpiTransport:
         bus=bus,
         device=device,
         speed_hz=config.spi_speed_hz,
-        mode=0,
+        mode=1,
     )
 
 

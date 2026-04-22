@@ -42,8 +42,8 @@ def parse_args() -> argparse.Namespace:
 
 def build_transport(args: argparse.Namespace) -> Esp32SpiTransport:
     if args.bus is not None and args.device is not None:
-        return Esp32SpiTransport(bus=args.bus, device=args.device, speed_hz=args.speed_hz, mode=0)
-    return Esp32SpiTransport(device_path=args.spi_device, speed_hz=args.speed_hz, mode=0)
+        return Esp32SpiTransport(bus=args.bus, device=args.device, speed_hz=args.speed_hz, mode=1)
+    return Esp32SpiTransport(device_path=args.spi_device, speed_hz=args.speed_hz, mode=1)
 
 
 def send_enable(transport: Esp32SpiTransport, axis_id: int, enable: bool, poll_interval: float) -> None:
