@@ -1166,19 +1166,73 @@ void CommInterface::multiAxisExecutorTask(void* arg)
         // IDLE: wait for segments from the planner
         // ══════════════════════════════════════════════════════════════════
         case ExecState::IDLE: {
-            // Non-blocking receive: coast-mode keeps RMT alive during gaps,
-            // so we must refill the ring ASAP. A blocking wait would delay
-            // step delivery and cause coast-mode pauses at low speed.
+            // Blocking receive with a 2-tick (2 ms) timeout.
+            //
+            // Why blocking, not timeout=0?
+            // When the planner (Core 0) calls xQueueSend(segment_queue_),
+            // ESP-IDF SMP FreeRTOS calls xTaskRemoveFromEventList() which
+            // moves this task from xTasksWaitingToReceive → ready list,
+            // then fires an IPI (portYIELD_WITHIN_API → portYIELD_OTHER_CORE)
+            // to Core 1.  The executor wakes within a few µs.
+            //
+            // With the old non-blocking (timeout=0) + vTaskDelay(1) pattern
+            // the executor slept on a TIMER, NOT on the queue, so the IPI
+            // was never triggered.  The mandatory 1-ms polling gap let the
+            // RMT ring drain completely at 1500 RPM before the executor
+            // re-fetched segments → axis 0 underrun_count advanced.
             planned_segment_t seg;
-            if (xQueueReceive(seg_queue, &seg, 0) == pdTRUE) {
+            if (xQueueReceive(seg_queue, &seg, pdMS_TO_TICKS(2)) == pdTRUE) {
                 batch[0]    = seg;
                 batch_count = 1;
                 batch_index = 0;
                 state = ExecState::FETCH;
             } else {
-                // Timeout — kick-start any stalled axes (RMT underrun
-                // while we were blocked on xQueueReceive).
+                // 2-ms timeout — segment queue was empty.
                 kickStartActiveAxes();
+
+                // ── Deferred notification flush-on-idle ───────────────────
+                // When the segment queue is empty AND all active axis rings
+                // are completely empty, the motor has physically finished
+                // executing every pending step.
+                //
+                // Normally fireDeferred() only fires a notification when
+                // esp_timer_get_time() >= fire_at_us (the scheduled
+                // completion time).  But if the planner's timeline was ahead
+                // of wall-clock (segments buffered into the ring faster than
+                // real-time), fire_at_us can be tens to hundreds of ms in
+                // the future even though the ring is already drained.
+                //
+                // During that window last_executed_sequence stays frozen,
+                // the host's inflight queue doesn't drain, the host stops
+                // sending new segments, and after 5 s the stall detector
+                // fires — causing ~30-second blockages.
+                //
+                // Solution: when both ring and segment queue are empty, fire
+                // ALL remaining deferred notifications immediately.  The
+                // host's last_executed_sequence catches up within milliseconds
+                // and resumes sending without triggering stall detection.
+                if (defer_head != defer_tail && active_axis_count > 0) {
+                    bool all_rings_empty = true;
+                    for (uint8_t a = 0;
+                         a < active_axis_count && all_rings_empty; ++a) {
+                        const uint8_t aid = active_axis_ids[a];
+                        if (aid < self->n_motors_ &&
+                            self->queues_[aid] != nullptr &&
+                            self->queues_[aid]->driver().ringFreeSlots()
+                                < STEP_RING_SIZE) {
+                            all_rings_empty = false;
+                        }
+                    }
+                    if (all_rings_empty) {
+                        // Flush: fire all pending deferred notifications now.
+                        while (defer_head != defer_tail) {
+                            const int idx = defer_head & (DEFER_DEPTH - 1);
+                            self->notifySegmentExecuted(
+                                static_cast<uint16_t>(defer_seqs[idx]));
+                            ++defer_head;
+                        }
+                    }
+                }
             }
             break;
         }
@@ -1477,13 +1531,12 @@ void CommInterface::multiAxisExecutorTask(void* arg)
 
         } // switch(state)
 
-        // ── Watchdog safety: yield if idle, sleep if very idle ───────────────
-        // If we fetched zero segments in FETCH, sleep to let IDLE1 run.
-        // Otherwise, yield to respect other tasks without 10ms stalls.
-        if (state == ExecState::IDLE && batch_count == 0) {
-            vTaskDelay(1);  // Very idle — sleep and let watchdog reset
-        } else {
-            taskYIELD();    // Still have work — yield but stay ready
+        // ── Watchdog safety: yield between non-IDLE state transitions ────────
+        // IDLE already blocks inside xQueueReceive above — no extra sleep
+        // needed.  All other states do bounded work then yield so higher-
+        // priority tasks (SPI, sensor) get CPU promptly.
+        if (state != ExecState::IDLE) {
+            taskYIELD();
         }
     } // for(;;)
 }

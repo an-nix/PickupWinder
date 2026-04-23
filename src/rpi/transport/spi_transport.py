@@ -9,6 +9,7 @@ from typing import Iterable
 
 from transport.messages import (
     SPI_FRAME_SIZE,
+    MessageHeader,
     SpiMessageType,
     SpiMessageResult,
     StatusPayload,
@@ -44,7 +45,7 @@ class Esp32SpiTransport:
         device: int | None = None,
         *,
         device_path: str | None = None,
-        speed_hz: int = 8_000_000,
+        speed_hz: int = 4_000_000,
         mode: int = 1,
     ):
         try:
@@ -74,21 +75,25 @@ class Esp32SpiTransport:
         # On Raspberry Pi spidev, delay_usecs is a controller-side transfer
         # delay and does not reliably create a slave-visible re-arm window
         # between two separate Python xfer calls. Without a ready GPIO, the
-        # ESP32 slave needs a small host-side gap so spi_slave_transmit() can
+        # ESP32 slave needs a host-visible idle gap so spi_slave_transmit() can
         # rebuild and re-arm the next DMA descriptor before CS is asserted
-        # again. Empirically, 500 µs removes the recurring short-frame pattern
-        # while keeping enough throughput for 1500 RPM tests at 8 MHz.
-        self._inter_transfer_guard_s: float = 0.0005
+        # again. Espressif explicitly recommends a ready/handshake GPIO; while
+        # we still run without that wire, use a conservative software guard.
+        # 800 µs costs little at 4 MHz because one motion frame can carry many
+        # segments, but it materially reduces short frames and bad-magic polls.
+        self._inter_transfer_guard_s: float = 0.0008
         self._last_xfer_end_ts: float = 0.0
         self._diag_total_xfers: int = 0
         self._diag_bad_magic: int = 0
         self._diag_bad_crc: int = 0
         self._diag_zero_rx: int = 0
+        self._diag_echo_rx: int = 0
         self._diag_reopens: int = 0
         self._diag_lifetime_total_xfers: int = 0
         self._diag_lifetime_bad_magic: int = 0
         self._diag_lifetime_bad_crc: int = 0
         self._diag_lifetime_zero_rx: int = 0
+        self._diag_lifetime_echo_rx: int = 0
         self._diag_lifetime_reopens: int = 0
         self._diag_last_log_ts: float = time.monotonic()
 
@@ -167,21 +172,51 @@ class Esp32SpiTransport:
     def _diag_maybe_log(self) -> None:
         now = time.monotonic()
         if now - self._diag_last_log_ts >= 1.0:
-            if self._diag_bad_magic or self._diag_bad_crc or self._diag_zero_rx:
+            if self._diag_bad_magic or self._diag_bad_crc or self._diag_zero_rx or self._diag_echo_rx:
                 logger.warning(
-                    "spi diag host: xfers=%d bad_magic=%d bad_crc=%d zero_rx=%d reopens=%d",
+                    "spi diag host: xfers=%d bad_magic=%d bad_crc=%d zero_rx=%d echo_rx=%d reopens=%d",
                     self._diag_total_xfers,
                     self._diag_bad_magic,
                     self._diag_bad_crc,
                     self._diag_zero_rx,
+                    self._diag_echo_rx,
                     self._diag_reopens,
                 )
             self._diag_total_xfers = 0
             self._diag_bad_magic = 0
             self._diag_bad_crc = 0
             self._diag_zero_rx = 0
+            self._diag_echo_rx = 0
             self._diag_reopens = 0
             self._diag_last_log_ts = now
+
+    @staticmethod
+    def _is_echoed_request_response(request_frame: bytes, response_frame: bytes) -> bool:
+        """Return True when *response_frame* is just the host request echoed back.
+
+        This shows up in the field as a parseable header with the request type
+        (commonly GET_STATUS = 0x06) instead of STATUS, and with the same
+        sequence/CRC as the frame we just transmitted. Treat it as transient
+        link noise / slave-not-ready behavior and retry.
+        """
+        if len(request_frame) != SPI_FRAME_SIZE or len(response_frame) != SPI_FRAME_SIZE:
+            return False
+        try:
+            request_header = MessageHeader.unpack(request_frame)
+            response_header = MessageHeader.unpack(response_frame)
+        except Exception:
+            return False
+        if response_header.msg_type == int(SpiMessageType.STATUS):
+            return False
+        return (
+            response_header.magic == request_header.magic
+            and response_header.version == request_header.version
+            and response_header.msg_type == request_header.msg_type
+            and response_header.sequence == request_header.sequence
+            and response_header.payload_length == request_header.payload_length
+            and response_header.flags == request_header.flags
+            and response_header.crc16 == request_header.crc16
+        )
 
     def __enter__(self) -> "Esp32SpiTransport":
         return self
@@ -219,6 +254,12 @@ class Esp32SpiTransport:
                 return status
             except ValueError as exc:
                 last_exc = exc
+                if self._is_echoed_request_response(frame, response):
+                    self._diag_echo_rx += 1
+                    self._diag_lifetime_echo_rx += 1
+                    if attempt < 14:
+                        time.sleep(0.0005)
+                        continue
                 if "bad magic" in str(exc) or "bad response CRC" in str(exc):
                     is_zero = response[:32] == b"\x00" * 32
                     if "bad magic" in str(exc):
@@ -252,7 +293,7 @@ class Esp32SpiTransport:
         sequence: int,
         *,
         hint_status: StatusPayload | None = None,
-        poll_interval_s: float = 0.0001,
+        poll_interval_s: float = 0.0005,
         timeout_s: float = 1.5,
     ) -> StatusPayload:
         """Wait until the ESP32 acknowledges *sequence* via last_rx_sequence.
@@ -339,6 +380,12 @@ class Esp32SpiTransport:
                 return status
             except ValueError as exc:
                 last_exc = exc
+                if self._is_echoed_request_response(frame, response):
+                    self._diag_echo_rx += 1
+                    self._diag_lifetime_echo_rx += 1
+                    time.sleep(0.0005)
+                    self._diag_maybe_log()
+                    continue
                 # show a short hex preview to aid debugging (first 32 bytes)
                 try:
                     preview = response[:32].hex()
@@ -405,6 +452,7 @@ class Esp32SpiTransport:
             "bad_magic": self._diag_lifetime_bad_magic,
             "bad_crc": self._diag_lifetime_bad_crc,
             "zero_rx": self._diag_lifetime_zero_rx,
+            "echo_rx": self._diag_lifetime_echo_rx,
             "reopens": self._diag_lifetime_reopens,
             "last_status_age_s": last_status_age_s,
         }

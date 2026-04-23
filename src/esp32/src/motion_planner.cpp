@@ -35,7 +35,7 @@ static const char* TAG = "planner";
 // ---------------------------------------------------------------------------
 
 static constexpr uint32_t    PLANNER_STACK = 4096;
-static constexpr UBaseType_t PLANNER_PRIO  = 8;   // Below SPI (10), above idle
+static constexpr UBaseType_t PLANNER_PRIO  = 23;  // Just below SPI task (24) on Core 0
 static constexpr BaseType_t  PLANNER_CORE  = 0;   // Same core as SPI task
 
 /** Current depth of the SPI→planner multi-axis command queue. */
