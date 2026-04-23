@@ -11,6 +11,9 @@ class AppConfiguration:
     rpc_socket_path: str = "/tmp/winding.sock"
     spi_device: str = "/dev/spidev0.0"
     spi_speed_hz: int = 4_000_000
+    spi_ready_gpio_chip: Optional[str] = "/dev/gpiochip0"
+    spi_ready_gpio_line: Optional[int] = 17
+    spi_ready_active_high: bool = True
 
     spindle_axis_id: int = 0
     spindle_steps_per_revolution: int = 200
@@ -65,6 +68,10 @@ class AppConfiguration:
             raise ValueError("lateral_steps_per_mm_override must be positive")
         if not re.fullmatch(r"/dev/spidev\d+\.\d+", self.spi_device):
             raise ValueError("spi_device must be in the form /dev/spidev<bus>.<device>")
+        if self.spi_ready_gpio_chip is not None and not str(self.spi_ready_gpio_chip).startswith("/dev/gpiochip"):
+            raise ValueError("spi_ready_gpio_chip must be in the form /dev/gpiochipN")
+        if self.spi_ready_gpio_line is not None and self.spi_ready_gpio_line < 0:
+            raise ValueError("spi_ready_gpio_line must be non-negative")
         if (
             self.lateral_soft_limit_min_mm is not None
             and self.lateral_soft_limit_max_mm is not None

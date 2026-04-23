@@ -22,7 +22,9 @@
  *   Motor B (Lateral / axis 1) : STEP=GPIO32  DIR=GPIO33  EN=GPIO25
  *
  *   SPI host link              : MOSI=GPIO23  MISO=GPIO19
- *                                SCLK=GPIO18  CS=GPIO5
+ *                                SCLK=GPIO18  CS=GPIO5  READY=GPIO17
+ *
+ *   Raspberry Pi control       : SHUTDOWN_REQ=GPIO16
  *
  * The Raspberry Pi demo lives in `src/rpi/` and streams fixed-size SPI
  * message frames to this firmware.
@@ -59,7 +61,10 @@ static constexpr gpio_num_t SPI_MOSI = GPIO_NUM_23;
 static constexpr gpio_num_t SPI_MISO = GPIO_NUM_19;
 static constexpr gpio_num_t SPI_SCLK = GPIO_NUM_18;
 static constexpr gpio_num_t SPI_CS   = GPIO_NUM_5;
-static constexpr gpio_num_t SPI_READY = GPIO_NUM_NC;
+static constexpr gpio_num_t SPI_READY = GPIO_NUM_17;
+
+// Raspberry Pi sideband control
+static constexpr gpio_num_t RPI_SHUTDOWN_REQ = GPIO_NUM_16;
 
 // Lateral home sensor (2-contact)
 static constexpr gpio_num_t HOME_NO = GPIO_NUM_21;
@@ -77,6 +82,32 @@ static StepperQueue  queue_b(motor_b, 1);
 
 static StepperQueue* queues[2] = {&queue_a, &queue_b};
 static CommInterface comm(queues, 2);
+
+static constexpr uint32_t RPI_SHUTDOWN_TASK_STACK = 2048;
+static constexpr UBaseType_t RPI_SHUTDOWN_TASK_PRIO = 2;
+static constexpr BaseType_t RPI_SHUTDOWN_TASK_CORE = 0;
+
+static void rpiShutdownSignalTask(void* arg)
+{
+    const gpio_num_t shutdown_pin = *static_cast<const gpio_num_t*>(arg);
+
+    gpio_config_t shutdown_cfg = {};
+    shutdown_cfg.pin_bit_mask = (1ULL << static_cast<uint32_t>(shutdown_pin));
+    shutdown_cfg.mode = GPIO_MODE_OUTPUT;
+    shutdown_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    shutdown_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    shutdown_cfg.intr_type = GPIO_INTR_DISABLE;
+    ESP_ERROR_CHECK(gpio_config(&shutdown_cfg));
+
+    // Keep the shutdown request line inactive until a future firmware command
+    // explicitly drives it. Host-side monitoring/handling will be added later.
+    gpio_set_level(shutdown_pin, 0);
+    ESP_LOGI(TAG, "Raspberry Pi shutdown request pin initialized on GPIO%d", (int)shutdown_pin);
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // app_main
@@ -116,7 +147,18 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(queue_a.init());
     ESP_ERROR_CHECK(queue_b.init());
 
-    // ── 4. Start SPI communication interface (Core 0, priority 10) ────────
+    // ── 4. Initialize Raspberry Pi sideband outputs ─────────────────────────
+    BaseType_t shutdown_task_ok = xTaskCreatePinnedToCore(
+        rpiShutdownSignalTask,
+        "rpi_shutdown",
+        RPI_SHUTDOWN_TASK_STACK,
+        (void*)&RPI_SHUTDOWN_REQ,
+        RPI_SHUTDOWN_TASK_PRIO,
+        nullptr,
+        RPI_SHUTDOWN_TASK_CORE);
+    ESP_ERROR_CHECK(shutdown_task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+
+    // ── 5. Start SPI communication interface (Core 0, priority 10) ────────
     ESP_ERROR_CHECK(comm.init({SPI_MOSI, SPI_MISO, SPI_SCLK, SPI_CS, SPI_READY, HOME_NO, HOME_NC}));
 
     // app_main may return — FreeRTOS scheduler continues running the tasks.

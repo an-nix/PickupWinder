@@ -63,7 +63,8 @@ The SPI link is full-duplex and fixed size.
 - CRC: `CRC16-CCITT-FALSE`
 - Endianness: little-endian
 - Electrical mode: SPI mode 1 on both the Raspberry Pi host and the ESP32 slave
-- ESP32 uses IO_MUX-native SPI pins and supports an optional extra `ready` GPIO for handshake, as recommended by ESP-IDF for reliable slave timing
+- ESP32 uses IO_MUX-native SPI pins with an active `ready` handshake GPIO on GPIO17, as recommended by ESP-IDF for reliable slave timing
+- ESP32 also exposes a reserved Raspberry Pi sideband output `shutdown_req` on GPIO16 for a future coordinated host shutdown path
 
 The production motion message is `MULTI_AXIS_SEGMENT_BLOCK`. `STEP_BLOCK` and `SEGMENT_BLOCK` remain for debug and legacy tooling only.
 
@@ -180,9 +181,10 @@ The Raspberry Pi consumes normalized state and owns higher-level policy such as 
 |---|---:|
 | Bobbin STEP / DIR / EN | 26 / 27 / 14 |
 | Lateral STEP / DIR / EN | 32 / 33 / 25 |
-| Tensioner STEP / DIR / EN | 16 / 17 / 4 |
 | Lateral home NO / NC | 22 / 21 |
 | SPI MOSI / MISO / SCLK / CS | 23 / 19 / 18 / 5 |
+| SPI READY | 17 |
+| Raspberry Pi SHUTDOWN_REQ | 16 |
 | HX711 #0 SCK / DOUT | 13 / 34 |
 | HX711 #1 SCK / DOUT | 12 / 39 |
 | Potentiometer | 36 |

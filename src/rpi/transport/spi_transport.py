@@ -36,6 +36,73 @@ from transport.messages import (
 logger = logging.getLogger(__name__)
 
 
+class _ReadyPinMonitor:
+    """Best-effort GPIO input reader for the ESP32 SPI READY sideband.
+
+    Prefers libgpiod v2 when available and falls back to the older Chip/Line API.
+    This keeps the transport usable across Raspberry Pi OS images that ship
+    different python-gpiod versions.
+    """
+
+    def __init__(self, chip_path: str, line_offset: int):
+        try:
+            import gpiod  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "READY GPIO handshake requested but python gpiod module is not installed"
+            ) from exc
+
+        self._gpiod = gpiod
+        self._chip_path = chip_path
+        self._line_offset = line_offset
+        self._reader = self._open_reader()
+
+    def _open_reader(self):
+        gpiod = self._gpiod
+        line_offset = self._line_offset
+        consumer = "pickupwinder-spi-ready"
+
+        if hasattr(gpiod, "request_lines") and hasattr(gpiod, "LineSettings"):
+            config = {
+                line_offset: gpiod.LineSettings(direction=gpiod.line.Direction.INPUT)
+            }
+            request = gpiod.request_lines(
+                self._chip_path,
+                consumer=consumer,
+                config=config,
+            )
+
+            def _read() -> int:
+                value = request.get_value(line_offset)
+                return int(getattr(value, "value", value))
+
+            self._close = getattr(request, "release", lambda: None)
+            return _read
+
+        chip_name = self._chip_path.removeprefix("/dev/")
+        chip = gpiod.Chip(chip_name)
+        line = chip.get_line(line_offset)
+        line.request(consumer=consumer, type=gpiod.LINE_REQ_DIR_IN)
+
+        def _read() -> int:
+            return int(line.get_value())
+
+        def _close() -> None:
+            try:
+                line.release()
+            finally:
+                chip.close()
+
+        self._close = _close
+        return _read
+
+    def value(self) -> int:
+        return self._reader()
+
+    def close(self) -> None:
+        self._close()
+
+
 class Esp32SpiTransport:
     """Thin wrapper around spidev using the PickupWinder fixed SPI frame format."""
 
@@ -47,6 +114,9 @@ class Esp32SpiTransport:
         device_path: str | None = None,
         speed_hz: int = 4_000_000,
         mode: int = 1,
+        ready_gpio_chip: str | None = None,
+        ready_gpio_line: int | None = None,
+        ready_active_high: bool = True,
     ):
         try:
             import spidev  # type: ignore
@@ -71,6 +141,10 @@ class Esp32SpiTransport:
         self._last_status: StatusPayload | None = None
         self._last_status_ts: float = 0.0
         self._last_stale_log_ts: float = 0.0
+        self._ready_monitor: _ReadyPinMonitor | None = None
+        self._ready_active_level = 1 if ready_active_high else 0
+        self._ready_wait_timeout_s = 0.050
+        self._ready_poll_sleep_s = 0.00002
         # Real wall-clock gap enforced between completed SPI calls.
         # On Raspberry Pi spidev, delay_usecs is a controller-side transfer
         # delay and does not reliably create a slave-visible re-arm window
@@ -95,9 +169,34 @@ class Esp32SpiTransport:
         self._diag_lifetime_zero_rx: int = 0
         self._diag_lifetime_echo_rx: int = 0
         self._diag_lifetime_reopens: int = 0
+        self._diag_ready_timeouts: int = 0
+        self._diag_lifetime_ready_timeouts: int = 0
         self._diag_last_log_ts: float = time.monotonic()
 
+        if ready_gpio_chip is not None and ready_gpio_line is not None:
+            try:
+                self._ready_monitor = _ReadyPinMonitor(ready_gpio_chip, ready_gpio_line)
+                self._inter_transfer_guard_s = 0.0
+                logger.info(
+                    "SPI READY handshake enabled on %s line %d (active_%s)",
+                    ready_gpio_chip,
+                    ready_gpio_line,
+                    "high" if ready_active_high else "low",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "failed to initialize SPI READY handshake on %s line %d: %s; falling back to software guard",
+                    ready_gpio_chip,
+                    ready_gpio_line,
+                    exc,
+                )
+
     def close(self) -> None:
+        if self._ready_monitor is not None:
+            try:
+                self._ready_monitor.close()
+            except Exception:
+                pass
         self._spi.close()
 
     @staticmethod
@@ -151,11 +250,7 @@ class Esp32SpiTransport:
         Uses explicit speed/mode-compatible arguments on every call to avoid
         hidden defaults. Prefers xfer3 when available.
         """
-        now = time.monotonic()
-        if self._last_xfer_end_ts > 0.0:
-            remaining_gap_s = self._inter_transfer_guard_s - (now - self._last_xfer_end_ts)
-            if remaining_gap_s > 0.0:
-                time.sleep(remaining_gap_s)
+        self._wait_until_ready()
 
         tx = list(frame)
         # Keep the spidev transfer itself simple and rely on the explicit host
@@ -169,17 +264,38 @@ class Esp32SpiTransport:
         self._last_xfer_end_ts = time.monotonic()
         return response
 
+    def _wait_until_ready(self) -> None:
+        if self._ready_monitor is not None:
+            deadline = time.monotonic() + self._ready_wait_timeout_s
+            while time.monotonic() < deadline:
+                if self._ready_monitor.value() == self._ready_active_level:
+                    return
+                time.sleep(self._ready_poll_sleep_s)
+            self._diag_ready_timeouts += 1
+            self._diag_lifetime_ready_timeouts += 1
+            logger.warning(
+                "SPI READY handshake timeout on %s; falling back to software guard for this transfer",
+                self._device_path,
+            )
+
+        now = time.monotonic()
+        if self._last_xfer_end_ts > 0.0:
+            remaining_gap_s = self._inter_transfer_guard_s - (now - self._last_xfer_end_ts)
+            if remaining_gap_s > 0.0:
+                time.sleep(remaining_gap_s)
+
     def _diag_maybe_log(self) -> None:
         now = time.monotonic()
         if now - self._diag_last_log_ts >= 1.0:
-            if self._diag_bad_magic or self._diag_bad_crc or self._diag_zero_rx or self._diag_echo_rx:
+            if self._diag_bad_magic or self._diag_bad_crc or self._diag_zero_rx or self._diag_echo_rx or self._diag_ready_timeouts:
                 logger.warning(
-                    "spi diag host: xfers=%d bad_magic=%d bad_crc=%d zero_rx=%d echo_rx=%d reopens=%d",
+                    "spi diag host: xfers=%d bad_magic=%d bad_crc=%d zero_rx=%d echo_rx=%d ready_timeouts=%d reopens=%d",
                     self._diag_total_xfers,
                     self._diag_bad_magic,
                     self._diag_bad_crc,
                     self._diag_zero_rx,
                     self._diag_echo_rx,
+                    self._diag_ready_timeouts,
                     self._diag_reopens,
                 )
             self._diag_total_xfers = 0
@@ -187,6 +303,7 @@ class Esp32SpiTransport:
             self._diag_bad_crc = 0
             self._diag_zero_rx = 0
             self._diag_echo_rx = 0
+            self._diag_ready_timeouts = 0
             self._diag_reopens = 0
             self._diag_last_log_ts = now
 
@@ -453,6 +570,7 @@ class Esp32SpiTransport:
             "bad_crc": self._diag_lifetime_bad_crc,
             "zero_rx": self._diag_lifetime_zero_rx,
             "echo_rx": self._diag_lifetime_echo_rx,
+            "ready_timeouts": self._diag_lifetime_ready_timeouts,
             "reopens": self._diag_lifetime_reopens,
             "last_status_age_s": last_status_age_s,
         }

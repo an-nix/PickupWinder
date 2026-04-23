@@ -63,6 +63,9 @@ def _create_transport(config: AppConfiguration) -> Esp32SpiTransport:
         device=device,
         speed_hz=config.spi_speed_hz,
         mode=1,
+        ready_gpio_chip=config.spi_ready_gpio_chip,
+        ready_gpio_line=config.spi_ready_gpio_line,
+        ready_active_high=config.spi_ready_active_high,
     )
 
 

@@ -94,6 +94,7 @@ Do not document or extend `src/rpi/core/app.py` as the active runtime path. It i
   - `doc/stepper_engine.md`
   - `doc/sequencing.md` when sequencing logic changes
 - If hardware pins change, update `src/esp32/src/main.cpp`, `doc/architecture.md`, and this file.
+- Current SPI sideband pins: `READY=GPIO17`, `RPI_SHUTDOWN_REQ=GPIO16`.
 - If protocol structs change, update both firmware and Python mirrors in the same change.
 
 ## Cleanup rules

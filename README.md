@@ -4,7 +4,7 @@ Automated and assisted guitar pickup winding with a Raspberry Pi host and an ESP
 
 - Host: Python on Raspberry Pi
 - MCU: ESP32 with ESP-IDF and FreeRTOS
-- Link: full-duplex SPI, fixed 512-byte frames
+- Link: full-duplex SPI, fixed 512-byte frames, with ESP32 `READY` handshake output on GPIO17 and optional Raspberry Pi host-side GPIO polling support
 - Active SPI mode: 1 (CPOL=0, CPHA=1)
 - Production motion path: `MULTI_AXIS_SEGMENT_BLOCK`
 
@@ -96,9 +96,10 @@ Default JSON-RPC socket:
 |---|---:|
 | Bobbin STEP / DIR / EN | 26 / 27 / 14 |
 | Lateral STEP / DIR / EN | 32 / 33 / 25 |
-| Tensioner STEP / DIR / EN | 16 / 17 / 4 |
 | Lateral home NO / NC | 21 / 22 |
 | SPI MOSI / MISO / SCLK / CS | 23 / 19 / 18 / 5 |
+| SPI READY | 17 |
+| Raspberry Pi SHUTDOWN_REQ | 16 |
 | HX711 #0 SCK / DOUT | 13 / 34 |
 | HX711 #1 SCK / DOUT | 12 / 39 |
 | Potentiometer | 36 |
