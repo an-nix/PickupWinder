@@ -539,6 +539,11 @@ void StepperDriver::emergencyStop()
     last_chunk_had_steps_ = false;
     coast_idle_count_ = 0;
 
+        // Fix: rmt_disable/enable peut réinitialiser l'état GPIO.
+    // Réécrire DIR explicitement pour garantir la cohérence
+    // entre last_dir_ et la pin physique.
+    gpio_set_level(dir_pin_, last_dir_ ? 1 : 0);
+
     ESP_LOGW(TAG, "motor%u: emergency stop", motor_id_);
 }
 
@@ -621,16 +626,23 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
     const bool new_dir = block.steps[0].direction;
     bool need_toggle = (new_dir != last_dir_);
 
+ 
+
     // If the ring is empty and the motor is idle, explicitly set the DIR pin
     // to the requested direction now. This avoids relying on the initial
     // `last_dir_` state and ensures reverse mode is applied on the first block.
     if (!rmt_running_.load(std::memory_order_relaxed) &&
         ring_read_.load(std::memory_order_relaxed) == ring_write_.load(std::memory_order_relaxed) &&
-        need_toggle) {
+        need_toggle) 
+        {
+           ESP_LOGI(TAG, "motor%u: pushBlock new_dir=%d last_dir=%d need_toggle=%d rmt_running=%d",
+         motor_id_, (int)new_dir, (int)last_dir_, (int)need_toggle,
+         (int)rmt_running_.load(std::memory_order_relaxed));
         gpio_set_level(dir_pin_, new_dir ? 1 : 0);
         last_dir_ = new_dir;
         need_toggle = false;
-    } else {
+        } 
+    else {
         last_dir_ = new_dir;
     }
     last_dir_commanded_.store(new_dir, std::memory_order_release);

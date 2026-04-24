@@ -18,7 +18,7 @@ class AppConfiguration:
     spindle_axis_id: int = 0
     spindle_steps_per_revolution: int = 200
     spindle_microstepping: int = 32
-    spindle_invert_direction: bool = False
+    spindle_invert_direction: bool = True
     spindle_max_speed_rpm: int = 1750
     # Unit: RPM/s (revolutions per minute gained per second).
     spindle_max_acceleration_rpm: Optional[float] = 500
@@ -28,7 +28,7 @@ class AppConfiguration:
     lateral_axis_id: int = 1
     lateral_steps_per_revolution: int = 200
     lateral_microstepping: int = 32
-    lateral_invert_direction: bool = True
+    lateral_invert_direction: bool = False
     lateral_max_rpm: int = 1000     
     # Unit: mm/s² on traverse axis.
     lateral_max_acceleration_mm_per_s2: Optional[float] = None

@@ -854,6 +854,13 @@ class MoveQueue:
         next_sequence = self._next_motion_sequence()
 
         for phase_name, sub_move, arm_endstop in move.phases():
+            logger.info(
+                    "homing phase=%s arm=%s reverse=%s",
+                    phase_name,
+                    arm_endstop,
+                    sub_move.axis_configs[0].ramp.reverse_direction,
+                    
+                )
             if self._stop_requested:
                 self._set_endstop_armed(move.axis_id, arm=False)
                 stop_plan = self._active_stop_plan or self._default_stop_plan(
