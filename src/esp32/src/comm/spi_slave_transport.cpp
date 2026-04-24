@@ -1,3 +1,8 @@
+/**
+ * @file spi_slave_transport.cpp
+ * @brief SPI slave transport task and frame processing implementation.
+ */
+
 #include "spi_slave_transport.h"
 
 #include <string.h>

@@ -1,3 +1,8 @@
+/**
+ * @file multi_axis_executor.cpp
+ * @brief Multi-axis executor state machine implementation.
+ */
+
 #include "multi_axis_executor.h"
 
 #include <esp_log.h>
@@ -5,7 +10,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include "comm_runtime.h"
+#include "../comm/comm_runtime.h"
 
 static const char* TAG = "multi_exec";
 

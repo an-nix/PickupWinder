@@ -1,3 +1,8 @@
+/**
+ * @file comm_request_dispatcher.h
+ * @brief Dispatch validated SPI requests to motion/control handlers.
+ */
+
 #pragma once
 
 #include <esp_err.h>
@@ -6,10 +11,24 @@
 
 class CommRuntime;
 
+/**
+ * @brief Stateful SPI request dispatcher with deduplication cache.
+ *
+ * Input messages are assumed to be transport-validated (magic/version/CRC). This
+ * class performs payload-level validation, executes the requested action, maps
+ * `esp_err_t` to protocol result codes and publishes ACK metadata.
+ */
 class CommRequestDispatcher {
 public:
+    /** @brief Create dispatcher bound to shared runtime context. */
     explicit CommRequestDispatcher(CommRuntime& runtime);
 
+    /**
+     * @brief Process a validated request frame.
+     * @param header Parsed SPI header.
+     * @param payload Pointer to payload bytes.
+     * @return `SpiMessageResult` value encoded as `uint8_t`.
+     */
     uint8_t processValidatedRequest(const SpiMessageHeader& header,
                                     const uint8_t* payload);
 

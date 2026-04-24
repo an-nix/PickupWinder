@@ -1,3 +1,8 @@
+/**
+ * @file comm_request_dispatcher.cpp
+ * @brief SPI request dispatch and deduplication implementation.
+ */
+
 #include "comm_request_dispatcher.h"
 
 #include <string.h>

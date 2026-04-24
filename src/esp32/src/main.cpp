@@ -35,10 +35,10 @@
 #include <esp_log.h>
 #include <driver/gpio.h>
 
-#include "step_types.h"
-#include "stepper_driver.h"
-#include "stepper_queue.h"
-#include "comm_interface.h"
+#include "motion/step_types.h"
+#include "motion/stepper_driver.h"
+#include "motion/stepper_queue.h"
+#include "comm/comm_interface.h"
 
 static const char* TAG = "main";
 

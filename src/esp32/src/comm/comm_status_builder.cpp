@@ -1,3 +1,8 @@
+/**
+ * @file comm_status_builder.cpp
+ * @brief Status frame composition implementation.
+ */
+
 #include "comm_status_builder.h"
 
 #include <esp_log.h>

@@ -11,24 +11,14 @@
 
 static const char* TAG = "stepper_queue";
 
-// Compile-time invariant: the auto-start fill threshold must be large enough
-// that the second encode_steps ping-pong callback never immediately underruns.
 static_assert(STEP_STREAM_START_FILL >= 2 * PART_SIZE,
               "STEP_STREAM_START_FILL must be >= 2 * PART_SIZE to prevent "
               "immediate ISR underrun on second encoder callback");
-
-// ---------------------------------------------------------------------------
-// Constructor
-// ---------------------------------------------------------------------------
 
 StepperQueue::StepperQueue(StepperDriver& driver, uint8_t motor_id)
     : driver_(driver)
     , motor_id_(motor_id)
 {}
-
-// ---------------------------------------------------------------------------
-// init()
-// ---------------------------------------------------------------------------
 
 esp_err_t StepperQueue::init()
 {
@@ -36,10 +26,6 @@ esp_err_t StepperQueue::init()
              motor_id_);
     return ESP_OK;
 }
-
-// ---------------------------------------------------------------------------
-// enqueueMotionBlock() / enqueueStepBlock() / enqueueSegmentBlock()
-// ---------------------------------------------------------------------------
 
 esp_err_t StepperQueue::enqueueMotionBlock(const motion_block_t& block,
                                            uint32_t timeout_ms)
@@ -70,26 +56,10 @@ esp_err_t StepperQueue::enqueueSegmentBlock(const segment_block_t& block,
     return enqueueMotionBlock(motion, timeout_ms);
 }
 
-// ---------------------------------------------------------------------------
-// available()
-// ---------------------------------------------------------------------------
-
 uint32_t StepperQueue::available() const
 {
     return static_cast<uint32_t>(STEPPER_QUEUE_DEPTH);
 }
-
-// ---------------------------------------------------------------------------
-// executeConstantRateBlock() / kickStart()
-// ---------------------------------------------------------------------------
-//
-// executeConstantRateBlock() deliberately does NOT call maybeStartDriver().
-// The start decision belongs to the caller: MultiAxisExecutor drain loop
-// calls kickStart() ONCE per block batch, after ALL
-// available blocks have been written to the ring.  This guarantees the ring
-// is pre-filled with multiple segments of look-ahead before RMT starts,
-// preventing the per-segment underruns that occur at low speed when each
-// segment contributes only 2–5 steps.
 
 esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
                                                   uint16_t step_count,
@@ -99,7 +69,6 @@ esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
         return ESP_OK;
     }
 
-    // Compute uniform interval: RMT clock is 80 MHz → 80 ticks/µs.
     uint32_t interval_ticks = (duration_us * RMT_TICKS_PER_US) / step_count;
     if (interval_ticks < RMT_STEP_MIN_TICKS) {
         interval_ticks = RMT_STEP_MIN_TICKS;
@@ -129,7 +98,6 @@ esp_err_t StepperQueue::kickStart()
 {
     esp_err_t err = maybeStartDriver(driver_, true);
     if (err != ESP_OK) {
-        // B6: log explicite — diagnostique les échecs RMT silencieux
         ESP_LOGW(TAG, "motor%u: kickStart failed: %s",
                  motor_id_, esp_err_to_name(err));
     }
@@ -140,10 +108,6 @@ void StepperQueue::gracefulStop()
 {
     driver_.gracefulStop();
 }
-
-// ---------------------------------------------------------------------------
-// maybeStartDriver() / pushExpandedBlock()
-// ---------------------------------------------------------------------------
 
 esp_err_t StepperQueue::maybeStartDriver(StepperDriver& driver, bool force_start)
 {
@@ -179,9 +143,6 @@ esp_err_t StepperQueue::maybeStartDriver(StepperDriver& driver, bool force_start
 
 esp_err_t StepperQueue::pushExpandedBlock(StepperDriver& driver, const step_block_t& block)
 {
-    // If RMT is not running AND ring is completely full, we must start
-    // streaming to make room.  This is a safety valve only — normally the
-    // executor calls kickStart() after draining a batch.
     if (!driver.isStreaming() && driver.ringFreeSlots() == 0) {
         esp_err_t err = maybeStartDriver(driver, true);
         if (err != ESP_OK) {
@@ -189,12 +150,5 @@ esp_err_t StepperQueue::pushExpandedBlock(StepperDriver& driver, const step_bloc
         }
     }
 
-    // Pass the current task handle so ISR ring-space notifications wake the
-    // global multi-axis executor when it is blocked on this ring.
     return driver.pushBlock(block, xTaskGetCurrentTaskHandle());
-
-    // NOTE: maybeStartDriver() is NOT called here.
-    // The multi-axis executor calls kickStart() once after draining all available
-    // segments into the ring.  With coast-mode the RMT never stops between
-    // segments, so no restart is needed during normal streaming.
 }

@@ -1,3 +1,8 @@
+/**
+ * @file comm_interface.cpp
+ * @brief Communication subsystem façade implementation.
+ */
+
 #include "comm_interface.h"
 
 #include <driver/gpio.h>
@@ -5,7 +10,7 @@
 
 #include "comm_request_dispatcher.h"
 #include "comm_status_builder.h"
-#include "multi_axis_executor.h"
+#include "../motion/multi_axis_executor.h"
 #include "spi_slave_transport.h"
 
 static const char* TAG = "comm_iface";
