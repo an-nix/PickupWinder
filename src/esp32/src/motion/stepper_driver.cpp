@@ -259,15 +259,8 @@ bool StepperDriver::isEndstopMoveAllowed(bool direction) const
 
 bool StepperDriver::prepareEndstopMove(bool direction)
 {
-    if (!isEndstopMoveAllowed(direction)) {
-        return false;
-    }
-
-    if (endstop_clearance_pending_.load(std::memory_order_acquire)
-        && direction == endstop_clearance_direction_.load(std::memory_order_acquire)) {
-        endstop_active_.store(false, std::memory_order_release);
-    }
-    return true;
+    // FIX 2: permission check only; do not clear endstop_active_ here.
+    return isEndstopMoveAllowed(direction);
 }
 
 void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
@@ -467,6 +460,8 @@ void StepperDriver::emergencyStop()
     coast_idle_count_ = 0;
 
     gpio_set_level(dir_pin_, last_dir_ ? 1 : 0);
+    // FIX 3: force STEP pin low on emergency stop.
+    gpio_set_level(step_pin_, 0);
 
     ESP_LOGW(TAG, "motor%u: emergency stop", motor_id_);
 }
@@ -542,6 +537,11 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
     }
 
     for (uint32_t i = 0; i < count; i++) {
+        // FIX 1: check latch before entering ringFree wait/write path.
+        if (endstop_active_.load(std::memory_order_acquire)) {
+            return ESP_ERR_INVALID_STATE;
+        }
+
         static constexpr uint8_t PUSH_RETRY_MAX = 20;
         uint8_t push_retry_count = 0;
 

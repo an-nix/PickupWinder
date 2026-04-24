@@ -102,10 +102,14 @@ void MultiAxisExecutor::run()
 
     auto requestPlannerFlush = [&](uint16_t motion_sequence) {
         flush_request_t req { .flush_sequence = motion_sequence };
-        if (runtime_.flushQueue() != nullptr && xQueueSend(runtime_.flushQueue(), &req, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "auto-flush queue full after recovery at seq=%u",
-                     static_cast<unsigned>(motion_sequence));
+        // FIX 4: retry flush enqueue before warning.
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (xQueueSend(runtime_.flushQueue(), &req, pdMS_TO_TICKS(1)) == pdTRUE) {
+                return;
+            }
         }
+        ESP_LOGW(TAG, "auto-flush queue full after 3 retries at seq=%u",
+                 static_cast<unsigned>(motion_sequence));
     };
 
     uint32_t wm_iter = 0;
