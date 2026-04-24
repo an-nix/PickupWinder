@@ -320,6 +320,31 @@ class MoveQueue:
             self._update_axis_endstop_state(axis_id, status)
         return status
 
+    def _wait_for_transport_request_result(
+        self,
+        sequence: int,
+        *,
+        send_status: Any | None = None,
+    ) -> Any:
+        try:
+            if send_status is not None:
+                return self._transport.wait_for_request_result(
+                    sequence,
+                    hint_status=send_status,
+                    poll_interval_s=self._poll_interval_s,
+                )
+            return self._transport.wait_for_request_result(
+                sequence,
+                poll_interval_s=self._poll_interval_s,
+            )
+        except TypeError as exc:
+            if send_status is None or "hint_status" not in str(exc):
+                raise
+            return self._transport.wait_for_request_result(
+                sequence,
+                poll_interval_s=self._poll_interval_s,
+            )
+
     def _confirm_initial_closed_endstop(self, axis_id: int) -> int:
         """Confirm a startup CLOSED reading before launching preclear.
 
@@ -375,10 +400,12 @@ class MoveQueue:
         Returns:
             Timeout en secondes, minimum 1.0 s.
         """
+        recovery_guard_s = 0.5
+
         # Priorité 1 : attribut explicite
         estimated = getattr(sub_move, "estimated_duration_s", None)
         if estimated is not None and estimated > 0:
-            return max(1.0, float(estimated) * margin)
+            return max(1.0, float(estimated) * margin + recovery_guard_s)
 
         # Priorité 2 : RampMove.ramp.total_duration (via axis_configs[0].ramp ou sub_move.ramp)
         ramp = getattr(sub_move, "ramp", None)
@@ -388,7 +415,7 @@ class MoveQueue:
         if ramp is not None:
             total = getattr(ramp, "total_duration", None)
             if total is not None and total > 0:
-                return max(1.0, float(total) * margin)
+                return max(1.0, float(total) * margin + recovery_guard_s)
 
         # Priorité 3 : estimation brute steps / hz
         steps = getattr(sub_move, "total_steps", None) or getattr(sub_move, "step_count", None)
@@ -396,10 +423,77 @@ class MoveQueue:
         if hz is None and ramp is not None:
             hz = getattr(ramp, "target_hz", None)
         if steps and hz and float(steps) > 0 and float(hz) > 0:
-            return max(1.0, (abs(float(steps)) / float(hz)) * margin)
+            return max(1.0, (abs(float(steps)) / float(hz)) * margin + recovery_guard_s)
 
         # Fallback
-        return max(2.0, _ENDSTOP_RELEASE_TIMEOUT_S)
+        return max(2.0, _ENDSTOP_RELEASE_TIMEOUT_S + recovery_guard_s)
+
+    def _wait_for_post_hit_recovery(
+        self,
+        axis_id: int,
+        *,
+        stop_timeout_s: float = 1.0,
+        recovery_guard_s: float = 0.080,
+    ) -> Any:
+        """Wait for the firmware to finish stop + RECOVERY after an endstop hit.
+
+        The approach phase stops asynchronously in firmware: the executor still
+        has to finish its emergency-stop / planner-flush / RECOVERY cycle after
+        the host-side streamer observes ``endstop_triggered``.  Starting the
+        backoff too early can cause the first reverse segments to be drained
+        before the executor returns to IDLE, leaving the switch physically
+        closed and causing a host-side timeout on ``_wait_for_endstop_open``.
+        """
+        deadline = time.monotonic() + stop_timeout_s
+        last_status = None
+        while time.monotonic() < deadline:
+            last_status = self._read_status(axis_id)
+            running = int(getattr(last_status, "running_mask", 0))
+            if (running & (1 << axis_id)) == 0:
+                break
+            time.sleep(0.010)
+        else:
+            running_mask = int(getattr(last_status, "running_mask", 0xFF)) if last_status else 0xFF
+            raise RuntimeError(
+                f"post-hit stop timeout on axis {axis_id}: running_mask=0x{running_mask:02X}"
+            )
+
+        time.sleep(recovery_guard_s)
+        status = self._read_status(axis_id)
+        lateral_state = int(
+            getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
+        )
+        if lateral_state == LATERAL_ENDSTOP_ABSENT:
+            raise RuntimeError(
+                f"endstop became ABSENT after hit on axis {axis_id} — check wiring"
+            )
+        return status
+
+    def _wait_for_endstop_latch_cleared(
+        self,
+        axis_id: int,
+        *,
+        timeout_s: float = 0.5,
+    ) -> None:
+        """Wait until endstop_hit_mask reports no hit for the given axis.
+
+        ENABLE_ENDSTOP(arm=1) clears the firmware latch, but the cleared state
+        may not be visible in the status payload until the next SPI exchange.
+        Starting a homing stream before confirming the latch is clear risks the
+        streamer detecting a stale hit immediately and terminating the phase
+        without any real movement.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            status = self._read_status(axis_id)
+            hit_mask = int(getattr(status, "endstop_hit_mask", 0xFF))
+            if (hit_mask & (1 << axis_id)) == 0:
+                return
+            time.sleep(0.010)
+        raise RuntimeError(
+            f"endstop latch not cleared after arm on axis {axis_id}: "
+            f"endstop_hit_mask still set after {timeout_s:.1f}s"
+        )
 
     def _wait_for_endstop_arm_state(
         self,
@@ -444,7 +538,7 @@ class MoveQueue:
         phase_name: str,
         sub_move: Move,
         arm_endstop: bool,
-        start_sequence: int,
+        start_sequence: int | None = None,
     ) -> MultiAxisRampStreamer:
         sub_move_axis_configs = sub_move.axis_configs
         if not sub_move_axis_configs:
@@ -457,11 +551,22 @@ class MoveQueue:
             getattr(baseline_status, "segments_dropped", 0)
         )
 
-        streamer = self._make_streamer(
-            sub_move_axis_configs,
-            keep_enabled_axes={move.axis_id},
-            initial_segments_dropped=baseline_segments_dropped,
-        )
+        if start_sequence is None:
+            start_sequence = self._next_motion_sequence()
+
+        try:
+            streamer = self._make_streamer(
+                sub_move_axis_configs,
+                keep_enabled_axes={move.axis_id},
+                initial_segments_dropped=baseline_segments_dropped,
+            )
+        except TypeError as exc:
+            if "initial_segments_dropped" not in str(exc):
+                raise
+            streamer = self._make_streamer(
+                sub_move_axis_configs,
+                keep_enabled_axes={move.axis_id},
+            )
         self._current_streamer = streamer
         if hasattr(streamer, "note_endstop_armed"):
             streamer.note_endstop_armed(move.axis_id, arm_endstop)
@@ -569,10 +674,9 @@ class MoveQueue:
 
     def _set_endstop_armed(self, axis_id: int, arm: bool) -> Any:
         sequence, send_status = self._transport.enable_endstop_request(axis_id, arm=arm)
-        status = self._transport.wait_for_request_result(
+        status = self._wait_for_transport_request_result(
             sequence,
-            hint_status=send_status,
-            poll_interval_s=self._poll_interval_s,
+            send_status=send_status,
         )
         self._update_axis_endstop_state(axis_id, status)
         if int(getattr(status, "last_result", SpiMessageResult.OK)) != int(SpiMessageResult.OK):
@@ -770,6 +874,8 @@ class MoveQueue:
             # Arm or disarm endstop for this phase and verify the mask in status.
             try:
                 self._set_endstop_armed(move.axis_id, arm=arm_endstop)
+                if arm_endstop:
+                    self._wait_for_endstop_latch_cleared(move.axis_id)
             except Exception as exc:
                 move.mark_failed(str(exc))
                 return
@@ -812,6 +918,14 @@ class MoveQueue:
                     move.mark_failed(str(exc))
                     return
 
+            if phase_name in ("approach", "search") and streamer.endstop_triggered:
+                try:
+                    self._wait_for_post_hit_recovery(move.axis_id)
+                except Exception as exc:
+                    self._set_endstop_armed(move.axis_id, arm=False)
+                    move.mark_failed(str(exc))
+                    return
+
             if phase_name == "backoff":
                 try:
                     self._wait_for_endstop_open(
@@ -821,6 +935,21 @@ class MoveQueue:
                 except Exception as exc:
                     self._set_endstop_armed(move.axis_id, arm=False)
                     move.mark_failed(str(exc))
+                    return
+
+                _deadline = time.monotonic() + 1.0
+                while time.monotonic() < _deadline:
+                    _status = self._read_status(move.axis_id)
+                    if (int(getattr(_status, "running_mask", 0)) & (1 << move.axis_id)) == 0:
+                        break
+                    time.sleep(0.010)
+                else:
+                    _running_mask = int(getattr(_status, "running_mask", 0xFF))
+                    self._set_endstop_armed(move.axis_id, arm=False)
+                    move.mark_failed(
+                        f"backoff stop timeout on axis {move.axis_id}: "
+                        f"running_mask=0x{_running_mask:02X} still non-zero after backoff"
+                    )
                     return
 
             if self._stop_requested:

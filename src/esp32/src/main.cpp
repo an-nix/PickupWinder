@@ -61,7 +61,7 @@ static constexpr gpio_num_t SPI_MOSI = GPIO_NUM_23;
 static constexpr gpio_num_t SPI_MISO = GPIO_NUM_19;
 static constexpr gpio_num_t SPI_SCLK = GPIO_NUM_18;
 static constexpr gpio_num_t SPI_CS   = GPIO_NUM_5;
-static constexpr gpio_num_t SPI_READY = GPIO_NUM_17;
+static constexpr gpio_num_t SPI_READY = GPIO_NUM_4;
 
 // Raspberry Pi sideband control
 static constexpr gpio_num_t RPI_SHUTDOWN_REQ = GPIO_NUM_16;

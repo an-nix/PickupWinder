@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from core.config import AppConfiguration
 from core.events import EventBus, EventKind
@@ -8,8 +9,10 @@ from core.shared_state import SharedState
 from motion import RampConfig
 from motion.axis_state import AxisState
 from motion.move import HomingMove, MoveState
-from motion.move_queue import MoveQueue
 from transport.spi_transport import Esp32SpiTransport
+
+if TYPE_CHECKING:
+    from motion.move_queue import MoveQueue
 
 
 logger = logging.getLogger(__name__)

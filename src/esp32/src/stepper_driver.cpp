@@ -7,6 +7,8 @@
 
 #include "stepper_driver.h"
 
+#include "messages.h"
+
 #include <algorithm>
 #include <cstring>
 #include <esp_log.h>
@@ -36,14 +38,14 @@ static const char* TAG = "stepper_driver";
 // underruns and audible stutter.
 //
 // RMT clock: 80 MHz (1 tick = 12.5 ns).
-// PART_SIZE = 8: one callback per 8 symbols.
+// PART_SIZE = 4: one callback per 4 symbols.
 
 /** Number of consecutive empty-ring callbacks before auto-stopping.
  *  Coast symbols now match the last step rate (last_ticks_ per symbol half),
- *  so at 1500 rpm (500 ticks/step = 6.25 µs) each coast callback takes ~50 µs.
- *  250000 callbacks × ~50 µs = ~12.5 seconds of idle before auto-stop.
+ *  so at 1500 rpm (500 ticks/step = 6.25 µs) each coast callback takes ~25 µs.
+ *  250000 callbacks × ~25 µs = ~6.25 seconds of idle before auto-stop.
  *  At slower speeds the coast period is longer per callback, so the idle time
- *  is always at least 12.5 s regardless of speed. */
+ *  is always at least 6.25 s regardless of speed. */
 static constexpr uint32_t COAST_IDLE_LIMIT = 250000;
 
 extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
@@ -232,41 +234,140 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
 // ---------------------------------------------------------------------------
 //
 // Fires on any edge of either endstop contact (NO or NC).
-// Validates the dual-contact NO/NC logic to guard against noise and cable breaks:
-//   NO=0, NC=1 → endstop CLOSED (triggered) → set endstop_active_
-//   NO=1, NC=0 → endstop OPEN  (released)   → clear endstop_active_
-//   NO==NC      → ABSENT or cable break       → fail-safe: set endstop_active_
+// The dual-contact sensor has three raw states:
+//   NO=0, NC=1 → CLOSED  (valid hit)
+//   NO=1, NC=0 → OPEN    (valid release)
+//   NO==NC      → INVALID (crossover or wiring fault)
+//
+// CLOSED is acted on immediately in ISR context.
+// INVALID is tracked separately and promoted to ABSENT only if it persists
+// beyond the task-level debounce window.
 //
 // arg = StepperDriver* (owns all needed state — no CommInterface dependency).
+
+namespace {
+
+static inline StepperDriver::EndstopSignalState decodeEndstopSignalState(int no_lvl,
+                                                                         int nc_lvl)
+{
+    if (no_lvl == 0 && nc_lvl == 1) {
+        return StepperDriver::EndstopSignalState::CLOSED;
+    }
+    if (no_lvl == 1 && nc_lvl == 0) {
+        return StepperDriver::EndstopSignalState::OPEN;
+    }
+    return StepperDriver::EndstopSignalState::INVALID;
+}
+
+} // namespace
+
+uint8_t StepperDriver::reportedEndstopState() const
+{
+    if (endstop_no_pin_ == GPIO_NUM_NC || endstop_nc_pin_ == GPIO_NUM_NC) {
+        return static_cast<uint8_t>(LateralEndstopState::ABSENT);
+    }
+
+    const EndstopSignalState raw = static_cast<EndstopSignalState>(
+        endstop_signal_state_.load(std::memory_order_acquire));
+    if (raw == EndstopSignalState::CLOSED) {
+        return static_cast<uint8_t>(LateralEndstopState::PRESENT_CLOSED);
+    }
+    if (raw == EndstopSignalState::OPEN) {
+        return static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+    }
+
+    const TickType_t invalid_since =
+        endstop_invalid_since_tick_.load(std::memory_order_acquire);
+    if (invalid_since != 0) {
+        const TickType_t now = xTaskGetTickCount();
+        if ((now - invalid_since) >= ENDSTOP_INVALID_DEBOUNCE_TICKS) {
+            return static_cast<uint8_t>(LateralEndstopState::ABSENT);
+        }
+    }
+
+    const EndstopSignalState stable = static_cast<EndstopSignalState>(
+        endstop_last_stable_state_.load(std::memory_order_acquire));
+    return (stable == EndstopSignalState::CLOSED)
+        ? static_cast<uint8_t>(LateralEndstopState::PRESENT_CLOSED)
+        : static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+}
+
+bool StepperDriver::isEndstopMoveAllowed(bool direction) const
+{
+    (void)direction;
+
+    if (!isEndstopArmed()) {
+        return true;
+    }
+
+    const uint8_t state = reportedEndstopState();
+    if (state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
+        return false;
+    }
+
+    return true;
+}
+
+bool StepperDriver::prepareEndstopMove(bool direction)
+{
+    if (!isEndstopMoveAllowed(direction)) {
+        return false;
+    }
+
+    if (endstop_clearance_pending_.load(std::memory_order_acquire)) {
+        endstop_active_.store(false, std::memory_order_release);
+    }
+    return true;
+}
 
 void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
 {
     StepperDriver* drv = static_cast<StepperDriver*>(arg);
 
+    const int no_lvl = gpio_get_level(drv->endstop_no_pin_);
+    const int nc_lvl = gpio_get_level(drv->endstop_nc_pin_);
+
+    const EndstopSignalState raw = decodeEndstopSignalState(no_lvl, nc_lvl);
+    drv->endstop_signal_state_.store(static_cast<uint8_t>(raw), std::memory_order_release);
+
+    const TickType_t now_tick = xTaskGetTickCountFromISR();
+    if (raw == EndstopSignalState::INVALID) {
+        const TickType_t invalid_since =
+            drv->endstop_invalid_since_tick_.load(std::memory_order_relaxed);
+        if (invalid_since == 0) {
+            drv->endstop_invalid_since_tick_.store(now_tick, std::memory_order_release);
+        }
+        return;
+    }
+
+    drv->endstop_last_stable_state_.store(static_cast<uint8_t>(raw), std::memory_order_release);
+    drv->endstop_invalid_since_tick_.store(0, std::memory_order_release);
+
+    if (raw == EndstopSignalState::OPEN) {
+        drv->endstop_active_.store(false, std::memory_order_release);
+        drv->endstop_clearance_pending_.store(false, std::memory_order_release);
+        return;
+    }
+
     if (!drv->isEndstopArmed()) {
         return;
     }
 
-    const int no_lvl = gpio_get_level(drv->endstop_no_pin_);
-    const int nc_lvl = gpio_get_level(drv->endstop_nc_pin_);
-
-    const bool triggered = (no_lvl == 0 && nc_lvl == 1) || (no_lvl == nc_lvl);
-
-    if (triggered) {
-        drv->endstop_active_.store(true, std::memory_order_release);
+    const bool was_active = drv->endstop_active_.exchange(true, std::memory_order_acq_rel);
+    if (!was_active) {
         drv->endstop_hit_count_.fetch_add(1, std::memory_order_relaxed);
-        // Wake the executor task so it drains the pipeline immediately.
-        BaseType_t woken = pdFALSE;
-        TaskHandle_t exec = drv->executor_task_.load(std::memory_order_relaxed);
-        if (exec != nullptr) {
-            vTaskNotifyGiveFromISR(exec, &woken);
-        }
-        if (woken) portYIELD_FROM_ISR();
-    } else {
-        // Endstop released — clear flag.
-        // Host must re-arm via SPI ENABLE_ENDSTOP before the next move.
-        drv->endstop_active_.store(false, std::memory_order_release);
     }
+    drv->endstop_clearance_pending_.store(true, std::memory_order_release);
+    drv->endstop_clearance_direction_.store(
+        !drv->last_dir_commanded_.load(std::memory_order_acquire),
+        std::memory_order_release);
+
+    BaseType_t woken = pdFALSE;
+    TaskHandle_t exec = drv->executor_task_.load(std::memory_order_relaxed);
+    if (exec != nullptr) {
+        vTaskNotifyGiveFromISR(exec, &woken);
+    }
+    if (woken) portYIELD_FROM_ISR();
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +401,19 @@ esp_err_t StepperDriver::initEndstopIsr(gpio_num_t no_pin, gpio_num_t nc_pin)
         ESP_RETURN_ON_ERROR(
             gpio_isr_handler_add(pin, &StepperDriver::endstopIsrHandler, this),
             TAG, "gpio_isr_handler_add failed for pin %d", (int)pin);
+    }
+
+    const EndstopSignalState initial_state = decodeEndstopSignalState(
+        gpio_get_level(no_pin), gpio_get_level(nc_pin));
+    endstop_signal_state_.store(static_cast<uint8_t>(initial_state), std::memory_order_release);
+    if (initial_state == EndstopSignalState::INVALID) {
+        endstop_last_stable_state_.store(
+            static_cast<uint8_t>(EndstopSignalState::OPEN),
+            std::memory_order_release);
+        endstop_invalid_since_tick_.store(xTaskGetTickCount(), std::memory_order_release);
+    } else {
+        endstop_last_stable_state_.store(static_cast<uint8_t>(initial_state), std::memory_order_release);
+        endstop_invalid_since_tick_.store(0, std::memory_order_release);
     }
 
     ESP_LOGI(TAG, "motor%u: endstop ISR installed NO=GPIO%d NC=GPIO%d",
@@ -519,9 +633,10 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
     } else {
         last_dir_ = new_dir;
     }
+    last_dir_commanded_.store(new_dir, std::memory_order_release);
 
-    // If the endstop already fired before we even start writing, abort.
-    if (endstop_active_.load(std::memory_order_acquire)) {
+    // Validate endstop/homing permission before writing anything into the ring.
+    if (!prepareEndstopMove(new_dir)) {
         return ESP_ERR_INVALID_STATE;
     }
 

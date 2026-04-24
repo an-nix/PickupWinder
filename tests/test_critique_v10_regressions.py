@@ -296,6 +296,37 @@ def test_wait_for_request_result_ignores_transient_protocol_error_after_matching
     assert status.last_result == int(SpiMessageResult.OK)
 
 
+def test_spi_transport_disables_ready_handshake_after_repeated_timeouts() -> None:
+    class FakeReadyMonitor:
+        def value(self) -> int:
+            return 0
+
+    transport = Esp32SpiTransport.__new__(Esp32SpiTransport)
+    transport._ready_monitor = FakeReadyMonitor()
+    transport._ready_active_level = 1
+    transport._ready_wait_timeout_s = 0.0
+    transport._ready_poll_sleep_s = 0.0
+    transport._ready_timeout_streak = 0
+    transport._ready_timeout_disable_threshold = 3
+    transport._ready_handshake_disabled = False
+    transport._diag_ready_timeouts = 0
+    transport._diag_lifetime_ready_timeouts = 0
+    transport._device_path = "/dev/spidev0.0"
+    transport._inter_transfer_guard_s = 0.0
+    transport._last_xfer_end_ts = 0.0
+
+    Esp32SpiTransport._wait_until_ready(transport)
+    Esp32SpiTransport._wait_until_ready(transport)
+    assert transport._ready_handshake_disabled is False
+
+    Esp32SpiTransport._wait_until_ready(transport)
+    assert transport._ready_handshake_disabled is True
+    assert transport._diag_lifetime_ready_timeouts == 3
+
+    Esp32SpiTransport._wait_until_ready(transport)
+    assert transport._diag_lifetime_ready_timeouts == 3
+
+
 def test_streamer_does_not_false_trigger_on_initial_segments_dropped_baseline() -> None:
     streamer = MultiAxisRampStreamer.from_axis_ids(
         transport=SimpleNamespace(get_status=lambda: SimpleNamespace(last_executed_sequence=0xFFFF)),

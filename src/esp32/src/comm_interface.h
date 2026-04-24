@@ -76,11 +76,11 @@ private:
     // Build the status payload for the outgoing status frame (called on Core 0).
     void buildStatusFrame(uint8_t* out_frame) const;
 
-    // Read lateral endstop pins and return an encoded LateralEndstopState.
+    // Return the debounced driver-owned lateral endstop state.
     uint8_t readLateralEndstopState() const;
 
-    // Return true if axis movement is permitted given lateral endstop state.
-    bool isLateralMovementAllowed(uint8_t axis_id) const;
+    // Return true if axis movement is permitted by the lateral homing guard.
+    bool isLateralMovementAllowed(uint8_t axis_id, bool direction) const;
 
     // Validate and dispatch an incoming request frame payload (called from spiTask).
     esp_err_t handleFrame(const SpiMessageHeader& header, const uint8_t* payload);

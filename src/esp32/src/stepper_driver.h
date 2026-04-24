@@ -189,38 +189,104 @@ public:
     void setExecutorTask(TaskHandle_t t) { executor_task_.store(t, std::memory_order_release); }
 
     /**
-     * @brief Set by the GPIO endstop ISR when contact is detected.
-     * Read by encode_steps() in ISR context to stop the RMT immediately.
-     * Cleared by the host via SPI ENABLE_ENDSTOP command or when the
-     * endstop sensor returns to open state.
-     * std::atomic for ISR ↔ task safety.
+     * @brief Debounced physical state of the dual-contact endstop.
+     *
+     * OPEN/CLOSED are valid switch states. INVALID means both contacts read
+     * the same level; this can be a transient crossover or a persistent fault.
+     */
+    enum class EndstopSignalState : uint8_t {
+        OPEN = 0,
+        CLOSED = 1,
+        INVALID = 2,
+    };
+
+    /**
+     * @brief Fast-stop latch observed by `encode_steps()` in ISR context.
+     *
+     * This is asserted as soon as the ISR sees a definite CLOSED state while
+     * the endstop is armed. `encode_steps()` checks it before emitting each
+     * callback chunk, which bounds stop latency.
      */
     std::atomic<bool> endstop_active_ {false};
+    /**
+     * @brief Latched after the first valid hit and held until the switch
+     *        re-opens or the host re-arms/disarms the endstop.
+     *
+     * While set, the firmware allows only the stored clearance direction.
+     */
+    std::atomic<bool> endstop_clearance_pending_ {false};
+    /** Direction that moves away from the switch after a latched hit. */
+    std::atomic<bool> endstop_clearance_direction_ {false};
     std::atomic<uint32_t> endstop_hit_count_ {0};
+    /** Latest raw NO/NC decoding produced by the GPIO ISR. */
+    std::atomic<uint8_t> endstop_signal_state_ {
+        static_cast<uint8_t>(EndstopSignalState::OPEN)
+    };
+    /** Latest non-invalid state. Used to hide short contact crossover glitches. */
+    std::atomic<uint8_t> endstop_last_stable_state_ {
+        static_cast<uint8_t>(EndstopSignalState::OPEN)
+    };
+    /** Tick at which INVALID was first observed (0 = no current invalid window). */
+    std::atomic<TickType_t> endstop_invalid_since_tick_ {0};
 
-    /** @brief Arm the endstop — ISR will stop motion on trigger. */
+    /**
+     * @brief Arm the endstop and clear the previous homing latch.
+     *
+     * Host contract: call this before each seek phase (fast seek and slow
+     * seek). Re-arming clears the previous hit and clearance state.
+     */
     void armEndstop() {
         endstop_active_.store(false, std::memory_order_release);
+        endstop_clearance_pending_.store(false, std::memory_order_release);
         endstop_hit_count_.store(0, std::memory_order_relaxed);
         endstop_armed_.store(true, std::memory_order_release);
     }
 
-    /** @brief Disarm the endstop — ISR will not stop motion on trigger.
-     *  Use during intentional clearance moves commanded by the host.
-     *  Also resets endstop_hit_count_ so that the next status frame reports
-     *  endstop_hit_mask=0 immediately after disarm, preventing false endstop
-     *  detection on the following phase. */
+    /**
+     * @brief Disarm the endstop and clear all homing-related latches.
+     *
+        * The host orchestrates the full homing sequence and disarms the endstop
+        * before the backoff phase, Klipper-style. The firmware therefore keeps
+        * only the fast-stop latch and ABSENT fail-safe semantics.
+     */
     void disarmEndstop() {
         endstop_armed_.store(false, std::memory_order_release);
         endstop_active_.store(false, std::memory_order_release);
-        endstop_hit_count_.store(0, std::memory_order_relaxed);  // R1: clean hit_mask on disarm
+        endstop_clearance_pending_.store(false, std::memory_order_release);
+        endstop_hit_count_.store(0, std::memory_order_relaxed);
     }
 
     /** @brief True if the endstop is currently armed. */
     bool isEndstopArmed() const { return endstop_armed_.load(std::memory_order_acquire); }
 
-    /** @brief True if the endstop is currently triggered. */
+    /** @brief True if the fast-stop latch is currently asserted. */
     bool isEndstopActive() const { return endstop_active_.load(std::memory_order_acquire); }
+
+    /**
+     * @brief Return the debounced protocol-facing endstop state.
+     *
+     * A short INVALID crossover is reported as the last stable OPEN/CLOSED
+     * state. A persistent INVALID state is promoted to
+     * `LateralEndstopState::ABSENT`.
+     */
+    uint8_t reportedEndstopState() const;
+
+    /**
+     * @brief Return true if a move in @p direction is permitted.
+     *
+        * When the endstop is armed, the firmware remains permissive for
+        * PRESENT_OPEN / PRESENT_CLOSED and only blocks motion when the sensor is
+        * reported ABSENT. Homing phase sequencing stays host-driven.
+     */
+    bool isEndstopMoveAllowed(bool direction) const;
+
+    /**
+     * @brief Validate and prepare a move before writing it to the ring.
+     *
+        * Any permitted post-hit move clears the fast-stop latch so the host can
+        * resume motion once it has sequenced the next phase.
+     */
+    bool prepareEndstopMove(bool direction);
 
     void clearEndstopHit() {
         endstop_hit_count_.store(0, std::memory_order_relaxed);
@@ -262,8 +328,10 @@ private:
 
     std::atomic<bool>     rmt_running_ {false};
     bool                  last_dir_    {true};
+    std::atomic<bool>     last_dir_commanded_ {true};
     bool                  enabled_     {false};
     std::atomic<bool>     endstop_armed_  {false};
+    static constexpr TickType_t ENDSTOP_INVALID_DEBOUNCE_TICKS = pdMS_TO_TICKS(5);
 
     /** Endstop pin numbers — set by initEndstopIsr(), read by endstopIsrHandler(). */
     gpio_num_t            endstop_no_pin_ {GPIO_NUM_NC};
@@ -284,7 +352,9 @@ private:
     /**
      * @brief GPIO ISR — fires on any edge of either endstop pin (NO or NC).
      * arg = StepperDriver* that owns the endstop.
-     * Validates NO/NC logic and sets endstop_active_ for sub-100 µs RMT stop.
+    * Decodes the dual-contact sensor, latches a hit on definite CLOSED, and
+    * tracks transient INVALID crossover samples separately from persistent
+    * wiring faults.
      */
     static void IRAM_ATTR endstopIsrHandler(void* arg);
 };

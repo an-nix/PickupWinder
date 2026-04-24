@@ -34,7 +34,8 @@
  *
  *   On flush, the planner drains both cmd_queue_ and segment_queue_, then
  *   pushes a flush sentinel (is_flush=true) so the executor can reset its
- *   state atomically.
+ *   state atomically. Flush requests may come either from the host or from
+ *   the executor's internal recovery path after an endstop/fault event.
  */
 
 #pragma once

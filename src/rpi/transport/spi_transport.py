@@ -145,6 +145,9 @@ class Esp32SpiTransport:
         self._ready_active_level = 1 if ready_active_high else 0
         self._ready_wait_timeout_s = 0.050
         self._ready_poll_sleep_s = 0.00002
+        self._ready_timeout_streak: int = 0
+        self._ready_timeout_disable_threshold: int = 3
+        self._ready_handshake_disabled: bool = False
         # Real wall-clock gap enforced between completed SPI calls.
         # On Raspberry Pi spidev, delay_usecs is a controller-side transfer
         # delay and does not reliably create a slave-visible re-arm window
@@ -265,18 +268,28 @@ class Esp32SpiTransport:
         return response
 
     def _wait_until_ready(self) -> None:
-        if self._ready_monitor is not None:
+        if self._ready_monitor is not None and not self._ready_handshake_disabled:
             deadline = time.monotonic() + self._ready_wait_timeout_s
             while time.monotonic() < deadline:
                 if self._ready_monitor.value() == self._ready_active_level:
+                    self._ready_timeout_streak = 0
                     return
                 time.sleep(self._ready_poll_sleep_s)
             self._diag_ready_timeouts += 1
             self._diag_lifetime_ready_timeouts += 1
-            logger.warning(
-                "SPI READY handshake timeout on %s; falling back to software guard for this transfer",
-                self._device_path,
-            )
+            self._ready_timeout_streak += 1
+            if self._ready_timeout_streak >= self._ready_timeout_disable_threshold:
+                self._ready_handshake_disabled = True
+                logger.warning(
+                    "SPI READY handshake timed out %d times on %s; disabling READY GPIO for this session and using software guard",
+                    self._ready_timeout_streak,
+                    self._device_path,
+                )
+            else:
+                logger.warning(
+                    "SPI READY handshake timeout on %s; falling back to software guard for this transfer",
+                    self._device_path,
+                )
 
         now = time.monotonic()
         if self._last_xfer_end_ts > 0.0:
@@ -571,6 +584,7 @@ class Esp32SpiTransport:
             "zero_rx": self._diag_lifetime_zero_rx,
             "echo_rx": self._diag_lifetime_echo_rx,
             "ready_timeouts": self._diag_lifetime_ready_timeouts,
+            "ready_handshake_disabled": int(self._ready_handshake_disabled),
             "reopens": self._diag_lifetime_reopens,
             "last_status_age_s": last_status_age_s,
         }

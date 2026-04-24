@@ -90,7 +90,16 @@ class MockSpiTransport:
         self._status = self._make_status(seq)
         return seq, self._status
 
-    def wait_for_request_result(self, sequence: int, *, poll_interval_s: float = 0.001, timeout_s: float = 1.5) -> StatusPayload:
+    def wait_for_request_result(
+        self,
+        sequence: int,
+        *,
+        hint_status: StatusPayload | None = None,
+        poll_interval_s: float = 0.001,
+        timeout_s: float = 1.5,
+    ) -> StatusPayload:
+        if hint_status is not None and int(getattr(hint_status, "last_rx_sequence", -1)) == int(sequence):
+            return hint_status
         return self._make_status(sequence)
 
     def set_axis_enabled_request(self, axis_id: int, enable: bool) -> tuple[int, StatusPayload]:

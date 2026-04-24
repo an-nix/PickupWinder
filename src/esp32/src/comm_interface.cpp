@@ -515,7 +515,10 @@ esp_err_t CommInterface::handleStepBlock(const StepBlockPayload& payload)
     if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!isLateralMovementAllowed(payload.axis_id)) {
+    const bool direction = (payload.step_count > 0)
+        ? ((payload.entries[0].flags & SpiStepFlags::DIR_REVERSE) != 0)
+        : false;
+    if (!isLateralMovementAllowed(payload.axis_id, direction)) {
         return ESP_ERR_INVALID_STATE;
     }
     if (payload.step_count > STEP_BLOCK_SIZE) {
@@ -539,11 +542,19 @@ esp_err_t CommInterface::handleSegmentBlock(const SegmentBlockPayload& payload)
     if (payload.axis_id >= n_motors_ || queues_[payload.axis_id] == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!isLateralMovementAllowed(payload.axis_id)) {
-        return ESP_ERR_INVALID_STATE;
-    }
     if (payload.segment_count > SEGMENT_BLOCK_SIZE) {
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    for (uint32_t i = 0; i < payload.segment_count; ++i) {
+        if (payload.segments[i].step_count == 0) {
+            continue;
+        }
+        const bool direction =
+            (payload.segments[i].flags & SpiStepFlags::DIR_REVERSE) != 0;
+        if (!isLateralMovementAllowed(payload.axis_id, direction)) {
+            return ESP_ERR_INVALID_STATE;
+        }
     }
 
     motion_block_t block {};
@@ -628,9 +639,6 @@ esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
         if (block.axis_ids[a] >= n_motors_ || queues_[block.axis_ids[a]] == nullptr) {
             return ESP_ERR_INVALID_ARG;
         }
-        if (!isLateralMovementAllowed(block.axis_ids[a])) {
-            return ESP_ERR_INVALID_STATE;
-        }
     }
     cursor += axis_count;
 
@@ -651,6 +659,12 @@ esp_err_t CommInterface::handleMultiAxisSegmentBlock(const uint8_t* payload,
             uint16_t steps;
             memcpy(&steps, cursor, 2);
             block.segments[s].step_counts[a] = steps;
+            if (steps > 0) {
+                const bool direction = (dir_mask & static_cast<uint16_t>(1U << a)) != 0;
+                if (!isLateralMovementAllowed(block.axis_ids[a], direction)) {
+                    return ESP_ERR_INVALID_STATE;
+                }
+            }
             cursor += 2;
         }
     }
@@ -707,39 +721,23 @@ void CommInterface::notifySegmentExecuted(uint16_t motion_seq)
 
 uint8_t CommInterface::readLateralEndstopState() const
 {
-    // Read lateral endstop NO/NC pins and return the encoded LateralEndstopState.
-    if (pins_.home_pin_no == GPIO_NUM_NC || pins_.home_pin_nc == GPIO_NUM_NC) {
+    // Return the debounced state maintained by the lateral axis driver.
+    if (n_motors_ <= 1 || queues_[1] == nullptr) {
         return static_cast<uint8_t>(LateralEndstopState::ABSENT);
     }
-
-    const int no_state = gpio_get_level(pins_.home_pin_no);
-    const int nc_state = gpio_get_level(pins_.home_pin_nc);
-
-    if (no_state == nc_state) {
-        return static_cast<uint8_t>(LateralEndstopState::ABSENT);
-    }
-    if (no_state == 0 && nc_state == 1) {
-        return static_cast<uint8_t>(LateralEndstopState::PRESENT_CLOSED);
-    }
-    return static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+    return queues_[1]->driver().reportedEndstopState();
 }
 
-bool CommInterface::isLateralMovementAllowed(uint8_t axis_id) const
+bool CommInterface::isLateralMovementAllowed(uint8_t axis_id, bool direction) const
 {
     // Only axis 1 (lateral) is gated by the endstop; other axes are always allowed.
     if (axis_id != 1) {
         return true;
     }
-    // Backoff after a homing hit must be allowed while the physical contact is
-    // still closed, provided the host has explicitly DISARMED the endstop.
-    // The passive gate therefore applies only when the firmware protection is armed.
     if (axis_id >= n_motors_ || queues_[axis_id] == nullptr) {
         return false;
     }
-    if (!queues_[axis_id]->driver().isEndstopArmed()) {
-        return true;
-    }
-    return readLateralEndstopState() == static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+    return queues_[axis_id]->driver().isEndstopMoveAllowed(direction);
 }
 
 esp_err_t CommInterface::handleFrame(const SpiMessageHeader& header, const uint8_t* payload)
@@ -1149,6 +1147,17 @@ void CommInterface::multiAxisExecutorTask(void* arg)
         }
     };
 
+    // Lambda: tell the planner to discard any future motion beyond the point
+    // where recovery was triggered. This prevents stale queued segments from
+    // resuming motion after an endstop hit or ring failure.
+    auto requestPlannerFlush = [&](uint16_t motion_sequence) {
+        flush_request_t req { .flush_sequence = motion_sequence };
+        if (s_flush_queue != nullptr && xQueueSend(s_flush_queue, &req, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "auto-flush queue full after recovery at seq=%u",
+                     static_cast<unsigned>(motion_sequence));
+        }
+    };
+
     // ── Main loop ─────────────────────────────────────────────────────────
     uint32_t wm_iter = 0;
     for (;;) {
@@ -1304,6 +1313,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                         // Drain remaining batch and stop immediately.
                         clearMultiExecFlags();
                         self->queues_[eid]->driver().emergencyStop();
+                        requestPlannerFlush(seg.motion_sequence);
                         ESP_LOGW(TAG, "endstop on axis %u at seq=%u",
                                  eid, seg.motion_sequence);
                         endstop_hit = true;
@@ -1332,6 +1342,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     if (self->queues_[1] != nullptr) {
                         self->queues_[1]->driver().emergencyStop();
                     }
+                    requestPlannerFlush(seg.motion_sequence);
                     state = ExecState::RECOVERY;
                     goto exit_drain;
                 }
@@ -1369,11 +1380,13 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                     if (axis_id >= self->n_motors_ ||
                         self->queues_[axis_id] == nullptr) continue;
                     if (seg.axes[a].step_count == 0) continue;
-                    if (axis_id == 1 && lateral_blocked) {
+                    if (axis_id == 1 && lateral_blocked
+                        && !self->isLateralMovementAllowed(axis_id, seg.axes[a].direction)) {
                         clearMultiExecFlags();
                         ESP_LOGW(TAG, "axis1 blocked while armed at seq=%u",
                                  seg.motion_sequence);
                         self->queues_[axis_id]->driver().emergencyStop();
+                        requestPlannerFlush(seg.motion_sequence);
                         state = ExecState::RECOVERY;
                         goto exit_drain;
                     }
@@ -1389,6 +1402,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                         ESP_LOGW(TAG, "axis %u endstop mid-seg seq=%u",
                                  axis_id, seg.motion_sequence);
                         axis_queue->driver().emergencyStop();
+                        requestPlannerFlush(seg.motion_sequence);
                         state = ExecState::RECOVERY;
                         goto exit_drain;
                     } else if (err == ESP_ERR_TIMEOUT) {
@@ -1396,6 +1410,7 @@ void CommInterface::multiAxisExecutorTask(void* arg)
                         ESP_LOGE(TAG, "axis %u ring timeout at seq=%u — forcing RECOVERY",
                                  axis_id, seg.motion_sequence);
                         axis_queue->driver().emergencyStop();
+                        requestPlannerFlush(seg.motion_sequence);
                         state = ExecState::RECOVERY;
                         goto exit_drain;
                     } else if (err != ESP_OK) {

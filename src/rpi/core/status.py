@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from core.config import AppConfiguration
-from core.lateral import LateralAxisController
 from core.shared_state import SharedState
 from transport.messages import StatusPayload
+
+if TYPE_CHECKING:
+    from core.lateral import LateralAxisController
 
 
 def serialize_firmware_status(status: StatusPayload) -> dict[str, Any]:

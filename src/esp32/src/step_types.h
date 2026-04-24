@@ -24,8 +24,9 @@
  *   160 kHz target: interval = 80 000 000 / 160 000 = 500 ticks  (6.25 µs)
  *   100 Hz  min   : interval = 800 000 ticks → clamped to 0xFFFF (65535)
  *
- *   PART_SIZE=8: one encoder callback per 8 steps.
- *     At 160 kHz: callback every 50 µs — well within FreeRTOS tick budget.
+ *   PART_SIZE=4: one encoder callback per 4 steps.
+ *     At 160 kHz: callback every 25 µs — short enough to reduce endstop
+ *     overtravel while still keeping ISR load manageable.
  */
 
 #pragma once
@@ -93,12 +94,12 @@ static inline bool sequence_is_stale_or_equal_u16(uint16_t candidate, uint16_t r
  * the ring empties, but small chunks still help because each callback
  * consumes fewer entries, giving the executor more time to refill.
  *
- * PART_SIZE=8 → one callback per 8 steps.
+ * PART_SIZE=4 → one callback per 4 steps.
  * RMT_MEM_SYMBOLS must be >= 64 for IDF constraints, so we set it to 64
  * independently (the driver calls the callback multiple times per
  * half-buffer when PART_SIZE < mem_block_symbols/2).
  */
-#define PART_SIZE               8U
+#define PART_SIZE               4U
 
 /** Total RMT hardware memory per channel.
  *  Must be >= 64 for IDF RMT driver constraints.

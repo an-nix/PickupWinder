@@ -36,7 +36,7 @@ class JsonRpcServer:
         self._handler = handler
         self._events = event_bus
         self._socket_path = socket_path
-        self._rpc_call_timeout_s = max(0.1, float(rpc_call_timeout_s))
+        self._rpc_call_timeout_s = max(0.001, float(rpc_call_timeout_s))
         self._max_request_bytes = max(1024, int(max_request_bytes))
 
         self._accept_thread: threading.Thread | None = None

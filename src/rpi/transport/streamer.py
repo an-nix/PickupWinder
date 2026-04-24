@@ -404,10 +404,30 @@ class MultiAxisRampStreamer:
         self._last_sequence_advance_value = received_sequence
         self._last_sequence_advance_time = time.time()
 
+    def _wait_for_request_result(self, sequence: int, send_status=None):
+        try:
+            if send_status is not None:
+                return self._transport.wait_for_request_result(
+                    sequence,
+                    hint_status=send_status,
+                    poll_interval_s=self._poll_interval_s,
+                )
+            return self._transport.wait_for_request_result(
+                sequence,
+                poll_interval_s=self._poll_interval_s,
+            )
+        except TypeError as exc:
+            if send_status is None or "hint_status" not in str(exc):
+                raise
+            return self._transport.wait_for_request_result(
+                sequence,
+                poll_interval_s=self._poll_interval_s,
+            )
+
     def _enable_axes(self) -> None:
         for axis_id in self._axis_ids:
             sequence, send_status = self._transport.set_axis_enabled_request(axis_id, True)
-            status = self._transport.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=self._poll_interval_s)
+            status = self._wait_for_request_result(sequence, send_status)
             if status.last_result != int(SpiMessageResult.OK):
                 raise RuntimeError(f"enable axis {axis_id} failed with result=0x{status.last_result:02X}")
 
@@ -429,7 +449,7 @@ class MultiAxisRampStreamer:
                 continue
 
             sequence, send_status = self._transport.set_axis_enabled_request(axis_id, False)
-            status = self._transport.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=self._poll_interval_s)
+            status = self._wait_for_request_result(sequence, send_status)
             if status.last_result != int(SpiMessageResult.OK):
                 raise RuntimeError(f"disable axis {axis_id} failed with result=0x{status.last_result:02X}")
 
@@ -713,7 +733,7 @@ class MultiAxisRampStreamer:
         Call before starting a move that should stop on endstop contact.
         """
         sequence, send_status = self._transport.enable_endstop_request(axis_id, arm=True)
-        self._transport.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=self._poll_interval_s)
+        self._wait_for_request_result(sequence, send_status)
         self._endstop_armed_axes.add(axis_id)
 
     def disarm_endstop(self, axis_id: int) -> None:
@@ -722,7 +742,7 @@ class MultiAxisRampStreamer:
         Call before a clearance move that must pass through the endstop.
         """
         sequence, send_status = self._transport.enable_endstop_request(axis_id, arm=False)
-        self._transport.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=self._poll_interval_s)
+        self._wait_for_request_result(sequence, send_status)
         self._endstop_armed_axes.discard(axis_id)
 
     @property
@@ -828,6 +848,12 @@ class MultiAxisRampStreamer:
                         break
 
                 segment_duration_s = segment.duration_us / 1_000_000.0
+                if (
+                    batch
+                    and batch_duration_s + segment_duration_s > effective_buffer_target_s
+                ):
+                    self._pending_segment = segment
+                    break
 
                 reference_sequence = (
                     batch[-1].sequence
@@ -856,11 +882,7 @@ class MultiAxisRampStreamer:
             segments=batch,
         )
         transport_seq, send_status = self._transport.send_multi_axis_segment_block_request(payload)
-        ack_status = self._transport.wait_for_request_result(
-            transport_seq,
-            hint_status=send_status,
-            poll_interval_s=self._poll_interval_s,
-        )
+        ack_status = self._wait_for_request_result(transport_seq, send_status)
         self._update_confirmed_motion_sequence(ack_status)
 
         if ack_status.last_result == int(SpiMessageResult.OK):

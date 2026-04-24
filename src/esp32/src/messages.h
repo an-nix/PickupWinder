@@ -53,7 +53,16 @@ enum class SpiMessageType : uint8_t {
      * All axes share the same duration_us; steps may differ per axis.
      */
     MULTI_AXIS_SEGMENT_BLOCK = 0x13,
-    /** Arm or disarm the hardware endstop on a given axis. */
+    /**
+     * Arm or disarm the hardware endstop on a given axis.
+     *
+     * Homing contract:
+     *   - arm before each seek phase,
+     *   - after a hit, stop enqueueing toward the switch,
+     *   - backoff may remain armed because the firmware latches and permits
+     *     only the clearance direction until the switch re-opens,
+     *   - re-arm before the slow seek to clear the previous hit latch.
+     */
     ENABLE_ENDSTOP           = 0x14,
     PING                     = 0x7F,
 
@@ -167,7 +176,7 @@ static_assert(sizeof(FlushPayload) == 4, "FlushPayload must be 4 bytes");
 
 struct __attribute__((packed)) EnableEndstopPayload {
     uint8_t axis_id;  ///< axis to arm/disarm
-    uint8_t arm;      ///< 1 = arm, 0 = disarm
+    uint8_t arm;      ///< 1 = arm and clear previous hit latch, 0 = disarm
     uint8_t reserved[2];
 };
 
@@ -231,9 +240,9 @@ struct __attribute__((packed)) StatusPayload {
     uint8_t  enabled_mask;
     uint8_t  running_mask;
     uint8_t lateral_endstop_state;
-    /** Bit N = 1 means axis N endstop is armed (will stop motion on trigger). */
+    /** Bit N = 1 means axis N endstop protection is currently armed. */
     uint8_t endstop_armed_mask;
-    /** Bit N = 1 means axis N hit its endstop since the last arm. */
+    /** Bit N = 1 means axis N hit its endstop since the last arm command. */
     uint8_t endstop_hit_mask;
     /**
     * Motion sequence of the most recently fully-executed multi-axis segment.

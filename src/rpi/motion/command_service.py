@@ -134,9 +134,23 @@ class MotionCommandService:
         self,
         approach_rpm: float = 120.0,
         search_rpm: float = 10.0,
-        backoff_steps: int = 400,
+        backoff_steps: int | None = None,
     ) -> dict[str, Any]:
-        """Start lateral homing asynchronously and return immediately."""
+        """Start lateral homing asynchronously and return immediately.
+
+        ``backoff_steps`` defaults to 2 full motor revolutions when *None* is
+        passed.  This guarantees at least 2 × pitch_mm of mechanical travel
+        regardless of the configured leadscrew pitch, which is sufficient to
+        release any standard mechanical endstop (typical release travel ≤ 2 mm).
+        Pass an explicit integer to override (e.g. for non-standard hardware).
+        """
+        if backoff_steps is None:
+            steps_per_rev = (
+                self._config.lateral_steps_per_revolution
+                * self._config.lateral_microstepping
+            )
+            # 2 full revolutions — pitch-agnostic safe default for endstop release.
+            backoff_steps = steps_per_rev * 2
         if self._state.engine_state != EngineState.IDLE:
             raise RuntimeError(
                 "home_lateral only allowed when engine is IDLE; if a FAULT occurred, "
@@ -164,7 +178,7 @@ class MotionCommandService:
             "axis_id": self._config.lateral_axis_id,
             "approach_rpm": approach_rpm,
             "search_rpm": search_rpm,
-            "backoff_steps": backoff_steps,
+            "backoff_steps": backoff_steps,  # actual value after default expansion
         }
 
     def _wait_for_lateral_home_completion(self, move: Any) -> None:

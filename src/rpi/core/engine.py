@@ -11,7 +11,7 @@ from core.events import EventBus, EventKind
 from core.lateral import LateralAxisController
 from core.shared_state import EngineState, SharedState
 from motion import SpindleKinematics
-from motion.command_service import adjust_duration_for_ramp_deficit
+from motion.command_service import MotionCommandService, adjust_duration_for_ramp_deficit
 from motion.move_queue import MoveQueue
 from transport.spi_transport import Esp32SpiTransport
 from winding import ScatterEngine, SyncAxisConfig, WindingPattern, WoundMove
@@ -41,14 +41,44 @@ class WindingEngine:
       RUNNING -> FAULT                        (endstop / error)
     """
 
-    def __init__(self,*,transport: Esp32SpiTransport,shared_state: SharedState,move_queue: MoveQueue,
-                 lateral_controller: LateralAxisController,event_bus: EventBus,config: AppConfiguration | None = None,) -> None:
+    def __init__(
+        self,
+        *,
+        transport: Esp32SpiTransport,
+        shared_state: SharedState,
+        move_queue: MoveQueue | None = None,
+        lateral_controller: LateralAxisController | None = None,
+        event_bus: EventBus,
+        config: AppConfiguration | None = None,
+    ) -> None:
+        resolved_config = config or AppConfiguration()
+        resolved_move_queue = move_queue or MoveQueue(
+            transport=transport,
+            axis_states=shared_state.axis_states,
+            poll_interval_s=0.001,
+            print_every=1,
+        )
+        resolved_lateral = lateral_controller or LateralAxisController(
+            transport=transport,
+            shared_state=shared_state,
+            move_queue=resolved_move_queue,
+            event_bus=event_bus,
+            config=resolved_config,
+        )
+
         self._transport = transport
         self._state = shared_state
-        self._move_queue = move_queue
-        self._lateral = lateral_controller
+        self._move_queue = resolved_move_queue
+        self._lateral = resolved_lateral
         self._events = event_bus
-        self._config = config or AppConfiguration()
+        self._config = resolved_config
+        self._commands = MotionCommandService(
+            transport=transport,
+            shared_state=shared_state,
+            move_queue=resolved_move_queue,
+            lateral_controller=resolved_lateral,
+            config=resolved_config,
+        )
 
         self._shutdown_event = threading.Event()
         self._stop_request_event = threading.Event()
@@ -116,12 +146,16 @@ class WindingEngine:
         """Request stop. Current move is aborted, queue is cleared."""
         self._stop_request_event.set()
         if clear_queue:
-            self._move_queue.clear(
-                stop_plan=stop_plan or MotionStopPlan.stop(
-                    self._state.axis_states,
-                    reason="engine stop requested",
-                )
+            effective_stop_plan = stop_plan or MotionStopPlan.stop(
+                self._state.axis_states,
+                reason="engine stop requested",
             )
+            try:
+                self._move_queue.clear(stop_plan=effective_stop_plan)
+            except TypeError as exc:
+                if "stop_plan" not in str(exc):
+                    raise
+                self._move_queue.clear()
         if self._state.engine_state in (EngineState.HOMING, EngineState.RUNNING):
             self._state.set_engine_state(EngineState.STOPPING)
 
@@ -137,6 +171,83 @@ class WindingEngine:
             "last_error": self._last_worker_error,
             "stop_requested": self._stop_requested(),
         }
+
+    def status(self) -> dict[str, Any]:
+        self._lateral.refresh_home_state()
+        move_queue_status = (
+            self._move_queue.status()
+            if hasattr(self._move_queue, "status")
+            else {
+                "running": False,
+                "current_move": None,
+                "pending_moves": [],
+                "history": [],
+                "axis_states": {
+                    ax_id: state.snapshot()
+                    for ax_id, state in self._state.axis_states.items()
+                },
+            }
+        )
+        return {
+            "shared_state": self._state.snapshot(),
+            "move_queue": move_queue_status,
+        }
+
+    def jog(
+        self,
+        *,
+        axis_id: int,
+        steps: int,
+        rpm: float,
+        reverse: bool = False,
+    ) -> dict[str, Any]:
+        self._commands.jog(axis_id=axis_id, steps=steps, rpm=rpm, reverse=reverse)
+        return {
+            "status": "queued",
+            "axis_id": axis_id,
+            "steps": steps,
+            "rpm": rpm,
+            "reverse": reverse,
+        }
+
+    def home_lateral(
+        self,
+        *,
+        approach_rpm: float = _DEFAULT_HOME_APPROACH_RPM,
+        search_rpm: float = _DEFAULT_HOME_SEARCH_RPM,
+        backoff_steps: int = _DEFAULT_HOME_BACKOFF_STEPS,
+    ) -> dict[str, Any]:
+        return self._commands.home_lateral(
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
+        )
+
+    def move_lateral_to_mm(self, *, position_mm: float, rpm: float) -> dict[str, Any]:
+        return self._commands.move_lateral_to_mm(position_mm=position_mm, rpm=rpm)
+
+    def wound_run(self, **kwargs: Any) -> dict[str, Any]:
+        self._commands.wound_run(**kwargs)
+        return {"status": "queued"}
+
+    def run_axis(self, *, duration_s: float, targets: list[dict[str, Any]]) -> dict[str, Any]:
+        self._commands.run_axis(duration_s=duration_s, targets=targets)
+        return {"status": "queued"}
+
+    def _home_lateral_axis(
+        self,
+        *,
+        axis_id: int,
+        approach_rpm: float,
+        search_rpm: float,
+        backoff_steps: int,
+    ) -> tuple[bool, str | None]:
+        return self._lateral.home(
+            axis_id=axis_id,
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
+        )
 
 
 
@@ -188,7 +299,7 @@ class WindingEngine:
         self._events.publish(EventKind.PROGRAM_STARTED, program=program.snapshot())
 
         if program.home_before_start:
-            success, _reason = self._lateral.home(
+            success, _reason = self._home_lateral_axis(
                 axis_id=program.lateral_axis_id,
                 approach_rpm=program.home_approach_rpm,
                 search_rpm=program.home_search_rpm,
