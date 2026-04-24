@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import Any
 
 from core.config import AppConfiguration
@@ -69,6 +68,8 @@ class MotionCommandService:
         self._move_queue = move_queue
         self._lateral = lateral_controller
         self._config = config
+        self._manual_home_lock = threading.Lock()
+        self._manual_home_thread: threading.Thread | None = None
 
     # ── Transport commands ──────────────────────────────────────────────────
 
@@ -157,20 +158,19 @@ class MotionCommandService:
                 "acknowledge it with winding.clear_fault first"
             )
 
-        self._state.set_engine_state(EngineState.HOMING)
-        move = self._lateral.start_home(
-            axis_id=self._config.lateral_axis_id,
-            approach_rpm=approach_rpm,
-            search_rpm=search_rpm,
-            backoff_steps=backoff_steps,
-        )
+        with self._manual_home_lock:
+            if self._manual_home_thread is not None and self._manual_home_thread.is_alive():
+                raise RuntimeError("home_lateral is already in progress")
 
+        self._state.set_engine_state(EngineState.HOMING)
         monitor = threading.Thread(
-            target=self._wait_for_lateral_home_completion,
-            args=(move,),
+            target=self._run_lateral_home,
+            args=(approach_rpm, search_rpm, int(backoff_steps)),
             daemon=True,
             name="manual_home_monitor",
         )
+        with self._manual_home_lock:
+            self._manual_home_thread = monitor
         monitor.start()
 
         return {
@@ -181,13 +181,29 @@ class MotionCommandService:
             "backoff_steps": backoff_steps,  # actual value after default expansion
         }
 
-    def _wait_for_lateral_home_completion(self, move: Any) -> None:
-        while not move.done:
-            time.sleep(0.05)
-
-        success, _reason = self._lateral.finalize_home_move(move)
-        if success and self._state.engine_state == EngineState.HOMING:
-            self._state.set_engine_state(EngineState.IDLE)
+    def _run_lateral_home(
+        self,
+        approach_rpm: float,
+        search_rpm: float,
+        backoff_steps: int,
+    ) -> None:
+        try:
+            success, reason = self._lateral.home(
+                axis_id=self._config.lateral_axis_id,
+                approach_rpm=approach_rpm,
+                search_rpm=search_rpm,
+                backoff_steps=backoff_steps,
+            )
+            if success and self._state.engine_state == EngineState.HOMING:
+                self._state.set_engine_state(EngineState.IDLE)
+            elif not success and self._state.engine_state == EngineState.HOMING:
+                self._state.set_fault(reason or "lateral homing failed")
+        except Exception as exc:
+            logger.exception("manual lateral homing failed")
+            self._state.set_fault(f"manual lateral homing failed: {exc}")
+        finally:
+            with self._manual_home_lock:
+                self._manual_home_thread = None
 
 
     def move_lateral_to_mm(

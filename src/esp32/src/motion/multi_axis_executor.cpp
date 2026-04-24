@@ -17,6 +17,7 @@ static const char* TAG = "multi_exec";
 static constexpr uint32_t MULTI_EXEC_STACK = 8192;
 static constexpr UBaseType_t MULTI_EXEC_PRIO = 20;
 static constexpr BaseType_t MULTI_EXEC_CORE = 1;
+static constexpr int64_t LATERAL_ABSENT_FAILSAFE_US = 50 * 1000;
 
 MultiAxisExecutor::MultiAxisExecutor(CommRuntime& runtime)
     : runtime_(runtime)
@@ -70,6 +71,7 @@ void MultiAxisExecutor::run()
 
     uint8_t active_axis_ids[MULTI_AXIS_MAX_AXES] = {};
     uint8_t active_axis_count = 0;
+    int64_t lateral_absent_armed_since_us = 0;
 
     planned_segment_t batch[EXEC_BATCH_LIMIT];
     uint32_t batch_count = 0;
@@ -210,15 +212,24 @@ void MultiAxisExecutor::run()
 
                 if (lateral_endstop_armed
                     && lateral_state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
-                    ESP_LOGW(TAG, "lateral endstop ABSENT while armed at seq=%u — fail-safe stop",
-                             static_cast<unsigned>(seg.motion_sequence));
-                    StepperQueue* lateral_queue = runtime_.queueForAxis(1);
-                    if (lateral_queue != nullptr) {
-                        lateral_queue->driver().emergencyStop();
+                    const int64_t now_us = esp_timer_get_time();
+                    if (lateral_absent_armed_since_us == 0) {
+                        lateral_absent_armed_since_us = now_us;
                     }
-                    requestPlannerFlush(seg.motion_sequence);
-                    state = ExecState::RECOVERY;
-                    goto exit_drain;
+                    if ((now_us - lateral_absent_armed_since_us) >= LATERAL_ABSENT_FAILSAFE_US) {
+                        ESP_LOGW(TAG, "lateral endstop ABSENT while armed for %lld us at seq=%u — fail-safe stop",
+                                 static_cast<long long>(now_us - lateral_absent_armed_since_us),
+                                 static_cast<unsigned>(seg.motion_sequence));
+                        StepperQueue* lateral_queue = runtime_.queueForAxis(1);
+                        if (lateral_queue != nullptr) {
+                            lateral_queue->driver().emergencyStop();
+                        }
+                        requestPlannerFlush(seg.motion_sequence);
+                        state = ExecState::RECOVERY;
+                        goto exit_drain;
+                    }
+                } else {
+                    lateral_absent_armed_since_us = 0;
                 }
 
                 const bool lateral_blocked =

@@ -111,7 +111,6 @@ public:
      */
     void armEndstop() {
         endstop_active_.store(false, std::memory_order_release);
-        endstop_clearance_pending_.store(false, std::memory_order_release);
         endstop_hit_count_.store(0, std::memory_order_relaxed);
         endstop_closed_confirmations_ = 0;
         endstop_armed_.store(true, std::memory_order_release);

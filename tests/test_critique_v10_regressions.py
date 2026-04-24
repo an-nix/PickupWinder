@@ -129,21 +129,13 @@ def test_motion_command_wound_run_uses_lateral_steps_per_mm() -> None:
 
 
 def test_motion_command_home_lateral_returns_immediately_and_completes_async() -> None:
-    class FakeMove:
-        def __init__(self, axis_id: int) -> None:
-            self.axis_id = axis_id
-            self.done = False
-
     config = AppConfiguration()
     state = SharedState(axis_states={})
-    move = FakeMove(config.lateral_axis_id)
-    finalized: list[FakeMove] = []
+    started: list[tuple[int, float, float, int]] = []
 
-    def _start_home(**_kwargs):
-        return move
-
-    def _finalize_home_move(completed_move):
-        finalized.append(completed_move)
+    def _home(*, axis_id: int, approach_rpm: float, search_rpm: float, backoff_steps: int):
+        started.append((axis_id, approach_rpm, search_rpm, backoff_steps))
+        time.sleep(0.05)
         return True, None
 
     commands = MotionCommandService(
@@ -151,8 +143,7 @@ def test_motion_command_home_lateral_returns_immediately_and_completes_async() -
         shared_state=state,
         move_queue=SimpleNamespace(),
         lateral_controller=SimpleNamespace(
-            start_home=_start_home,
-            finalize_home_move=_finalize_home_move,
+            home=_home,
         ),
         config=config,
     )
@@ -168,12 +159,11 @@ def test_motion_command_home_lateral_returns_immediately_and_completes_async() -
     }
     assert state.engine_state.name == "HOMING"
 
-    move.done = True
     deadline = time.monotonic() + 1.0
-    while not finalized and time.monotonic() < deadline:
+    while state.engine_state.name != "IDLE" and time.monotonic() < deadline:
         time.sleep(0.01)
 
-    assert finalized == [move]
+    assert started == [(config.lateral_axis_id, 20.0, 10.0, 3200)]
     assert state.engine_state.name == "IDLE"
 
 

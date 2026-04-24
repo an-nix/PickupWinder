@@ -210,15 +210,6 @@ uint8_t StepperDriver::reportedEndstopState() const
         return static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
     }
 
-    const TickType_t invalid_since =
-        endstop_invalid_since_tick_.load(std::memory_order_acquire);
-    if (invalid_since != 0) {
-        const TickType_t now = xTaskGetTickCount();
-        if ((now - invalid_since) >= ENDSTOP_INVALID_DEBOUNCE_TICKS) {
-            return static_cast<uint8_t>(LateralEndstopState::ABSENT);
-        }
-    }
-
     const EndstopSignalState stable = static_cast<EndstopSignalState>(
         endstop_last_stable_state_.load(std::memory_order_acquire));
     return (stable == EndstopSignalState::CLOSED)
