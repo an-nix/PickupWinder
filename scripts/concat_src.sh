@@ -8,19 +8,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST_DIR="$ROOT_DIR/doc/generated"
 DEST_FILE="$DEST_DIR/esp32_src_full_dump.txt"
 
+ESP32_DIR="$ROOT_DIR/src/esp32"
+ESP32_SRC_DIR="$ESP32_DIR/src"
+
 FILES=(
-  "$ROOT_DIR/src/esp32/src/step_types.h"
-  "$ROOT_DIR/src/esp32/src/stepper_queue.h"
-  "$ROOT_DIR/src/esp32/src/stepper_queue.cpp"
-  "$ROOT_DIR/src/esp32/src/stepper_driver.h"
-  "$ROOT_DIR/src/esp32/src/stepper_driver.cpp"
-  "$ROOT_DIR/src/esp32/src/motion_planner.h"
-  "$ROOT_DIR/src/esp32/src/motion_planner.cpp"
-  "$ROOT_DIR/src/esp32/src/messages.h"
-  "$ROOT_DIR/src/esp32/src/main.cpp"
-  "$ROOT_DIR/src/esp32/src/comm_interface.h"
-  "$ROOT_DIR/src/esp32/src/comm_interface.cpp"
-  "$ROOT_DIR/src/esp32/CMakeLists.txt"
+  "$ESP32_DIR/CMakeLists.txt"
+  "$ESP32_SRC_DIR/CMakeLists.txt"
+  "$ESP32_SRC_DIR/main.cpp"
+)
+
+while IFS= read -r f; do
+  FILES+=("$f")
+done < <(
+  find "$ESP32_SRC_DIR/comm" "$ESP32_SRC_DIR/motion" \
+    -type f \( -name '*.h' -o -name '*.cpp' \) 2>/dev/null | sort
 )
 
 mkdir -p "$DEST_DIR"

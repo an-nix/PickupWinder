@@ -228,8 +228,6 @@ uint8_t StepperDriver::reportedEndstopState() const
 
 bool StepperDriver::isEndstopMoveAllowed(bool direction) const
 {
-    (void)direction;
-
     if (!isEndstopArmed()) {
         return true;
     }
@@ -237,6 +235,23 @@ bool StepperDriver::isEndstopMoveAllowed(bool direction) const
     const uint8_t state = reportedEndstopState();
     if (state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
         return false;
+    }
+
+    if (state == static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN)) {
+        return true;
+    }
+
+    // Armed + physically CLOSED:
+    // - If we have a known post-hit clearance direction, only that direction
+    //   is allowed.
+    // - Otherwise (closed before any armed hit), reject movement fail-safe.
+    if (state == static_cast<uint8_t>(LateralEndstopState::PRESENT_CLOSED)) {
+        if (!endstop_clearance_pending_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        const bool clearance_direction =
+            endstop_clearance_direction_.load(std::memory_order_acquire);
+        return direction == clearance_direction;
     }
 
     return true;
@@ -248,7 +263,8 @@ bool StepperDriver::prepareEndstopMove(bool direction)
         return false;
     }
 
-    if (endstop_clearance_pending_.load(std::memory_order_acquire)) {
+    if (endstop_clearance_pending_.load(std::memory_order_acquire)
+        && direction == endstop_clearance_direction_.load(std::memory_order_acquire)) {
         endstop_active_.store(false, std::memory_order_release);
     }
     return true;
