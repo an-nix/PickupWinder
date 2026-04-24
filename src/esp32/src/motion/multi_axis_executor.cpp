@@ -181,19 +181,6 @@ void MultiAxisExecutor::run()
                     active_axis_ids[a] = seg.axis_ids[a];
                 }
 
-                uint8_t guarded_axis_ids[MULTI_AXIS_MAX_AXES] = {};
-                uint8_t guarded_axis_count = 0;
-
-                auto clearMultiExecFlags = [&]() {
-                    for (uint8_t i = 0; i < guarded_axis_count; ++i) {
-                        const uint8_t axis_id = guarded_axis_ids[i];
-                        StepperQueue* axis_queue = runtime_.queueForAxis(axis_id);
-                        if (axis_queue != nullptr) {
-                            axis_queue->setMultiExecActive(false);
-                        }
-                    }
-                };
-
                 bool endstop_hit = false;
                 for (uint8_t a = 0; a < seg.axis_count && !endstop_hit; ++a) {
                     const uint8_t axis_id = seg.axis_ids[a];
@@ -202,7 +189,6 @@ void MultiAxisExecutor::run()
                         continue;
                     }
                     if (axis_queue->driver().isEndstopActive()) {
-                        clearMultiExecFlags();
                         axis_queue->driver().emergencyStop();
                         requestPlannerFlush(seg.motion_sequence);
                         ESP_LOGW(TAG, "endstop on axis %u at seq=%u",
@@ -226,7 +212,6 @@ void MultiAxisExecutor::run()
                     && lateral_state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
                     ESP_LOGW(TAG, "lateral endstop ABSENT while armed at seq=%u — fail-safe stop",
                              static_cast<unsigned>(seg.motion_sequence));
-                    clearMultiExecFlags();
                     StepperQueue* lateral_queue = runtime_.queueForAxis(1);
                     if (lateral_queue != nullptr) {
                         lateral_queue->driver().emergencyStop();
@@ -239,17 +224,6 @@ void MultiAxisExecutor::run()
                 const bool lateral_blocked =
                     lateral_endstop_armed
                     && lateral_state != static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
-
-                for (uint8_t a = 0; a < seg.axis_count; ++a) {
-                    const uint8_t axis_id = seg.axis_ids[a];
-                    StepperQueue* axis_queue = runtime_.queueForAxis(axis_id);
-                    if (axis_queue != nullptr) {
-                        axis_queue->setMultiExecActive(true);
-                        if (guarded_axis_count < MULTI_AXIS_MAX_AXES) {
-                            guarded_axis_ids[guarded_axis_count++] = axis_id;
-                        }
-                    }
-                }
 
                 for (uint8_t a = 0; a < seg.axis_count; ++a) {
                     const uint8_t axis_id = seg.axis_ids[a];
@@ -267,7 +241,6 @@ void MultiAxisExecutor::run()
                     }
                     if (axis_id == 1 && lateral_blocked
                         && !runtime_.isLateralMovementAllowed(axis_id, seg.axes[a].direction)) {
-                        clearMultiExecFlags();
                         ESP_LOGW(TAG, "axis1 blocked while armed at seq=%u",
                                  static_cast<unsigned>(seg.motion_sequence));
                         axis_queue->driver().emergencyStop();
@@ -282,7 +255,6 @@ void MultiAxisExecutor::run()
                         seg.duration_us);
 
                     if (err == ESP_ERR_INVALID_STATE) {
-                        clearMultiExecFlags();
                         ESP_LOGW(TAG, "axis %u endstop mid-seg seq=%u",
                                  static_cast<unsigned>(axis_id),
                                  static_cast<unsigned>(seg.motion_sequence));
@@ -291,7 +263,6 @@ void MultiAxisExecutor::run()
                         state = ExecState::RECOVERY;
                         goto exit_drain;
                     } else if (err == ESP_ERR_TIMEOUT) {
-                        clearMultiExecFlags();
                         ESP_LOGE(TAG, "axis %u ring timeout at seq=%u — forcing RECOVERY",
                                  static_cast<unsigned>(axis_id),
                                  static_cast<unsigned>(seg.motion_sequence));
@@ -306,7 +277,6 @@ void MultiAxisExecutor::run()
                                  esp_err_to_name(err));
                     }
                 }
-                clearMultiExecFlags();
 
                 const int64_t now_us = esp_timer_get_time();
                 const int64_t fire_at_us =
@@ -371,12 +341,18 @@ void MultiAxisExecutor::run()
             planned_segment_t discard;
             uint32_t drained = 0;
             uint16_t last_drained_seq = 0;
+            bool drained_real_segment = false;
             while (drained < SEGMENT_QUEUE_DEPTH
                    && xQueueReceive(seg_queue, &discard, 0) == pdTRUE) {
                 if (!discard.is_flush) {
                     last_drained_seq = discard.motion_sequence;
+                    drained_real_segment = true;
                 }
                 ++drained;
+            }
+
+            if (drained_real_segment) {
+                runtime_.notifySegmentExecuted(last_drained_seq);
             }
 
             defer_head = defer_tail = 0;

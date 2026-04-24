@@ -5,7 +5,6 @@
 
 #pragma once
 
-#include <atomic>
 #include <freertos/FreeRTOS.h>
 #include <esp_err.h>
 #include "step_types.h"
@@ -38,18 +37,9 @@ public:
     StepperDriver& driver() { return driver_; }
     const StepperDriver& driver() const { return driver_; }
 
-    void setMultiExecActive(bool active) {
-        multi_exec_active_.store(active, std::memory_order_release);
-    }
-
-    bool isMultiExecActive() const {
-        return multi_exec_active_.load(std::memory_order_acquire);
-    }
-
 private:
     StepperDriver& driver_;
     uint8_t        motor_id_;
-    std::atomic<bool> multi_exec_active_ {false};
 
     static esp_err_t maybeStartDriver(StepperDriver& driver, bool force_start);
     static esp_err_t pushExpandedBlock(StepperDriver& driver, const step_block_t& block);

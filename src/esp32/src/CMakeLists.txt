@@ -6,7 +6,6 @@
 
 file(GLOB root_sources
 	${CMAKE_SOURCE_DIR}/src/main.cpp
-	${CMAKE_SOURCE_DIR}/src/motion_planner.cpp
 )
 
 file(GLOB comm_sources ${CMAKE_SOURCE_DIR}/src/comm/*.cpp)

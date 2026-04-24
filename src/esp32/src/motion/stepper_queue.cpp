@@ -58,7 +58,15 @@ esp_err_t StepperQueue::enqueueSegmentBlock(const segment_block_t& block,
 
 uint32_t StepperQueue::available() const
 {
-    return static_cast<uint32_t>(STEPPER_QUEUE_DEPTH);
+    const uint32_t ring_free = driver_.ringFreeSlots();
+    const uint32_t equiv = ring_free / STEP_BLOCK_SIZE;
+    // Returns 0 when ring_free < STEP_BLOCK_SIZE. The host must
+    // treat queue_free_slots == 0 as back-pressure (slow down), not
+    // as a hard stop. The ring drains continuously while the motor
+    // is running and space will reappear within microseconds.
+    // The planner_queue_free field in StatusPayload is a better
+    // gate for send-rate decisions.
+    return (equiv < STEPPER_QUEUE_DEPTH) ? equiv : STEPPER_QUEUE_DEPTH;
 }
 
 esp_err_t StepperQueue::executeConstantRateBlock(bool direction,

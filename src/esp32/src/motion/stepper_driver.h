@@ -95,10 +95,25 @@ public:
     };
     std::atomic<TickType_t> endstop_invalid_since_tick_ {0};
 
+    /**
+     * @note After an endstop hit, endstop_active_ remains set and blocks
+     * the RMT encoder (encode_steps returns done=true immediately).
+     * The host MUST send ENABLE_ENDSTOP(arm=1) before issuing any backoff
+     * motion — including the slow seek — so that armEndstop() clears
+     * the latch and allows the RMT to resume. This is the expected
+     * Klipper-style sequence:
+     *   1. fast seek  → hit detected → endstop_active_ latched
+     *   2. host sends ENABLE_ENDSTOP(arm=1)  → latch cleared, driver re-armed
+     *   3. host sends backoff segments
+     *   4. host sends ENABLE_ENDSTOP(arm=1) again before slow seek
+     *   5. slow seek  → hit detected → latch set again
+     *   6. host sends ENABLE_ENDSTOP(arm=0) to disarm after homing completes
+     */
     void armEndstop() {
         endstop_active_.store(false, std::memory_order_release);
         endstop_clearance_pending_.store(false, std::memory_order_release);
         endstop_hit_count_.store(0, std::memory_order_relaxed);
+        endstop_closed_confirmations_ = 0;
         endstop_armed_.store(true, std::memory_order_release);
     }
 
@@ -107,6 +122,7 @@ public:
         endstop_active_.store(false, std::memory_order_release);
         endstop_clearance_pending_.store(false, std::memory_order_release);
         endstop_hit_count_.store(0, std::memory_order_relaxed);
+        endstop_closed_confirmations_ = 0;
     }
 
     bool isEndstopArmed() const { return endstop_armed_.load(std::memory_order_acquire); }
@@ -143,7 +159,17 @@ private:
     std::atomic<bool>     last_dir_commanded_ {true};
     bool                  enabled_     {false};
     std::atomic<bool>     endstop_armed_  {false};
+    // Number of consecutive CLOSED readings required before latching
+    // endstop_active_. The dual-contact NO/NC sensor fires two GPIO
+    // edges almost simultaneously on actuation (~µs apart at hardware
+    // level), so 2 confirmations filter single-edge spikes without
+    // adding measurable stop latency. Do not raise above 3 — the ISR
+    // fires on ANYEDGE of either pin, so a genuine hit produces at
+    // most 2 rapid CLOSED edges before the ISR may see an INVALID
+    // crossover transient that resets the counter.
+    static constexpr uint8_t ENDSTOP_CLOSED_CONFIRM_COUNT = 2;
     static constexpr TickType_t ENDSTOP_INVALID_DEBOUNCE_TICKS = pdMS_TO_TICKS(5);
+    volatile uint8_t      endstop_closed_confirmations_ {0};
 
     gpio_num_t            endstop_no_pin_ {GPIO_NUM_NC};
     gpio_num_t            endstop_nc_pin_ {GPIO_NUM_NC};

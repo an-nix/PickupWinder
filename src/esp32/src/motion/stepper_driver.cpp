@@ -275,6 +275,7 @@ void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
 
     const TickType_t now_tick = xTaskGetTickCountFromISR();
     if (raw == EndstopSignalState::INVALID) {
+        drv->endstop_closed_confirmations_ = 0;
         const TickType_t invalid_since =
             drv->endstop_invalid_since_tick_.load(std::memory_order_relaxed);
         if (invalid_since == 0) {
@@ -287,12 +288,21 @@ void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
     drv->endstop_invalid_since_tick_.store(0, std::memory_order_release);
 
     if (raw == EndstopSignalState::OPEN) {
+        drv->endstop_closed_confirmations_ = 0;
         drv->endstop_active_.store(false, std::memory_order_release);
         drv->endstop_clearance_pending_.store(false, std::memory_order_release);
         return;
     }
 
     if (!drv->isEndstopArmed()) {
+        return;
+    }
+
+    const uint8_t confirmations = drv->endstop_closed_confirmations_;
+    if (confirmations < ENDSTOP_CLOSED_CONFIRM_COUNT) {
+        drv->endstop_closed_confirmations_ = static_cast<uint8_t>(confirmations + 1);
+    }
+    if (drv->endstop_closed_confirmations_ < ENDSTOP_CLOSED_CONFIRM_COUNT) {
         return;
     }
 
