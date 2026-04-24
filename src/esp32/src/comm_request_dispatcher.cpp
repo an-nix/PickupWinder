@@ -3,12 +3,12 @@
 #include <string.h>
 #include <esp_log.h>
 
-#include "comm_interface.h"
+#include "comm_runtime.h"
 
 static const char* TAG = "comm_dispatch";
 
-CommRequestDispatcher::CommRequestDispatcher(CommInterface& owner)
-    : owner_(owner)
+CommRequestDispatcher::CommRequestDispatcher(CommRuntime& runtime)
+    : runtime_(runtime)
 {
 }
 
@@ -56,9 +56,7 @@ void CommRequestDispatcher::cacheProcessedRequest(const SpiMessageHeader& header
 
 void CommRequestDispatcher::publishAck(const SpiMessageHeader& header, uint8_t result)
 {
-    owner_.last_rx_sequence_ = header.sequence;
-    owner_.last_rx_type_ = header.msg_type;
-    owner_.last_result_ = result;
+    runtime_.publishAck(header, result);
 }
 
 uint8_t CommRequestDispatcher::mapRequestResult(esp_err_t err)
@@ -115,7 +113,7 @@ uint8_t CommRequestDispatcher::processValidatedRequest(const SpiMessageHeader& h
 
 esp_err_t CommRequestDispatcher::handleEnableAxis(const EnableAxisPayload& payload)
 {
-    StepperQueue* axis_queue = owner_.queueForAxis(payload.axis_id);
+    StepperQueue* axis_queue = runtime_.queueForAxis(payload.axis_id);
     if (axis_queue == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -131,8 +129,8 @@ esp_err_t CommRequestDispatcher::handleEnableAxis(const EnableAxisPayload& paylo
 esp_err_t CommRequestDispatcher::handleEmergencyStop(const EmergencyStopPayload& payload)
 {
     if (payload.axis_id == 0xFF) {
-        for (uint8_t axis = 0; axis < owner_.n_motors_; ++axis) {
-            StepperQueue* axis_queue = owner_.queueForAxis(axis);
+        for (uint8_t axis = 0; axis < runtime_.motorCount(); ++axis) {
+            StepperQueue* axis_queue = runtime_.queueForAxis(axis);
             if (axis_queue != nullptr) {
                 axis_queue->driver().emergencyStop();
             }
@@ -140,7 +138,7 @@ esp_err_t CommRequestDispatcher::handleEmergencyStop(const EmergencyStopPayload&
         return ESP_OK;
     }
 
-    StepperQueue* axis_queue = owner_.queueForAxis(payload.axis_id);
+    StepperQueue* axis_queue = runtime_.queueForAxis(payload.axis_id);
     if (axis_queue == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -152,8 +150,8 @@ esp_err_t CommRequestDispatcher::handleEmergencyStop(const EmergencyStopPayload&
 esp_err_t CommRequestDispatcher::handleStopAxis(const EmergencyStopPayload& payload)
 {
     if (payload.axis_id == 0xFF) {
-        for (uint8_t axis = 0; axis < owner_.n_motors_; ++axis) {
-            StepperQueue* axis_queue = owner_.queueForAxis(axis);
+        for (uint8_t axis = 0; axis < runtime_.motorCount(); ++axis) {
+            StepperQueue* axis_queue = runtime_.queueForAxis(axis);
             if (axis_queue != nullptr) {
                 axis_queue->gracefulStop();
             }
@@ -161,7 +159,7 @@ esp_err_t CommRequestDispatcher::handleStopAxis(const EmergencyStopPayload& payl
         return ESP_OK;
     }
 
-    StepperQueue* axis_queue = owner_.queueForAxis(payload.axis_id);
+    StepperQueue* axis_queue = runtime_.queueForAxis(payload.axis_id);
     if (axis_queue == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -172,8 +170,8 @@ esp_err_t CommRequestDispatcher::handleStopAxis(const EmergencyStopPayload& payl
 
 esp_err_t CommRequestDispatcher::handleDisableAll()
 {
-    for (uint8_t axis = 0; axis < owner_.n_motors_; ++axis) {
-        StepperQueue* axis_queue = owner_.queueForAxis(axis);
+    for (uint8_t axis = 0; axis < runtime_.motorCount(); ++axis) {
+        StepperQueue* axis_queue = runtime_.queueForAxis(axis);
         if (axis_queue != nullptr) {
             axis_queue->driver().disable();
         }
@@ -183,19 +181,19 @@ esp_err_t CommRequestDispatcher::handleDisableAll()
 
 esp_err_t CommRequestDispatcher::handleResetStats()
 {
-    for (uint8_t axis = 0; axis < owner_.n_motors_; ++axis) {
-        StepperQueue* axis_queue = owner_.queueForAxis(axis);
+    for (uint8_t axis = 0; axis < runtime_.motorCount(); ++axis) {
+        StepperQueue* axis_queue = runtime_.queueForAxis(axis);
         if (axis_queue != nullptr) {
             axis_queue->driver().resetUnderrunCount();
         }
     }
-    owner_.planner_.resetStats();
+    runtime_.planner().resetStats();
     return ESP_OK;
 }
 
 esp_err_t CommRequestDispatcher::handleEnableEndstop(const EnableEndstopPayload& payload)
 {
-    StepperQueue* axis_queue = owner_.queueForAxis(payload.axis_id);
+    StepperQueue* axis_queue = runtime_.queueForAxis(payload.axis_id);
     if (axis_queue == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -213,66 +211,22 @@ esp_err_t CommRequestDispatcher::handleEnableEndstop(const EnableEndstopPayload&
 
 esp_err_t CommRequestDispatcher::handleStepBlock(const StepBlockPayload& payload)
 {
-    StepperQueue* axis_queue = owner_.queueForAxis(payload.axis_id);
-    if (axis_queue == nullptr) {
+    if (!runtime_.hasAxis(payload.axis_id)) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    const bool direction = (payload.step_count > 0)
-        ? ((payload.entries[0].flags & SpiStepFlags::DIR_REVERSE) != 0)
-        : false;
-    if (!owner_.isLateralMovementAllowed(payload.axis_id, direction)) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (payload.step_count > STEP_BLOCK_SIZE) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    motion_block_t block {};
-    block.kind = MOTION_BLOCK_KIND_STEP;
-    block.payload.step.count = payload.step_count;
-    for (uint32_t i = 0; i < block.payload.step.count; ++i) {
-        block.payload.step.steps[i].interval_ticks = payload.entries[i].interval_ticks;
-        block.payload.step.steps[i].direction = (payload.entries[i].flags & SpiStepFlags::DIR_REVERSE) != 0;
-    }
-
-    return axis_queue->enqueueMotionBlock(block, 0);
+    (void)payload;
+    ESP_LOGW(TAG, "legacy STEP_BLOCK is no longer supported; use MULTI_AXIS_SEGMENT_BLOCK");
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t CommRequestDispatcher::handleSegmentBlock(const SegmentBlockPayload& payload)
 {
-    StepperQueue* axis_queue = owner_.queueForAxis(payload.axis_id);
-    if (axis_queue == nullptr) {
+    if (!runtime_.hasAxis(payload.axis_id)) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (payload.segment_count > SEGMENT_BLOCK_SIZE) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    for (uint32_t i = 0; i < payload.segment_count; ++i) {
-        if (payload.segments[i].step_count == 0) {
-            continue;
-        }
-        const bool direction =
-            (payload.segments[i].flags & SpiStepFlags::DIR_REVERSE) != 0;
-        if (!owner_.isLateralMovementAllowed(payload.axis_id, direction)) {
-            return ESP_ERR_INVALID_STATE;
-        }
-    }
-
-    motion_block_t block {};
-    block.kind = MOTION_BLOCK_KIND_SEGMENT;
-    block.payload.segment.count = payload.segment_count;
-    for (uint32_t i = 0; i < block.payload.segment.count; ++i) {
-        block.payload.segment.segments[i].step_count = payload.segments[i].step_count;
-        block.payload.segment.segments[i].start_ticks = payload.segments[i].start_ticks;
-        block.payload.segment.segments[i].add_ticks = payload.segments[i].add_ticks;
-        block.payload.segment.segments[i].direction =
-            (payload.segments[i].flags & SpiStepFlags::DIR_REVERSE) != 0;
-        block.payload.segment.segments[i].reserved = 0;
-    }
-
-    return axis_queue->enqueueMotionBlock(block, 0);
+    (void)payload;
+    ESP_LOGW(TAG, "legacy SEGMENT_BLOCK is no longer supported; use MULTI_AXIS_SEGMENT_BLOCK");
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t CommRequestDispatcher::handleMultiAxisSegmentBlock(const uint8_t* payload,
@@ -302,10 +256,10 @@ esp_err_t CommRequestDispatcher::handleMultiAxisSegmentBlock(const uint8_t* payl
         return ESP_ERR_INVALID_SIZE;
     }
 
-    if (sequence_is_stale_or_equal_u16(hdr_val.block_seq, owner_.last_accepted_block_seq_)) {
+    if (sequence_is_stale_or_equal_u16(hdr_val.block_seq, runtime_.lastAcceptedBlockSeq())) {
         ESP_LOGW(TAG, "drop stale/duplicate block_seq=%u last=%u",
                  static_cast<unsigned>(hdr_val.block_seq),
-                 static_cast<unsigned>(owner_.last_accepted_block_seq_));
+                 static_cast<unsigned>(runtime_.lastAcceptedBlockSeq()));
         return ESP_OK;
     }
 
@@ -316,7 +270,7 @@ esp_err_t CommRequestDispatcher::handleMultiAxisSegmentBlock(const uint8_t* payl
     const uint8_t* cursor = payload + sizeof(MultiAxisSegmentBlockHeader);
     for (uint8_t a = 0; a < axis_count; ++a) {
         block.axis_ids[a] = cursor[a];
-        if (!owner_.hasAxis(block.axis_ids[a])) {
+        if (!runtime_.hasAxis(block.axis_ids[a])) {
             return ESP_ERR_INVALID_ARG;
         }
     }
@@ -341,7 +295,7 @@ esp_err_t CommRequestDispatcher::handleMultiAxisSegmentBlock(const uint8_t* payl
             block.segments[s].step_counts[a] = steps;
             if (steps > 0) {
                 const bool direction = (dir_mask & static_cast<uint16_t>(1U << a)) != 0;
-                if (!owner_.isLateralMovementAllowed(block.axis_ids[a], direction)) {
+                if (!runtime_.isLateralMovementAllowed(block.axis_ids[a], direction)) {
                     return ESP_ERR_INVALID_STATE;
                 }
             }
@@ -349,22 +303,22 @@ esp_err_t CommRequestDispatcher::handleMultiAxisSegmentBlock(const uint8_t* payl
         }
     }
 
-    if (xQueueSend(owner_.multi_axis_queue_, &block, 0) != pdTRUE) {
+    if (xQueueSend(runtime_.multiAxisQueue(), &block, 0) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    owner_.last_accepted_block_seq_ = hdr_val.block_seq;
+    runtime_.setLastAcceptedBlockSeq(hdr_val.block_seq);
     return ESP_OK;
 }
 
 esp_err_t CommRequestDispatcher::handleFlush(const FlushPayload& flush_payload)
 {
     flush_request_t req { .flush_sequence = flush_payload.flush_sequence };
-    if (xQueueSend(owner_.flush_queue_, &req, 0) != pdTRUE) {
+    if (xQueueSend(runtime_.flushQueue(), &req, 0) != pdTRUE) {
         ESP_LOGW(TAG, "flush queue full — flush_seq=%u dropped",
                  static_cast<unsigned>(flush_payload.flush_sequence));
         return ESP_ERR_TIMEOUT;
     }
-    owner_.last_accepted_block_seq_ = 0xFFFFu;
+    runtime_.setLastAcceptedBlockSeq(0xFFFFu);
     return ESP_OK;
 }
 

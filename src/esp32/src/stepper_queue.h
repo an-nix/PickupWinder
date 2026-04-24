@@ -1,22 +1,21 @@
 /**
  * @file stepper_queue.h
- * @brief Per-motor FreeRTOS queue + executor task for motion blocks.
+ * @brief Per-motor helper around StepperDriver for multi-axis execution.
  *
- * The host now sends compressed motion segments rather than only explicit
- * per-step blocks. `StepperQueue` remains the boundary between transport and
- * execution:
+ * Production motion now goes through the global multi-axis executor. `StepperQueue`
+ * remains the per-axis boundary around `StepperDriver` for:
  *
- * - Core 0 / SPI task enqueues `motion_block_t`
- * - Core 1 / executor task expands segments into `step_block_t`
- * - `StepperDriver` streams the concrete steps via RMT
+ * - driver enable/disable/stop control
+ * - constant-rate segment expansion into `step_block_t`
+ * - coordinated RMT start for synchronised multi-axis motion
+ *
+ * Legacy per-axis `STEP_BLOCK` / `SEGMENT_BLOCK` execution is no longer active.
  */
 
 #pragma once
 
 #include <atomic>
 #include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
-#include <freertos/task.h>
 #include <esp_err.h>
 #include "step_types.h"
 #include "stepper_driver.h"
@@ -32,21 +31,17 @@ public:
     StepperQueue(StepperDriver& driver, uint8_t motor_id);
 
     /**
-     * @brief Create the FreeRTOS queue and launch the executor task.
+        * @brief Initialise the per-axis helper state.
      *
      * Must be called after StepperDriver::init().
      */
     esp_err_t init();
 
     /**
-     * @brief Enqueue a step block for execution.
+        * @brief Legacy compatibility entry point for deprecated per-axis motion.
      *
-     * Called by the communication layer (producer side).  Blocks for up to
-     * @p timeout_ms milliseconds if the queue is full.
-     *
-     * @param block       Block of pre-timed step commands.
-     * @param timeout_ms  Maximum wait time in ms (0 = non-blocking).
-     * @return ESP_OK on success, ESP_ERR_TIMEOUT if the queue was full.
+        * Production firmware no longer runs the historical per-axis executor task;
+        * callers should use `MULTI_AXIS_SEGMENT_BLOCK` instead.
      */
     esp_err_t enqueueMotionBlock(const motion_block_t& block,
                                  uint32_t timeout_ms = portMAX_DELAY);
@@ -132,19 +127,6 @@ private:
     uint8_t        motor_id_;
     std::atomic<bool> multi_exec_active_ {false};
 
-    QueueHandle_t  queue_  {nullptr};
-    TaskHandle_t   task_   {nullptr};
-
     static esp_err_t maybeStartDriver(StepperDriver& driver, bool force_start);
     static esp_err_t pushExpandedBlock(StepperDriver& driver, const step_block_t& block);
-    static esp_err_t executeSegmentBlock(StepperDriver& driver, const segment_block_t& block);
-
-    /**
-     * @brief Executor task body.
-     *
-    * Pinned to Core 1, priority 24. Dequeues `motion_block_t`, expands any
-    * compressed segments into `step_block_t`, and keeps the software ring as
-    * full as possible before starting / restarting the RMT stream.
-     */
-    static void executorTask(void* arg);
 };

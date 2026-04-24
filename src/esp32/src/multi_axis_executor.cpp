@@ -5,7 +5,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include "comm_interface.h"
+#include "comm_runtime.h"
 
 static const char* TAG = "multi_exec";
 
@@ -13,8 +13,8 @@ static constexpr uint32_t MULTI_EXEC_STACK = 8192;
 static constexpr UBaseType_t MULTI_EXEC_PRIO = 20;
 static constexpr BaseType_t MULTI_EXEC_CORE = 1;
 
-MultiAxisExecutor::MultiAxisExecutor(CommInterface& owner)
-    : owner_(owner)
+MultiAxisExecutor::MultiAxisExecutor(CommRuntime& runtime)
+    : runtime_(runtime)
 {
 }
 
@@ -44,8 +44,8 @@ void MultiAxisExecutor::run()
 
     {
         TaskHandle_t my_handle = xTaskGetCurrentTaskHandle();
-        for (uint8_t a = 0; a < owner_.n_motors_; ++a) {
-            StepperQueue* axis_queue = owner_.queueForAxis(a);
+        for (uint8_t a = 0; a < runtime_.motorCount(); ++a) {
+            StepperQueue* axis_queue = runtime_.queueForAxis(a);
             if (axis_queue != nullptr) {
                 axis_queue->driver().setExecutorTask(my_handle);
             }
@@ -55,7 +55,7 @@ void MultiAxisExecutor::run()
     ESP_LOGI(TAG, "multi_exec stack high watermark at start: %u bytes free",
              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
 
-    QueueHandle_t seg_queue = owner_.planner_.segmentQueue();
+    QueueHandle_t seg_queue = runtime_.planner().segmentQueue();
 
     constexpr int DEFER_DEPTH = 256;
     int64_t defer_fire_us[DEFER_DEPTH] = {};
@@ -77,7 +77,7 @@ void MultiAxisExecutor::run()
         while (defer_head != defer_tail) {
             const int idx = defer_head & (DEFER_DEPTH - 1);
             if (now >= defer_fire_us[idx]) {
-                owner_.notifySegmentExecuted(static_cast<uint16_t>(defer_seqs[idx]));
+                runtime_.notifySegmentExecuted(static_cast<uint16_t>(defer_seqs[idx]));
                 ++defer_head;
             } else {
                 break;
@@ -88,7 +88,7 @@ void MultiAxisExecutor::run()
     auto kickStartActiveAxes = [&]() {
         for (uint8_t a = 0; a < active_axis_count; ++a) {
             const uint8_t axis_id = active_axis_ids[a];
-            StepperQueue* axis_queue = owner_.queueForAxis(axis_id);
+            StepperQueue* axis_queue = runtime_.queueForAxis(axis_id);
             if (axis_queue != nullptr) {
                 axis_queue->kickStart();
             }
@@ -97,7 +97,7 @@ void MultiAxisExecutor::run()
 
     auto requestPlannerFlush = [&](uint16_t motion_sequence) {
         flush_request_t req { .flush_sequence = motion_sequence };
-        if (owner_.flush_queue_ != nullptr && xQueueSend(owner_.flush_queue_, &req, 0) != pdTRUE) {
+        if (runtime_.flushQueue() != nullptr && xQueueSend(runtime_.flushQueue(), &req, 0) != pdTRUE) {
             ESP_LOGW(TAG, "auto-flush queue full after recovery at seq=%u",
                      static_cast<unsigned>(motion_sequence));
         }
@@ -126,7 +126,7 @@ void MultiAxisExecutor::run()
                     bool all_rings_empty = true;
                     for (uint8_t a = 0; a < active_axis_count && all_rings_empty; ++a) {
                         const uint8_t aid = active_axis_ids[a];
-                        StepperQueue* axis_queue = owner_.queueForAxis(aid);
+                        StepperQueue* axis_queue = runtime_.queueForAxis(aid);
                         if (axis_queue != nullptr && axis_queue->driver().ringFreeSlots() < STEP_RING_SIZE) {
                             all_rings_empty = false;
                         }
@@ -134,7 +134,7 @@ void MultiAxisExecutor::run()
                     if (all_rings_empty) {
                         while (defer_head != defer_tail) {
                             const int idx = defer_head & (DEFER_DEPTH - 1);
-                            owner_.notifySegmentExecuted(static_cast<uint16_t>(defer_seqs[idx]));
+                            runtime_.notifySegmentExecuted(static_cast<uint16_t>(defer_seqs[idx]));
                             ++defer_head;
                         }
                     }
@@ -178,7 +178,7 @@ void MultiAxisExecutor::run()
                 auto clearMultiExecFlags = [&]() {
                     for (uint8_t i = 0; i < guarded_axis_count; ++i) {
                         const uint8_t axis_id = guarded_axis_ids[i];
-                        StepperQueue* axis_queue = owner_.queueForAxis(axis_id);
+                        StepperQueue* axis_queue = runtime_.queueForAxis(axis_id);
                         if (axis_queue != nullptr) {
                             axis_queue->setMultiExecActive(false);
                         }
@@ -188,7 +188,7 @@ void MultiAxisExecutor::run()
                 bool endstop_hit = false;
                 for (uint8_t a = 0; a < seg.axis_count && !endstop_hit; ++a) {
                     const uint8_t axis_id = seg.axis_ids[a];
-                    StepperQueue* axis_queue = owner_.queueForAxis(axis_id);
+                    StepperQueue* axis_queue = runtime_.queueForAxis(axis_id);
                     if (axis_queue == nullptr) {
                         continue;
                     }
@@ -207,18 +207,18 @@ void MultiAxisExecutor::run()
                     goto exit_drain;
                 }
 
-                const uint8_t lateral_state = owner_.readLateralEndstopState();
+                const uint8_t lateral_state = runtime_.readLateralEndstopState();
                 const bool lateral_endstop_armed =
-                    owner_.n_motors_ > 1
-                    && owner_.queueForAxis(1) != nullptr
-                    && owner_.queueForAxis(1)->driver().isEndstopArmed();
+                    runtime_.motorCount() > 1
+                    && runtime_.queueForAxis(1) != nullptr
+                    && runtime_.queueForAxis(1)->driver().isEndstopArmed();
 
                 if (lateral_endstop_armed
                     && lateral_state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
                     ESP_LOGW(TAG, "lateral endstop ABSENT while armed at seq=%u — fail-safe stop",
                              static_cast<unsigned>(seg.motion_sequence));
                     clearMultiExecFlags();
-                    StepperQueue* lateral_queue = owner_.queueForAxis(1);
+                    StepperQueue* lateral_queue = runtime_.queueForAxis(1);
                     if (lateral_queue != nullptr) {
                         lateral_queue->driver().emergencyStop();
                     }
@@ -233,7 +233,7 @@ void MultiAxisExecutor::run()
 
                 for (uint8_t a = 0; a < seg.axis_count; ++a) {
                     const uint8_t axis_id = seg.axis_ids[a];
-                    StepperQueue* axis_queue = owner_.queueForAxis(axis_id);
+                    StepperQueue* axis_queue = runtime_.queueForAxis(axis_id);
                     if (axis_queue != nullptr) {
                         axis_queue->setMultiExecActive(true);
                         if (guarded_axis_count < MULTI_AXIS_MAX_AXES) {
@@ -244,7 +244,7 @@ void MultiAxisExecutor::run()
 
                 for (uint8_t a = 0; a < seg.axis_count; ++a) {
                     const uint8_t axis_id = seg.axis_ids[a];
-                    StepperQueue* axis_queue = owner_.queueForAxis(axis_id);
+                    StepperQueue* axis_queue = runtime_.queueForAxis(axis_id);
                     if (axis_queue != nullptr && !axis_queue->driver().isStreaming()) {
                         axis_queue->kickStart();
                     }
@@ -252,12 +252,12 @@ void MultiAxisExecutor::run()
 
                 for (uint8_t a = 0; a < seg.axis_count; ++a) {
                     const uint8_t axis_id = seg.axis_ids[a];
-                    StepperQueue* axis_queue = owner_.queueForAxis(axis_id);
+                    StepperQueue* axis_queue = runtime_.queueForAxis(axis_id);
                     if (axis_queue == nullptr || seg.axes[a].step_count == 0) {
                         continue;
                     }
                     if (axis_id == 1 && lateral_blocked
-                        && !owner_.isLateralMovementAllowed(axis_id, seg.axes[a].direction)) {
+                        && !runtime_.isLateralMovementAllowed(axis_id, seg.axes[a].direction)) {
                         clearMultiExecFlags();
                         ESP_LOGW(TAG, "axis1 blocked while armed at seq=%u",
                                  static_cast<unsigned>(seg.motion_sequence));
@@ -311,7 +311,7 @@ void MultiAxisExecutor::run()
                 } else {
                     const int evict_idx = defer_head & (DEFER_DEPTH - 1);
                     const uint32_t evicted_seq = defer_seqs[evict_idx];
-                    owner_.notifySegmentExecuted(static_cast<uint16_t>(evicted_seq));
+                    runtime_.notifySegmentExecuted(static_cast<uint16_t>(evicted_seq));
                     ++defer_head;
                     const int idx = defer_tail & (DEFER_DEPTH - 1);
                     defer_fire_us[idx] = fire_at_us;
@@ -349,7 +349,7 @@ void MultiAxisExecutor::run()
         case ExecState::FLUSH: {
             const planned_segment_t& flush_seg = batch[batch_index];
             defer_head = defer_tail = 0;
-            owner_.notifySegmentExecuted(flush_seg.flush_sequence);
+            runtime_.notifySegmentExecuted(flush_seg.flush_sequence);
             ESP_LOGI(TAG, "executor flush at seq=%u",
                      static_cast<unsigned>(flush_seg.flush_sequence));
             batch_count = 0;

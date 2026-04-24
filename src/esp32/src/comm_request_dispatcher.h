@@ -4,11 +4,11 @@
 
 #include "messages.h"
 
-class CommInterface;
+class CommRuntime;
 
 class CommRequestDispatcher {
 public:
-    explicit CommRequestDispatcher(CommInterface& owner);
+    explicit CommRequestDispatcher(CommRuntime& runtime);
 
     uint8_t processValidatedRequest(const SpiMessageHeader& header,
                                     const uint8_t* payload);
@@ -25,7 +25,7 @@ private:
 
     static constexpr uint8_t RECENT_REQUEST_CACHE_DEPTH = 4;
 
-    CommInterface& owner_;
+    CommRuntime& runtime_;
     ProcessedRequestSignature recent_request_cache_[RECENT_REQUEST_CACHE_DEPTH] {};
     uint8_t recent_request_cache_write_index_ {0};
 
