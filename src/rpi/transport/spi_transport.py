@@ -132,7 +132,7 @@ class Esp32SpiTransport:
         self._open_device_path = device_path
         self._speed_hz = speed_hz
         self._mode = mode
-        self._device_path = None
+        self._device_path: str | None = None
 
         self._open_spi()
         self._sequence = 0

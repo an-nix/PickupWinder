@@ -24,6 +24,8 @@ from transport.spi_transport import Esp32SpiTransport
 _MAX_HISTORY = 50
 _ENDSTOP_VERIFY_TIMEOUT_S = 0.5
 _ENDSTOP_RELEASE_TIMEOUT_S = 1.5
+_ENDSTOP_OPEN_CONFIRM_SAMPLES = 3
+_ENDSTOP_OPEN_CONFIRM_INTERVAL_S = 0.015
 _INITIAL_ENDSTOP_CONFIRM_SAMPLES = 3
 _INITIAL_ENDSTOP_CONFIRM_INTERVAL_S = 0.01
 
@@ -230,8 +232,11 @@ class MoveQueue:
         try:
             if isinstance(move, CompositeMove):
                 self._execute_homing(move)  # type: ignore[arg-type]
-            elif isinstance(move, WoundMove) or getattr(move, "is_synchronized_move", False):
+            elif isinstance(move, WoundMove):
                 self._execute_wound_move(move)
+            elif getattr(move, "is_synchronized_move", False):
+                # AdaptiveWindingMove is duck-typed as WoundMove.
+                self._execute_wound_move(move)  # type: ignore[arg-type]
             elif isinstance(move, Move):
                 self._execute_ramp_move(move)
             else:
@@ -467,6 +472,12 @@ class MoveQueue:
             raise RuntimeError(
                 f"endstop became ABSENT after hit on axis {axis_id} — check wiring"
             )
+        if lateral_state == LATERAL_ENDSTOP_PRESENT_OPEN:
+            logger.warning(
+                "endstop on axis %s returned OPEN during post-hit recovery "
+                "(possible bounce or fast backoff) — proceeding with backoff",
+                axis_id,
+            )
         return status
 
     def _wait_for_endstop_latch_cleared(
@@ -521,12 +532,20 @@ class MoveQueue:
 
     def _wait_for_endstop_open(self, axis_id: int, timeout_s: float = _ENDSTOP_RELEASE_TIMEOUT_S) -> Any:
         deadline = time.monotonic() + timeout_s
+        consecutive_open = 0
         last_status = None
         while time.monotonic() < deadline:
             last_status = self._read_status(axis_id)
-            if int(getattr(last_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)) == LATERAL_ENDSTOP_PRESENT_OPEN:
-                return last_status
-            time.sleep(self._poll_interval_s)
+            state = int(
+                getattr(last_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
+            )
+            if state == LATERAL_ENDSTOP_PRESENT_OPEN:
+                consecutive_open += 1
+                if consecutive_open >= _ENDSTOP_OPEN_CONFIRM_SAMPLES:
+                    return last_status
+            else:
+                consecutive_open = 0
+            time.sleep(_ENDSTOP_OPEN_CONFIRM_INTERVAL_S)
         raise RuntimeError(
             f"endstop release timeout on axis {axis_id}: state=0x{int(getattr(last_status, 'lateral_endstop_state', 0xFF)):02X}"
         )
@@ -570,6 +589,8 @@ class MoveQueue:
         self._current_streamer = streamer
         if hasattr(streamer, "note_endstop_armed"):
             streamer.note_endstop_armed(move.axis_id, arm_endstop)
+        if hasattr(streamer, "set_homing_mode"):
+            streamer.set_homing_mode(True)
         streamer.set_generator(
             self._wrap_segment_sequence(
                 sub_move.segments(),

@@ -22,7 +22,7 @@ from core.coordinator import MotionCoordinator
 from core.status import RuntimeStatusService
 from jsonrpc.handlers import RpcHandler
 from jsonrpc.protocol import JsonRpcError
-from motion.command_service import MotionCommandService
+from core.command_service import MotionCommandService
 from winding import AdaptiveWindingSessionConfig
 from winding.program import WindingProgram
 from winding.service import AdaptiveWindingService

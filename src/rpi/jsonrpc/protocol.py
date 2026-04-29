@@ -80,14 +80,16 @@ def make_response(result: Any, request_id: Any | None) -> str:
 
 
 def make_error_response(error: JsonRpcError, request_id: Any | None) -> str:
-    payload = {
-        "jsonrpc": JSONRPC_VERSION,
-        "error": {
-            "code": error.code,
-            "message": error.message,
-        },
-        "id": request_id,
+    error_obj: dict[str, Any] = {
+        "code": error.code,
+        "message": error.message,
     }
     if error.data is not None:
-        payload["error"]["data"] = error.data
+        error_obj["data"] = error.data
+
+    payload: dict[str, Any] = {
+        "jsonrpc": JSONRPC_VERSION,
+        "error": error_obj,
+        "id": request_id,
+    }
     return json.dumps(payload)

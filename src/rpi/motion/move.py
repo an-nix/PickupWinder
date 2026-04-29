@@ -335,7 +335,7 @@ class HomingMove(CompositeMove):
             ),
         )
 
-    def phases(self) -> list[tuple[str, RampMove, bool]]:
+    def phases(self) -> list[tuple[str, Move, bool]]:
         """
         Return an ordered list of ``(phase_name, sub_move, endstop_armed)``.
         The ``MoveQueue`` iterates this list, arming/disarming the endstop

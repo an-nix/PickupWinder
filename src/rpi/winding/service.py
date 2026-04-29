@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any
+from typing import Any, Literal, overload
 
 from core.config import AppConfiguration
 from core.coordinator import MotionStopPlan
@@ -271,6 +271,20 @@ class AdaptiveWindingService:
             "active": snapshot["state"] not in {"completed", "stopped", "fault"},
             "session": snapshot,
         }
+
+    @overload
+    def _require_session(
+        self,
+        *,
+        allow_terminal: Literal[True],
+    ) -> AdaptiveWindingRuntime | None: ...
+
+    @overload
+    def _require_session(
+        self,
+        *,
+        allow_terminal: Literal[False] = False,
+    ) -> AdaptiveWindingRuntime: ...
 
     def _require_session(self, *, allow_terminal: bool = False) -> AdaptiveWindingRuntime | None:
         with self._lock:

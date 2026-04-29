@@ -11,7 +11,7 @@ from core.events import EventBus, EventKind
 from core.lateral import LateralAxisController
 from core.shared_state import EngineState, SharedState
 from motion import SpindleKinematics
-from motion.command_service import MotionCommandService, adjust_duration_for_ramp_deficit
+from core.command_service import MotionCommandService, adjust_duration_for_ramp_deficit
 from motion.move_queue import MoveQueue
 from transport.spi_transport import Esp32SpiTransport
 from winding import ScatterEngine, SyncAxisConfig, WindingPattern, WoundMove

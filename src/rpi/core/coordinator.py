@@ -9,6 +9,7 @@ services directly.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Iterable
@@ -50,7 +51,7 @@ class MotionStopPlan:
     @classmethod
     def pause(
         cls,
-        axis_states: dict[int, object],
+        axis_states: Mapping[int, object],
         axis_ids: Iterable[int] | None = None,
         *,
         reason: str | None = None,
@@ -71,7 +72,7 @@ class MotionStopPlan:
     @classmethod
     def stop(
         cls,
-        axis_states: dict[int, object],
+        axis_states: Mapping[int, object],
         axis_ids: Iterable[int] | None = None,
         *,
         reason: str | None = None,
@@ -87,7 +88,7 @@ class MotionStopPlan:
     @classmethod
     def emergency_stop(
         cls,
-        axis_states: dict[int, object],
+        axis_states: Mapping[int, object],
         axis_ids: Iterable[int] | None = None,
         *,
         reason: str | None = None,

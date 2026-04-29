@@ -367,6 +367,9 @@ class MotionCommandService:
         axis_ids: set[int] = set()
         axis_configs: list[AxisMotionConfig] = []
 
+
+        logger.log("Processing run_axis target: %s", targets)
+
         for target in targets:
             if not isinstance(target, dict):
                 raise TypeError("each target must be a dict")
@@ -376,7 +379,7 @@ class MotionCommandService:
             axis_id = int(target["axis_id"])
             rpm = float(target["rpm"])
             reverse = bool(target.get("reverse", False))
-
+            logger.log("Received run_axis target: axis_id=%d, rpm=%.1f, reverse=%s", axis_id, rpm, reverse)
             if axis_id in axis_ids:
                 raise ValueError(f"duplicate axis_id {axis_id}")
             axis_ids.add(axis_id)

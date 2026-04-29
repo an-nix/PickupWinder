@@ -84,6 +84,7 @@ class WindingRunAxisHandler(tornado.web.RequestHandler):
             axis_id = int(self.get_query_argument("axis_id"))
             rpm = float(self.get_query_argument("rpm"))
             duration_s = float(self.get_query_argument("duration_s"))
+            reverse = bool(self.get_query_argument("reverse", default="0"))
         except tornado.web.MissingArgumentError as exc:
             self.set_status(400)
             self.write(json.dumps({"error": str(exc)}))
@@ -92,14 +93,14 @@ class WindingRunAxisHandler(tornado.web.RequestHandler):
             self.set_status(400)
             self.write(json.dumps({"error": f"Invalid parameter: {exc}"}))
             return
-
+        print(f"Received run_axis command: axis_id={axis_id}, rpm={rpm}, duration_s={duration_s}, reverse={reverse}")
         request_id = int(time.time() * 1000)
         request_payload = make_request(
             "winding.run_axis",
             params={
                 "duration_s": duration_s,
                 "targets": [
-                    {"axis_id": axis_id, "rpm": rpm},
+                    {"axis_id": axis_id, "rpm": rpm,"reverse": reverse},
                 ],
             },
             request_id=request_id,

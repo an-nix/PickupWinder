@@ -259,6 +259,7 @@ class MultiAxisRampStreamer:
         self._last_underrun_count: tuple[int, int, int, int] | None = None
         self._last_segments_dropped: int = max(0, int(initial_segments_dropped))
         self._last_logged_segments_dropped: int | None = self._last_segments_dropped
+        self._homing_mode = False
 
         self._sync_with_firmware_status()
         start_sequence = (
@@ -542,7 +543,13 @@ class MultiAxisRampStreamer:
         return False
 
     def _log_runtime_diagnostics(self, status) -> None:
-        underrun = tuple(int(v) for v in getattr(status, "underrun_count", (0, 0, 0, 0)))
+        raw_underrun = getattr(status, "underrun_count", (0, 0, 0, 0))
+        underrun: tuple[int, int, int, int] = (
+            int(raw_underrun[0]),
+            int(raw_underrun[1]),
+            int(raw_underrun[2]),
+            int(raw_underrun[3]),
+        )
         if self._last_underrun_count is None:
             self._last_underrun_count = underrun
         elif underrun != self._last_underrun_count:
@@ -587,7 +594,13 @@ class MultiAxisRampStreamer:
 
         multi_axis_free = int(getattr(status, "multi_axis_queue_free", -1))
         planner_free = int(getattr(status, "planner_queue_free", -1))
-        ring_free = tuple(int(v) for v in getattr(status, "ring_free_slots", (0, 0, 0, 0)))
+        raw_ring_free = getattr(status, "ring_free_slots", (0, 0, 0, 0))
+        ring_free: tuple[int, int, int, int] = (
+            int(raw_ring_free[0]),
+            int(raw_ring_free[1]),
+            int(raw_ring_free[2]),
+            int(raw_ring_free[3]),
+        )
         last_executed = int(getattr(status, "last_executed_sequence", -1))
         tracked_ring_free = [
             ring_free[axis_id]
@@ -658,9 +671,13 @@ class MultiAxisRampStreamer:
                 self._mark_endstop_triggered()
                 return True
 
-        # segments_dropped uniquement si un axe armé est aussi arrêté
+        # segments_dropped uniquement hors homing et si un axe armé est aussi arrêté
         dropped_now = int(getattr(status, "segments_dropped", 0))
-        if self._endstop_armed_axes and dropped_now > self._last_segments_dropped:
+        if (
+            not self._homing_mode
+            and self._endstop_armed_axes
+            and dropped_now > self._last_segments_dropped
+        ):
             any_armed_stopped = any(
                 (running_mask & (1 << a)) == 0
                 for a in self._endstop_armed_axes
@@ -678,6 +695,10 @@ class MultiAxisRampStreamer:
             self._endstop_armed_axes.add(axis_id)
         else:
             self._endstop_armed_axes.discard(axis_id)
+
+    def set_homing_mode(self, enabled: bool) -> None:
+        """Disable segments_dropped false-positive detection during homing."""
+        self._homing_mode = bool(enabled)
 
     def _mark_endstop_triggered(self) -> None:
         if self._endstop_triggered:

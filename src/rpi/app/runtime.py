@@ -13,7 +13,7 @@ from core.status import RuntimeStatusService
 from jsonrpc import JsonRpcServer, SystemRpcHandler
 from jsonrpc.winding_handler import WindingRpcHandler
 from motion.axis_state import AxisLimits, AxisState
-from motion.command_service import MotionCommandService
+from core.command_service import MotionCommandService
 from motion.move_queue import MoveQueue
 from transport.spi_transport import Esp32SpiTransport
 from winding.service import AdaptiveWindingService

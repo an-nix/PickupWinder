@@ -90,6 +90,13 @@ def make_openapi_schema(
                             "schema": {"type": "number"},
                             "description": "Duration of the motion in seconds.",
                         },
+                        {
+                            "name": "reverse",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "boolean", "default": False},
+                            "description": "Whether to reverse the direction of the axis.",
+                        },
                     ],
                     "responses": {
                         "200": {

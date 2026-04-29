@@ -9,10 +9,6 @@ __all__ = [
     "AxisMotionConfig",
     "MultiAxisSegmentGenerator",
     "SpindleKinematics",
-    "HomingController",
-    "HomingFaultError",
-    "HomingTimeoutError",
-    "SegmentSpec",
 ]
 
 
@@ -32,18 +28,6 @@ def __getattr__(name: str):
     if name == "SpindleKinematics":
         from .spindle_kinematics import SpindleKinematics
         return SpindleKinematics
-    if name == "HomingController":
-        from .homing_controller import HomingController
-        return HomingController
-    if name == "HomingFaultError":
-        from .homing_controller import HomingFaultError
-        return HomingFaultError
-    if name == "HomingTimeoutError":
-        from .homing_controller import HomingTimeoutError
-        return HomingTimeoutError
-    if name == "SegmentSpec":
-        from .homing_controller import SegmentSpec
-        return SegmentSpec
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
