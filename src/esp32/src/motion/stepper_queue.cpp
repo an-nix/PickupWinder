@@ -77,12 +77,6 @@ esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "motor%u: executeConstantRateBlock dir=%d steps=%u dur=%lu",
-             motor_id_,
-             (int)direction,
-             (unsigned)step_count,
-             (unsigned long)duration_us);
-
     uint32_t interval_ticks = (duration_us * RMT_TICKS_PER_US) / step_count;
     if (interval_ticks < RMT_STEP_MIN_TICKS) {
         interval_ticks = RMT_STEP_MIN_TICKS;

@@ -75,7 +75,8 @@ static inline bool sequence_is_stale_or_equal_u16(uint16_t candidate, uint16_t r
 #define RMT_STEP_MIN_TICKS      16U
 
 /** Maximum interval in ticks: 16-bit RMT field → 65535 ticks = ~819 µs → ~1.2 kHz floor */
-#define RMT_STEP_MAX_TICKS      65534U
+#define RMT_STEP_MAX_TICKS      0xFFFFU
+//#define RMT_STEP_MAX_TICKS      65534U
 
 /** Default hold interval before any step has been consumed (= minimum interval).
  *  Prevents duration1 wraparound to ~65535 ticks on first ring-empty hold. */
