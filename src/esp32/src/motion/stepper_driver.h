@@ -29,7 +29,10 @@
  *   Direction changes are handled in ISR context via gpio_ll (register-level).
  *   When a ring entry has toggle_dir=1 and the previous chunk contained step
  *   pulses, a pause chunk is emitted first to meet the driver IC's direction
- *   setup time, and the toggle is deferred to the next callback invocation.
+ *   setup time, and the absolute DIR level from target_dir is applied on the
+ *   next callback invocation. The driver keeps the applied GPIO state separate
+ *   from the last commanded direction so queued reversals cannot desynchronize
+ *   software state from the physical DIR pin.
  */
 
 #pragma once
@@ -61,12 +64,22 @@ public:
     uint32_t ringFreeSlots() const { return ringFree(); }
     bool isStreaming() const { return rmt_running_.load(std::memory_order_acquire); }
     bool isStopped()  const { return rmt_stopped_.load(std::memory_order_acquire); }
+    void setAppliedDirection(bool direction) {
+        applied_dir_.store(direction, std::memory_order_release);
+    }
 
     ring_entry_t          ring_[STEP_RING_SIZE];
     std::atomic<uint32_t> ring_write_ {0};
     std::atomic<uint32_t> ring_read_  {0};
 
     gpio_num_t            dir_pin_;
+    /// Physical inversion flag: when true, the logical DIR level is XOR'd
+    /// before driving the GPIO pin. All endstop/direction logic operates on
+    /// the logical (pre-XOR) value; only the GPIO output and ring target_dir
+    /// see the physical level. Must be set before init() is called.
+    bool                  invert_direction_ {false};
+
+    void setInvertDirection(bool invert) { invert_direction_ = invert; }
     std::atomic<bool>     rmt_stopped_ {true};
     bool                  last_chunk_had_steps_ {false};
     uint16_t              last_ticks_ {RMT_STEP_DEFAULT_TICKS};
@@ -154,7 +167,7 @@ private:
     rmt_transmit_config_t tx_config_ {};
 
     std::atomic<bool>     rmt_running_ {false};
-    bool                  last_dir_    {true};
+    std::atomic<bool>     applied_dir_ {true};
     std::atomic<bool>     last_dir_commanded_ {true};
     bool                  enabled_     {false};
     std::atomic<bool>     endstop_armed_  {false};

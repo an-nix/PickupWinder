@@ -129,6 +129,15 @@ extern "C" void app_main(void)
     // RMT interrupts are registered on the core that calls the init function.
     // By doing this on Core 1, we prevent the 40 kHz RMT ISRs from starving
     // the SPI task and its hardware interrupts on Core 0.
+
+    // Hardware direction inversion for the lateral axis (axis 1 / motor_b).
+    // Set to true when the physical wiring makes DIR=0 move toward the endstop
+    // (i.e. the opposite of the logical convention expected by the host).
+    // This must be configured before motor_b.init() so that the initial GPIO
+    // level is set correctly. All endstop and direction logic operates on the
+    // logical level; the XOR is applied only at the GPIO output stage.
+    motor_b.setInvertDirection(true);
+
     struct InitTask {
         static void run(void*) {
             ESP_ERROR_CHECK(motor_a.init());

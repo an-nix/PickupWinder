@@ -99,6 +99,9 @@ void MotionPlanner::resetStats()
 {
     segments_planned_ = 0;
     segments_dropped_ = 0;
+    last_planned_motion_seq_ = 0xFFFFu;
+    last_flush_processed_seq_  = 0xFFFFu;
+    last_flush_sequence_valid_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +135,22 @@ void MotionPlanner::planBlock(const multi_axis_block_t& block)
 
 void MotionPlanner::handleFlush(const flush_request_t& req)
 {
+    // Ignore stale flushes: a flush whose sequence is not newer than the last
+    // processed one must not purge segments that were already enqueued for
+    // a more-recent motion (e.g. backoff after endstop).
+    if (req.source == FLUSH_SOURCE_HOST
+        && last_flush_sequence_valid_ &&
+        sequence_is_stale_or_equal_u16(req.flush_sequence, last_flush_processed_seq_)) {
+        ESP_LOGW(TAG, "ignoring stale host flush seq=%u (last=%u)",
+                 static_cast<unsigned>(req.flush_sequence),
+                 static_cast<unsigned>(last_flush_processed_seq_));
+        return;
+    }
+    if (req.source == FLUSH_SOURCE_HOST) {
+        last_flush_processed_seq_   = req.flush_sequence;
+        last_flush_sequence_valid_  = true;
+    }
+
     // Non-blocking flush: mark pending state and drop any currently stored
     // pending_block_.  We will attempt to push a flush sentinel to the
     // output queue without blocking; if that fails we remember the flush
@@ -139,7 +158,10 @@ void MotionPlanner::handleFlush(const flush_request_t& req)
     has_pending_block_ = false; // drop current pending block
     pending_segment_idx_ = 0;
     timeline_us_ = esp_timer_get_time();
-    last_planned_motion_seq_ = req.flush_sequence;
+    // flush_sequence is a transport/control sequence, not a motion_sequence.
+    // Reset the motion watermark so the next planned segment batch is accepted
+    // regardless of its motion_sequence value.
+    last_planned_motion_seq_ = 0xFFFFu;
 
     multi_axis_block_t dropped_block {};
     planned_segment_t dropped_seg {};
@@ -160,15 +182,18 @@ void MotionPlanner::handleFlush(const flush_request_t& req)
     flush_seg.flush_sequence = req.flush_sequence;
     if (xQueueSend(segment_queue_, &flush_seg, 0) == pdTRUE) {
         flush_pending_ = false;
-        ESP_LOGI(TAG, "flush sentinel posted seq=%u dropped_cmd=%lu dropped_seg=%lu",
+        ESP_LOGI(TAG, "flush sentinel posted seq=%u source=%u dropped_cmd=%lu dropped_seg=%lu",
                  req.flush_sequence,
+                 static_cast<unsigned>(req.source),
                  static_cast<unsigned long>(dropped_cmd),
                  static_cast<unsigned long>(dropped_planned));
     } else {
         // Queue full — remember to retry later.
         flush_pending_ = true;
         pending_flush_sequence_ = req.flush_sequence;
-        ESP_LOGW(TAG, "flush sentinel queued later seq=%u", req.flush_sequence);
+        ESP_LOGW(TAG, "flush sentinel queued later seq=%u source=%u",
+                 req.flush_sequence,
+                 static_cast<unsigned>(req.source));
     }
 }
 
@@ -187,9 +212,39 @@ void MotionPlanner::plannerTask(void* arg)
     for (;;) {
         const int64_t loop_start = esp_timer_get_time();
 
-        // 1) Handle any flush requests immediately (non-blocking).
-        if (xQueueReceive(self->flush_queue_, &flush_req, 0) == pdTRUE) {
-            self->handleFlush(flush_req);
+        // 1) Drain all pending flush requests.
+        //    Keep the newest host flush and the newest internal flush in their
+        //    own sequence domains; never compare host and internal sequences
+        //    against each other. If an internal flush is present, it takes
+        //    precedence for this iteration because it reflects executor-side
+        //    recovery at the current motion boundary.
+        {
+            bool has_host_flush = false;
+            bool has_internal_flush = false;
+            flush_request_t latest_host_flush{};
+            flush_request_t latest_internal_flush{};
+            while (xQueueReceive(self->flush_queue_, &flush_req, 0) == pdTRUE) {
+                if (flush_req.source == FLUSH_SOURCE_INTERNAL) {
+                    if (!has_internal_flush ||
+                        sequence_is_newer_u16(flush_req.flush_sequence,
+                                             latest_internal_flush.flush_sequence)) {
+                        latest_internal_flush = flush_req;
+                        has_internal_flush = true;
+                    }
+                } else {
+                    if (!has_host_flush ||
+                        sequence_is_newer_u16(flush_req.flush_sequence,
+                                             latest_host_flush.flush_sequence)) {
+                        latest_host_flush = flush_req;
+                        has_host_flush = true;
+                    }
+                }
+            }
+            if (has_internal_flush) {
+                self->handleFlush(latest_internal_flush);
+            } else if (has_host_flush) {
+                self->handleFlush(latest_host_flush);
+            }
         }
 
         // 2) If a previous flush sentinel failed to post, retry non-blocking.

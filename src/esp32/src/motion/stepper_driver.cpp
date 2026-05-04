@@ -98,8 +98,10 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             }
             return PART_SIZE;
         }
+        // Apply hardware inversion here — target_dir is logical, GPIO is physical.
         gpio_ll_set_level(&GPIO, drv->dir_pin_,
-                          gpio_ll_get_level(&GPIO, drv->dir_pin_) ^ 1);
+            (entry->target_dir ^ (drv->invert_direction_ ? 1u : 0u)) ? 1 : 0);
+        drv->setAppliedDirection(entry->target_dir != 0);  // store logical
         entry->toggle_dir = 0;
     }
 
@@ -383,7 +385,8 @@ esp_err_t StepperDriver::init()
     }
 
     gpio_set_level(en_pin_,  1);
-    gpio_set_level(dir_pin_, last_dir_ ? 1 : 0);
+    gpio_set_level(dir_pin_,
+        (applied_dir_.load(std::memory_order_acquire) ^ invert_direction_) ? 1 : 0);
 
     rmt_tx_channel_config_t tx_cfg = {};
     tx_cfg.gpio_num           = step_pin_;
@@ -460,7 +463,8 @@ void StepperDriver::emergencyStop()
     last_chunk_had_steps_ = false;
     coast_idle_count_ = 0;
 
-    gpio_set_level(dir_pin_, last_dir_ ? 1 : 0);
+    gpio_set_level(dir_pin_,
+        (applied_dir_.load(std::memory_order_acquire) ^ invert_direction_) ? 1 : 0);
     // FIX 3: force STEP pin low on emergency stop.
     gpio_set_level(step_pin_, 0);
 
@@ -515,22 +519,20 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
     const uint32_t count = std::min<uint32_t>(block.count, STEP_BLOCK_SIZE);
 
     const bool new_dir = block.steps[0].direction;
-    bool need_toggle = (new_dir != last_dir_);
+    const bool applied_dir = applied_dir_.load(std::memory_order_acquire);
+    bool need_toggle = (new_dir != applied_dir);
 
     if (!rmt_running_.load(std::memory_order_relaxed) &&
         ring_read_.load(std::memory_order_relaxed) == ring_write_.load(std::memory_order_relaxed) &&
         need_toggle)
         {
-           ESP_LOGI(TAG, "motor%u: pushBlock new_dir=%d last_dir=%d need_toggle=%d rmt_running=%d",
-         motor_id_, (int)new_dir, (int)last_dir_, (int)need_toggle,
+           ESP_LOGI(TAG, "motor%u: pushBlock new_dir=%d applied_dir=%d need_toggle=%d rmt_running=%d",
+         motor_id_, (int)new_dir, (int)applied_dir, (int)need_toggle,
          (int)rmt_running_.load(std::memory_order_relaxed));
-        gpio_set_level(dir_pin_, new_dir ? 1 : 0);
-        last_dir_ = new_dir;
+        gpio_set_level(dir_pin_, (new_dir ^ invert_direction_) ? 1 : 0);
+        applied_dir_.store(new_dir, std::memory_order_release);  // logical
         need_toggle = false;
         }
-    else {
-        last_dir_ = new_dir;
-    }
     last_dir_commanded_.store(new_dir, std::memory_order_release);
 
     if (!prepareEndstopMove(new_dir)) {
@@ -579,7 +581,7 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
         ring_entry_t* e = &ring_[wr & STEP_RING_MASK];
         e->ticks      = static_cast<uint16_t>(ticks);
         e->toggle_dir = (i == 0 && need_toggle) ? 1 : 0;
-        e->pad        = 0;
+        e->target_dir = static_cast<uint8_t>(new_dir ? 1 : 0);
 
         ring_write_.store(wr + 1, std::memory_order_release);
     }

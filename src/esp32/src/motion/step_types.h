@@ -259,8 +259,8 @@ typedef struct {
  */
 typedef struct {
     uint16_t ticks;      /**< Total step period in RMT ticks (2 MHz).  0 = invalid. */
-    uint8_t  toggle_dir; /**< 1 = toggle DIR pin before this step.                   */
-    uint8_t  pad;        /**< Padding for 4-byte alignment.                          */
+    uint8_t  toggle_dir; /**< 1 = apply target_dir before this step.                */
+    uint8_t  target_dir; /**< Absolute DIR level to apply when toggle_dir == 1.     */
 } ring_entry_t;
 
 // ---------------------------------------------------------------------------
@@ -299,11 +299,25 @@ typedef struct {
     multi_axis_segment_t segments[MULTI_AXIS_BLOCK_SIZE];
 } multi_axis_block_t;
 
+typedef enum {
+    FLUSH_SOURCE_HOST = 0,
+    FLUSH_SOURCE_INTERNAL = 1,
+} flush_request_source_t;
+
 /**
- * @brief Flush request: discard all segments with motion_sequence > threshold.
+ * @brief Internal planner flush request.
+ *
+ * This is a firmware-only queue item, not a SPI wire struct.
+ * `flush_sequence` belongs to the source-specific control domain:
+ * - host flushes use the host-provided SPI flush sequence
+ * - internal flushes use an executor-generated/internal sequence token
+ *
+ * It must never be interpreted as a motion_sequence.
  */
 typedef struct {
-    uint16_t flush_sequence; /**< Keep segments ≤ this; discard the rest       */
+    uint16_t flush_sequence;
+    uint8_t  source;
+    uint8_t  reserved;
 } flush_request_t;
 
 #ifdef __cplusplus

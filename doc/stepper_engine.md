@@ -50,7 +50,7 @@ This ensures the ESP32 planner queue maintains enough headroom for brief transpo
 - `PART_SIZE = 8` symbols per encoder callback.
 - `trans_queue_depth = 1`.
 - Normal steps use a balanced HIGH/LOW pulse split.
-- Direction changes insert a fixed LOW pause before toggling DIR.
+- Direction changes insert a fixed LOW pause before setting DIR to the queued absolute target level.
 - `pushExpandedBlock()` must not start the driver.
 - `kickStart()` is owned by the post-drain batch decision, not by per-segment code.
 - Host-side send confirmation only counts after `wait_for_request_result()` returns `OK`.

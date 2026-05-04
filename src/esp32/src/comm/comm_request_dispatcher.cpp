@@ -317,7 +317,11 @@ esp_err_t CommRequestDispatcher::handleMultiAxisSegmentBlock(const uint8_t* payl
 
 esp_err_t CommRequestDispatcher::handleFlush(const FlushPayload& flush_payload)
 {
-    flush_request_t req { .flush_sequence = flush_payload.flush_sequence };
+    flush_request_t req {
+        .flush_sequence = flush_payload.flush_sequence,
+        .source = FLUSH_SOURCE_HOST,
+        .reserved = 0,
+    };
     if (xQueueSend(runtime_.flushQueue(), &req, 0) != pdTRUE) {
         ESP_LOGW(TAG, "flush queue full — flush_seq=%u dropped",
                  static_cast<unsigned>(flush_payload.flush_sequence));

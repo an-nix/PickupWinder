@@ -174,6 +174,11 @@ private:
     bool     flush_pending_ {false};
     uint16_t pending_flush_sequence_ {0};
 
+    // Stale-flush guard: track the last flush sequence that was actually
+    // processed so that older (stale) flush requests can be discarded.
+    uint16_t last_flush_processed_seq_  {0xFFFFu};
+    bool     last_flush_sequence_valid_ {false};
+
     /**
      * @brief Expand one multi_axis_block_t into planned_segment_t entries.
      *
