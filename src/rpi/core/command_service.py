@@ -31,6 +31,23 @@ from winding import ScatterEngine, SyncAxisConfig, WindingPattern, WoundMove
 logger = logging.getLogger(__name__)
 
 
+def _coerce_bool_param(value: Any, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if value in (0, 0.0):
+            return False
+        if value in (1, 1.0):
+            return True
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    raise ValueError(f"{field_name} must be a boolean value")
+
+
 def adjust_duration_for_ramp_deficit(
     *,
     total_turns: float,
@@ -133,9 +150,6 @@ class MotionCommandService:
 
     def home_lateral(
         self,
-        approach_rpm: float = 120.0,
-        search_rpm: float = 10.0,
-        backoff_steps: int | None = None,
     ) -> dict[str, Any]:
         """Start lateral homing asynchronously and return immediately.
 
@@ -145,6 +159,10 @@ class MotionCommandService:
         release any standard mechanical endstop (typical release travel ≤ 2 mm).
         Pass an explicit integer to override (e.g. for non-standard hardware).
         """
+        approach_rpm = self._config.lateral_homing_approach_rpm
+        search_rpm = self._config.lateral_homing_search_rpm
+        backoff_steps = self._config.lateral_homing_backoff_steps
+
         if backoff_steps is None:
             steps_per_rev = (
                 self._config.lateral_steps_per_revolution
@@ -377,7 +395,10 @@ class MotionCommandService:
 
             axis_id = int(target["axis_id"])
             rpm = float(target["rpm"])
-            reverse = bool(target.get("reverse", False))
+            reverse = _coerce_bool_param(
+                target.get("reverse", False),
+                field_name="reverse",
+            )
             logger.info("Received run_axis target: axis_id=%d, rpm=%.1f, reverse=%s", axis_id, rpm, reverse)
             if axis_id in axis_ids:
                 raise ValueError(f"duplicate axis_id {axis_id}")
@@ -391,6 +412,7 @@ class MotionCommandService:
                 )
                 max_accel = self._config.spindle_max_acceleration_steps_per_s2
                 max_decel = self._config.spindle_max_deceleration_steps_per_s2
+                invert_direction = bool(self._config.spindle_invert_direction)
             elif axis_id == self._config.lateral_axis_id:
                 max_rpm = float(self._config.lateral_max_rpm)
                 steps_per_rev = (
@@ -399,6 +421,7 @@ class MotionCommandService:
                 )
                 max_accel = self._config.lateral_max_acceleration_steps_per_s2
                 max_decel = self._config.lateral_max_deceleration_steps_per_s2
+                invert_direction = bool(self._config.lateral_invert_direction)
             else:
                 raise ValueError(f"Unsupported axis_id {axis_id}")
 
@@ -406,6 +429,7 @@ class MotionCommandService:
                 raise ValueError("rpm must be positive")
 
             target_rpm = min(rpm, max_rpm)
+            effective_reverse = invert_direction ^ reverse
             accel_s, cruise_s, decel_s = compute_ramp_times(
                 target_rpm=target_rpm,
                 duration_s=duration_s,
@@ -421,7 +445,7 @@ class MotionCommandService:
                 accel_s=accel_s,
                 cruise_s=cruise_s,
                 decel_s=decel_s,
-                reverse_direction=reverse,
+                reverse_direction=effective_reverse,
             )
 
             if (

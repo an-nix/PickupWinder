@@ -165,6 +165,21 @@ class WindingStatusHandler(tornado.web.RequestHandler):
         self.write(json.dumps(response.get("result", response)))
 
 
+class WindingClearFaultHandler(tornado.web.RequestHandler):
+    def get(self) -> None:
+        request_payload = make_request("winding.clear_fault", params=None, request_id=1)
+        response = self.application.rpc_client.send_raw(request_payload)
+        if response is None:
+            self.set_status(204)
+            return
+        if "error" in response:
+            self.set_status(502)
+            self.write(json.dumps(response))
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps(response.get("result", response)))
+
+
 class ReDocHandler(tornado.web.RequestHandler):
     def get(self) -> None:
         self.set_header("Content-Type", "text/html")
@@ -199,6 +214,7 @@ def make_application(
             (r"/run_axis", WindingRunAxisHandler),
             (r"/home", WindingHomeHandler),
             (r"/status", WindingStatusHandler),
+            (r"/clear_fault", WindingClearFaultHandler),
             (r"/openapi.json", OpenApiHandler),
             (r"/docs", ReDocHandler),
             (r"/swagger", SwaggerUIHandler),

@@ -64,6 +64,27 @@ def make_openapi_schema(
                     }
                 }
             },
+            "/clear_fault": {
+                "get": {
+                    "summary": "Clear winding faults",
+                    "description": "Invoke winding.clear_fault on the backend to acknowledge and clear the current fault.",
+                    "responses": {
+                        "200": {
+                            "description": "Clear fault command result",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object"
+                                    }
+                                }
+                            }
+                        },
+                        "502": {
+                            "description": "Backend RPC error"
+                        }
+                    }
+                }
+            },
             "/run_axis": {
                 "get": {
                     "summary": "Run axis for a duration",
