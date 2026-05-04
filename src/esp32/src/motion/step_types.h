@@ -58,7 +58,7 @@ static inline bool sequence_is_stale_or_equal_u16(uint16_t candidate, uint16_t r
 // ---------------------------------------------------------------------------
 
 /** RMT TX channel resolution: 80 MHz  (1 tick = 12.5 ns) */
-#define RMT_STEP_RESOLUTION_HZ  80000000UL
+#define RMT_STEP_RESOLUTION_HZ  40000000UL
 
 /** Ticks per microsecond derived from RMT_STEP_RESOLUTION_HZ (80 at 80 MHz). */
 #define RMT_TICKS_PER_US        (RMT_STEP_RESOLUTION_HZ / 1000000UL)
@@ -75,7 +75,7 @@ static inline bool sequence_is_stale_or_equal_u16(uint16_t candidate, uint16_t r
 #define RMT_STEP_MIN_TICKS      16U
 
 /** Maximum interval in ticks: 16-bit RMT field → 65535 ticks = ~819 µs → ~1.2 kHz floor */
-#define RMT_STEP_MAX_TICKS      0xFFFFU
+#define RMT_STEP_MAX_TICKS      65534U
 
 /** Default hold interval before any step has been consumed (= minimum interval).
  *  Prevents duration1 wraparound to ~65535 ticks on first ring-empty hold. */

@@ -69,7 +69,7 @@ class RampConfig:
     cruise_s: float = 3.0
     decel_s: float = 10.0
     # Must match RMT_STEP_RESOLUTION_HZ in stepper_driver.h (80 MHz).
-    resolution_hz: int = 80_000_000
+    resolution_hz: int = 40_000_000
     reverse_direction: bool = False
     phase_segments: int = 8
     segment_duration_s: float = 0.05

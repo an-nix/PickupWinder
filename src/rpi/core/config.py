@@ -28,7 +28,7 @@ class AppConfiguration:
     lateral_axis_id: int = 1
     lateral_steps_per_revolution: int = 200
     lateral_microstepping: int = 32
-    lateral_invert_direction: bool = False
+    lateral_invert_direction: bool = True
     lateral_max_rpm: int = 1000     
     # Unit: mm/s² on traverse axis.
     lateral_max_acceleration_mm_per_s2: Optional[float] = None
