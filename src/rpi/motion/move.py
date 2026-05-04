@@ -284,8 +284,9 @@ class HomingMove(CompositeMove):
 
     def _make_backoff_move(self) -> RampMove:
         """Phase 2: move away from endstop."""
+        backoff_rpm = max(self.search_rpm, self.approach_rpm * 0.5)
         total_s = (self.backoff_steps / float(self.steps_per_rev)) / (
-            self.search_rpm / 60.0
+            backoff_rpm / 60.0
         )
         return RampMove(
             name=f"{self.name}:backoff",
@@ -296,10 +297,10 @@ class HomingMove(CompositeMove):
                         ramp=RampConfig(
                             axis_id=self.axis_id,
                             steps_per_rev=self.steps_per_rev,
-                            target_rpm=self.search_rpm,
-                            accel_s=min(0.1, total_s * 0.3),
+                            target_rpm=backoff_rpm,
+                            accel_s=min(0.1, total_s * 0.1),
                             cruise_s=max(total_s - 0.2, 0.0),
-                            decel_s=min(0.1, total_s * 0.3),
+                            decel_s=min(0.1, total_s * 0.1),
                             # Backoff moves AWAY from endstop = opposite direction
                             reverse_direction=not self.reverse_direction,
                         ),
