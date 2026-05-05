@@ -297,7 +297,7 @@ class MoveQueue:
         )
 
     def _next_motion_sequence(self) -> int:
-        status = self._transport.get_status()
+        status = self._read_status(allow_stale=False)
         last_executed = int(getattr(status, "last_executed_sequence", -1))
         if last_executed == 0xFFFF or last_executed < 0:
             return 0
@@ -319,8 +319,18 @@ class MoveQueue:
         armed_mask = int(getattr(status, "endstop_armed_mask", 0))
         return bool(armed_mask & self._axis_mask(axis_id)) is arm
 
-    def _read_status(self, axis_id: int | None = None) -> Any:
-        status = self._transport.get_status()
+    def _read_status(
+        self,
+        axis_id: int | None = None,
+        *,
+        allow_stale: bool = True,
+    ) -> Any:
+        try:
+            status = self._transport.get_status(allow_stale=allow_stale)
+        except TypeError as exc:
+            if "allow_stale" not in str(exc):
+                raise
+            status = self._transport.get_status()
         if axis_id is not None:
             self._update_axis_endstop_state(axis_id, status)
         return status
@@ -360,7 +370,7 @@ class MoveQueue:
         confirmed_state = LATERAL_ENDSTOP_PRESENT_CLOSED
         for _ in range(_INITIAL_ENDSTOP_CONFIRM_SAMPLES - 1):
             time.sleep(_INITIAL_ENDSTOP_CONFIRM_INTERVAL_S)
-            status = self._read_status(axis_id)
+            status = self._read_status(axis_id, allow_stale=False)
             state = int(
                 getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
             )
@@ -375,7 +385,7 @@ class MoveQueue:
         return confirmed_state
 
     def _ensure_homing_can_start(self, axis_id: int, phase_name: str) -> None:
-        status = self._read_status(axis_id)
+        status = self._read_status(axis_id, allow_stale=False)
         lateral_state = int(getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT))
         if lateral_state == LATERAL_ENDSTOP_ABSENT:
             raise RuntimeError(
@@ -452,7 +462,7 @@ class MoveQueue:
         deadline = time.monotonic() + stop_timeout_s
         last_status = None
         while time.monotonic() < deadline:
-            last_status = self._read_status(axis_id)
+            last_status = self._read_status(axis_id, allow_stale=False)
             running = int(getattr(last_status, "running_mask", 0))
             if (running & (1 << axis_id)) == 0:
                 break
@@ -464,7 +474,7 @@ class MoveQueue:
             )
 
         time.sleep(recovery_guard_s)
-        status = self._read_status(axis_id)
+        status = self._read_status(axis_id, allow_stale=False)
         lateral_state = int(
             getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
         )
@@ -496,7 +506,7 @@ class MoveQueue:
         """
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            status = self._read_status(axis_id)
+            status = self._read_status(axis_id, allow_stale=False)
             hit_mask = int(getattr(status, "endstop_hit_mask", 0xFF))
             if (hit_mask & (1 << axis_id)) == 0:
                 return
@@ -519,7 +529,7 @@ class MoveQueue:
         deadline = time.monotonic() + timeout_s
         last_status = None
         while time.monotonic() < deadline:
-            last_status = self._read_status(axis_id)
+            last_status = self._read_status(axis_id, allow_stale=False)
             if self._status_has_endstop_armed(last_status, axis_id, arm):
                 return last_status
             time.sleep(self._poll_interval_s)
@@ -535,7 +545,7 @@ class MoveQueue:
         consecutive_open = 0
         last_status = None
         while time.monotonic() < deadline:
-            last_status = self._read_status(axis_id)
+            last_status = self._read_status(axis_id, allow_stale=False)
             state = int(
                 getattr(last_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
             )
@@ -565,7 +575,7 @@ class MoveQueue:
                 f"homing sub-move {phase_name} has no public axis_configs"
             )
 
-        baseline_status = self._read_status(move.axis_id)
+        baseline_status = self._read_status(move.axis_id, allow_stale=False)
         baseline_segments_dropped = int(
             getattr(baseline_status, "segments_dropped", 0)
         )
@@ -645,7 +655,7 @@ class MoveQueue:
         # pour que le GPIO se stabilise après relâchement du contact physique.
         time.sleep(0.020)
         # Relecture finale pour confirmer l'état avant d'armer la phase approach.
-        final_status = self._read_status(move.axis_id)
+        final_status = self._read_status(move.axis_id, allow_stale=False)
         lateral_state = int(
             getattr(final_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
         )
@@ -669,7 +679,7 @@ class MoveQueue:
             return  # succès nominal
 
         # Lire le status pour diagnostiquer
-        status = self._read_status(move.axis_id)
+        status = self._read_status(move.axis_id, allow_stale=False)
         lateral_state = int(
             getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
         )
@@ -855,7 +865,7 @@ class MoveQueue:
         axis_state = self._axis_states.get(move.axis_id)
 
         try:
-            initial_status = self._read_status(move.axis_id)
+            initial_status = self._read_status(move.axis_id, allow_stale=False)
             initial_state = int(
                 getattr(initial_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
             )
@@ -966,13 +976,14 @@ class MoveQueue:
                     return
 
                 _deadline = time.monotonic() + 1.0
+                _status = None  # B5-FIX: ensure _status is bound before the else clause
                 while time.monotonic() < _deadline:
-                    _status = self._read_status(move.axis_id)
+                    _status = self._read_status(move.axis_id, allow_stale=False)
                     if (int(getattr(_status, "running_mask", 0)) & (1 << move.axis_id)) == 0:
                         break
                     time.sleep(0.010)
                 else:
-                    _running_mask = int(getattr(_status, "running_mask", 0xFF))
+                    _running_mask = int(getattr(_status, "running_mask", 0xFF)) if _status is not None else 0xFF
                     self._set_endstop_armed(move.axis_id, arm=False)
                     move.mark_failed(
                         f"backoff stop timeout on axis {move.axis_id}: "

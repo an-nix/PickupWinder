@@ -342,6 +342,14 @@ void MultiAxisExecutor::run()
 
         case ExecState::FLUSH: {
             const planned_segment_t& flush_seg = batch[batch_index];
+            // B3-FIX: drain deferred notifications before clearing the ring so
+            // that last_executed_sequence_ advances monotonically even when all
+            // segments were already dispatched at flush time.
+            while (defer_head != defer_tail) {
+                const int idx = defer_head & (DEFER_DEPTH - 1);
+                runtime_.notifySegmentExecuted(static_cast<uint16_t>(defer_seqs[idx]));
+                ++defer_head;
+            }
             defer_head = defer_tail = 0;
             ESP_LOGI(TAG, "executor flush at seq=%u",
                      static_cast<unsigned>(flush_seg.flush_sequence));
@@ -396,6 +404,20 @@ void MultiAxisExecutor::run()
                 runtime_.notifySegmentExecuted(last_drained_seq);
             }
 
+            // B1-FIX: drain pending deferred notifications before clearing the
+            // ring.  When the segment queue was empty at recovery time (all
+            // segments already dispatched to the step ring), drained_real_segment
+            // is false and notifySegmentExecuted was never called above.  The
+            // defer ring holds those already-dispatched sequences; report the
+            // highest one so last_executed_sequence_ keeps advancing.
+            // sequence_is_newer_u16 inside notifySegmentExecuted makes this
+            // safe even when drained_real_segment was true (older deferred
+            // sequences simply lose the monotonic comparison).
+            while (defer_head != defer_tail) {
+                const int idx = defer_head & (DEFER_DEPTH - 1);
+                runtime_.notifySegmentExecuted(static_cast<uint16_t>(defer_seqs[idx]));
+                ++defer_head;
+            }
             defer_head = defer_tail = 0;
 
             if (drained_real_segment) {
@@ -406,6 +428,11 @@ void MultiAxisExecutor::run()
                 ESP_LOGW(TAG, "recovery: drained %lu remaining segments (none)",
                          static_cast<unsigned long>(drained));
             }
+
+            // B2-FIX: reset the lateral-absent timer so the failsafe does not
+            // re-fire immediately on the very next DRAIN entry if the ABSENT
+            // condition was transient (e.g. connector briefly disturbed).
+            lateral_absent_armed_since_us = 0;
 
             batch_count = 0;
             batch_index = 0;

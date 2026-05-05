@@ -124,6 +124,8 @@ public:
      */
     void armEndstop() {
         endstop_active_.store(false, std::memory_order_release);
+        endstop_clearance_pending_.store(false, std::memory_order_release);
+        endstop_clearance_direction_.store(false, std::memory_order_release);
         endstop_hit_count_.store(0, std::memory_order_relaxed);
         endstop_closed_confirmations_ = 0;
         endstop_armed_.store(true, std::memory_order_release);
@@ -171,14 +173,20 @@ private:
     std::atomic<bool>     last_dir_commanded_ {true};
     bool                  enabled_     {false};
     std::atomic<bool>     endstop_armed_  {false};
-    // Number of consecutive CLOSED readings required before latching
-    // endstop_active_. The dual-contact NO/NC sensor fires two GPIO
-    // edges almost simultaneously on actuation (~µs apart at hardware
-    // level), so 2 confirmations filter single-edge spikes without
-    // adding measurable stop latency. Do not raise above 3 — the ISR
-    // fires on ANYEDGE of either pin, so a genuine hit produces at
-    // most 2 rapid CLOSED edges before the ISR may see an INVALID
-    // crossover transient that resets the counter.
+    // Number of consecutive CLOSED ISR invocations required before
+    // latching endstop_active_.
+    //
+    // Counter rules (endstopIsrHandler):
+    //   CLOSED  → counter++            (only state that increments it)
+    //   OPEN    → counter = 0          (resets; also clears endstop_active_)
+    //   INVALID → counter unchanged    (crossover transient is ignored)
+    //
+    // With ANYEDGE on both NO and NC, a genuine closure produces at least
+    // 2 CLOSED ISR events (one per pin settling to its final level).
+    // INVALID crossover transients between those edges do NOT reset the
+    // counter.  Count=3 is reliably reached via the 3rd edge from contact
+    // settling.  Do not raise above 3 without verifying the sensor produces
+    // enough CLOSED edges before any OPEN bounce resets the count to zero.
     static constexpr uint8_t ENDSTOP_CLOSED_CONFIRM_COUNT = 3;
     static constexpr TickType_t ENDSTOP_INVALID_DEBOUNCE_TICKS = pdMS_TO_TICKS(5);
     volatile uint8_t      endstop_closed_confirmations_ {0};

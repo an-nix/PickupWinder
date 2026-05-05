@@ -371,6 +371,45 @@ def test_move_queue_set_endstop_armed_uses_ack_mask_without_extra_poll() -> None
     assert returned is status
 
 
+def test_move_queue_next_motion_sequence_requires_fresh_status() -> None:
+    allow_stale_calls: list[bool] = []
+
+    class FakeTransport:
+        def get_status(self, *, allow_stale: bool = True):
+            allow_stale_calls.append(allow_stale)
+            return SimpleNamespace(last_executed_sequence=7)
+
+    queue = move_queue_module.MoveQueue(
+        transport=FakeTransport(),
+        axis_states={},
+        poll_interval_s=0.0,
+    )
+
+    assert queue._next_motion_sequence() == 8
+    assert allow_stale_calls == [False]
+
+
+def test_move_queue_homing_start_requires_fresh_status() -> None:
+    allow_stale_calls: list[bool] = []
+
+    class FakeTransport:
+        def get_status(self, *, allow_stale: bool = True):
+            allow_stale_calls.append(allow_stale)
+            return SimpleNamespace(
+                lateral_endstop_state=messages_module.LATERAL_ENDSTOP_PRESENT_OPEN
+            )
+
+    queue = move_queue_module.MoveQueue(
+        transport=FakeTransport(),
+        axis_states={},
+        poll_interval_s=0.0,
+    )
+
+    queue._ensure_homing_can_start(1, "start")
+
+    assert allow_stale_calls == [False]
+
+
 def test_move_queue_resumes_after_expected_endstop_from_flush_floor() -> None:
     class FakeTransport:
         def get_status(self):
