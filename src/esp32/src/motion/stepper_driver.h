@@ -187,7 +187,7 @@ private:
     // counter.  Count=3 is reliably reached via the 3rd edge from contact
     // settling.  Do not raise above 3 without verifying the sensor produces
     // enough CLOSED edges before any OPEN bounce resets the count to zero.
-    static constexpr uint8_t ENDSTOP_CLOSED_CONFIRM_COUNT = 1;
+    static constexpr uint8_t ENDSTOP_CLOSED_CONFIRM_COUNT = 3;
     static constexpr TickType_t ENDSTOP_INVALID_DEBOUNCE_TICKS = pdMS_TO_TICKS(5);
     volatile uint8_t      endstop_closed_confirmations_ {0};
 

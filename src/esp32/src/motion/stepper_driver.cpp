@@ -17,7 +17,9 @@
 
 static const char* TAG = "stepper_driver";
 
-static constexpr uint32_t COAST_IDLE_LIMIT = 250000;
+//static constexpr uint32_t COAST_IDLE_LIMIT = 250000;
+static constexpr uint32_t COAST_IDLE_LIMIT = 50000;  
+
 
 extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
                                           size_t /*data_size*/,

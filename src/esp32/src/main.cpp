@@ -22,7 +22,7 @@
  *   Motor B (Lateral / axis 1) : STEP=GPIO32  DIR=GPIO33  EN=GPIO25
  *
  *   SPI host link              : MOSI=GPIO23  MISO=GPIO19
- *                                SCLK=GPIO18  CS=GPIO5  READY=GPIO17
+ *                                SCLK=GPIO18  CS=GPIO5  READY=GPIO4
  *
  *   Raspberry Pi control       : SHUTDOWN_REQ=GPIO16
  *
