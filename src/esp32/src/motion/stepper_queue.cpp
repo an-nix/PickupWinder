@@ -81,9 +81,10 @@ esp_err_t StepperQueue::executeConstantRateBlock(bool direction,
     if (interval_ticks < RMT_STEP_MIN_TICKS) {
         interval_ticks = RMT_STEP_MIN_TICKS;
     }
-    if (interval_ticks > RMT_STEP_MAX_TICKS) {
-        interval_ticks = RMT_STEP_MAX_TICKS;
-    }
+    /* No upper clamp here: pushBlock() handles large ticks by pre-emitting
+     * hold (idle) ring entries for periods > RMT_STEP_MAX_SYMBOL_TICKS.
+     * The final clamp inside pushBlock() still guards against values above
+     * RMT_STEP_MAX_TICKS (2 000 000 ticks ≈ 0.37 RPM at 32 microsteps). */
 
     uint32_t remaining = step_count;
     while (remaining > 0) {

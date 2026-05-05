@@ -89,7 +89,7 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     drv->coast_idle_count_ = 0;
 
     ring_entry_t* entry = &drv->ring_[rd & STEP_RING_MASK];
-    if (entry->toggle_dir) {
+    if (entry->toggle_dir & 1) {
         if (drv->last_chunk_had_steps_) {
             drv->last_chunk_had_steps_ = false;
             uint32_t last = drv->last_ticks_;
@@ -116,7 +116,10 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         if (rd != wr) {
             ring_entry_t* e = &drv->ring_[rd & STEP_RING_MASK];
 
-            if (e->toggle_dir && i > 0) {
+            /* Direction reversal mid-chunk (bit 0 set, not a hold entry, and
+             * not the first slot): flush remaining slots with idle symbols so
+             * the toggle is handled cleanly at the next callback.            */
+            if ((e->toggle_dir & 1) && i > 0) {
                 uint32_t last = drv->last_ticks_;
                 if (last < MIN_CMD_TICKS) last = MIN_CMD_TICKS;
                 uint16_t half = static_cast<uint16_t>(
@@ -131,24 +134,36 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             }
 
             uint16_t t = e->ticks;
-            uint16_t high_ticks = t >> 1;
-            uint16_t low_ticks = t - high_ticks;
-            if (high_ticks < RMT_STEP_PULSE_TICKS) {
-                high_ticks = RMT_STEP_PULSE_TICKS;
-                low_ticks = t - high_ticks;
-            }
-            if (low_ticks < RMT_STEP_PULSE_TICKS) {
-                low_ticks = RMT_STEP_PULSE_TICKS;
-                high_ticks = t - low_ticks;
-            }
-            drv->last_ticks_ = t;
-            symbols[i].level0    = 1;
-            symbols[i].duration0 = high_ticks;
-            symbols[i].level1    = 0;
-            symbols[i].duration1 = low_ticks;
 
-            rd++;
-            has_steps = true;
+            if (e->toggle_dir & RING_ENTRY_HOLD) {
+                /* Hold (idle) entry: emit a silent pause symbol — no step pulse. */
+                drv->last_ticks_ = t;
+                uint16_t half = static_cast<uint16_t>(t >> 1);
+                symbols[i].level0    = 0;
+                symbols[i].duration0 = half;
+                symbols[i].level1    = 0;
+                symbols[i].duration1 = static_cast<uint16_t>(t - half);
+                rd++;
+                /* has_steps unchanged: hold entries don't count as a step. */
+            } else {
+                uint16_t high_ticks = t >> 1;
+                uint16_t low_ticks  = t - high_ticks;
+                if (high_ticks < RMT_STEP_PULSE_TICKS) {
+                    high_ticks = RMT_STEP_PULSE_TICKS;
+                    low_ticks  = t - high_ticks;
+                }
+                if (low_ticks < RMT_STEP_PULSE_TICKS) {
+                    low_ticks  = RMT_STEP_PULSE_TICKS;
+                    high_ticks = t - low_ticks;
+                }
+                drv->last_ticks_ = t;
+                symbols[i].level0    = 1;
+                symbols[i].duration0 = high_ticks;
+                symbols[i].level1    = 0;
+                symbols[i].duration1 = low_ticks;
+                rd++;
+                has_steps = true;
+            }
         } else {
             drv->ring_underrun_count_.fetch_add(1, std::memory_order_relaxed);
             {
@@ -555,15 +570,10 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
         return ESP_ERR_INVALID_STATE;
     }
 
-    for (uint32_t i = 0; i < count; i++) {
-        // FIX 1: check latch before entering ringFree wait/write path.
-        if (endstop_active_.load(std::memory_order_acquire)) {
-            return ESP_ERR_INVALID_STATE;
-        }
-
+    /* Helper: wait until at least one ring slot is free.
+     * Returns ESP_ERR_INVALID_STATE on endstop, ESP_ERR_TIMEOUT if RMT won't start. */
+    auto waitOneSlot = [&](uint8_t& retry_count) -> esp_err_t {
         static constexpr uint8_t PUSH_RETRY_MAX = 20;
-        uint8_t push_retry_count = 0;
-
         while (ringFree() == 0) {
             if (endstop_active_.load(std::memory_order_acquire)) {
                 return ESP_ERR_INVALID_STATE;
@@ -573,8 +583,8 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
                 if (kick_err != ESP_OK) {
                     ESP_LOGW(TAG, "motor%u: pushBlock kick startStream: %s",
                              motor_id_, esp_err_to_name(kick_err));
-                    ++push_retry_count;
-                    if (push_retry_count >= PUSH_RETRY_MAX) {
+                    ++retry_count;
+                    if (retry_count >= PUSH_RETRY_MAX) {
                         ESP_LOGE(TAG,
                                  "motor%u: pushBlock timeout — ring full, RMT won't start",
                                  motor_id_);
@@ -587,11 +597,55 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
                 return ESP_ERR_INVALID_STATE;
             }
         }
+        return ESP_OK;
+    };
+
+    for (uint32_t i = 0; i < count; i++) {
+        // FIX 1: check latch before entering ringFree wait/write path.
+        if (endstop_active_.load(std::memory_order_acquire)) {
+            return ESP_ERR_INVALID_STATE;
+        }
 
         uint32_t ticks = block.steps[i].interval_ticks;
-
         ticks = std::max<uint32_t>(ticks, RMT_STEP_MIN_TICKS);
         ticks = std::min<uint32_t>(ticks, RMT_STEP_MAX_TICKS);
+
+        /* ── Slow-speed expansion ───────────────────────────────────────────
+         * The RMT hardware uses 15-bit duration fields per symbol half, so the
+         * maximum period per ring entry is 32767 + 32767 = 65534 ticks.
+         * When ticks > RMT_STEP_MAX_SYMBOL_TICKS we pre-push hold (idle) ring
+         * entries that carry the excess time, then emit the actual step entry
+         * with the remainder (≤ 65534 ticks).  High-speed steps (ticks ≤ 65534)
+         * take the fast path with zero hold entries.                          */
+        if (ticks > RMT_STEP_MAX_SYMBOL_TICKS) {
+            uint32_t hold_remaining = ticks - RMT_STEP_MAX_SYMBOL_TICKS;
+            ticks = RMT_STEP_MAX_SYMBOL_TICKS;  // step entry gets the last slot
+
+            while (hold_remaining > 0) {
+                if (endstop_active_.load(std::memory_order_acquire)) {
+                    return ESP_ERR_INVALID_STATE;
+                }
+                uint8_t hold_retry = 0;
+                esp_err_t herr = waitOneSlot(hold_retry);
+                if (herr != ESP_OK) return herr;
+
+                const uint16_t this_hold = (hold_remaining > RMT_STEP_MAX_SYMBOL_TICKS)
+                    ? static_cast<uint16_t>(RMT_STEP_MAX_SYMBOL_TICKS)
+                    : static_cast<uint16_t>(hold_remaining);
+                hold_remaining -= this_hold;
+
+                uint32_t hw = ring_write_.load(std::memory_order_relaxed);
+                ring_entry_t* he = &ring_[hw & STEP_RING_MASK];
+                he->ticks      = this_hold;
+                he->toggle_dir = RING_ENTRY_HOLD;
+                he->target_dir = 0;
+                ring_write_.store(hw + 1, std::memory_order_release);
+            }
+        }
+
+        uint8_t push_retry_count = 0;
+        esp_err_t serr = waitOneSlot(push_retry_count);
+        if (serr != ESP_OK) return serr;
 
         uint32_t wr = ring_write_.load(std::memory_order_relaxed);
         ring_entry_t* e = &ring_[wr & STEP_RING_MASK];
