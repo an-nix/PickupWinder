@@ -28,6 +28,7 @@ _ENDSTOP_OPEN_CONFIRM_SAMPLES = 3
 _ENDSTOP_OPEN_CONFIRM_INTERVAL_S = 0.015
 _INITIAL_ENDSTOP_CONFIRM_SAMPLES = 3
 _INITIAL_ENDSTOP_CONFIRM_INTERVAL_S = 0.01
+_MULTI_AXIS_QUEUE_DEPTH = 64
 
 
 logger = logging.getLogger(__name__)
@@ -449,6 +450,7 @@ class MoveQueue:
         *,
         stop_timeout_s: float = 1.0,
         recovery_guard_s: float = 0.150,
+        drain_timeout_s: float = 1.0,
     ) -> Any:
         """Wait for the firmware to finish stop + RECOVERY after an endstop hit.
 
@@ -473,8 +475,56 @@ class MoveQueue:
                 f"post-hit stop timeout on axis {axis_id}: running_mask=0x{running_mask:02X}"
             )
 
-        time.sleep(recovery_guard_s)
-        status = self._read_status(axis_id, allow_stale=False)
+        quiescent_deadline = time.monotonic() + drain_timeout_s
+        quiescent_since: float | None = None
+        status = last_status
+        while time.monotonic() < quiescent_deadline:
+            status = self._read_status(axis_id, allow_stale=False)
+            running_mask = int(getattr(status, "running_mask", 0))
+            axis_stopped = (running_mask & (1 << axis_id)) == 0
+
+            ring_free = tuple(int(v) for v in getattr(status, "ring_free_slots", ()))
+            axis_ring_empty = (
+                0 <= axis_id < len(ring_free)
+                and ring_free[axis_id] >= MultiAxisRampStreamer.STEP_RING_CAPACITY
+            )
+
+            planner_free = int(
+                getattr(
+                    status,
+                    "planner_queue_free",
+                    MultiAxisRampStreamer.SEGMENT_QUEUE_DEPTH,
+                )
+            )
+            planner_empty = planner_free >= MultiAxisRampStreamer.SEGMENT_QUEUE_DEPTH
+
+            multi_axis_free = int(
+                getattr(status, "multi_axis_queue_free", _MULTI_AXIS_QUEUE_DEPTH)
+            )
+            multi_axis_empty = multi_axis_free >= _MULTI_AXIS_QUEUE_DEPTH
+
+            if axis_stopped and axis_ring_empty and planner_empty and multi_axis_empty:
+                if quiescent_since is None:
+                    quiescent_since = time.monotonic()
+                elif (time.monotonic() - quiescent_since) >= recovery_guard_s:
+                    break
+            else:
+                quiescent_since = None
+
+            time.sleep(0.010)
+        else:
+            running_mask = int(getattr(status, "running_mask", 0xFF)) if status else 0xFF
+            ring_repr = tuple(int(v) for v in getattr(status, "ring_free_slots", ())) if status else ()
+            planner_free = int(getattr(status, "planner_queue_free", -1)) if status else -1
+            multi_axis_free = int(getattr(status, "multi_axis_queue_free", -1)) if status else -1
+            raise RuntimeError(
+                f"post-hit recovery did not quiesce on axis {axis_id}: "
+                f"running_mask=0x{running_mask:02X}, "
+                f"ring_free={ring_repr}, "
+                f"planner_queue_free={planner_free}, "
+                f"multi_axis_queue_free={multi_axis_free}"
+            )
+
         lateral_state = int(
             getattr(status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
         )

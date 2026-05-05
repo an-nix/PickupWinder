@@ -704,9 +704,14 @@ class MultiAxisRampStreamer:
         if self._endstop_triggered:
             return
         self._endstop_triggered = True
-        flush_seq = self._last_confirmed_motion_seq
+        flush_seq = self._last_sent_motion_seq
         if flush_seq < 0:
-            flush_seq = self._last_sent_motion_seq
+            flush_seq = self._last_confirmed_motion_seq
+        elif (
+            self._last_confirmed_motion_seq >= 0
+            and sequence_is_greater(self._last_confirmed_motion_seq, flush_seq)
+        ):
+            flush_seq = self._last_confirmed_motion_seq
         if flush_seq < 0:
             flush_seq = 0xFFFF
         self._flush_floor_sequence = int(flush_seq) & 0xFFFF

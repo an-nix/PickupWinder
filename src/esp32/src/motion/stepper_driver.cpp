@@ -39,6 +39,10 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     }
 
     if (drv->endstop_active_.load(std::memory_order_relaxed)) {
+        drv->ring_read_.store(0, std::memory_order_relaxed);
+        drv->ring_write_.store(0, std::memory_order_relaxed);
+        drv->last_chunk_had_steps_ = false;
+        drv->coast_idle_count_ = 0;
         drv->rmt_stopped_.store(true, std::memory_order_relaxed);
         *done = true;
         return 0;
