@@ -119,23 +119,10 @@ class WindingRunAxisHandler(tornado.web.RequestHandler):
 
 class WindingHomeHandler(tornado.web.RequestHandler):
     def get(self) -> None:
-        try:
-            approach_rpm = float(self.get_query_argument("approach_rpm", default="100.0"))
-            search_rpm = float(self.get_query_argument("search_rpm", default="20.0"))
-            backoff_steps = int(self.get_query_argument("backoff_steps", default="3200"))
-        except ValueError as exc:
-            self.set_status(400)
-            self.write(json.dumps({"error": f"Invalid parameter: {exc}"}))
-            return
-
         request_id = int(time.time() * 1000)
         request_payload = make_request(
             "winding.home_lateral",
-            params={
-                "approach_rpm": approach_rpm,
-                "search_rpm": search_rpm,
-                "backoff_steps": backoff_steps,
-            },
+            params=None,
             request_id=request_id,
         )
         response = self.application.rpc_client.send_raw(request_payload)

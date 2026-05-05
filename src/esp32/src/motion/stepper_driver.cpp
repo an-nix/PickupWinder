@@ -290,8 +290,10 @@ void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
 
     if (raw == EndstopSignalState::OPEN) {
         drv->endstop_closed_confirmations_ = 0;
-        drv->endstop_active_.store(false, std::memory_order_release);
-        drv->endstop_clearance_pending_.store(false, std::memory_order_release);
+        // Anti-bounce: Do NOT clear endstop_active_ here. 
+        // Once tripped, the endstop must remain active until the host explicitly
+        // disarms it or re-arms it. A bouncing switch generating OPEN signals
+        // must not un-latch the emergency stop state.
         return;
     }
 

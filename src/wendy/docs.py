@@ -142,30 +142,7 @@ def make_openapi_schema(
             "/home": {
                 "get": {
                     "summary": "Home the lateral axis",
-                    "description": "Invoke winding.home_lateral on the backend to run the lateral homing procedure.",
-                    "parameters": [
-                        {
-                            "name": "approach_rpm",
-                            "in": "query",
-                            "required": False,
-                            "schema": {"type": "number", "default": 100.0},
-                            "description": "Approach speed in RPM.",
-                        },
-                        {
-                            "name": "search_rpm",
-                            "in": "query",
-                            "required": False,
-                            "schema": {"type": "number", "default": 20.0},
-                            "description": "Search speed in RPM.",
-                        },
-                        {
-                            "name": "backoff_steps",
-                            "in": "query",
-                            "required": False,
-                            "schema": {"type": "integer", "default": 3200},
-                            "description": "Backoff steps after endstop trigger.",
-                        },
-                    ],
+                    "description": "Invoke winding.home_lateral on the backend to run the lateral homing procedure using the configured defaults.",
                     "responses": {
                         "200": {
                             "description": "Homing command result",

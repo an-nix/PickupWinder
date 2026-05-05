@@ -614,6 +614,9 @@ class MoveQueue:
         return streamer
 
     def _next_sequence_after_streamer(self, streamer: Any) -> int:
+        last_sent = int(getattr(streamer, "last_sent_motion_seq", -1))
+        if last_sent >= 0:
+            return (last_sent + 1) & 0xFFFF
         next_from_status = self._next_motion_sequence()
         flush_floor = int(getattr(streamer, "flush_floor_sequence", -1))
         if flush_floor < 0:

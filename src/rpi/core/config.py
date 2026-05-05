@@ -48,7 +48,7 @@ class AppConfiguration:
 
     # Homing parameters
     lateral_homing_approach_rpm: float = 15.0
-    lateral_homing_search_rpm: float = 5.0
+    lateral_homing_search_rpm: float = 10.0
     lateral_homing_backoff_steps: Optional[int] = 6144
 
     def __post_init__(self) -> None:
