@@ -12,7 +12,10 @@ The split is deliberate. Geometry, winding strategy, retry policy, and session l
 ### Host
 
 - `src/rpi/winding_main.py`: process entry point.
-- `src/rpi/motion/engine.py`: runtime orchestration for moves and winding programs.
+- `src/rpi/app/runtime.py`: runtime composition and lifecycle.
+- `src/rpi/core/engine.py`: runtime orchestration for moves and winding programs.
+- `src/rpi/core/lateral.py`: traverse-axis homing, home-state, and soft-limit rules.
+- `src/rpi/core/status.py`: explicit snapshots for `winder.*` and `winding.status`.
 - `src/rpi/motion/move_queue.py`: move serialization, flush coordination, sequence seeding.
 - `src/rpi/motion/segment_generator.py`: host-side segment generation utilities.
 - `src/rpi/motion/multi_axis_segment_generator.py`: general multi-axis move generator.
@@ -59,6 +62,9 @@ The SPI link is full-duplex and fixed size.
 - Header size: `12` bytes
 - CRC: `CRC16-CCITT-FALSE`
 - Endianness: little-endian
+- Electrical mode: SPI mode 1 on both the Raspberry Pi host and the ESP32 slave
+- ESP32 uses IO_MUX-native SPI pins with an active `ready` handshake GPIO on GPIO17, as recommended by ESP-IDF for reliable slave timing
+- ESP32 also exposes a reserved Raspberry Pi sideband output `shutdown_req` on GPIO16 for a future coordinated host shutdown path
 
 The production motion message is `MULTI_AXIS_SEGMENT_BLOCK`. `STEP_BLOCK` and `SEGMENT_BLOCK` remain for debug and legacy tooling only.
 
@@ -92,6 +98,16 @@ The host owns all high-level motion semantics.
 - transport sequencing.
 - lateral homing state and host-side soft-limit enforcement.
 
+The host runtime is now split by responsibility rather than by startup order:
+
+- `winding_main.py` only handles process startup and signals.
+- `app/runtime.py` wires transport, shared state, engine, and RPC.
+- `core/engine.py` owns program orchestration and command entry points.
+- `core/lateral.py` owns traverse-specific rules.
+- `core/status.py` builds explicit status/config payloads instead of relying on generic object introspection.
+- `winding/adaptive.py` defines the adaptive winding session model, chunk planner, and tracked synchronized winding move.
+- `winding/service.py` owns the live winding session thread: homing, chunk planning, controlled pause/resume, window retargeting, and progress tracking.
+
 The winding path follows an electronic gearing model:
 
 - `SpindleKinematics` computes bobbin turns over time.
@@ -100,6 +116,14 @@ The winding path follows an electronic gearing model:
 - `SynchronizedSegmentGenerator` samples the time domain and emits synchronized multi-axis segments.
 
 Manual moves and jogs use `MultiAxisSegmentGenerator`, but they still produce the same `MultiAxisSegment` objects consumed by the streamer.
+
+The adaptive winding path is host-driven and chunked on purpose:
+
+- spindle turns remain the primary progress unit,
+- traverse window low/high bounds can be updated while the session is paused or while the next chunk is being planned,
+- target RPM can be changed live and a target RPM of zero is treated as a controlled pause request,
+- the host tracks turns completed, turns remaining, guide position, and active window in shared state,
+- near a traverse edge the planner brakes the spindle to zero before reversing the guide so lateral inversion time is explicit rather than implicit.
 
 ### Lateral axis state model
 
@@ -157,9 +181,10 @@ The Raspberry Pi consumes normalized state and owns higher-level policy such as 
 |---|---:|
 | Bobbin STEP / DIR / EN | 26 / 27 / 14 |
 | Lateral STEP / DIR / EN | 32 / 33 / 25 |
-| Tensioner STEP / DIR / EN | 16 / 17 / 4 |
-| Lateral home NO / NC | 21 / 22 |
+| Lateral home NO / NC | 22 / 21 |
 | SPI MOSI / MISO / SCLK / CS | 23 / 19 / 18 / 5 |
+| SPI READY | 17 |
+| Raspberry Pi SHUTDOWN_REQ | 16 |
 | HX711 #0 SCK / DOUT | 13 / 34 |
 | HX711 #1 SCK / DOUT | 12 / 39 |
 | Potentiometer | 36 |

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
@@ -99,19 +100,7 @@ class WindingProgram:
         return total_turns / spindle_rps
 
     def snapshot(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "num_layers": self.num_layers,
-            "spindle_rpm": self.spindle_rpm,
-            "layer_pitch_mm": self.layer_pitch_mm,
-            "wire_diameter_mm": self.wire_diameter_mm,
-            "bobbin_width_mm": self.bobbin_width_mm,
-            "turns_per_mm": self.turns_per_mm,
-            "scatter_amplitude_mm": self.scatter_amplitude_mm,
-            "scatter_damping_margin_mm": self.scatter_damping_margin_mm,
-            "scatter_freq1": self.scatter_freq1,
-            "scatter_freq2": self.scatter_freq2,
-            "accel_s": self.accel_s,
-            "decel_s": self.decel_s,
-            "layer_duration_s": self.layer_duration_s(),
-        }
+        snapshot = dataclasses.asdict(self)
+        snapshot["turns_per_mm"] = self.turns_per_mm
+        snapshot["layer_duration_s"] = self.layer_duration_s()
+        return snapshot

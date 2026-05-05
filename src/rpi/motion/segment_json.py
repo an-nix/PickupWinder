@@ -98,12 +98,12 @@ def load_segment_json(path: Path | str) -> tuple[list[int], dict[str, Any], Iter
     segments = [segment_from_dict(item) for item in segments_raw]
     if not axis_ids:
         axis_ids = infer_axis_ids(segments)
-    if len(axis_ids) != len(segments[0].steps):
+    if segments and len(axis_ids) != len(segments[0].steps):
         raise ValueError("axis_ids length does not match segment step count")
 
     return axis_ids, metadata, iter(segments)
 
 
 def load_segments(path: Path | str) -> list[MultiAxisSegment]:
-    _, iterator = load_segment_json(path)
+    _axis_ids, _metadata, iterator = load_segment_json(path)
     return list(iterator)

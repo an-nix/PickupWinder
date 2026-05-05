@@ -7,6 +7,8 @@
 
 #include "stepper_driver.h"
 
+#include "../comm/messages.h"
+
 #include <algorithm>
 #include <cstring>
 #include <esp_log.h>
@@ -15,36 +17,9 @@
 
 static const char* TAG = "stepper_driver";
 
-// ---------------------------------------------------------------------------
-// encode_steps() — simple_encoder callback, runs in ISR context (IRAM)
-// ---------------------------------------------------------------------------
-//
-// ── COAST MODE ─────────────────────────────────────────────────────────────
-// The RMT transaction is NEVER stopped due to an empty ring buffer.
-// When the ring is empty, the callback emits LOW-level pause symbols
-// ("coasting") and increments a pause counter.  As soon as new data
-// arrives in the ring, the next callback seamlessly resumes emitting
-// step pulses — zero restart overhead.
-//
-// The transaction is only terminated by:
-//   1. An explicit stop request (rmt_stopped_ = true)
-//   2. An endstop trigger
-//   3. An idle timeout (COAST_IDLE_LIMIT consecutive empty callbacks)
-//
-// This eliminates the stop/restart cycle that caused ~200-500 µs gaps
-// between segments at low speed, which was the primary source of
-// underruns and audible stutter.
-//
-// RMT clock: 80 MHz (1 tick = 12.5 ns).
-// PART_SIZE = 8: one callback per 8 symbols.
+//static constexpr uint32_t COAST_IDLE_LIMIT = 250000;
+static constexpr uint32_t COAST_IDLE_LIMIT = 50000;  
 
-/** Number of consecutive empty-ring callbacks before auto-stopping.
- *  Coast symbols now match the last step rate (last_ticks_ per symbol half),
- *  so at 1500 rpm (500 ticks/step = 6.25 µs) each coast callback takes ~50 µs.
- *  250000 callbacks × ~50 µs = ~12.5 seconds of idle before auto-stop.
- *  At slower speeds the coast period is longer per callback, so the idle time
- *  is always at least 12.5 s regardless of speed. */
-static constexpr uint32_t COAST_IDLE_LIMIT = 250000;
 
 extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
                                           size_t /*data_size*/,
@@ -57,17 +32,19 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     *done = false;
 
     if (symbols_free < PART_SIZE) {
-        return 0;  // Wait for more space
+        return 0;
     }
 
-    // ── Explicit stop request ────────────────────────────────────────────
     if (drv->rmt_stopped_.load(std::memory_order_relaxed)) {
         *done = true;
         return 0;
     }
 
-    // ── Endstop trigger — immediate stop ─────────────────────────────────
     if (drv->endstop_active_.load(std::memory_order_relaxed)) {
+        drv->ring_read_.store(0, std::memory_order_relaxed);
+        drv->ring_write_.store(0, std::memory_order_relaxed);
+        drv->last_chunk_had_steps_ = false;
+        drv->coast_idle_count_ = 0;
         drv->rmt_stopped_.store(true, std::memory_order_relaxed);
         *done = true;
         return 0;
@@ -76,22 +53,16 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     uint32_t rd = drv->ring_read_.load(std::memory_order_acquire);
     uint32_t wr = drv->ring_write_.load(std::memory_order_acquire);
 
-    // ── Ring empty — COAST: emit pause symbols, keep transaction alive ───
     if (rd == wr) {
         drv->last_chunk_had_steps_ = false;
         drv->coast_idle_count_++;
 
-        // After extended idle, auto-stop the transaction to free RMT resources.
         if (drv->coast_idle_count_ >= COAST_IDLE_LIMIT) {
             drv->rmt_stopped_.store(true, std::memory_order_relaxed);
             *done = true;
             return 0;
         }
 
-        // Emit pause symbols at the same rate as the last step so the ISR
-        // callback frequency does not spike during coast (which would starve
-        // the executor task and extend the coast period in a feedback loop).
-        // last_ticks_/2 per duration0+duration1 ≈ last step interval per symbol.
         {
             uint32_t last = drv->last_ticks_;
             if (last < MIN_CMD_TICKS) last = MIN_CMD_TICKS;
@@ -105,7 +76,6 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             }
         }
 
-        // Notify producer/executor so they can refill the ring.
         TaskHandle_t prod = drv->producer_task_.load(std::memory_order_relaxed);
         TaskHandle_t exec = drv->executor_task_.load(std::memory_order_relaxed);
         BaseType_t woken = pdFALSE;
@@ -116,15 +86,11 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
         return PART_SIZE;
     }
 
-    // ── Ring has data — reset idle counter ───────────────────────────────
     drv->coast_idle_count_ = 0;
 
-    // ── Direction change handling ────────────────────────────────────────
     ring_entry_t* entry = &drv->ring_[rd & STEP_RING_MASK];
-    if (entry->toggle_dir) {
+    if (entry->toggle_dir & 1) {
         if (drv->last_chunk_had_steps_) {
-            // Previous chunk had steps — emit a speed-matched pause chunk so
-            // the next callback can toggle DIR safely at the chunk boundary.
             drv->last_chunk_had_steps_ = false;
             uint32_t last = drv->last_ticks_;
             if (last < MIN_CMD_TICKS) last = MIN_CMD_TICKS;
@@ -138,22 +104,22 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             }
             return PART_SIZE;
         }
-        // Safe to toggle now (previous chunk was a pause or first chunk)
+        // Apply hardware inversion here — target_dir is logical, GPIO is physical.
         gpio_ll_set_level(&GPIO, drv->dir_pin_,
-                          gpio_ll_get_level(&GPIO, drv->dir_pin_) ^ 1);
+            (entry->target_dir ^ (drv->invert_direction_ ? 1u : 0u)) ? 1 : 0);
+        drv->setAppliedDirection(entry->target_dir != 0);  // store logical
         entry->toggle_dir = 0;
     }
 
-    // ── Fill PART_SIZE symbols from ring buffer ──────────────────────────
-    // (dir-change pause path below also uses last_ticks_ for speed-matching)
     bool has_steps = false;
     for (uint32_t i = 0; i < PART_SIZE; i++) {
         if (rd != wr) {
             ring_entry_t* e = &drv->ring_[rd & STEP_RING_MASK];
 
-            // Handle mid-chunk direction changes: stop filling, pad the
-            // remainder with a fixed LOW-level pause chunk.
-            if (e->toggle_dir && i > 0) {
+            /* Direction reversal mid-chunk (bit 0 set, not a hold entry, and
+             * not the first slot): flush remaining slots with idle symbols so
+             * the toggle is handled cleanly at the next callback.            */
+            if ((e->toggle_dir & 1) && i > 0) {
                 uint32_t last = drv->last_ticks_;
                 if (last < MIN_CMD_TICKS) last = MIN_CMD_TICKS;
                 uint16_t half = static_cast<uint16_t>(
@@ -168,28 +134,37 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
             }
 
             uint16_t t = e->ticks;
-            uint16_t high_ticks = t >> 1;
-            uint16_t low_ticks = t - high_ticks;
-            if (high_ticks < RMT_STEP_PULSE_TICKS) {
-                high_ticks = RMT_STEP_PULSE_TICKS;
-                low_ticks = t - high_ticks;
-            }
-            if (low_ticks < RMT_STEP_PULSE_TICKS) {
-                low_ticks = RMT_STEP_PULSE_TICKS;
-                high_ticks = t - low_ticks;
-            }
-            drv->last_ticks_ = t;
-            symbols[i].level0    = 1;
-            symbols[i].duration0 = high_ticks;
-            symbols[i].level1    = 0;
-            symbols[i].duration1 = low_ticks;
 
-            rd++;
-            has_steps = true;
+            if (e->toggle_dir & RING_ENTRY_HOLD) {
+                /* Hold (idle) entry: emit a silent pause symbol — no step pulse. */
+                drv->last_ticks_ = t;
+                uint16_t half = static_cast<uint16_t>(t >> 1);
+                symbols[i].level0    = 0;
+                symbols[i].duration0 = half;
+                symbols[i].level1    = 0;
+                symbols[i].duration1 = static_cast<uint16_t>(t - half);
+                rd++;
+                /* has_steps unchanged: hold entries don't count as a step. */
+            } else {
+                uint16_t high_ticks = t >> 1;
+                uint16_t low_ticks  = t - high_ticks;
+                if (high_ticks < RMT_STEP_PULSE_TICKS) {
+                    high_ticks = RMT_STEP_PULSE_TICKS;
+                    low_ticks  = t - high_ticks;
+                }
+                if (low_ticks < RMT_STEP_PULSE_TICKS) {
+                    low_ticks  = RMT_STEP_PULSE_TICKS;
+                    high_ticks = t - low_ticks;
+                }
+                drv->last_ticks_ = t;
+                symbols[i].level0    = 1;
+                symbols[i].duration0 = high_ticks;
+                symbols[i].level1    = 0;
+                symbols[i].duration1 = low_ticks;
+                rd++;
+                has_steps = true;
+            }
         } else {
-            // Ring exhausted mid-chunk — pad remainder with speed-matched
-            // pause (coast). Do NOT set rmt_stopped_. The next callback will
-            // coast or resume from new data.  Count this as a soft underrun.
             drv->ring_underrun_count_.fetch_add(1, std::memory_order_relaxed);
             {
                 uint32_t last = drv->last_ticks_;
@@ -227,51 +202,150 @@ extern "C" size_t IRAM_ATTR encode_steps(const void* /*data*/,
     return PART_SIZE;
 }
 
-// ---------------------------------------------------------------------------
-// endstopIsrHandler()  — GPIO ISR, IRAM_ATTR
-// ---------------------------------------------------------------------------
-//
-// Fires on any edge of either endstop contact (NO or NC).
-// Validates the dual-contact NO/NC logic to guard against noise and cable breaks:
-//   NO=0, NC=1 → endstop CLOSED (triggered) → set endstop_active_
-//   NO=1, NC=0 → endstop OPEN  (released)   → clear endstop_active_
-//   NO==NC      → ABSENT or cable break       → fail-safe: set endstop_active_
-//
-// arg = StepperDriver* (owns all needed state — no CommInterface dependency).
+namespace {
+
+static inline StepperDriver::EndstopSignalState decodeEndstopSignalState(int no_lvl,
+                                                                         int nc_lvl)
+{
+    if (no_lvl == 0 && nc_lvl == 1) {
+        return StepperDriver::EndstopSignalState::CLOSED;
+    }
+    if (no_lvl == 1 && nc_lvl == 0) {
+        return StepperDriver::EndstopSignalState::OPEN;
+    }
+    return StepperDriver::EndstopSignalState::INVALID;
+}
+
+} // namespace
+
+uint8_t StepperDriver::reportedEndstopState() const
+{
+    if (endstop_no_pin_ == GPIO_NUM_NC || endstop_nc_pin_ == GPIO_NUM_NC) {
+        return static_cast<uint8_t>(LateralEndstopState::ABSENT);
+    }
+
+    const EndstopSignalState raw = static_cast<EndstopSignalState>(
+        endstop_signal_state_.load(std::memory_order_acquire));
+    if (raw == EndstopSignalState::CLOSED) {
+        return static_cast<uint8_t>(LateralEndstopState::PRESENT_CLOSED);
+    }
+    if (raw == EndstopSignalState::OPEN) {
+        return static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+    }
+
+    const TickType_t invalid_since =
+        endstop_invalid_since_tick_.load(std::memory_order_acquire);
+    if (invalid_since != 0) {
+        const TickType_t now_tick = xTaskGetTickCount();
+        if ((now_tick - invalid_since) >= ENDSTOP_INVALID_DEBOUNCE_TICKS) {
+            return static_cast<uint8_t>(LateralEndstopState::ABSENT);
+        }
+    }
+
+    const EndstopSignalState stable = static_cast<EndstopSignalState>(
+        endstop_last_stable_state_.load(std::memory_order_acquire));
+    return (stable == EndstopSignalState::CLOSED)
+        ? static_cast<uint8_t>(LateralEndstopState::PRESENT_CLOSED)
+        : static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN);
+}
+
+bool StepperDriver::isEndstopMoveAllowed(bool direction) const
+{
+    if (!isEndstopArmed()) {
+        return true;
+    }
+
+    const uint8_t state = reportedEndstopState();
+    if (state == static_cast<uint8_t>(LateralEndstopState::ABSENT)) {
+        return false;
+    }
+
+    if (state == static_cast<uint8_t>(LateralEndstopState::PRESENT_OPEN)) {
+        return true;
+    }
+
+    // Armed + physically CLOSED:
+    // - If we have a known post-hit clearance direction, only that direction
+    //   is allowed.
+    // - Otherwise (closed before any armed hit), reject movement fail-safe.
+    if (state == static_cast<uint8_t>(LateralEndstopState::PRESENT_CLOSED)) {
+        if (!endstop_clearance_pending_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        const bool clearance_direction =
+            endstop_clearance_direction_.load(std::memory_order_acquire);
+        return direction == clearance_direction;
+    }
+
+    return true;
+}
+
+bool StepperDriver::prepareEndstopMove(bool direction)
+{
+    // FIX 2: permission check only; do not clear endstop_active_ here.
+    return isEndstopMoveAllowed(direction);
+}
 
 void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
 {
     StepperDriver* drv = static_cast<StepperDriver*>(arg);
 
+    const int no_lvl = gpio_get_level(drv->endstop_no_pin_);
+    const int nc_lvl = gpio_get_level(drv->endstop_nc_pin_);
+
+    const EndstopSignalState raw = decodeEndstopSignalState(no_lvl, nc_lvl);
+    drv->endstop_signal_state_.store(static_cast<uint8_t>(raw), std::memory_order_release);
+
+    const TickType_t now_tick = xTaskGetTickCountFromISR();
+    if (raw == EndstopSignalState::INVALID) {
+        const TickType_t invalid_since =
+            drv->endstop_invalid_since_tick_.load(std::memory_order_relaxed);
+        if (invalid_since == 0) {
+            drv->endstop_invalid_since_tick_.store(now_tick, std::memory_order_release);
+        }
+        return;
+    }
+
+    drv->endstop_last_stable_state_.store(static_cast<uint8_t>(raw), std::memory_order_release);
+    drv->endstop_invalid_since_tick_.store(0, std::memory_order_release);
+
+    if (raw == EndstopSignalState::OPEN) {
+        drv->endstop_closed_confirmations_ = 0;
+        // Anti-bounce: Do NOT clear endstop_active_ here. 
+        // Once tripped, the endstop must remain active until the host explicitly
+        // disarms it or re-arms it. A bouncing switch generating OPEN signals
+        // must not un-latch the emergency stop state.
+        return;
+    }
+
     if (!drv->isEndstopArmed()) {
         return;
     }
 
-    const int no_lvl = gpio_get_level(drv->endstop_no_pin_);
-    const int nc_lvl = gpio_get_level(drv->endstop_nc_pin_);
-
-    const bool triggered = (no_lvl == 0 && nc_lvl == 1) || (no_lvl == nc_lvl);
-
-    if (triggered) {
-        drv->endstop_active_.store(true, std::memory_order_release);
-        drv->endstop_hit_count_.fetch_add(1, std::memory_order_relaxed);
-        // Wake the executor task so it drains the pipeline immediately.
-        BaseType_t woken = pdFALSE;
-        TaskHandle_t exec = drv->executor_task_.load(std::memory_order_relaxed);
-        if (exec != nullptr) {
-            vTaskNotifyGiveFromISR(exec, &woken);
-        }
-        if (woken) portYIELD_FROM_ISR();
-    } else {
-        // Endstop released — clear flag.
-        // Host must re-arm via SPI ENABLE_ENDSTOP before the next move.
-        drv->endstop_active_.store(false, std::memory_order_release);
+    const uint8_t confirmations = drv->endstop_closed_confirmations_;
+    if (confirmations < ENDSTOP_CLOSED_CONFIRM_COUNT) {
+        drv->endstop_closed_confirmations_ = static_cast<uint8_t>(confirmations + 1);
     }
-}
+    if (drv->endstop_closed_confirmations_ < ENDSTOP_CLOSED_CONFIRM_COUNT) {
+        return;
+    }
 
-// ---------------------------------------------------------------------------
-// initEndstopIsr()
-// ---------------------------------------------------------------------------
+    const bool was_active = drv->endstop_active_.exchange(true, std::memory_order_acq_rel);
+    if (!was_active) {
+        drv->endstop_hit_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    drv->endstop_clearance_pending_.store(true, std::memory_order_release);
+    drv->endstop_clearance_direction_.store(
+        !drv->last_dir_commanded_.load(std::memory_order_acquire),
+        std::memory_order_release);
+
+    BaseType_t woken = pdFALSE;
+    TaskHandle_t exec = drv->executor_task_.load(std::memory_order_relaxed);
+    if (exec != nullptr) {
+        vTaskNotifyGiveFromISR(exec, &woken);
+    }
+    if (woken) portYIELD_FROM_ISR();
+}
 
 esp_err_t StepperDriver::initEndstopIsr(gpio_num_t no_pin, gpio_num_t nc_pin)
 {
@@ -284,7 +358,6 @@ esp_err_t StepperDriver::initEndstopIsr(gpio_num_t no_pin, gpio_num_t nc_pin)
     endstop_no_pin_ = no_pin;
     endstop_nc_pin_ = nc_pin;
 
-    // gpio_install_isr_service returns ESP_ERR_INVALID_STATE if already called.
     esp_err_t err = gpio_install_isr_service(0);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "motor%u: gpio_install_isr_service failed: %s",
@@ -302,14 +375,23 @@ esp_err_t StepperDriver::initEndstopIsr(gpio_num_t no_pin, gpio_num_t nc_pin)
             TAG, "gpio_isr_handler_add failed for pin %d", (int)pin);
     }
 
+    const EndstopSignalState initial_state = decodeEndstopSignalState(
+        gpio_get_level(no_pin), gpio_get_level(nc_pin));
+    endstop_signal_state_.store(static_cast<uint8_t>(initial_state), std::memory_order_release);
+    if (initial_state == EndstopSignalState::INVALID) {
+        endstop_last_stable_state_.store(
+            static_cast<uint8_t>(EndstopSignalState::OPEN),
+            std::memory_order_release);
+        endstop_invalid_since_tick_.store(xTaskGetTickCount(), std::memory_order_release);
+    } else {
+        endstop_last_stable_state_.store(static_cast<uint8_t>(initial_state), std::memory_order_release);
+        endstop_invalid_since_tick_.store(0, std::memory_order_release);
+    }
+
     ESP_LOGI(TAG, "motor%u: endstop ISR installed NO=GPIO%d NC=GPIO%d",
              motor_id_, (int)no_pin, (int)nc_pin);
     return ESP_OK;
 }
-
-// ---------------------------------------------------------------------------
-// Constructor
-// ---------------------------------------------------------------------------
 
 StepperDriver::StepperDriver(gpio_num_t step_pin, gpio_num_t dir_pin,
                              gpio_num_t en_pin,   uint8_t    motor_id)
@@ -321,13 +403,8 @@ StepperDriver::StepperDriver(gpio_num_t step_pin, gpio_num_t dir_pin,
     memset(ring_, 0, sizeof(ring_));
 }
 
-// ---------------------------------------------------------------------------
-// init()
-// ---------------------------------------------------------------------------
-
 esp_err_t StepperDriver::init()
 {
-    // ── 1. DIR and EN GPIO ──────────────────────────────────────────────────
     gpio_config_t io_conf = {};
     io_conf.mode          = GPIO_MODE_OUTPUT;
     io_conf.intr_type     = GPIO_INTR_DISABLE;
@@ -339,9 +416,9 @@ esp_err_t StepperDriver::init()
     }
 
     gpio_set_level(en_pin_,  1);
-    gpio_set_level(dir_pin_, last_dir_ ? 1 : 0);
+    gpio_set_level(dir_pin_,
+        (applied_dir_.load(std::memory_order_acquire) ^ invert_direction_) ? 1 : 0);
 
-    // ── 2. RMT TX channel ───────────────────────────────────────────────────
     rmt_tx_channel_config_t tx_cfg = {};
     tx_cfg.gpio_num           = step_pin_;
     tx_cfg.clk_src            = RMT_CLK_SRC_DEFAULT;
@@ -357,7 +434,6 @@ esp_err_t StepperDriver::init()
         return err;
     }
 
-    // ── 3. Simple encoder with callback ─────────────────────────────────────
     rmt_simple_encoder_config_t enc_cfg = {};
     enc_cfg.callback       = encode_steps;
     enc_cfg.arg            = this;
@@ -369,12 +445,10 @@ esp_err_t StepperDriver::init()
         return err;
     }
 
-    // ── 4. Transmit config ──────────────────────────────────────────────────
     tx_config_.loop_count              = 0;
     tx_config_.flags.eot_level         = 0;
     tx_config_.flags.queue_nonblocking = 1;
 
-    // ── 5. on_trans_done callback ───────────────────────────────────────────
     rmt_tx_event_callbacks_t cbs = {};
     cbs.on_trans_done = &StepperDriver::on_trans_done_isr;
     err = rmt_tx_register_event_callbacks(channel_, &cbs, this);
@@ -383,7 +457,6 @@ esp_err_t StepperDriver::init()
         return err;
     }
 
-    // ── 6. Enable the RMT channel ───────────────────────────────────────────
     err = rmt_enable(channel_);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "motor%u: rmt_enable failed: %s", motor_id_, esp_err_to_name(err));
@@ -396,10 +469,6 @@ esp_err_t StepperDriver::init()
              STEP_RING_SIZE, PART_SIZE);
     return ESP_OK;
 }
-
-// ---------------------------------------------------------------------------
-// enable / disable / emergencyStop
-// ---------------------------------------------------------------------------
 
 void StepperDriver::enable()
 {
@@ -425,28 +494,23 @@ void StepperDriver::emergencyStop()
     last_chunk_had_steps_ = false;
     coast_idle_count_ = 0;
 
+    gpio_set_level(dir_pin_,
+        (applied_dir_.load(std::memory_order_acquire) ^ invert_direction_) ? 1 : 0);
+    // FIX 3: force STEP pin low on emergency stop.
+    gpio_set_level(step_pin_, 0);
+
     ESP_LOGW(TAG, "motor%u: emergency stop", motor_id_);
 }
-
-// ---------------------------------------------------------------------------
-// stopStream()
-// ---------------------------------------------------------------------------
 
 void StepperDriver::stopStream()
 {
     if (!rmt_running_.load(std::memory_order_relaxed)) return;
 
-    // Signal the encoder callback to end the transmission
     rmt_stopped_.store(true, std::memory_order_release);
 
-    // Wait for the RMT hardware to finish the current transaction
     rmt_tx_wait_all_done(channel_, pdMS_TO_TICKS(500));
     rmt_running_.store(false, std::memory_order_relaxed);
 }
-
-// ---------------------------------------------------------------------------
-// startStream()
-// ---------------------------------------------------------------------------
 
 esp_err_t StepperDriver::startStream()
 {
@@ -455,10 +519,6 @@ esp_err_t StepperDriver::startStream()
     last_chunk_had_steps_ = false;
     coast_idle_count_ = 0;
 
-    // `this` is in internal DRAM (static global) — passes esp_ptr_internal()
-    // check. sizeof(*this) > 0 passes payload_bytes != 0. The callback ignores
-    // both data and data_size entirely. Reset the encoder so each new
-    // transaction restarts from symbol position 0.
     encoder_->reset(encoder_);
     esp_err_t err = rmt_transmit(channel_, encoder_, this, sizeof(*this), &tx_config_);
     if (err != ESP_OK) {
@@ -470,23 +530,11 @@ esp_err_t StepperDriver::startStream()
     return err;
 }
 
-// ---------------------------------------------------------------------------
-// gracefulStop()
-// ---------------------------------------------------------------------------
-
 void StepperDriver::gracefulStop()
 {
-    // Signal the encoder callback to stop after the current ring contents
-    // have been consumed (no ring reset, unlike emergencyStop).
     rmt_stopped_.store(true, std::memory_order_release);
-    // Do not call rmt_tx_wait_all_done here — the caller should not block.
-    // The RMT transaction will end naturally after the pause chunk fires.
     rmt_running_.store(false, std::memory_order_relaxed);
 }
-
-// ---------------------------------------------------------------------------
-// pushBlock()
-// ---------------------------------------------------------------------------
 
 esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t caller_task)
 {
@@ -494,9 +542,6 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
         return ESP_OK;
     }
 
-    // Always update producer_task_ unconditionally so the ISR ring-space
-    // notification always wakes the task that is actually blocked here,
-    // not a stale handle from a previous call.
     producer_task_.store((caller_task != nullptr)
                      ? caller_task
                      : xTaskGetCurrentTaskHandle(),
@@ -505,37 +550,30 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
     const uint32_t count = std::min<uint32_t>(block.count, STEP_BLOCK_SIZE);
 
     const bool new_dir = block.steps[0].direction;
-    bool need_toggle = (new_dir != last_dir_);
+    const bool applied_dir = applied_dir_.load(std::memory_order_acquire);
+    bool need_toggle = (new_dir != applied_dir);
 
-    // If the ring is empty and the motor is idle, explicitly set the DIR pin
-    // to the requested direction now. This avoids relying on the initial
-    // `last_dir_` state and ensures reverse mode is applied on the first block.
     if (!rmt_running_.load(std::memory_order_relaxed) &&
         ring_read_.load(std::memory_order_relaxed) == ring_write_.load(std::memory_order_relaxed) &&
-        need_toggle) {
-        gpio_set_level(dir_pin_, new_dir ? 1 : 0);
-        last_dir_ = new_dir;
+        need_toggle)
+        {
+           ESP_LOGI(TAG, "motor%u: pushBlock new_dir=%d applied_dir=%d need_toggle=%d rmt_running=%d",
+         motor_id_, (int)new_dir, (int)applied_dir, (int)need_toggle,
+         (int)rmt_running_.load(std::memory_order_relaxed));
+        gpio_set_level(dir_pin_, (new_dir ^ invert_direction_) ? 1 : 0);
+        applied_dir_.store(new_dir, std::memory_order_release);  // logical
         need_toggle = false;
-    } else {
-        last_dir_ = new_dir;
-    }
+        }
+    last_dir_commanded_.store(new_dir, std::memory_order_release);
 
-    // If the endstop already fired before we even start writing, abort.
-    if (endstop_active_.load(std::memory_order_acquire)) {
+    if (!prepareEndstopMove(new_dir)) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    for (uint32_t i = 0; i < count; i++) {
-        // Back-pressure: wait until the encoder ISR has consumed at least one
-        // chunk and notified this producer task. This avoids a CPU1 spin loop
-        // and keeps the task watchdog satisfied.
-        //
-        // B2 FIX: deadlock guard — si startStream() échoue (trans_queue pleine),
-        // l'ISR ne fire jamais et ring_read_ ne progresse pas. Retour d'erreur
-        // explicite après 20 tentatives (20 × 5 ms = 100 ms max).
+    /* Helper: wait until at least one ring slot is free.
+     * Returns ESP_ERR_INVALID_STATE on endstop, ESP_ERR_TIMEOUT if RMT won't start. */
+    auto waitOneSlot = [&](uint8_t& retry_count) -> esp_err_t {
         static constexpr uint8_t PUSH_RETRY_MAX = 20;
-        uint8_t push_retry_count = 0;
-
         while (ringFree() == 0) {
             if (endstop_active_.load(std::memory_order_acquire)) {
                 return ESP_ERR_INVALID_STATE;
@@ -545,8 +583,8 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
                 if (kick_err != ESP_OK) {
                     ESP_LOGW(TAG, "motor%u: pushBlock kick startStream: %s",
                              motor_id_, esp_err_to_name(kick_err));
-                    ++push_retry_count;
-                    if (push_retry_count >= PUSH_RETRY_MAX) {
+                    ++retry_count;
+                    if (retry_count >= PUSH_RETRY_MAX) {
                         ESP_LOGE(TAG,
                                  "motor%u: pushBlock timeout — ring full, RMT won't start",
                                  motor_id_);
@@ -559,33 +597,67 @@ esp_err_t StepperDriver::pushBlock(const step_block_t& block, TaskHandle_t calle
                 return ESP_ERR_INVALID_STATE;
             }
         }
+        return ESP_OK;
+    };
+
+    for (uint32_t i = 0; i < count; i++) {
+        // FIX 1: check latch before entering ringFree wait/write path.
+        if (endstop_active_.load(std::memory_order_acquire)) {
+            return ESP_ERR_INVALID_STATE;
+        }
 
         uint32_t ticks = block.steps[i].interval_ticks;
-
         ticks = std::max<uint32_t>(ticks, RMT_STEP_MIN_TICKS);
         ticks = std::min<uint32_t>(ticks, RMT_STEP_MAX_TICKS);
+
+        /* ── Slow-speed expansion ───────────────────────────────────────────
+         * The RMT hardware uses 15-bit duration fields per symbol half, so the
+         * maximum period per ring entry is 32767 + 32767 = 65534 ticks.
+         * When ticks > RMT_STEP_MAX_SYMBOL_TICKS we pre-push hold (idle) ring
+         * entries that carry the excess time, then emit the actual step entry
+         * with the remainder (≤ 65534 ticks).  High-speed steps (ticks ≤ 65534)
+         * take the fast path with zero hold entries.                          */
+        if (ticks > RMT_STEP_MAX_SYMBOL_TICKS) {
+            uint32_t hold_remaining = ticks - RMT_STEP_MAX_SYMBOL_TICKS;
+            ticks = RMT_STEP_MAX_SYMBOL_TICKS;  // step entry gets the last slot
+
+            while (hold_remaining > 0) {
+                if (endstop_active_.load(std::memory_order_acquire)) {
+                    return ESP_ERR_INVALID_STATE;
+                }
+                uint8_t hold_retry = 0;
+                esp_err_t herr = waitOneSlot(hold_retry);
+                if (herr != ESP_OK) return herr;
+
+                const uint16_t this_hold = (hold_remaining > RMT_STEP_MAX_SYMBOL_TICKS)
+                    ? static_cast<uint16_t>(RMT_STEP_MAX_SYMBOL_TICKS)
+                    : static_cast<uint16_t>(hold_remaining);
+                hold_remaining -= this_hold;
+
+                uint32_t hw = ring_write_.load(std::memory_order_relaxed);
+                ring_entry_t* he = &ring_[hw & STEP_RING_MASK];
+                he->ticks      = this_hold;
+                he->toggle_dir = RING_ENTRY_HOLD;
+                he->target_dir = 0;
+                ring_write_.store(hw + 1, std::memory_order_release);
+            }
+        }
+
+        uint8_t push_retry_count = 0;
+        esp_err_t serr = waitOneSlot(push_retry_count);
+        if (serr != ESP_OK) return serr;
 
         uint32_t wr = ring_write_.load(std::memory_order_relaxed);
         ring_entry_t* e = &ring_[wr & STEP_RING_MASK];
         e->ticks      = static_cast<uint16_t>(ticks);
         e->toggle_dir = (i == 0 && need_toggle) ? 1 : 0;
-        e->pad        = 0;
+        e->target_dir = static_cast<uint8_t>(new_dir ? 1 : 0);
 
         ring_write_.store(wr + 1, std::memory_order_release);
     }
 
-    // NOTE: startStream() is NOT called here.
-    //
-    // The executor task (stepper_queue.cpp) calls startStream() explicitly after
-    // draining all available FreeRTOS queue blocks into the ring. This maximises
-    // ring fill before the RMT starts, which is critical at high step rates where
-    // a single 64-step block lasts less than one SPI round-trip.
     return ESP_OK;
 }
-
-// ---------------------------------------------------------------------------
-// on_trans_done ISR
-// ---------------------------------------------------------------------------
 
 bool IRAM_ATTR StepperDriver::on_trans_done_isr(
     rmt_channel_handle_t /*tx_chan*/,

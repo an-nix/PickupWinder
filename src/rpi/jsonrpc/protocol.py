@@ -25,6 +25,11 @@ class JsonRpcInvalidRequestError(JsonRpcError):
         super().__init__(-32600, "Invalid Request", data)
 
 
+class JsonRpcInvalidParamsError(JsonRpcError):
+    def __init__(self, message: str, data: Any | None = None) -> None:
+        super().__init__(-32602, f"Invalid params: {message}", data)
+
+
 class JsonRpcMethodNotFoundError(JsonRpcError):
     def __init__(self, method: str) -> None:
         super().__init__(-32601, f"Method not found: {method}", {"method": method})
@@ -59,9 +64,13 @@ def parse_json_rpc(payload: str) -> JsonRpcRequest:
     if "method" not in message or not isinstance(message["method"], str):
         raise JsonRpcInvalidRequestError(message)
 
+    params = message.get("params")
+    if params is not None and not isinstance(params, (dict, list)):
+        raise JsonRpcInvalidRequestError(message)
+
     return JsonRpcRequest(
         method=message["method"],
-        params=message.get("params"),
+        params=params,
         id=message.get("id"),
     )
 
@@ -71,14 +80,16 @@ def make_response(result: Any, request_id: Any | None) -> str:
 
 
 def make_error_response(error: JsonRpcError, request_id: Any | None) -> str:
-    payload = {
-        "jsonrpc": JSONRPC_VERSION,
-        "error": {
-            "code": error.code,
-            "message": error.message,
-        },
-        "id": request_id,
+    error_obj: dict[str, Any] = {
+        "code": error.code,
+        "message": error.message,
     }
     if error.data is not None:
-        payload["error"]["data"] = error.data
+        error_obj["data"] = error.data
+
+    payload: dict[str, Any] = {
+        "jsonrpc": JSONRPC_VERSION,
+        "error": error_obj,
+        "id": request_id,
+    }
     return json.dumps(payload)

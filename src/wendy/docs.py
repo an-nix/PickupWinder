@@ -64,10 +64,31 @@ def make_openapi_schema(
                     }
                 }
             },
+            "/clear_fault": {
+                "get": {
+                    "summary": "Clear winding faults",
+                    "description": "Invoke winding.clear_fault on the backend to acknowledge and clear the current fault.",
+                    "responses": {
+                        "200": {
+                            "description": "Clear fault command result",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object"
+                                    }
+                                }
+                            }
+                        },
+                        "502": {
+                            "description": "Backend RPC error"
+                        }
+                    }
+                }
+            },
             "/run_axis": {
                 "get": {
                     "summary": "Run axis for a duration",
-                    "description": "Compute steps from RPM and duration, then call winding.jog on the backend.",
+                    "description": "Compute steps from RPM and duration, then call winding.run_axis on the backend.",
                     "parameters": [
                         {
                             "name": "axis_id",
@@ -90,10 +111,41 @@ def make_openapi_schema(
                             "schema": {"type": "number"},
                             "description": "Duration of the motion in seconds.",
                         },
+                        {
+                            "name": "reverse",
+                            "in": "query",
+                            "required": False,
+                            "schema": {"type": "boolean", "default": False},
+                            "description": "Whether to reverse the direction of the axis.",
+                        },
                     ],
                     "responses": {
                         "200": {
                             "description": "Run axis command result",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object"
+                                    }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Invalid request parameters"
+                        },
+                        "502": {
+                            "description": "Backend RPC error"
+                        }
+                    }
+                }
+            },
+            "/home": {
+                "get": {
+                    "summary": "Home the lateral axis",
+                    "description": "Invoke winding.home_lateral on the backend to run the lateral homing procedure using the configured defaults.",
+                    "responses": {
+                        "200": {
+                            "description": "Homing command result",
                             "content": {
                                 "application/json": {
                                     "schema": {

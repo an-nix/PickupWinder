@@ -4,7 +4,7 @@ from jsonrpc import UnixJsonRpcClient
 
 
 def main() -> None:
-    socket_path = "/tmp/pickup_winder_rpc.sock"
+    socket_path = "/tmp/winding.sock"
     client = UnixJsonRpcClient(socket_path, timeout_s=30.0)
 
     print(f"Connecting to JSON-RPC server at {socket_path}")

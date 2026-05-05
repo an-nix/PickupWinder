@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Callable, Iterator
 
 from .ramp_config import RampConfig
 from .segment_generator import AxisStepProfile, StepProfileSegmentGenerator
@@ -13,6 +13,10 @@ from transport.messages import MultiAxisSegment
 class AxisMotionConfig:
     axis_id: int
     ramp: RampConfig
+
+
+def _make_step_fn(ramp: RampConfig) -> Callable[[float], float]:
+    return lambda t: ramp.steps_at(t)
 
 
 class MultiAxisSegmentGenerator(StepProfileSegmentGenerator):
@@ -28,7 +32,7 @@ class MultiAxisSegmentGenerator(StepProfileSegmentGenerator):
         axis_profiles = [
             AxisStepProfile(
                 axis_index=config.axis_id,
-                step_at=lambda t, ramp=config.ramp: ramp.steps_at(t),
+                step_at=_make_step_fn(config.ramp),
                 reverse_direction=config.ramp.reverse_direction,
                 total_duration=config.ramp.total_duration,
             )

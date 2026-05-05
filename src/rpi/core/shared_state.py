@@ -43,6 +43,7 @@ class SharedState:
         self._current_program: WindingProgram | None = None
         self._current_layer: LayerProgress | None = None
         self._completed_layers: int = 0
+        self._winding_session: dict[str, Any] | None = None
         self._fault_message: str | None = None
         self._started_at: float | None = None
         self._completed_at: float | None = None
@@ -96,6 +97,43 @@ class SharedState:
         with self._lock:
             return self._completed_layers
 
+    # ── Adaptive winding session ─────────────────────────────────────────
+
+    def set_winding_session(self, snapshot: dict[str, Any] | None) -> None:
+        with self._lock:
+            self._winding_session = snapshot
+
+    # ── Atomic composite transitions ─────────────────────────────────────
+    # These methods update engine_state and winding_session in a single lock
+    # acquisition, eliminating the TOCTOU window that exists when callers
+    # call set_engine_state() and set_winding_session() separately.
+
+    def transition_to_paused(self, session_snapshot: dict[str, Any]) -> None:
+        """Atomically set engine state to PAUSED and update the session snapshot."""
+        with self._lock:
+            self._engine_state = EngineState.PAUSED
+            self._winding_session = session_snapshot
+
+    def transition_to_running(self, session_snapshot: dict[str, Any]) -> None:
+        """Atomically set engine state to RUNNING and update the session snapshot."""
+        with self._lock:
+            self._engine_state = EngineState.RUNNING
+            self._winding_session = session_snapshot
+
+    def transition_to_idle_session(
+        self, session_snapshot: dict[str, Any] | None = None
+    ) -> None:
+        """Atomically set engine state to IDLE and update the session snapshot."""
+        with self._lock:
+            self._engine_state = EngineState.IDLE
+            self._winding_session = session_snapshot
+
+    def transition_to_stopping(self, session_snapshot: dict[str, Any]) -> None:
+        """Atomically set engine state to STOPPING and update the session snapshot."""
+        with self._lock:
+            self._engine_state = EngineState.STOPPING
+            self._winding_session = session_snapshot
+
     # ── Fault ──────────────────────────────────────────────────────────────
 
     def set_fault(self, message: str) -> None:
@@ -129,6 +167,7 @@ class SharedState:
                            if self._current_program else None,
                 "current_layer": layer_snap,
                 "completed_layers": self._completed_layers,
+                "winding_session": self._winding_session,
                 "fault_message": self._fault_message,
                 "started_at": self._started_at,
                 "completed_at": self._completed_at,

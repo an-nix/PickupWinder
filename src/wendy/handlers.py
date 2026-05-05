@@ -84,6 +84,8 @@ class WindingRunAxisHandler(tornado.web.RequestHandler):
             axis_id = int(self.get_query_argument("axis_id"))
             rpm = float(self.get_query_argument("rpm"))
             duration_s = float(self.get_query_argument("duration_s"))
+            #reverse = bool(self.get_query_argument("reverse", default="0"))
+            reverse = self.get_query_argument("reverse", default=False)
         except tornado.web.MissingArgumentError as exc:
             self.set_status(400)
             self.write(json.dumps({"error": str(exc)}))
@@ -92,16 +94,36 @@ class WindingRunAxisHandler(tornado.web.RequestHandler):
             self.set_status(400)
             self.write(json.dumps({"error": f"Invalid parameter: {exc}"}))
             return
-
+        print(f"Received run_axis command: axis_id={axis_id}, rpm={rpm}, duration_s={duration_s}, reverse={reverse}")
         request_id = int(time.time() * 1000)
         request_payload = make_request(
             "winding.run_axis",
             params={
                 "duration_s": duration_s,
                 "targets": [
-                    {"axis_id": axis_id, "rpm": rpm},
+                    {"axis_id": axis_id, "rpm": rpm,"reverse": reverse},
                 ],
             },
+            request_id=request_id,
+        )
+        response = self.application.rpc_client.send_raw(request_payload)
+        if response is None:
+            self.set_status(204)
+            return
+        if "error" in response:
+            self.set_status(502)
+            self.write(json.dumps(response))
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps(response.get("result", response)))
+
+
+class WindingHomeHandler(tornado.web.RequestHandler):
+    def get(self) -> None:
+        request_id = int(time.time() * 1000)
+        request_payload = make_request(
+            "winding.home_lateral",
+            params=None,
             request_id=request_id,
         )
         response = self.application.rpc_client.send_raw(request_payload)
@@ -119,6 +141,21 @@ class WindingRunAxisHandler(tornado.web.RequestHandler):
 class WindingStatusHandler(tornado.web.RequestHandler):
     def get(self) -> None:
         request_payload = make_request("winding.status", params=None, request_id=1)
+        response = self.application.rpc_client.send_raw(request_payload)
+        if response is None:
+            self.set_status(204)
+            return
+        if "error" in response:
+            self.set_status(502)
+            self.write(json.dumps(response))
+            return
+        self.set_header("Content-Type", "application/json")
+        self.write(json.dumps(response.get("result", response)))
+
+
+class WindingClearFaultHandler(tornado.web.RequestHandler):
+    def get(self) -> None:
+        request_payload = make_request("winding.clear_fault", params=None, request_id=1)
         response = self.application.rpc_client.send_raw(request_payload)
         if response is None:
             self.set_status(204)
@@ -163,7 +200,9 @@ def make_application(
             (r"/rpc", JsonRpcHttpHandler, dict(rpc_client=rpc_client)),
             (r"/ws", JsonRpcWebSocketHandler),
             (r"/run_axis", WindingRunAxisHandler),
+            (r"/home", WindingHomeHandler),
             (r"/status", WindingStatusHandler),
+            (r"/clear_fault", WindingClearFaultHandler),
             (r"/openapi.json", OpenApiHandler),
             (r"/docs", ReDocHandler),
             (r"/swagger", SwaggerUIHandler),

@@ -15,6 +15,8 @@ Ce document décrit le format des trames SPI, la sémantique d'ACK pipelinée, e
 
 Une transaction SPI échange toujours une trame complète dans chaque sens.
 
+Mode électrique actif : SPI mode `1` (`CPOL=0`, `CPHA=1`) sur le Raspberry Pi et sur l'ESP32. Cette symétrie est requise ; mélanger les modes ou revenir en mode `0` réintroduit une zone de timing déjà observée comme fragile avec le slave DMA ESP32.
+
 ```text
 Host TX request N   ---> ESP32 parses request N
 Host RX status N   <--- ESP32 returns status built after request N-1
@@ -38,7 +40,7 @@ Le CRC est calculé sur `header (crc16=0) + payload`.
 
 ## Messages actifs
 
-- `GET_STATUS (0x06)` : télémétrie et confirmation de traitement.
+- `GET_STATUS (0x06)` : télémétrie pure, sans publication d'un nouvel ACK de contrôle.
 - `FLUSH (0x12)` : abandon des segments au-delà d'un seuil de séquence.
 - `MULTI_AXIS_SEGMENT_BLOCK (0x13)` : chemin de production.
 - `ENABLE_ENDSTOP (0x14)` : armement/désarmement matériel.
@@ -69,6 +71,10 @@ un homing réussi, puis retombe sur des heuristiques plus faibles seulement en
 compatibilité.
 
 Le host doit considérer `last_result` comme l'ACK réel d'une requête seulement après avoir attendu la confirmation du `last_rx_sequence` correspondant.
+Le triplet publié `last_rx_sequence` / `last_rx_type` / `last_result` désigne toujours la
+dernière requête de contrôle non télémétrique effectivement prise en compte par le firmware.
+Les polls `GET_STATUS`, `PING`, `NOP` et les parse errors SPI transitoires (`BAD_MAGIC`,
+`BAD_VERSION`, `BAD_LENGTH`, `BAD_CRC`) ne doivent pas écraser cet ACK publié.
 
 ## Sémantique d'ACK
 
@@ -82,6 +88,12 @@ Règle impérative :
 
 - ne jamais interpréter la réponse full-duplex immédiate comme l'ACK certain de la requête courante ;
 - attendre que `StatusPayload.last_rx_sequence == request_sequence`.
+
+Conséquence pratique :
+
+- `GET_STATUS` sert à lire l'état courant,
+- `wait_for_request_result()` sert à confirmer une requête de contrôle,
+- un poll de statut ne doit jamais faire "disparaître" l'ACK de la requête précédente.
 
 ## Séquences utilisées
 

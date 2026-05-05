@@ -32,14 +32,19 @@ class AxisState:
         steps_per_rev: int = 200 * 32,
         steps_per_mm: float | None = None,
         limits: AxisLimits | None = None,
+        homed: bool = False,
+        position_steps: int | None = None,
     ) -> None:
         self.axis_id = axis_id
         self.steps_per_rev = steps_per_rev
         self.steps_per_mm = steps_per_mm
         self.limits = limits or AxisLimits()
         self._lock = Lock()
-        self._position_steps: int | None = None  # None = unknown (needs homing)
-        self._homed: bool = False
+        initial_position = position_steps
+        if homed and initial_position is None:
+            initial_position = 0
+        self._position_steps: int | None = initial_position
+        self._homed: bool = bool(homed)
         self._endstop_state: int = 255  # 255 = absent, 0 = open, 1 = closed
 
     # ── Position ────────────────────────────────────────────────────────
@@ -88,14 +93,18 @@ class AxisState:
 
     # ── Soft limits ─────────────────────────────────────────────────────
 
-    def check_move(self, delta_steps: int) -> bool:
+    def check_move(self, delta_steps: int, *, strict: bool = False) -> bool:
         """
         Returns True if moving delta_steps from current position is within
-        soft limits. Returns True if position is unknown (limit not checkable).
+        soft limits.
+
+        If the current position is unknown:
+          - strict=False: returns True because limits cannot be checked.
+          - strict=True: returns False and the move is refused.
         """
         with self._lock:
             if self._position_steps is None:
-                return True
+                return not strict
             target = self._position_steps + delta_steps
             if self.limits.min_steps is not None and target < self.limits.min_steps:
                 return False

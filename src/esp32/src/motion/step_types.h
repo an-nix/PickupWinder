@@ -24,8 +24,9 @@
  *   160 kHz target: interval = 80 000 000 / 160 000 = 500 ticks  (6.25 µs)
  *   100 Hz  min   : interval = 800 000 ticks → clamped to 0xFFFF (65535)
  *
- *   PART_SIZE=8: one encoder callback per 8 steps.
- *     At 160 kHz: callback every 50 µs — well within FreeRTOS tick budget.
+ *   PART_SIZE=4: one encoder callback per 4 steps.
+ *     At 160 kHz: callback every 25 µs — short enough to reduce endstop
+ *     overtravel while still keeping ISR load manageable.
  */
 
 #pragma once
@@ -73,8 +74,30 @@ static inline bool sequence_is_stale_or_equal_u16(uint16_t candidate, uint16_t r
  */
 #define RMT_STEP_MIN_TICKS      16U
 
-/** Maximum interval in ticks: 16-bit RMT field → 65535 ticks = ~819 µs → ~1.2 kHz floor */
-#define RMT_STEP_MAX_TICKS      0xFFFFU
+/**
+ * Maximum period representable by one RMT symbol (two 15-bit duration fields).
+ * Each field holds at most 32767 ticks → total 32767+32767 = 65534 ticks ≈ 819 µs.
+ * Periods exceeding this limit are expanded into hold (idle) ring entries by
+ * pushBlock() so every individual ring entry stays within this bound.
+ */
+#define RMT_STEP_MAX_SYMBOL_TICKS  65534U
+
+/**
+ * Maximum overall step interval in ticks.
+ * Raised to support very slow speeds: 2 000 000 ticks / 80 MHz = 25 ms/step
+ * → ~0.37 RPM at 32 microsteps, 200 steps/rev.
+ * Larger values are silently clamped; the ring expansion in pushBlock() handles
+ * any value up to this limit transparently.
+ */
+#define RMT_STEP_MAX_TICKS      2000000UL
+
+/**
+ * toggle_dir value written into a ring entry that carries only idle (hold) time.
+ * bit 0 = direction-change-needed, bit 1 = is_hold.
+ * Hold entries cause the encoder to emit a silent pause symbol instead of a step
+ * pulse, allowing step periods longer than RMT_STEP_MAX_SYMBOL_TICKS.
+ */
+#define RING_ENTRY_HOLD  2U
 
 /** Default hold interval before any step has been consumed (= minimum interval).
  *  Prevents duration1 wraparound to ~65535 ticks on first ring-empty hold. */
@@ -93,12 +116,12 @@ static inline bool sequence_is_stale_or_equal_u16(uint16_t candidate, uint16_t r
  * the ring empties, but small chunks still help because each callback
  * consumes fewer entries, giving the executor more time to refill.
  *
- * PART_SIZE=8 → one callback per 8 steps.
+ * PART_SIZE=4 → one callback per 4 steps.
  * RMT_MEM_SYMBOLS must be >= 64 for IDF constraints, so we set it to 64
  * independently (the driver calls the callback multiple times per
  * half-buffer when PART_SIZE < mem_block_symbols/2).
  */
-#define PART_SIZE               8U
+#define PART_SIZE               4U
 
 /** Total RMT hardware memory per channel.
  *  Must be >= 64 for IDF RMT driver constraints.
@@ -255,11 +278,20 @@ typedef struct {
  *
  * Produced by the executor task, consumed by the simple_encoder callback.
  * SPSC: one writer (task), one reader (ISR).
+ *
+ * toggle_dir encoding:
+ *   0               – step, no direction change
+ *   1  (bit 0)      – step, apply target_dir before the pulse
+ *   2  (RING_ENTRY_HOLD, bit 1) – idle/hold entry, no step pulse emitted;
+ *                     ticks ≤ RMT_STEP_MAX_SYMBOL_TICKS.
+ *                     Used to extend step periods beyond 65534 ticks for very
+ *                     slow motion.  The encoder emits a silent pause symbol.
  */
 typedef struct {
-    uint16_t ticks;      /**< Total step period in RMT ticks (2 MHz).  0 = invalid. */
-    uint8_t  toggle_dir; /**< 1 = toggle DIR pin before this step.                   */
-    uint8_t  pad;        /**< Padding for 4-byte alignment.                          */
+    uint16_t ticks;      /**< Period in RMT ticks. For holds: idle duration (≤65534).
+                              For steps: step interval (≤65534).  0 = invalid.      */
+    uint8_t  toggle_dir; /**< See toggle_dir encoding above.                        */
+    uint8_t  target_dir; /**< Absolute DIR level to apply when (toggle_dir & 1).   */
 } ring_entry_t;
 
 // ---------------------------------------------------------------------------
@@ -298,11 +330,25 @@ typedef struct {
     multi_axis_segment_t segments[MULTI_AXIS_BLOCK_SIZE];
 } multi_axis_block_t;
 
+typedef enum {
+    FLUSH_SOURCE_HOST = 0,
+    FLUSH_SOURCE_INTERNAL = 1,
+} flush_request_source_t;
+
 /**
- * @brief Flush request: discard all segments with motion_sequence > threshold.
+ * @brief Internal planner flush request.
+ *
+ * This is a firmware-only queue item, not a SPI wire struct.
+ * `flush_sequence` belongs to the source-specific control domain:
+ * - host flushes use the host-provided SPI flush sequence
+ * - internal flushes use an executor-generated/internal sequence token
+ *
+ * It must never be interpreted as a motion_sequence.
  */
 typedef struct {
-    uint16_t flush_sequence; /**< Keep segments ≤ this; discard the rest       */
+    uint16_t flush_sequence;
+    uint8_t  source;
+    uint8_t  reserved;
 } flush_request_t;
 
 #ifdef __cplusplus

@@ -421,6 +421,43 @@ def test_streamer_flushes_to_last_confirmed_sequence_on_endstop():
     assert streamer._flush_sequence_requested == 12
 
 
+def test_streamer_flushes_when_endstop_is_detected_on_status_poll(monkeypatch):
+    class TrackingTransport(MockSpiTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flush_calls: list[int] = []
+
+        def flush_until(self, sequence: int):
+            self.flush_calls.append(sequence)
+            return super().flush_until(sequence)
+
+    transport = TrackingTransport()
+    streamer = MultiAxisRampStreamer(
+        transport=transport,
+        axis_streams=[StreamAxisConfig(axis_id=1, ramp=RampConfig(axis_id=1, target_rpm=300.0))],
+    )
+    streamer.note_endstop_armed(1, True)
+    streamer.set_generator(iter(()))
+    streamer._last_confirmed_motion_seq = 21
+
+    endstop_checks = {"count": 0}
+
+    def fake_check_endstop(_status):
+        endstop_checks["count"] += 1
+        if endstop_checks["count"] == 2:
+            streamer._mark_endstop_triggered()
+            return True
+        return False
+
+    monkeypatch.setattr(streamer, "_check_endstop", fake_check_endstop)
+
+    total_segments = streamer.stream_all()
+
+    assert total_segments == 0
+    assert transport.flush_calls == [21]
+    assert streamer._flush_sequence_requested is None
+
+
 def test_axis_state_reports_closed_endstop_from_protocol_value():
     axis_state = AxisState(axis_id=1)
 
@@ -561,6 +598,89 @@ def test_engine_exposes_public_config_property():
     )
 
     assert engine.config is config
+
+
+def test_engine_request_stop_keeps_worker_thread_alive(monkeypatch):
+    class FakeMoveQueue:
+        def __init__(self, transport, axis_states, poll_interval_s, print_every):
+            self._current_move = None
+
+        def start(self) -> None:
+            pass
+
+        def stop(self, timeout_s: float = 5.0) -> None:
+            pass
+
+        def clear(self) -> None:
+            pass
+
+        @property
+        def pending_count(self) -> int:
+            return 0
+
+        @property
+        def current_move(self):
+            return self._current_move
+
+        def status(self) -> dict[str, object]:
+            return {
+                "running": False,
+                "current_move": None,
+                "pending_moves": [],
+                "history": [],
+                "axis_states": {},
+            }
+
+    monkeypatch.setattr("core.engine.MoveQueue", FakeMoveQueue)
+
+    engine = WindingEngine(
+        transport=SimpleNamespace(),
+        shared_state=SharedState(axis_states={}),
+        event_bus=EventBus(),
+        config=AppConfiguration(),
+    )
+
+    engine.start()
+    engine.request_stop()
+    engine._program_event.set()
+    engine._thread.join(timeout=0.2)
+
+    assert engine._thread is not None
+    assert engine._thread.is_alive() is True
+
+    engine.stop(timeout_s=0.2)
+
+
+def test_execute_program_returns_early_after_homing_failure(monkeypatch):
+    engine = WindingEngine(
+        transport=SimpleNamespace(),
+        shared_state=SharedState(axis_states={}),
+        event_bus=EventBus(),
+        config=AppConfiguration(),
+    )
+    program = WindingProgram(
+        name="failing_home",
+        num_layers=1,
+        spindle_rpm=120.0,
+        layer_pitch_mm=0.1,
+        wire_diameter_mm=0.05,
+        home_before_start=True,
+    )
+
+    monkeypatch.setattr(
+        engine,
+        "_home_lateral_axis",
+        lambda **kwargs: (False, "simulated homing failure"),
+    )
+
+    def _unexpected_run_layer(*args, **kwargs):
+        raise AssertionError("_run_layer must not be called when homing fails")
+
+    monkeypatch.setattr(engine, "_run_layer", _unexpected_run_layer)
+
+    engine._execute_program(program)
+
+    assert engine._state.engine_state.name == "HOMING"
 
 
 def test_engine_jog_rejects_unhomed_lateral_axis():
@@ -883,6 +1003,7 @@ def test_execute_homing_waits_for_endstop_request_confirmation(monkeypatch):
                 last_executed_sequence=0xFFFF,
                 lateral_endstop_state=self.endstop_state,
                 endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
             )
 
         def enable_endstop_request(self, axis_id: int, arm: bool):
@@ -896,6 +1017,7 @@ def test_execute_homing_waits_for_endstop_request_confirmation(monkeypatch):
                 last_result=0,
                 lateral_endstop_state=self.endstop_state,
                 endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
             )
 
     class FakeStreamer:
@@ -958,6 +1080,7 @@ def test_execute_homing_fails_when_endstop_not_open_before_start(monkeypatch):
                 last_executed_sequence=0xFFFF,
                 lateral_endstop_state=self.endstop_state,
                 endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
             )
 
         def enable_endstop_request(self, axis_id: int, arm: bool):
@@ -970,6 +1093,7 @@ def test_execute_homing_fails_when_endstop_not_open_before_start(monkeypatch):
                 last_result=0,
                 lateral_endstop_state=self.endstop_state,
                 endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
             )
 
     class FakeStreamer:
@@ -1031,6 +1155,7 @@ def test_execute_homing_fails_when_endstop_sensor_is_absent(monkeypatch):
                 last_executed_sequence=0xFFFF,
                 lateral_endstop_state=LATERAL_ENDSTOP_ABSENT,
                 endstop_armed_mask=0,
+                endstop_hit_mask=0,
             )
 
         def enable_endstop_request(self, axis_id: int, arm: bool):
@@ -1078,6 +1203,7 @@ def test_execute_homing_disarms_before_backoff_and_waits_for_release(monkeypatch
                 last_executed_sequence=0xFFFF,
                 lateral_endstop_state=self.endstop_state,
                 endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
             )
 
         def enable_endstop_request(self, axis_id: int, arm: bool):
@@ -1091,6 +1217,7 @@ def test_execute_homing_disarms_before_backoff_and_waits_for_release(monkeypatch
                 last_result=0,
                 lateral_endstop_state=self.endstop_state,
                 endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
             )
 
     class FakeStreamer:
@@ -1151,6 +1278,270 @@ def test_execute_homing_disarms_before_backoff_and_waits_for_release(monkeypatch
 
     assert move.state.name == "COMPLETED"
     assert transport.arm_history == [True, False, True, False]
+
+
+def test_execute_homing_waits_for_latch_clear_before_search_stream(monkeypatch):
+    class FakeTransport:
+        def __init__(self) -> None:
+            self._seq = 0
+            self.arm_state = False
+            self.endstop_state = LATERAL_ENDSTOP_PRESENT_OPEN
+            self.hit_mask = 0
+            self._stale_hit_polls_remaining = 0
+
+        def get_status(self):
+            hit_mask = self.hit_mask
+            if self.arm_state and self._stale_hit_polls_remaining > 0:
+                hit_mask = 1 << 1
+                self._stale_hit_polls_remaining -= 1
+                if self._stale_hit_polls_remaining == 0:
+                    self.hit_mask = 0
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=hit_mask,
+                running_mask=0,
+            )
+
+        def enable_endstop_request(self, axis_id: int, arm: bool):
+            self._seq += 1
+            self.arm_state = arm
+            if arm:
+                self._stale_hit_polls_remaining = 2
+                self.hit_mask = 1 << 1
+            else:
+                self.hit_mask = 0
+            return self._seq, SimpleNamespace()
+
+        def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001):
+            return SimpleNamespace(
+                last_result=0,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=self.hit_mask,
+                running_mask=0,
+            )
+
+    class FakeStreamer:
+        def __init__(self, transport: FakeTransport, phase_name: str) -> None:
+            self._transport = transport
+            self._phase_name = phase_name
+            self.endstop_triggered = phase_name in ("approach", "search")
+
+        def note_endstop_armed(self, axis_id: int, arm: bool) -> None:
+            return None
+
+        def set_generator(self, generator) -> None:
+            self._generator = generator
+
+        def stream_all(self) -> int:
+            if self._phase_name == "approach":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_CLOSED
+            elif self._phase_name == "backoff":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_OPEN
+            elif self._phase_name == "search":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_CLOSED
+            return 0
+
+    transport = FakeTransport()
+    queue = MoveQueue(
+        transport=transport,
+        axis_states={1: AxisState(axis_id=1)},
+        poll_interval_s=0.001,
+        print_every=1,
+    )
+    phase_order = iter(["approach", "backoff", "search"])
+    monkeypatch.setattr(
+        queue,
+        "_make_streamer",
+        lambda axis_configs, keep_enabled_axes=None: FakeStreamer(transport, next(phase_order)),
+    )
+
+    move = HomingMove(
+        name="home_latch_clear",
+        axis_id=1,
+        steps_per_rev=6400,
+        approach_rpm=100.0,
+        search_rpm=20.0,
+        backoff_steps=3200,
+        max_approach_steps=6400,
+    )
+
+    queue._execute_homing(move)
+
+    assert move.state.name == "COMPLETED"
+    assert transport.hit_mask == 0
+
+
+def test_execute_homing_fails_when_backoff_does_not_stop(monkeypatch):
+    class FakeTransport:
+        def __init__(self) -> None:
+            self._seq = 0
+            self.arm_state = False
+            self.endstop_state = LATERAL_ENDSTOP_PRESENT_OPEN
+            self.running_mask = 0
+
+        def get_status(self):
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
+                running_mask=self.running_mask,
+            )
+
+        def enable_endstop_request(self, axis_id: int, arm: bool):
+            self._seq += 1
+            self.arm_state = arm
+            return self._seq, SimpleNamespace()
+
+        def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001):
+            return SimpleNamespace(
+                last_result=0,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
+                running_mask=self.running_mask,
+            )
+
+    class FakeStreamer:
+        def __init__(self, transport: FakeTransport, phase_name: str) -> None:
+            self._transport = transport
+            self._phase_name = phase_name
+            self.endstop_triggered = phase_name in ("approach", "search")
+
+        def note_endstop_armed(self, axis_id: int, arm: bool) -> None:
+            return None
+
+        def set_generator(self, generator) -> None:
+            self._generator = generator
+
+        def stream_all(self) -> int:
+            if self._phase_name == "approach":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_CLOSED
+            elif self._phase_name == "backoff":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_OPEN
+                self._transport.running_mask = 1 << 1
+            return 0
+
+    transport = FakeTransport()
+    queue = MoveQueue(
+        transport=transport,
+        axis_states={1: AxisState(axis_id=1)},
+        poll_interval_s=0.001,
+        print_every=1,
+    )
+    phase_order = iter(["approach", "backoff", "search"])
+    monkeypatch.setattr(
+        queue,
+        "_make_streamer",
+        lambda axis_configs, keep_enabled_axes=None: FakeStreamer(transport, next(phase_order)),
+    )
+
+    move = HomingMove(
+        name="home_backoff_running",
+        axis_id=1,
+        steps_per_rev=6400,
+        approach_rpm=100.0,
+        search_rpm=20.0,
+        backoff_steps=3200,
+        max_approach_steps=6400,
+    )
+
+    queue._execute_homing(move)
+
+    assert move.state.name == "FAILED"
+    assert move.error is not None
+    assert "backoff stop timeout" in move.error
+
+
+def test_execute_homing_waits_for_post_hit_recovery_after_search(monkeypatch):
+    class FakeTransport:
+        def __init__(self) -> None:
+            self._seq = 0
+            self.arm_state = False
+            self.endstop_state = LATERAL_ENDSTOP_PRESENT_OPEN
+
+        def get_status(self):
+            return SimpleNamespace(
+                last_executed_sequence=0xFFFF,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
+                running_mask=0,
+            )
+
+        def enable_endstop_request(self, axis_id: int, arm: bool):
+            self._seq += 1
+            self.arm_state = arm
+            return self._seq, SimpleNamespace()
+
+        def wait_for_request_result(self, sequence: int, poll_interval_s: float = 0.001):
+            return SimpleNamespace(
+                last_result=0,
+                lateral_endstop_state=self.endstop_state,
+                endstop_armed_mask=(1 << 1) if self.arm_state else 0,
+                endstop_hit_mask=0,
+                running_mask=0,
+            )
+
+    class FakeStreamer:
+        def __init__(self, transport: FakeTransport, phase_name: str) -> None:
+            self._transport = transport
+            self._phase_name = phase_name
+            self.endstop_triggered = phase_name in ("approach", "search")
+
+        def note_endstop_armed(self, axis_id: int, arm: bool) -> None:
+            return None
+
+        def set_generator(self, generator) -> None:
+            self._generator = generator
+
+        def stream_all(self) -> int:
+            if self._phase_name == "approach":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_CLOSED
+            elif self._phase_name == "backoff":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_OPEN
+            elif self._phase_name == "search":
+                self._transport.endstop_state = LATERAL_ENDSTOP_PRESENT_CLOSED
+            return 0
+
+    transport = FakeTransport()
+    queue = MoveQueue(
+        transport=transport,
+        axis_states={1: AxisState(axis_id=1)},
+        poll_interval_s=0.001,
+        print_every=1,
+    )
+    recovery_calls: list[int] = []
+
+    monkeypatch.setattr(
+        queue,
+        "_wait_for_post_hit_recovery",
+        lambda axis_id: recovery_calls.append(axis_id),
+    )
+    phase_order = iter(["approach", "backoff", "search"])
+    monkeypatch.setattr(
+        queue,
+        "_make_streamer",
+        lambda axis_configs, keep_enabled_axes=None: FakeStreamer(transport, next(phase_order)),
+    )
+
+    move = HomingMove(
+        name="home_search_recovery",
+        axis_id=1,
+        steps_per_rev=6400,
+        approach_rpm=100.0,
+        search_rpm=20.0,
+        backoff_steps=3200,
+        max_approach_steps=6400,
+    )
+
+    queue._execute_homing(move)
+
+    assert move.state.name == "COMPLETED"
+    assert recovery_calls == [1, 1]
 
 
 def test_execute_wound_move_invalidates_positions_on_stop_requested(monkeypatch):

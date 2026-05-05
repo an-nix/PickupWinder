@@ -50,7 +50,7 @@ This ensures the ESP32 planner queue maintains enough headroom for brief transpo
 - `PART_SIZE = 8` symbols per encoder callback.
 - `trans_queue_depth = 1`.
 - Normal steps use a balanced HIGH/LOW pulse split.
-- Direction changes insert a fixed LOW pause before toggling DIR.
+- Direction changes insert a fixed LOW pause before setting DIR to the queued absolute target level.
 - `pushExpandedBlock()` must not start the driver.
 - `kickStart()` is owned by the post-drain batch decision, not by per-segment code.
 - Host-side send confirmation only counts after `wait_for_request_result()` returns `OK`.
@@ -83,4 +83,5 @@ This ensures the ESP32 planner queue maintains enough headroom for brief transpo
 
 - `STEP_BLOCK` and `SEGMENT_BLOCK` still exist for debug and legacy tooling.
 - The production path is `MULTI_AXIS_SEGMENT_BLOCK` end-to-end.
+- Host-side `clear()` and `stop()` must propagate `request_stop()` to the active streamer; interrupted streamers are treated as aborted host moves, not as successful completion.
 - `resources/FastAccelStepper` remains reference-only and is not linked into the firmware.

@@ -34,7 +34,8 @@
  *
  *   On flush, the planner drains both cmd_queue_ and segment_queue_, then
  *   pushes a flush sentinel (is_flush=true) so the executor can reset its
- *   state atomically.
+ *   state atomically. Flush requests may come either from the host or from
+ *   the executor's internal recovery path after an endstop/fault event.
  */
 
 #pragma once
@@ -116,12 +117,14 @@ static constexpr uint32_t EXEC_BATCH_LIMIT = 16;
 static constexpr int64_t  EXEC_TIME_BUDGET_US = 8000;
 
 /** Planner tuning: time budget and per-iteration limit (watchdog-safe).
- *  200 µs budget allows processing 32+ segments per loop iteration at 5-10 µs/segment.
- *  Non-blocking xQueueSend ensures no watchdog blocking despite higher throughput.
- *  Higher batch size prevents executor starvation when planner runs infrequently.
+ *  At 1500 RPM the executor can drain the planned segment queue faster than
+ *  the old Core-0 planner budget refills it, especially while the SPI task is
+ *  servicing frequent status polls. Give the planner a wider per-iteration
+ *  budget so it can drain queued multi-axis blocks into SEGMENT_QUEUE_DEPTH
+ *  before the executor reaches the end of its lookahead.
  */
-static constexpr int64_t  PLANNER_TIME_BUDGET_US = 2000; // µs per planner loop
-static constexpr uint32_t PLANNER_MAX_SEGMENTS_PER_ITER = 60; // segments per loop to balance yield
+static constexpr int64_t  PLANNER_TIME_BUDGET_US = 8000; // µs per planner loop
+static constexpr uint32_t PLANNER_MAX_SEGMENTS_PER_ITER = 128; // up to one full seg queue per iteration
 
 // ---------------------------------------------------------------------------
 // MotionPlanner class
@@ -171,6 +174,11 @@ private:
     bool     flush_pending_ {false};
     uint16_t pending_flush_sequence_ {0};
 
+    // Stale-flush guard: track the last flush sequence that was actually
+    // processed so that older (stale) flush requests can be discarded.
+    uint16_t last_flush_processed_seq_  {0xFFFFu};
+    bool     last_flush_sequence_valid_ {false};
+
     /**
      * @brief Expand one multi_axis_block_t into planned_segment_t entries.
      *
@@ -189,7 +197,7 @@ private:
      * @brief Planner task body.
      *
      * Pinned to Core 0, priority 8 (below SPI task at 10, above idle).
-     * Runs in SPI task's idle time between spi_slave_transmit() calls.
+     * Runs opportunistically alongside the SPI task on Core 0.
      */
     static void plannerTask(void* arg);
 };
