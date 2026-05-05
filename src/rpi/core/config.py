@@ -46,6 +46,11 @@ class AppConfiguration:
     lateral_soft_limit_min_mm: Optional[float] = 0.0
     lateral_soft_limit_max_mm: Optional[float] = None
 
+    # Homing parameters
+    lateral_homing_approach_rpm: float = 15.0
+    lateral_homing_search_rpm: float = 5.0
+    lateral_homing_backoff_steps: Optional[int] = 6144
+
     def __post_init__(self) -> None:
         if self.spindle_steps_per_revolution <= 0:
             raise ValueError("spindle_steps_per_revolution must be positive")

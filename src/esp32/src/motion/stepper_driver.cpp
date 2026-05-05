@@ -268,7 +268,6 @@ void IRAM_ATTR StepperDriver::endstopIsrHandler(void* arg)
 
     const TickType_t now_tick = xTaskGetTickCountFromISR();
     if (raw == EndstopSignalState::INVALID) {
-        drv->endstop_closed_confirmations_ = 0;
         const TickType_t invalid_since =
             drv->endstop_invalid_since_tick_.load(std::memory_order_relaxed);
         if (invalid_since == 0) {

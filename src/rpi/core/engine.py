@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_HOME_APPROACH_RPM = 100.0
 _DEFAULT_HOME_SEARCH_RPM = 20.0
-_DEFAULT_HOME_BACKOFF_STEPS = 3200
+_DEFAULT_HOME_BACKOFF_STEPS = 6144
 
 
 class WindingEngine:

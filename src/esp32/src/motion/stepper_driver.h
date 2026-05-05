@@ -179,7 +179,7 @@ private:
     // fires on ANYEDGE of either pin, so a genuine hit produces at
     // most 2 rapid CLOSED edges before the ISR may see an INVALID
     // crossover transient that resets the counter.
-    static constexpr uint8_t ENDSTOP_CLOSED_CONFIRM_COUNT = 2;
+    static constexpr uint8_t ENDSTOP_CLOSED_CONFIRM_COUNT = 3;
     static constexpr TickType_t ENDSTOP_INVALID_DEBOUNCE_TICKS = pdMS_TO_TICKS(5);
     volatile uint8_t      endstop_closed_confirmations_ {0};
 

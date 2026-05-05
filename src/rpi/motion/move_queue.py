@@ -23,7 +23,7 @@ from transport.spi_transport import Esp32SpiTransport
 
 _MAX_HISTORY = 50
 _ENDSTOP_VERIFY_TIMEOUT_S = 0.5
-_ENDSTOP_RELEASE_TIMEOUT_S = 1.5
+_ENDSTOP_RELEASE_TIMEOUT_S = 3.0
 _ENDSTOP_OPEN_CONFIRM_SAMPLES = 3
 _ENDSTOP_OPEN_CONFIRM_INTERVAL_S = 0.015
 _INITIAL_ENDSTOP_CONFIRM_SAMPLES = 3
@@ -438,7 +438,7 @@ class MoveQueue:
         axis_id: int,
         *,
         stop_timeout_s: float = 1.0,
-        recovery_guard_s: float = 0.080,
+        recovery_guard_s: float = 0.150,
     ) -> Any:
         """Wait for the firmware to finish stop + RECOVERY after an endstop hit.
 
