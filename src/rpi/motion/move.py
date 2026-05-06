@@ -170,6 +170,11 @@ class CompositeMove(BaseMove, ABC):
     home_position_steps: int
 
     @abstractmethod
+    def preclear_move(self) -> RampMove:
+        """Return the move to execute if the endstop is found closed at start."""
+        ...
+
+    @abstractmethod
     def phases(self) -> "list[HomingPhaseDescriptor]":
         """Return an ordered list of :class:`HomingPhaseDescriptor` objects.
         The ``MoveQueue`` iterates these, arming / disarming the endstop
@@ -341,6 +346,9 @@ class HomingMove(CompositeMove):
             accel_frac=0.2, accel_cap=0.2,
             decel_frac=0.2, decel_cap=0.2,
         )
+
+    def preclear_move(self) -> RampMove:
+        return self._make_backoff_move()
 
     def _make_backoff_move(self) -> RampMove:
         """Phase 2: move away from endstop."""

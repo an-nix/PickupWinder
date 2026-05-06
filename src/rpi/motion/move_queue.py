@@ -617,12 +617,12 @@ class MoveQueue:
     def _streamer_stop_requested(streamer: MultiAxisRampStreamer) -> bool:
         return streamer.has_stop_been_requested()
 
-    def _clear_closed_endstop_before_homing(self, move: Any) -> None:
+    def _clear_closed_endstop_before_homing(self, move: CompositeMove) -> None:
         logger.info(
             "homing axis %s: endstop already closed at start, running preclear",
             move.axis_id,
         )
-        clearance_move = move._make_backoff_move()
+        clearance_move = move.preclear_move()
         self._set_endstop_armed(move.axis_id, arm=False)
         streamer = self._stream_homing_sub_move(
             move,

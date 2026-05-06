@@ -800,8 +800,8 @@ Depuis C4, `AdaptiveWindingMove` hérite de `SynchronizedMove` (pas de `Move` di
 
 | # | Message de commit | Périmètre | Dépendances | Statut |
 |---|---|---|---|---|
-| D1a | `refactor(engine): remove dead try/except TypeError in request_stop` | `core/engine.py` | — | ⬜ À faire |
-| D1b | `refactor(engine): remove hasattr guard in status()` | `core/engine.py` | — | ⬜ À faire |
+| D1a | `refactor(engine): remove dead try/except TypeError in request_stop` | `core/engine.py` | — | ✅  |
+| D1b | `refactor(engine): remove hasattr guard in status()` | `core/engine.py` | — | ✅ |
 | D2 | `refactor(move_queue): add preclear_move() to CompositeMove, retype _clear_closed_endstop` | `motion/move.py`, `motion/move_queue.py` | C1 ✅ | ⬜ À faire |
 | D3 | `refactor(move_queue): extract _finalize_streamer_move, eliminate duplication` | `motion/move_queue.py` | — | ⬜ À faire |
 | D4 | `refactor(winding): export SynchronizedMove from winding/__init__.py` | `winding/__init__.py` | C4 ✅ | ⬜ À faire |
