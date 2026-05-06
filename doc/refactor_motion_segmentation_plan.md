@@ -245,7 +245,7 @@ HomingMove (gelé — CompositeMove)
 
 ## 5. Plan de migration — étape par étape
 
-### Commit 1 — Supprimer le code step-based legacy
+### Commit 1 — Supprimer le code step-based legacy - FAIT
 **Fichiers :** `transport/messages.py`, `transport/spi_transport.py`, `transport/__init__.py`
 
 1. Supprimer `StepEntry`, `StepBlockPayload`, `_STEP_BLOCK_HEAD_STRUCT`, `STEP_BLOCK_SIZE`, `SpiStepFlags`
@@ -258,7 +258,7 @@ HomingMove (gelé — CompositeMove)
 
 ---
 
-### Commit 2 — Supprimer l'abstraction mono-axe SEGMENT_BLOCK
+### Commit 2 — Supprimer l'abstraction mono-axe SEGMENT_BLOCK - FAIT
 **Fichiers :** mêmes fichiers
 
 1. Supprimer `MotionSegment`, `SegmentBlockPayload`, `_SEGMENT_BLOCK_HEAD_STRUCT`, `SEGMENT_BLOCK_SIZE`
