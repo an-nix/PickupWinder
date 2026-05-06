@@ -5,7 +5,8 @@ from collections import deque
 from dataclasses import dataclass
 import json
 import time
-from typing import Any, Iterator
+from typing import Any, Iterator, TYPE_CHECKING
+from motion.segment_producer import SegmentProducer
 
 from transport.messages import (
     MULTI_AXIS_SEGMENT_BLOCK_SIZE,
@@ -376,7 +377,7 @@ class MultiAxisRampStreamer:
         # required_lookahead=32 against SPI failure bursts.
         return max(self.MIN_BUFFER_TIME_S, min(self.MAX_BUFFER_TIME_S, requested_time_s))
 
-    def set_generator(self, generator: Iterator[MultiAxisSegment]) -> None:
+    def set_generator(self, generator: SegmentProducer | Iterator[MultiAxisSegment]) -> None:
         """Override the segment generator for this streamer.
 
         Call before stream_all() when the segments are produced externally
@@ -405,7 +406,7 @@ class MultiAxisRampStreamer:
         self._last_sequence_advance_value = received_sequence
         self._last_sequence_advance_time = time.time()
 
-    def _wait_for_request_result(self, sequence: int, send_status=None):
+    def _wait_for_request_result(self, sequence: int, send_status: Any = None) -> Any:
         try:
             if send_status is not None:
                 return self._transport.wait_for_request_result(
@@ -798,7 +799,7 @@ class MultiAxisRampStreamer:
     def request_flush(self, sequence: int) -> None:
         self._flush_sequence_requested = sequence
 
-    def flush_until(self, sequence: int):
+    def flush_until(self, sequence: int) -> Any:
         status = self._transport.flush_until(sequence)
         self._inflight.clear()
         self._buffered_time_s = 0.0

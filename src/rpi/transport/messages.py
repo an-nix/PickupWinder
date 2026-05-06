@@ -3,23 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 import struct
-from typing import Iterable, List
+from typing import Iterable
 
 SPI_MSG_MAGIC = 0x5057
 SPI_MSG_VERSION = 3
 SPI_FRAME_SIZE = 512
 SPI_MAX_AXES = 4
-STEP_BLOCK_SIZE = 64
-SEGMENT_BLOCK_SIZE = 60
 MULTI_AXIS_SEGMENT_BLOCK_SIZE = 60
 
 _HEADER_STRUCT = struct.Struct("<HBBHHHH")
 _ENABLE_STRUCT = struct.Struct("<BB2x")
 _ESTOP_STRUCT = struct.Struct("<B3x")
-_STEP_BLOCK_HEAD_STRUCT = struct.Struct("<BBH")
-_STEP_ENTRY_STRUCT = struct.Struct("<IB")
-_SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<BBH")
-_SEGMENT_ENTRY_STRUCT = struct.Struct("<HHhBB")
 _MULTI_AXIS_SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<HBB")
 _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HHH")
 _STEP_COUNT_STRUCT = struct.Struct("<H")
@@ -58,9 +52,7 @@ class SpiMessageResult(IntEnum):
     ENDSTOP_BLOCKED = 0x09
 
 
-class SpiStepFlags(IntEnum):
-    NONE = 0x00
-    DIR_REVERSE = 0x01
+
 
 
 LATERAL_ENDSTOP_PRESENT_OPEN = 0x00
@@ -111,77 +103,28 @@ class EmergencyStopPayload:
         return _ESTOP_STRUCT.pack(self.axis_id)
 
 
-@dataclass(slots=True)
-class StepEntry:
-    interval_ticks: int
-    direction_reverse: bool = False
-
-    def pack(self) -> bytes:
-        flags = int(SpiStepFlags.DIR_REVERSE) if self.direction_reverse else int(SpiStepFlags.NONE)
-        return _STEP_ENTRY_STRUCT.pack(self.interval_ticks, flags)
 
 
-@dataclass(slots=True)
-class MotionSegment:
-    step_count: int
-    start_ticks: int
-    add_ticks: int
-    direction_reverse: bool = False
-
-    def pack(self) -> bytes:
-        flags = int(SpiStepFlags.DIR_REVERSE) if self.direction_reverse else int(SpiStepFlags.NONE)
-        return _SEGMENT_ENTRY_STRUCT.pack(self.step_count, self.start_ticks, self.add_ticks, flags, 0)
-
-
-@dataclass(slots=True)
-class StepBlockPayload:
-    axis_id: int
-    block_seq: int
-    entries: List[StepEntry]
-
-    def pack(self) -> bytes:
-        if len(self.entries) > STEP_BLOCK_SIZE:
-            raise ValueError(f"step block too large: {len(self.entries)} > {STEP_BLOCK_SIZE}")
-        payload = bytearray()
-        payload += _STEP_BLOCK_HEAD_STRUCT.pack(self.axis_id, self.block_seq, len(self.entries))
-        for entry in self.entries:
-            payload += entry.pack()
-        for _ in range(STEP_BLOCK_SIZE - len(self.entries)):
-            payload += _STEP_ENTRY_STRUCT.pack(0, 0)
-        return bytes(payload)
-
-
-@dataclass(slots=True)
-class SegmentBlockPayload:
-    axis_id: int
-    block_seq: int
-    segments: List[MotionSegment]
-
-    def pack(self) -> bytes:
-        if len(self.segments) > SEGMENT_BLOCK_SIZE:
-            raise ValueError(f"segment block too large: {len(self.segments)} > {SEGMENT_BLOCK_SIZE}")
-        payload = bytearray()
-        payload += _SEGMENT_BLOCK_HEAD_STRUCT.pack(self.axis_id, self.block_seq, len(self.segments))
-        for segment in self.segments:
-            payload += segment.pack()
-        for _ in range(SEGMENT_BLOCK_SIZE - len(self.segments)):
-            payload += _SEGMENT_ENTRY_STRUCT.pack(0, 0, 0, 0, 0)
-        return bytes(payload)
 
 
 @dataclass(slots=True)
 class MultiAxisSegment:
+    """Atomic firmware motion command.
+
+    direction_mask: bit i = 1 means axis i moves in reverse direction.
+    The mask is computed upstream by the segment generator, not in pack().
+    """
     sequence: int
     duration_us: int
-    steps: List[int]
-    directions: List[int]
+    steps: list[int]
+    direction_mask: int
 
 
 @dataclass(slots=True)
 class MultiAxisSegmentBlockPayload:
-    axis_ids: List[int]
+    axis_ids: list[int]
     block_seq: int
-    segments: List[MultiAxisSegment]
+    segments: list[MultiAxisSegment]
 
     def pack(self) -> bytes:
         if len(self.axis_ids) == 0:
@@ -200,20 +143,10 @@ class MultiAxisSegmentBlockPayload:
                 raise ValueError(
                     f"segment step count {len(segment.steps)} does not match axis count {axis_count}"
                 )
-            if len(segment.directions) != axis_count:
-                raise ValueError(
-                    f"segment direction count {len(segment.directions)} does not match axis count {axis_count}"
-                )
-
-            direction_mask = 0
-            for axis_index, direction in enumerate(segment.directions):
-                if direction:
-                    direction_mask |= 1 << axis_index
-
             payload += _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT.pack(
                 segment.sequence,
                 segment.duration_us,
-                direction_mask,
+                segment.direction_mask,
             )
             for step in segment.steps:
                 payload += _STEP_COUNT_STRUCT.pack(step)
@@ -390,12 +323,6 @@ def make_reset_stats(sequence: int = 0) -> bytes:
     return build_frame(SpiMessageType.RESET_STATS, b"", sequence=sequence)
 
 
-def make_step_block(payload: StepBlockPayload, sequence: int = 0) -> bytes:
-    return build_frame(SpiMessageType.STEP_BLOCK, payload.pack(), sequence=sequence)
-
-
-def make_segment_block(payload: SegmentBlockPayload, sequence: int = 0) -> bytes:
-    return build_frame(SpiMessageType.SEGMENT_BLOCK, payload.pack(), sequence=sequence)
 
 
 def make_multi_axis_segment_block(payload: MultiAxisSegmentBlockPayload, sequence: int = 0) -> bytes:

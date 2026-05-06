@@ -4,15 +4,14 @@ from dataclasses import dataclass
 
 from transport.messages import LATERAL_ENDSTOP_PRESENT_CLOSED
 from threading import Lock
-from typing import Optional
 
 
 @dataclass
 class AxisLimits:
     """Software travel limits in steps. None = no limit."""
 
-    min_steps: Optional[int] = None
-    max_steps: Optional[int] = None
+    min_steps: int | None = None
+    max_steps: int | None = None
 
 
 class AxisState:

@@ -44,7 +44,7 @@ Le CRC est calculé sur `header (crc16=0) + payload`.
 - `FLUSH (0x12)` : abandon des segments au-delà d'un seuil de séquence.
 - `MULTI_AXIS_SEGMENT_BLOCK (0x13)` : chemin de production.
 - `ENABLE_ENDSTOP (0x14)` : armement/désarmement matériel.
-- `STEP_BLOCK (0x10)` et `SEGMENT_BLOCK (0x11)` : legacy/debug.
+- `STEP_BLOCK (0x10)` et `SEGMENT_BLOCK (0x11)` : **legacy, rejetés par le firmware avec `ESP_ERR_NOT_SUPPORTED`**.
 
 ## `StatusPayload`
 

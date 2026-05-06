@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 from dataclasses import asdict, dataclass, fields
 import json
 from pathlib import Path
 import re
-from typing import Optional
 
 @dataclass
 class AppConfiguration:
@@ -11,8 +12,8 @@ class AppConfiguration:
     rpc_socket_path: str = "/tmp/winding.sock"
     spi_device: str = "/dev/spidev0.0"
     spi_speed_hz: int = 4_000_000
-    spi_ready_gpio_chip: Optional[str] = "/dev/gpiochip0"
-    spi_ready_gpio_line: Optional[int] = 17
+    spi_ready_gpio_chip: str | None = "/dev/gpiochip0"
+    spi_ready_gpio_line: int | None = 17
     spi_ready_active_high: bool = True
 
     spindle_axis_id: int = 0
@@ -21,35 +22,35 @@ class AppConfiguration:
     spindle_invert_direction: bool = True
     spindle_max_speed_rpm: int = 1750
     # Unit: RPM/s (revolutions per minute gained per second).
-    spindle_max_acceleration_rpm: Optional[float] = 500
+    spindle_max_acceleration_rpm: float | None = 500
     # Unit: RPM/s (revolutions per minute lost per second).
-    spindle_max_deceleration_rpm: Optional[float] = None
+    spindle_max_deceleration_rpm: float | None = None
 
     lateral_axis_id: int = 1
     lateral_steps_per_revolution: int = 200
     lateral_microstepping: int = 32
     lateral_invert_direction: bool = True
-    lateral_max_rpm: int = 1000     
+    lateral_max_rpm: int = 1000
     # Unit: mm/s² on traverse axis.
-    lateral_max_acceleration_mm_per_s2: Optional[float] = None
+    lateral_max_acceleration_mm_per_s2: float | None = None
     # Unit: mm/s² on traverse axis.
-    lateral_max_deceleration_mm_per_s2: Optional[float] = None
-    
+    lateral_max_deceleration_mm_per_s2: float | None = None
+
     # Leadscrew/traverse pitch in mm per revolution for the lateral axis.
     # Used to compute steps/mm: steps_per_rev * microstepping / pitch_mm
     lateral_traverse_pitch_mm: float = 1.0
     # Optional explicit override for lateral steps-per-mm. If set, this
     # value takes precedence over the computed value.
-    lateral_steps_per_mm_override: Optional[float] = None
+    lateral_steps_per_mm_override: float | None = None
     # Soft travel window for the lateral axis relative to the homing zero.
-    # ``None`` disables the corresponding bound.
-    lateral_soft_limit_min_mm: Optional[float] = 0.0
-    lateral_soft_limit_max_mm: Optional[float] = None
+    # None disables the corresponding bound.
+    lateral_soft_limit_min_mm: float | None = 0.0
+    lateral_soft_limit_max_mm: float | None = None
 
     # Homing parameters
     lateral_homing_approach_rpm: float = 15.0
     lateral_homing_search_rpm: float = 10.0
-    lateral_homing_backoff_steps: Optional[int] = 6144
+    lateral_homing_backoff_steps: int | None = 6144
 
     def __post_init__(self) -> None:
         if self.spindle_steps_per_revolution <= 0:
@@ -98,13 +99,13 @@ class AppConfiguration:
         return (self.lateral_steps_per_revolution * self.lateral_microstepping) / float(self.lateral_traverse_pitch_mm)
 
     @property
-    def lateral_soft_limit_min_steps(self) -> Optional[int]:
+    def lateral_soft_limit_min_steps(self) -> int | None:
         if self.lateral_soft_limit_min_mm is None:
             return None
         return int(round(float(self.lateral_soft_limit_min_mm) * self.lateral_steps_per_mm))
 
     @property
-    def lateral_soft_limit_max_steps(self) -> Optional[int]:
+    def lateral_soft_limit_max_steps(self) -> int | None:
         if self.lateral_soft_limit_max_mm is None:
             return None
         return int(round(float(self.lateral_soft_limit_max_mm) * self.lateral_steps_per_mm))

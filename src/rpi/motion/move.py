@@ -1,3 +1,15 @@
+# ---------------------------------------------------------------------------
+# NOTE D'ARCHITECTURE — Infrastructure homing gelée
+# ---------------------------------------------------------------------------
+# RampMove, RampMoveConfig et AxisMotionConfig sont conservés intentionnellement
+# comme infrastructure interne de HomingMove.
+# Ils NE font PAS partie de l'API publique de mouvement.
+# HomingMove._make_approach_move(), _make_backoff_move(), _make_search_move()
+# sont corrects, testés et gelés — toute modification nécessite une tâche
+# spécifique au homing avec revue dédiée.
+# Voir : doc/architecture.md § Politique d'isolement du homing
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 
 import time
@@ -354,76 +366,3 @@ class HomingMove(CompositeMove):
     @property
     def axis_ids(self) -> list[int]:
         return [self.axis_id]
-
-
-class JogMove(Move):
-    """
-    Move an axis by a fixed number of steps at a given speed.
-    Useful for manual positioning and clearance moves.
-
-    Example:
-        move = JogMove(
-            name="clear_endstop",
-            axis_id=1,
-            steps_per_rev=200 * 32,
-            steps=3200,           # 0.5 rev at 32 microstep
-            rpm=100.0,
-            reverse_direction=True,
-        )
-    """
-
-    def __init__(
-        self,
-        name: str,
-        axis_id: int,
-        steps_per_rev: int,
-        steps: int,
-        rpm: float,
-        reverse_direction: bool = False,
-        segment_duration_s: float = 0.004,
-    ) -> None:
-        super().__init__(name)
-        self.axis_id = axis_id
-        self._steps = steps
-        self._reverse = reverse_direction
-        total_s = (steps / float(steps_per_rev)) / (rpm / 60.0)
-        self._config = RampMoveConfig(
-            axis_configs=[
-                AxisMotionConfig(
-                    axis_id=axis_id,
-                    ramp=RampConfig(
-                        axis_id=axis_id,
-                        steps_per_rev=steps_per_rev,
-                        target_rpm=rpm,
-                        accel_s=min(0.15, total_s * 0.2),
-                        cruise_s=max(total_s - 0.3, 0.0),
-                        decel_s=min(0.15, total_s * 0.2),
-                        reverse_direction=reverse_direction,
-                    ),
-                )
-            ],
-            segment_duration_s=segment_duration_s,
-        )
-
-    def segments(self) -> Iterator[MultiAxisSegment]:
-        gen = MultiAxisSegmentGenerator(
-            self._config.axis_configs,
-            segment_duration_s=self._config.segment_duration_s,
-        )
-        yield from gen
-
-    def expected_delta_steps(self, axis_id: int) -> int | None:
-        if axis_id != self.axis_id:
-            return None
-        return -self._steps if self._reverse else self._steps
-
-    @property
-    def axis_ids(self) -> list[int]:
-        return [self.axis_id]
-
-    @property
-    def axis_configs(self) -> list[AxisMotionConfig]:
-        return self._config.axis_configs
-
-
-

@@ -7,8 +7,8 @@ __all__ = [
     "RampConfig",
     "compute_ramp_times",
     "AxisMotionConfig",
-    "MultiAxisSegmentGenerator",
     "SpindleKinematics",
+    "SegmentProducer",
 ]
 
 
@@ -28,6 +28,9 @@ def __getattr__(name: str):
     if name == "SpindleKinematics":
         from .spindle_kinematics import SpindleKinematics
         return SpindleKinematics
+    if name == "SegmentProducer":
+        from .segment_producer import SegmentProducer
+        return SegmentProducer
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

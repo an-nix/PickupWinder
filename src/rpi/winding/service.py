@@ -9,7 +9,7 @@ from core.coordinator import MotionStopPlan
 from core.events import EventBus, EventKind
 from core.lateral import LateralAxisController
 from core.shared_state import EngineState, SharedState
-from motion.move import JogMove
+from motion.move_builders import build_jog_move
 from motion.move_queue import MoveQueue
 from motion.spindle_kinematics import SpindleKinematics
 from winding.adaptive import (
@@ -496,16 +496,16 @@ class AdaptiveWindingService:
             )
             return
 
-        move = JogMove(
+        move = build_jog_move(
             name="adaptive_window_reposition",
             axis_id=self._config.lateral_axis_id,
+            steps=abs(delta_steps),
             steps_per_rev=(
                 self._config.lateral_steps_per_revolution
                 * self._config.lateral_microstepping
             ),
-            steps=abs(delta_steps),
             rpm=min(max(runtime.snapshot()["target_rpm"], 60.0), float(self._config.lateral_max_rpm)),
-            reverse_direction=(delta_steps < 0),
+            reverse=(delta_steps < 0),
         )
         self._move_queue.enqueue(move)
         self._move_queue.wait_until_idle(timeout_s=max(move.axis_configs[0].ramp.total_duration * 4.0, 10.0))
