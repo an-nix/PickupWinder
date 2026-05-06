@@ -26,7 +26,7 @@ from transport.messages import (
     make_get_status,
     make_reset_stats,
     make_segment_block,
-    make_step_block,
+    #make_step_block,
     make_stop_axis,
     make_multi_axis_segment_block,
     parse_status_frame,
@@ -687,11 +687,11 @@ class Esp32SpiTransport:
     def reset_stats(self) -> StatusPayload:
         return self.transfer_frame(make_reset_stats(self._next_sequence()))
 
-    def send_step_block(self, payload: StepBlockPayload) -> StatusPayload:
-        return self.transfer_frame(make_step_block(payload, self._next_sequence()))
+#    def send_step_block(self, payload: StepBlockPayload) -> StatusPayload:
+#        return self.transfer_frame(make_step_block(payload, self._next_sequence()))
 
-    def send_step_block_request(self, payload: StepBlockPayload) -> tuple[int, StatusPayload]:
-        return self.transfer_request(make_step_block(payload, self._next_sequence()))
+#    def send_step_block_request(self, payload: StepBlockPayload) -> tuple[int, StatusPayload]:
+#        return self.transfer_request(make_step_block(payload, self._next_sequence()))
 
     def send_segment_block(self, payload: SegmentBlockPayload) -> StatusPayload:
         return self.transfer_frame(make_segment_block(payload, self._next_sequence()))
@@ -740,30 +740,30 @@ class Esp32SpiTransport:
                 return status
             time.sleep(poll_interval_s)
 
-    def send_step_block_with_backpressure(
-        self,
-        payload: StepBlockPayload,
-        *,
-        minimum_free_blocks: int = 1,
-        poll_interval_s: float = 0.001,
-    ) -> StatusPayload:
-        self.wait_for_queue_space(payload.axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
-
-        sequence, send_status = self.send_step_block_request(payload)
-        status = self.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=poll_interval_s)
-
-        while status.last_result == int(SpiMessageResult.QUEUE_FULL):
-            time.sleep(poll_interval_s)
-            self.wait_for_queue_space(payload.axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
-            sequence, send_status = self.send_step_block_request(payload)
-            status = self.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=poll_interval_s)
-
-        if status.last_result != int(SpiMessageResult.OK):
-            raise RuntimeError(
-                f"step block request seq={sequence} failed with result=0x{status.last_result:02X} "
-                f"type=0x{status.last_rx_type:02X}"
-            )
-        return status
+#    def send_step_block_with_backpressure(
+#        self,
+#        payload: StepBlockPayload,
+#        *,
+#        minimum_free_blocks: int = 1,
+#        poll_interval_s: float = 0.001,
+#    ) -> StatusPayload:
+#        self.wait_for_queue_space(payload.axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
+#
+#        sequence, send_status = self.send_step_block_request(payload)
+#        status = self.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=poll_interval_s)
+#
+#        while status.last_result == int(SpiMessageResult.QUEUE_FULL):
+#            time.sleep(poll_interval_s)
+#            self.wait_for_queue_space(payload.axis_id, minimum_free_blocks=minimum_free_blocks, poll_interval_s=poll_interval_s)
+#            sequence, send_status = self.send_step_block_request(payload)
+#            status = self.wait_for_request_result(sequence, hint_status=send_status, poll_interval_s=poll_interval_s)
+#
+#        if status.last_result != int(SpiMessageResult.OK):
+#            raise RuntimeError(
+#                f"step block request seq={sequence} failed with result=0x{status.last_result:02X} "
+#                f"type=0x{status.last_rx_type:02X}"
+#            )
+#        return status
 
     def send_multi_axis_segment_block_with_backpressure(
         self,
