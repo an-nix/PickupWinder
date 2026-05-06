@@ -1,16 +1,35 @@
 from __future__ import annotations
 
+from abc import ABC
 from typing import Iterator
 
-from motion.move import Move
 from motion import SpindleKinematics
+from motion.move import Move
 from winding.winding_pattern import WindingPattern
 from winding.scatter_engine import ScatterEngine
 from winding.synchronized_segment_generator import SyncAxisConfig, SynchronizedSegmentGenerator
 from transport.messages import MultiAxisSegment
 
 
-class WoundMove(Move):
+class SynchronizedMove(Move, ABC):
+    """Abstract base for moves that stream spindle+traverse in lock-step.
+
+    Both ``WoundMove`` and ``AdaptiveWindingMove`` satisfy this contract.
+    ``MoveQueue`` dispatches on ``isinstance(move, SynchronizedMove)`` so
+    that neither subclass needs duck-type markers.
+
+    Required attributes (set by concrete ``__init__``):
+      - ``kinematics: SpindleKinematics``
+      - ``spindle_cfg: SyncAxisConfig``
+      - ``segment_duration_s: float``
+    """
+
+    kinematics: SpindleKinematics
+    spindle_cfg: SyncAxisConfig
+    segment_duration_s: float
+
+
+class WoundMove(SynchronizedMove):
     """
     A single continuous move executing the Electronic Gearing winding pattern.
     """

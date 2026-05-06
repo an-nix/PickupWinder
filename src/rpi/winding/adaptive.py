@@ -11,6 +11,7 @@ from motion.spindle_kinematics import SpindleKinematics
 from transport.messages import MultiAxisSegment
 from winding.scatter_engine import ScatterEngine
 from winding.synchronized_segment_generator import SyncAxisConfig
+from winding.wound_move import SynchronizedMove
 
 _EPSILON = 1e-6
 
@@ -654,10 +655,8 @@ class AdaptiveWindingRuntime:
             }
 
 
-class AdaptiveWindingMove(Move):
+class AdaptiveWindingMove(SynchronizedMove):
     """Tracked synchronized winding chunk with mutable session controls."""
-
-    is_synchronized_move = True
 
     def __init__(
         self,
