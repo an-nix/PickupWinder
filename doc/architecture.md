@@ -66,7 +66,7 @@ The SPI link is full-duplex and fixed size.
 - ESP32 uses IO_MUX-native SPI pins with an active `ready` handshake GPIO on GPIO17, as recommended by ESP-IDF for reliable slave timing
 - ESP32 also exposes a reserved Raspberry Pi sideband output `shutdown_req` on GPIO16 for a future coordinated host shutdown path
 
-The production motion message is `MULTI_AXIS_SEGMENT_BLOCK`. `STEP_BLOCK` and `SEGMENT_BLOCK` remain for debug and legacy tooling only.
+The production motion message is `MULTI_AXIS_SEGMENT_BLOCK`. `STEP_BLOCK (0x10)` and `SEGMENT_BLOCK (0x11)` are rejected by the firmware with `ESP_ERR_NOT_SUPPORTED`; the host no longer emits them.
 
 ### Pipelined ACK rule
 
@@ -115,7 +115,11 @@ The winding path follows an electronic gearing model:
 - `ScatterEngine` perturbs traverse position without spilling at the flanges.
 - `SynchronizedSegmentGenerator` samples the time domain and emits synchronized multi-axis segments.
 
-Manual moves and jogs use `MultiAxisSegmentGenerator`, but they still produce the same `MultiAxisSegment` objects consumed by the streamer.
+Manual moves and jogs use `build_jog_move()` (in `motion/move_builders.py`) which constructs a single-axis `RampMove`. All move types produce the same `MultiAxisSegment` objects consumed by the streamer.
+
+Segment producers implement the `SegmentProducer` structural protocol (`motion/segment_producer.py`): any object with `__iter__(self) -> Iterator[MultiAxisSegment]` is accepted by the streamer. `MultiAxisSegmentGenerator` is the general implementation; `RampMove` uses the trapezoidal profile generator.
+
+Each `MultiAxisSegment` carries a `direction_mask: int` bitmask (one bit per axis) replacing the former `directions: list[int]` per-axis list.
 
 The adaptive winding path is host-driven and chunked on purpose:
 
@@ -128,6 +132,7 @@ The adaptive winding path is host-driven and chunked on purpose:
 ### Lateral axis state model
 
 - The lateral axis home position is volatile and is treated as lost after a restart.
+- `HomingMove` is isolated in `motion/move.py` and executed phase-by-phase in `motion/move_queue.py`. Homing logic must not leak into `MultiAxisRampStreamer` or transport layers.
 - The host refuses lateral free-motion commands until homing completes.
 - Soft travel limits are enforced on the host before a lateral move is enqueued, so queue serialization and SPI block delivery remain unchanged.
 - After homing, the host streamer keeps the lateral enable pin asserted across later moves; if firmware status shows the enable bit dropped, the host invalidates the stored home state.

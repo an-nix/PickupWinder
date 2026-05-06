@@ -20,7 +20,8 @@ from core.config import AppConfiguration
 from core.lateral import LateralAxisController
 from core.shared_state import EngineState, SharedState
 from motion import AxisMotionConfig, RampConfig
-from motion.move import JogMove, RampMove, RampMoveConfig
+from motion.move import RampMove, RampMoveConfig
+from motion.move_builders import build_jog_move
 from motion.move_queue import MoveQueue
 from motion.ramp_config import compute_ramp_times
 from motion.spindle_kinematics import SpindleKinematics
@@ -138,13 +139,13 @@ class MotionCommandService:
         else:
             raise ValueError(f"jog: unsupported axis_id {axis_id}")
 
-        move = JogMove(
+        move = build_jog_move(
             name=f"jog_{axis_id}",
             axis_id=axis_id,
-            steps_per_rev=steps_per_rev,
             steps=steps,
+            steps_per_rev=steps_per_rev,
             rpm=rpm,
-            reverse_direction=reverse,
+            reverse=reverse,
         )
         self._move_queue.enqueue(move)
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Iterator, Tuple
+from typing import Callable, Iterator
 
 from transport.messages import MultiAxisSegment
 
@@ -76,7 +76,7 @@ class BaseSegmentGenerator(ABC):
                 self.segment_duration_s = self._adaptive_duration(estimated_rate)
 
     @abstractmethod
-    def _compute_segment(self, time_start: float, time_end: float) -> Tuple[list[int], list[int]]:
+    def _compute_segment(self, time_start: float, time_end: float) -> tuple[list[int], int]:
         """Return the next segment payload for the current time window."""
         ...
 
@@ -89,7 +89,7 @@ class StepProfileSegmentGenerator(BaseSegmentGenerator):
         self._current_steps = [profile.step_at(0.0) for profile in axis_profiles]
         self.overall_duration = max((profile.total_duration for profile in axis_profiles), default=0.0)
 
-    def _compute_segment(self, time_start: float, time_end: float) -> Tuple[list[int], int]:
+    def _compute_segment(self, time_start: float, time_end: float) -> tuple[list[int], int]:
         steps = [0] * len(self.axis_profiles)
         direction_mask = 0
 

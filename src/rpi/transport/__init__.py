@@ -3,12 +3,9 @@ from __future__ import annotations
 from .messages import (
     SPI_FRAME_SIZE,
     SPI_MAX_AXES,
-    #STEP_BLOCK_SIZE,
-    #SEGMENT_BLOCK_SIZE,
     MULTI_AXIS_SEGMENT_BLOCK_SIZE,
     SpiMessageType,
     SpiMessageResult,
-    #SpiStepFlags,
     LATERAL_ENDSTOP_PRESENT_OPEN,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
     LATERAL_ENDSTOP_ABSENT,

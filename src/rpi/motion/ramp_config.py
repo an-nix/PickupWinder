@@ -71,8 +71,6 @@ class RampConfig:
     # Must match RMT_STEP_RESOLUTION_HZ in stepper_driver.h (80 MHz).
     resolution_hz: int = 40_000_000
     reverse_direction: bool = False
-    phase_segments: int = 8
-    segment_duration_s: float = 0.05
 
     @property
     def start_hz(self) -> float:

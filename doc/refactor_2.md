@@ -2,7 +2,7 @@
 
 > Branche cible : `refactor/motion-segmentation`
 > Date : 2026-05-06
-> Statut : **Commits 1 et 2 terminés — Commits 3 à 6 en attente**
+> Statut : **Tous les commits 1 à 6 terminés ✅**
 
 ---
 
@@ -900,10 +900,10 @@ git checkout -b refactor/motion-segmentation
 |---|---|---|---|
 | 1 | `refactor(transport): remove legacy STEP_BLOCK payload and send functions` | `messages.py`, `spi_transport.py`, `__init__.py` | ✅ FAIT |
 | 2 | `refactor(transport): remove mono-axis SEGMENT_BLOCK payload and send functions` | Mêmes fichiers | ✅ FAIT |
-| 3 | `refactor(motion): purge commented dead code, replace MultiAxisSegment.directions with direction_mask` | `messages.py`, `__init__.py`, `segment_generator.py` | ⬜ À FAIRE |
-| 4 | `feat(motion): introduce SegmentProducer structural protocol` | `motion/segment_producer.py` (nouveau), `motion/__init__.py` | ⬜ À FAIRE |
-| 5 | `refactor(motion): delete JogMove, inline at all three call sites` | `move.py`, `command_service.py`, `winding/service.py` | ⬜ À FAIRE |
-| 6 | `docs+cleanup: remove orphan RampConfig fields, annotate homing isolation, align docs` | `ramp_config.py`, `move.py`, `streamer.py`, `motion/__init__.py`, docs | ⬜ À FAIRE |
+| 3 | `refactor(motion): purge commented dead code, replace MultiAxisSegment.directions with direction_mask` | `messages.py`, `__init__.py`, `segment_generator.py` | ✅ FAIT |
+| 4 | `feat(motion): introduce SegmentProducer structural protocol` | `motion/segment_producer.py` (nouveau), `motion/__init__.py` | ✅ FAIT |
+| 5 | `refactor(motion): delete JogMove, inline at all three call sites` | `move.py`, `command_service.py`, `winding/service.py` | ✅ FAIT |
+| 6 | `docs+cleanup: remove orphan RampConfig fields, annotate homing isolation, align docs` | `ramp_config.py`, `move.py`, `streamer.py`, `motion/__init__.py`, docs | ✅ FAIT |
 
 Chaque commit doit compiler et passer `mypy --strict` avant le suivant.
 

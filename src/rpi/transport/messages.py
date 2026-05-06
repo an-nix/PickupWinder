@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 import struct
-from typing import Iterable, List
+from typing import Iterable
 
 SPI_MSG_MAGIC = 0x5057
 SPI_MSG_VERSION = 3
@@ -109,17 +109,22 @@ class EmergencyStopPayload:
 
 @dataclass(slots=True)
 class MultiAxisSegment:
+    """Atomic firmware motion command.
+
+    direction_mask: bit i = 1 means axis i moves in reverse direction.
+    The mask is computed upstream by the segment generator, not in pack().
+    """
     sequence: int
     duration_us: int
-    steps: List[int]
+    steps: list[int]
     direction_mask: int
 
 
 @dataclass(slots=True)
 class MultiAxisSegmentBlockPayload:
-    axis_ids: List[int]
+    axis_ids: list[int]
     block_seq: int
-    segments: List[MultiAxisSegment]
+    segments: list[MultiAxisSegment]
 
     def pack(self) -> bytes:
         if len(self.axis_ids) == 0:
@@ -138,12 +143,7 @@ class MultiAxisSegmentBlockPayload:
                 raise ValueError(
                     f"segment step count {len(segment.steps)} does not match axis count {axis_count}"
                 )
-            if len(segment.directions) != axis_count:
-                raise ValueError(
-                    f"segment direction count {len(segment.directions)} does not match axis count {axis_count}"
-                )
-
-                payload += _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT.pack(
+            payload += _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT.pack(
                 segment.sequence,
                 segment.duration_us,
                 segment.direction_mask,

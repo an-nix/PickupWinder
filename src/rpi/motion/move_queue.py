@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from collections import deque
-from typing import Any
+from typing import Any, Iterator
 
 from core.coordinator import MotionStopPlan
 from core.events import EventBus, EventKind
@@ -771,7 +771,7 @@ class MoveQueue:
             return status
         return self._wait_for_endstop_arm_state(axis_id, arm)
 
-    def _wrap_segment_sequence(self, generator: Any, start_sequence: int):
+    def _wrap_segment_sequence(self, generator: Any, start_sequence: int) -> Iterator[Any]:
         sequence = start_sequence & 0xFFFF
         for segment in generator:
             segment.sequence = sequence
@@ -779,7 +779,7 @@ class MoveQueue:
             sequence = (sequence + 1) & 0xFFFF
 
     def _execute_ramp_move(self, move: Move) -> None:
-        """Execute a RampMove or JogMove via MultiAxisRampStreamer."""
+        """Execute a RampMove via MultiAxisRampStreamer."""
         move.mark_running()
         axis_configs = move.axis_configs
         if not axis_configs:

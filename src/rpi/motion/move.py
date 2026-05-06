@@ -1,3 +1,15 @@
+# ---------------------------------------------------------------------------
+# NOTE D'ARCHITECTURE — Infrastructure homing gelée
+# ---------------------------------------------------------------------------
+# RampMove, RampMoveConfig et AxisMotionConfig sont conservés intentionnellement
+# comme infrastructure interne de HomingMove.
+# Ils NE font PAS partie de l'API publique de mouvement.
+# HomingMove._make_approach_move(), _make_backoff_move(), _make_search_move()
+# sont corrects, testés et gelés — toute modification nécessite une tâche
+# spécifique au homing avec revue dédiée.
+# Voir : doc/architecture.md § Politique d'isolement du homing
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 
 import time
