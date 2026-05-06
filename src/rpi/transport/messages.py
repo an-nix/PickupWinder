@@ -10,7 +10,7 @@ SPI_MSG_VERSION = 3
 SPI_FRAME_SIZE = 512
 SPI_MAX_AXES = 4
 #STEP_BLOCK_SIZE = 64
-SEGMENT_BLOCK_SIZE = 60
+#SEGMENT_BLOCK_SIZE = 60
 MULTI_AXIS_SEGMENT_BLOCK_SIZE = 60
 
 _HEADER_STRUCT = struct.Struct("<HBBHHHH")
@@ -18,7 +18,7 @@ _ENABLE_STRUCT = struct.Struct("<BB2x")
 _ESTOP_STRUCT = struct.Struct("<B3x")
 #_STEP_BLOCK_HEAD_STRUCT = struct.Struct("<BBH")
 _STEP_ENTRY_STRUCT = struct.Struct("<IB")
-_SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<BBH")
+#_SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<BBH")
 _SEGMENT_ENTRY_STRUCT = struct.Struct("<HHhBB")
 _MULTI_AXIS_SEGMENT_BLOCK_HEAD_STRUCT = struct.Struct("<HBB")
 _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT = struct.Struct("<HHH")
@@ -111,38 +111,6 @@ class EmergencyStopPayload:
 
 
 
-
-@dataclass(slots=True)
-class MotionSegment:
-    step_count: int
-    start_ticks: int
-    add_ticks: int
-    direction_reverse: bool = False
-
-    def pack(self) -> bytes:
-        flags = int(SpiStepFlags.DIR_REVERSE) if self.direction_reverse else int(SpiStepFlags.NONE)
-        return _SEGMENT_ENTRY_STRUCT.pack(self.step_count, self.start_ticks, self.add_ticks, flags, 0)
-
-
-
-
-
-@dataclass(slots=True)
-class SegmentBlockPayload:
-    axis_id: int
-    block_seq: int
-    segments: List[MotionSegment]
-
-    def pack(self) -> bytes:
-        if len(self.segments) > SEGMENT_BLOCK_SIZE:
-            raise ValueError(f"segment block too large: {len(self.segments)} > {SEGMENT_BLOCK_SIZE}")
-        payload = bytearray()
-        payload += _SEGMENT_BLOCK_HEAD_STRUCT.pack(self.axis_id, self.block_seq, len(self.segments))
-        for segment in self.segments:
-            payload += segment.pack()
-        for _ in range(SEGMENT_BLOCK_SIZE - len(self.segments)):
-            payload += _SEGMENT_ENTRY_STRUCT.pack(0, 0, 0, 0, 0)
-        return bytes(payload)
 
 
 @dataclass(slots=True)
@@ -367,9 +335,6 @@ def make_reset_stats(sequence: int = 0) -> bytes:
 
 
 
-def make_segment_block(payload: SegmentBlockPayload, sequence: int = 0) -> bytes:
-    return build_frame(SpiMessageType.SEGMENT_BLOCK, payload.pack(), sequence=sequence)
-
 
 def make_multi_axis_segment_block(payload: MultiAxisSegmentBlockPayload, sequence: int = 0) -> bytes:
     return build_frame(SpiMessageType.MULTI_AXIS_SEGMENT_BLOCK, payload.pack(), sequence=sequence)
@@ -414,3 +379,41 @@ def make_enable_endstop(payload: EnableEndstopPayload, sequence: int = 0) -> byt
 
 #def make_step_block(payload: StepBlockPayload, sequence: int = 0) -> bytes:
 #    return build_frame(SpiMessageType.STEP_BLOCK, payload.pack(), sequence=sequence)
+
+
+
+#@dataclass(slots=True)
+#class MotionSegment:
+#    step_count: int
+#    start_ticks: int
+#    add_ticks: int
+#    direction_reverse: bool = False
+
+#    def pack(self) -> bytes
+#        flags = int(SpiStepFlags.DIR_REVERSE) if self.direction_reverse else int(SpiStepFlags.NONE)
+#        return _SEGMENT_ENTRY_STRUCT.pack(self.step_count, self.start_ticks, self.add_ticks, flags, 0)
+
+
+
+
+
+#@dataclass(slots=True)
+#class SegmentBlockPayload:
+#    axis_id: int
+#    block_seq: int
+#    segments: List[MotionSegment]
+
+#    def pack(self) -> bytes:
+#        if len(self.segments) > SEGMENT_BLOCK_SIZE:
+#            raise ValueError(f"segment block too large: {len(self.segments)} > {SEGMENT_BLOCK_SIZE}")
+#        payload = bytearray()
+#        payload += _SEGMENT_BLOCK_HEAD_STRUCT.pack(self.axis_id, self.block_seq, len(self.segments))
+#        for segment in self.segments:
+#            payload += segment.pack()
+#        for _ in range(SEGMENT_BLOCK_SIZE - len(self.segments)):
+#            payload += _SEGMENT_ENTRY_STRUCT.pack(0, 0, 0, 0, 0)
+#        return bytes(payload)
+
+
+#def make_segment_block(payload: SegmentBlockPayload, sequence: int = 0) -> bytes:
+#    return build_frame(SpiMessageType.SEGMENT_BLOCK, payload.pack(), sequence=sequence)

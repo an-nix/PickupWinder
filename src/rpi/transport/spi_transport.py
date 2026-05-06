@@ -14,8 +14,8 @@ from transport.messages import (
     SpiMessageResult,
     StatusPayload,
     MultiAxisSegmentBlockPayload,
-    SegmentBlockPayload,
-    StepBlockPayload,
+    #SegmentBlockPayload,
+    #StepBlockPayload,
     FlushPayload,
     EnableEndstopPayload,
     make_disable_all,
@@ -693,11 +693,11 @@ class Esp32SpiTransport:
 #    def send_step_block_request(self, payload: StepBlockPayload) -> tuple[int, StatusPayload]:
 #        return self.transfer_request(make_step_block(payload, self._next_sequence()))
 
-    def send_segment_block(self, payload: SegmentBlockPayload) -> StatusPayload:
-        return self.transfer_frame(make_segment_block(payload, self._next_sequence()))
+#    def send_segment_block(self, payload: SegmentBlockPayload) -> StatusPayload:
+#        return self.transfer_frame(make_segment_block(payload, self._next_sequence()))
 
-    def send_segment_block_request(self, payload: SegmentBlockPayload) -> tuple[int, StatusPayload]:
-        return self.transfer_request(make_segment_block(payload, self._next_sequence()))
+#    def send_segment_block_request(self, payload: SegmentBlockPayload) -> tuple[int, StatusPayload]:
+#        return self.transfer_request(make_segment_block(payload, self._next_sequence()))
 
     def send_multi_axis_segment_block(self, payload: MultiAxisSegmentBlockPayload) -> StatusPayload:
         return self.transfer_frame(make_multi_axis_segment_block(payload, self._next_sequence()))
