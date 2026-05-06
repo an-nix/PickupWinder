@@ -112,7 +112,7 @@ class MultiAxisSegment:
     sequence: int
     duration_us: int
     steps: List[int]
-    directions: List[int]
+    direction_mask: int
 
 
 @dataclass(slots=True)
@@ -143,15 +143,10 @@ class MultiAxisSegmentBlockPayload:
                     f"segment direction count {len(segment.directions)} does not match axis count {axis_count}"
                 )
 
-            direction_mask = 0
-            for axis_index, direction in enumerate(segment.directions):
-                if direction:
-                    direction_mask |= 1 << axis_index
-
-            payload += _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT.pack(
+                payload += _MULTI_AXIS_SEGMENT_ENTRY_HEADER_STRUCT.pack(
                 segment.sequence,
                 segment.duration_us,
-                direction_mask,
+                segment.direction_mask,
             )
             for step in segment.steps:
                 payload += _STEP_COUNT_STRUCT.pack(step)

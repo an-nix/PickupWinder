@@ -58,13 +58,13 @@ class BaseSegmentGenerator(ABC):
             duration_s = next_cursor - self._time_cursor
             duration_us = int(round(duration_s * 1_000_000))
 
-            steps, directions = self._compute_segment(self._time_cursor, next_cursor)
+            steps, direction_mask = self._compute_segment(self._time_cursor, next_cursor)
 
             yield MultiAxisSegment(
                 sequence=self._sequence,
                 duration_us=duration_us,
                 steps=steps,
-                directions=directions,
+                direction_mask=direction_mask,
             )
             self._sequence = (self._sequence + 1) & 0xFFFF
             self._time_cursor = next_cursor
@@ -89,9 +89,9 @@ class StepProfileSegmentGenerator(BaseSegmentGenerator):
         self._current_steps = [profile.step_at(0.0) for profile in axis_profiles]
         self.overall_duration = max((profile.total_duration for profile in axis_profiles), default=0.0)
 
-    def _compute_segment(self, time_start: float, time_end: float) -> Tuple[list[int], list[int]]:
+    def _compute_segment(self, time_start: float, time_end: float) -> Tuple[list[int], int]:
         steps = [0] * len(self.axis_profiles)
-        directions = [0] * len(self.axis_profiles)
+        direction_mask = 0
 
         for index, profile in enumerate(self.axis_profiles):
             target_steps = profile.step_at(time_end)
@@ -103,7 +103,8 @@ class StepProfileSegmentGenerator(BaseSegmentGenerator):
             is_negative = count < 0
             if is_negative:
                 count = abs(count)
-            directions[index] = 1 if is_negative ^ profile.reverse_direction else 0
+            if is_negative ^ profile.reverse_direction:
+                direction_mask |= (1 << index)
             steps[index] = count
 
-        return steps, directions
+        return steps, direction_mask
