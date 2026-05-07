@@ -66,7 +66,7 @@ The SPI link is full-duplex and fixed size.
 - ESP32 uses IO_MUX-native SPI pins with an active `ready` handshake GPIO on GPIO17, as recommended by ESP-IDF for reliable slave timing
 - ESP32 also exposes a reserved Raspberry Pi sideband output `shutdown_req` on GPIO16 for a future coordinated host shutdown path
 
-The production motion message is `MULTI_AXIS_SEGMENT_BLOCK`. `STEP_BLOCK (0x10)` and `SEGMENT_BLOCK (0x11)` are rejected by the firmware with `ESP_ERR_NOT_SUPPORTED`; the host no longer emits them.
+The production motion message is `MULTI_AXIS_SEGMENT_BLOCK`.
 
 ### Pipelined ACK rule
 
