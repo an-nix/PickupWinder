@@ -10,11 +10,13 @@ from core.coordinator import MotionStopPlan
 from core.events import EventBus, EventKind
 from motion.axis_state import AxisState
 from motion.move import BaseMove, CompositeMove, HomingPhaseDescriptor, Move, RampMove
+from motion.multi_axis_segment_generator import AxisMotionConfig
 from winding.wound_move import SynchronizedMove
 from transport.messages import (
     LATERAL_ENDSTOP_ABSENT,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
     LATERAL_ENDSTOP_PRESENT_OPEN,
+    MultiAxisSegment,
     SpiMessageResult,
     sequence_is_greater,
 )
@@ -274,7 +276,7 @@ class MoveQueue:
 
     def _make_streamer(
         self,
-        axis_configs,
+        axis_configs: list[AxisMotionConfig],
         *,
         keep_enabled_axes: set[int] | None = None,
         initial_segments_dropped: int = 0,
@@ -705,12 +707,49 @@ class MoveQueue:
             return status
         return self._wait_for_endstop_arm_state(axis_id, arm)
 
-    def _wrap_segment_sequence(self, generator: Any, start_sequence: int) -> Iterator[Any]:
+    def _wrap_segment_sequence(self, generator: Iterator[MultiAxisSegment], start_sequence: int) -> Iterator[MultiAxisSegment]:
         sequence = start_sequence & 0xFFFF
         for segment in generator:
             segment.sequence = sequence
             yield segment
             sequence = (sequence + 1) & 0xFFFF
+
+    def _finalize_streamer_move(
+        self,
+        move: Move,
+        streamer: MultiAxisRampStreamer,
+        axis_ids: list[int],
+    ) -> None:
+        """Handle post-stream outcome: endstop abort, stop request, or completion.
+
+        Updates axis positions: advances if delta is known, invalidates if None.
+        """
+        if streamer.endstop_triggered:
+            for ax_id in axis_ids:
+                if ax_id in self._axis_states:
+                    self._axis_states[ax_id].invalidate_position()
+            move.mark_aborted("endstop triggered", by_endstop=True)
+            return
+
+        if self._stop_requested or streamer.has_stop_been_requested():
+            stop_plan = self._active_stop_plan or self._default_stop_plan(
+                axis_ids,
+                "stop requested",
+            )
+            self._apply_stop_plan(axis_ids, stop_plan)
+            move.mark_aborted(f"{stop_plan.mode.value} requested")
+            return
+
+        for ax_id in axis_ids:
+            if ax_id not in self._axis_states:
+                continue
+            delta = move.expected_delta_steps(ax_id)
+            if delta is None:
+                self._axis_states[ax_id].invalidate_position()
+                continue
+            self._axis_states[ax_id].advance_position(delta)
+
+        move.mark_completed()
 
     def _execute_ramp_move(self, move: Move) -> None:
         """Execute a RampMove via MultiAxisRampStreamer."""
@@ -745,29 +784,7 @@ class MoveQueue:
         finally:
             self._current_streamer = None
 
-        if streamer.endstop_triggered:
-            for ax_id in axis_ids:
-                if ax_id in self._axis_states:
-                    self._axis_states[ax_id].invalidate_position()
-            move.mark_aborted("endstop triggered", by_endstop=True)
-            return
-
-        if self._stop_requested or streamer.has_stop_been_requested():
-            stop_plan = self._active_stop_plan or self._default_stop_plan(
-                axis_ids,
-                "stop requested",
-            )
-            self._apply_stop_plan(axis_ids, stop_plan)
-            move.mark_aborted(f"{stop_plan.mode.value} requested")
-            return
-
-        # Update position for axes with known delta.
-        for ax_id in axis_ids:
-            delta = move.expected_delta_steps(ax_id)
-            if delta is not None and ax_id in self._axis_states:
-                self._axis_states[ax_id].advance_position(delta)
-
-        move.mark_completed()
+        self._finalize_streamer_move(move, streamer, axis_ids)
 
     def _make_wound_streamer(self, move: SynchronizedMove, *, keep_enabled_axes: set[int] | None = None) -> MultiAxisRampStreamer:
         target_hz = (
@@ -812,31 +829,7 @@ class MoveQueue:
         finally:
             self._current_streamer = None
 
-        if streamer.endstop_triggered:
-            for ax_id in axis_ids:
-                if ax_id in self._axis_states:
-                    self._axis_states[ax_id].invalidate_position()
-            move.mark_aborted("endstop triggered", by_endstop=True)
-            return
-
-        if self._stop_requested or streamer.has_stop_been_requested():
-            stop_plan = self._active_stop_plan or self._default_stop_plan(
-                axis_ids,
-                "stop requested",
-            )
-            self._apply_stop_plan(axis_ids, stop_plan)
-            move.mark_aborted(f"{stop_plan.mode.value} requested")
-            return
-
-        for ax_id in move.axis_ids:
-            if ax_id not in self._axis_states:
-                continue
-            delta = move.expected_delta_steps(ax_id)
-            if delta is None:
-                self._axis_states[ax_id].invalidate_position()
-                continue
-            self._axis_states[ax_id].advance_position(delta)
-        move.mark_completed()
+        self._finalize_streamer_move(move, streamer, axis_ids)
 
     def _execute_composite(self, move: CompositeMove) -> None:
         """
@@ -859,13 +852,9 @@ class MoveQueue:
             )
             if initial_state == LATERAL_ENDSTOP_PRESENT_CLOSED:
                 initial_state = self._confirm_initial_closed_endstop(move.axis_id)
-            if initial_state == LATERAL_ENDSTOP_ABSENT:
-                self._ensure_homing_can_start(move.axis_id, "start")
-            elif initial_state == LATERAL_ENDSTOP_PRESENT_CLOSED:
+            if initial_state == LATERAL_ENDSTOP_PRESENT_CLOSED:
                 self._clear_closed_endstop_before_homing(move)
-                self._ensure_homing_can_start(move.axis_id, "start")
-            else:
-                self._ensure_homing_can_start(move.axis_id, "start")
+            self._ensure_homing_can_start(move.axis_id, "start")
         except Exception as exc:
             move.mark_failed(str(exc))
             return

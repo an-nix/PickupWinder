@@ -5,7 +5,6 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from motion.move import Move
 from motion.segment_generator import AxisStepProfile, StepProfileSegmentGenerator
 from motion.spindle_kinematics import SpindleKinematics
 from transport.messages import MultiAxisSegment

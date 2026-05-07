@@ -802,7 +802,7 @@ Depuis C4, `AdaptiveWindingMove` hérite de `SynchronizedMove` (pas de `Move` di
 |---|---|---|---|---|
 | D1a | `refactor(engine): remove dead try/except TypeError in request_stop` | `core/engine.py` | — | ✅  |
 | D1b | `refactor(engine): remove hasattr guard in status()` | `core/engine.py` | — | ✅ |
-| D2 | `refactor(move_queue): add preclear_move() to CompositeMove, retype _clear_closed_endstop` | `motion/move.py`, `motion/move_queue.py` | C1 ✅ | ⬜ À faire |
+| D2 | `refactor(move_queue): add preclear_move() to CompositeMove, retype _clear_closed_endstop` | `motion/move.py`, `motion/move_queue.py` | C1 ✅ | ✅ |
 | D3 | `refactor(move_queue): extract _finalize_streamer_move, eliminate duplication` | `motion/move_queue.py` | — | ⬜ À faire |
 | D4 | `refactor(winding): export SynchronizedMove from winding/__init__.py` | `winding/__init__.py` | C4 ✅ | ⬜ À faire |
 | D5 | `refactor(winding): remove dead Move import in adaptive.py` | `winding/adaptive.py` | C4 ✅ | ⬜ À faire |
@@ -838,3 +838,4 @@ winding/__init__.py
 - `move: Any` dans `_clear_closed_endstop_before_homing` (D2)
 - ~15 lignes dupliquées entre `_execute_ramp_move` et `_execute_wound_move` (D3)
 - Import mort `from motion.move import Move` dans `adaptive.py` (D5)
+
