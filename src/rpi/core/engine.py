@@ -150,12 +150,8 @@ class WindingEngine:
                 self._state.axis_states,
                 reason="engine stop requested",
             )
-            try:
-                self._move_queue.clear(stop_plan=effective_stop_plan)
-            except TypeError as exc:
-                if "stop_plan" not in str(exc):
-                    raise
-                self._move_queue.clear()
+            self._move_queue.clear(stop_plan=effective_stop_plan)
+
         if self._state.engine_state in (EngineState.HOMING, EngineState.RUNNING):
             self._state.set_engine_state(EngineState.STOPPING)
 
@@ -174,20 +170,8 @@ class WindingEngine:
 
     def status(self) -> dict[str, Any]:
         self._lateral.refresh_home_state()
-        move_queue_status = (
-            self._move_queue.status()
-            if hasattr(self._move_queue, "status")
-            else {
-                "running": False,
-                "current_move": None,
-                "pending_moves": [],
-                "history": [],
-                "axis_states": {
-                    ax_id: state.snapshot()
-                    for ax_id, state in self._state.axis_states.items()
-                },
-            }
-        )
+        move_queue_status = self._move_queue.status()
+
         return {
             "shared_state": self._state.snapshot(),
             "move_queue": move_queue_status,

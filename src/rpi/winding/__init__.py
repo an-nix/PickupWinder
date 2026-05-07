@@ -15,7 +15,7 @@ from winding.synchronized_segment_generator import (
     SyncAxisConfig,
     SynchronizedSegmentGenerator,
 )
-from winding.wound_move import WoundMove
+from winding.wound_move import SynchronizedMove, WoundMove
 
 __all__ = [
     "WindingProgram",
@@ -28,6 +28,7 @@ __all__ = [
     "WindingWindow",
     "ScatterEngine",
     "SyncAxisConfig",
+    "SynchronizedMove",
     "SynchronizedSegmentGenerator",
     "WoundMove",
     "awg_to_diameter_mm",

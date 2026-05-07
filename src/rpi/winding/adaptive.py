@@ -5,12 +5,12 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from motion.move import Move
 from motion.segment_generator import AxisStepProfile, StepProfileSegmentGenerator
 from motion.spindle_kinematics import SpindleKinematics
 from transport.messages import MultiAxisSegment
 from winding.scatter_engine import ScatterEngine
 from winding.synchronized_segment_generator import SyncAxisConfig
+from winding.wound_move import SynchronizedMove
 
 _EPSILON = 1e-6
 
@@ -654,10 +654,8 @@ class AdaptiveWindingRuntime:
             }
 
 
-class AdaptiveWindingMove(Move):
+class AdaptiveWindingMove(SynchronizedMove):
     """Tracked synchronized winding chunk with mutable session controls."""
-
-    is_synchronized_move = True
 
     def __init__(
         self,

@@ -9,12 +9,14 @@ from typing import Any, Iterator
 from core.coordinator import MotionStopPlan
 from core.events import EventBus, EventKind
 from motion.axis_state import AxisState
-from motion.move import BaseMove, CompositeMove, HomingMove, Move
-from winding.wound_move import WoundMove
+from motion.move import BaseMove, CompositeMove, Move, RampMove
+from motion.multi_axis_segment_generator import AxisMotionConfig
+from winding.wound_move import SynchronizedMove
 from transport.messages import (
     LATERAL_ENDSTOP_ABSENT,
     LATERAL_ENDSTOP_PRESENT_CLOSED,
     LATERAL_ENDSTOP_PRESENT_OPEN,
+    MultiAxisSegment,
     SpiMessageResult,
     sequence_is_greater,
 )
@@ -22,7 +24,6 @@ from transport.streamer import MultiAxisRampStreamer, StreamAxisConfig
 from transport.spi_transport import Esp32SpiTransport
 
 _MAX_HISTORY = 50
-_ENDSTOP_VERIFY_TIMEOUT_S = 0.5
 _ENDSTOP_RELEASE_TIMEOUT_S = 3.0
 _ENDSTOP_OPEN_CONFIRM_SAMPLES = 3
 _ENDSTOP_OPEN_CONFIRM_INTERVAL_S = 0.015
@@ -39,7 +40,7 @@ class MoveQueue:
     Executes Move objects in FIFO order, one at a time, in a daemon thread.
 
     Each Move produces segments which are fed to a fresh MultiAxisRampStreamer.
-    HomingMove is handled specially: MoveQueue executes its phases in order,
+    HomingMove (via CompositeMove) is handled specially: MoveQueue executes its phases in order,
     arming/disarming the endstop between phases and updating AxisState after
     the search phase completes.
 
@@ -232,12 +233,9 @@ class MoveQueue:
             return
         try:
             if isinstance(move, CompositeMove):
-                self._execute_homing(move)  # type: ignore[arg-type]
-            elif isinstance(move, WoundMove):
+                self._execute_composite(move)
+            elif isinstance(move, SynchronizedMove):
                 self._execute_wound_move(move)
-            elif getattr(move, "is_synchronized_move", False):
-                # AdaptiveWindingMove is duck-typed as WoundMove.
-                self._execute_wound_move(move)  # type: ignore[arg-type]
             elif isinstance(move, Move):
                 self._execute_ramp_move(move)
             else:
@@ -278,7 +276,7 @@ class MoveQueue:
 
     def _make_streamer(
         self,
-        axis_configs,
+        axis_configs: list[AxisMotionConfig],
         *,
         keep_enabled_axes: set[int] | None = None,
         initial_segments_dropped: int = 0,
@@ -326,12 +324,7 @@ class MoveQueue:
         *,
         allow_stale: bool = True,
     ) -> Any:
-        try:
-            status = self._transport.get_status(allow_stale=allow_stale)
-        except TypeError as exc:
-            if "allow_stale" not in str(exc):
-                raise
-            status = self._transport.get_status()
+        status = self._transport.get_status(allow_stale=allow_stale)
         if axis_id is not None:
             self._update_axis_endstop_state(axis_id, status)
         return status
@@ -342,24 +335,16 @@ class MoveQueue:
         *,
         send_status: Any | None = None,
     ) -> Any:
-        try:
-            if send_status is not None:
-                return self._transport.wait_for_request_result(
-                    sequence,
-                    hint_status=send_status,
-                    poll_interval_s=self._poll_interval_s,
-                )
+        if send_status is not None:
             return self._transport.wait_for_request_result(
                 sequence,
+                hint_status=send_status,
                 poll_interval_s=self._poll_interval_s,
             )
-        except TypeError as exc:
-            if send_status is None or "hint_status" not in str(exc):
-                raise
-            return self._transport.wait_for_request_result(
-                sequence,
-                poll_interval_s=self._poll_interval_s,
-            )
+        return self._transport.wait_for_request_result(
+            sequence,
+            poll_interval_s=self._poll_interval_s,
+        )
 
     def _confirm_initial_closed_endstop(self, axis_id: int) -> int:
         """Confirm a startup CLOSED reading before launching preclear.
@@ -400,49 +385,13 @@ class MoveQueue:
             )
 
     @staticmethod
-    def _compute_backoff_timeout(sub_move: Move, margin: float = 1.5) -> float:
-        """Calcule un timeout basé sur la durée estimée du sous-mouvement.
+    def _compute_backoff_timeout(sub_move: RampMove, margin: float = 1.5) -> float:
+        """Return a streaming timeout for a backoff/preclear RampMove.
 
-        Cherche les attributs dans l'ordre de priorité suivant :
-          1. sub_move.estimated_duration_s  (attribut ajouté par HomingMove)
-          2. sub_move.ramp.total_duration   (RampMove standard)
-          3. steps / target_hz              (estimation depuis les paramètres bruts)
-          4. 2.0 s                          (fallback de sécurité)
-
-        Args:
-            sub_move: Le Move correspondant au backoff ou preclear.
-            margin:   Facteur multiplicatif de sécurité (défaut 1.5×).
-
-        Returns:
-            Timeout en secondes, minimum 1.0 s.
+        timeout = total_duration × margin + 0.5 s recovery guard, minimum 1.0 s.
         """
-        recovery_guard_s = 0.5
-
-        # Priorité 1 : attribut explicite
-        estimated = getattr(sub_move, "estimated_duration_s", None)
-        if estimated is not None and estimated > 0:
-            return max(1.0, float(estimated) * margin + recovery_guard_s)
-
-        # Priorité 2 : RampMove.ramp.total_duration (via axis_configs[0].ramp ou sub_move.ramp)
-        ramp = getattr(sub_move, "ramp", None)
-        if ramp is None:
-            axis_configs = getattr(sub_move, "axis_configs", None) or []
-            ramp = getattr(axis_configs[0], "ramp", None) if axis_configs else None
-        if ramp is not None:
-            total = getattr(ramp, "total_duration", None)
-            if total is not None and total > 0:
-                return max(1.0, float(total) * margin + recovery_guard_s)
-
-        # Priorité 3 : estimation brute steps / hz
-        steps = getattr(sub_move, "total_steps", None) or getattr(sub_move, "step_count", None)
-        hz    = getattr(sub_move, "target_hz", None)
-        if hz is None and ramp is not None:
-            hz = getattr(ramp, "target_hz", None)
-        if steps and hz and float(steps) > 0 and float(hz) > 0:
-            return max(1.0, (abs(float(steps)) / float(hz)) * margin + recovery_guard_s)
-
-        # Fallback
-        return max(2.0, _ENDSTOP_RELEASE_TIMEOUT_S + recovery_guard_s)
+        total_s = sub_move.axis_configs[0].ramp.total_duration
+        return max(1.0, total_s * margin + 0.5)
 
     def _wait_for_post_hit_recovery(
         self,
@@ -612,7 +561,7 @@ class MoveQueue:
 
     def _stream_homing_sub_move(
         self,
-        move: HomingMove,
+        move: CompositeMove,
         *,
         phase_name: str,
         sub_move: Move,
@@ -633,24 +582,14 @@ class MoveQueue:
         if start_sequence is None:
             start_sequence = self._next_motion_sequence()
 
-        try:
-            streamer = self._make_streamer(
-                sub_move_axis_configs,
-                keep_enabled_axes={move.axis_id},
-                initial_segments_dropped=baseline_segments_dropped,
-            )
-        except TypeError as exc:
-            if "initial_segments_dropped" not in str(exc):
-                raise
-            streamer = self._make_streamer(
-                sub_move_axis_configs,
-                keep_enabled_axes={move.axis_id},
-            )
+        streamer = self._make_streamer(
+            sub_move_axis_configs,
+            keep_enabled_axes={move.axis_id},
+            initial_segments_dropped=baseline_segments_dropped,
+        )
         self._current_streamer = streamer
-        if hasattr(streamer, "note_endstop_armed"):
-            streamer.note_endstop_armed(move.axis_id, arm_endstop)
-        if hasattr(streamer, "set_homing_mode"):
-            streamer.set_homing_mode(True)
+        streamer.note_endstop_armed(move.axis_id, arm_endstop)
+        streamer.set_homing_mode(True)
         streamer.set_generator(
             self._wrap_segment_sequence(
                 sub_move.segments(),
@@ -663,12 +602,12 @@ class MoveQueue:
             self._current_streamer = None
         return streamer
 
-    def _next_sequence_after_streamer(self, streamer: Any) -> int:
-        last_sent = int(getattr(streamer, "last_sent_motion_seq", -1))
+    def _next_sequence_after_streamer(self, streamer: MultiAxisRampStreamer) -> int:
+        last_sent = streamer.last_sent_motion_seq
         if last_sent >= 0:
             return (last_sent + 1) & 0xFFFF
         next_from_status = self._next_motion_sequence()
-        flush_floor = int(getattr(streamer, "flush_floor_sequence", -1))
+        flush_floor = streamer.flush_floor_sequence
         if flush_floor < 0:
             return next_from_status
         candidate = (flush_floor + 1) & 0xFFFF
@@ -677,18 +616,15 @@ class MoveQueue:
         return next_from_status
 
     @staticmethod
-    def _streamer_stop_requested(streamer: Any) -> bool:
-        callback = getattr(streamer, "has_stop_been_requested", None)
-        if not callable(callback):
-            return False
-        return bool(callback())
+    def _streamer_stop_requested(streamer: MultiAxisRampStreamer) -> bool:
+        return streamer.has_stop_been_requested()
 
-    def _clear_closed_endstop_before_homing(self, move: HomingMove) -> None:
+    def _clear_closed_endstop_before_homing(self, move: CompositeMove) -> None:
         logger.info(
             "homing axis %s: endstop already closed at start, running preclear",
             move.axis_id,
         )
-        clearance_move = move._make_backoff_move()
+        clearance_move = move.preclear_move()
         self._set_endstop_armed(move.axis_id, arm=False)
         streamer = self._stream_homing_sub_move(
             move,
@@ -720,7 +656,7 @@ class MoveQueue:
 
     def _check_armed_phase_result(
         self,
-        move: HomingMove,
+        move: CompositeMove,
         phase_name: str,
         streamer: "MultiAxisRampStreamer",
     ) -> None:
@@ -771,12 +707,49 @@ class MoveQueue:
             return status
         return self._wait_for_endstop_arm_state(axis_id, arm)
 
-    def _wrap_segment_sequence(self, generator: Any, start_sequence: int) -> Iterator[Any]:
+    def _wrap_segment_sequence(self, generator: Iterator[MultiAxisSegment], start_sequence: int) -> Iterator[MultiAxisSegment]:
         sequence = start_sequence & 0xFFFF
         for segment in generator:
             segment.sequence = sequence
             yield segment
             sequence = (sequence + 1) & 0xFFFF
+
+    def _finalize_streamer_move(
+        self,
+        move: Move,
+        streamer: MultiAxisRampStreamer,
+        axis_ids: list[int],
+    ) -> None:
+        """Handle post-stream outcome: endstop abort, stop request, or completion.
+
+        Updates axis positions: advances if delta is known, invalidates if None.
+        """
+        if streamer.endstop_triggered:
+            for ax_id in axis_ids:
+                if ax_id in self._axis_states:
+                    self._axis_states[ax_id].invalidate_position()
+            move.mark_aborted("endstop triggered", by_endstop=True)
+            return
+
+        if self._stop_requested or streamer.has_stop_been_requested():
+            stop_plan = self._active_stop_plan or self._default_stop_plan(
+                axis_ids,
+                "stop requested",
+            )
+            self._apply_stop_plan(axis_ids, stop_plan)
+            move.mark_aborted(f"{stop_plan.mode.value} requested")
+            return
+
+        for ax_id in axis_ids:
+            if ax_id not in self._axis_states:
+                continue
+            delta = move.expected_delta_steps(ax_id)
+            if delta is None:
+                self._axis_states[ax_id].invalidate_position()
+                continue
+            self._axis_states[ax_id].advance_position(delta)
+
+        move.mark_completed()
 
     def _execute_ramp_move(self, move: Move) -> None:
         """Execute a RampMove via MultiAxisRampStreamer."""
@@ -811,31 +784,9 @@ class MoveQueue:
         finally:
             self._current_streamer = None
 
-        if streamer.endstop_triggered:
-            for ax_id in axis_ids:
-                if ax_id in self._axis_states:
-                    self._axis_states[ax_id].invalidate_position()
-            move.mark_aborted("endstop triggered", by_endstop=True)
-            return
+        self._finalize_streamer_move(move, streamer, axis_ids)
 
-        if self._stop_requested or streamer.has_stop_been_requested():
-            stop_plan = self._active_stop_plan or self._default_stop_plan(
-                axis_ids,
-                "stop requested",
-            )
-            self._apply_stop_plan(axis_ids, stop_plan)
-            move.mark_aborted(f"{stop_plan.mode.value} requested")
-            return
-
-        # Update position for axes with known delta.
-        for ax_id in axis_ids:
-            delta = move.expected_delta_steps(ax_id)
-            if delta is not None and ax_id in self._axis_states:
-                self._axis_states[ax_id].advance_position(delta)
-
-        move.mark_completed()
-
-    def _make_wound_streamer(self, move: WoundMove, *, keep_enabled_axes: set[int] | None = None) -> MultiAxisRampStreamer:
+    def _make_wound_streamer(self, move: SynchronizedMove, *, keep_enabled_axes: set[int] | None = None) -> MultiAxisRampStreamer:
         target_hz = (
             max(move.kinematics.target_rpm, 1.0) / 60.0
             * float(move.spindle_cfg.steps_per_unit)
@@ -853,8 +804,8 @@ class MoveQueue:
             keep_enabled_axes=keep_enabled_axes,
         )
 
-    def _execute_wound_move(self, move: WoundMove) -> None:
-        """Execute a WoundMove with explicit spindle/traverse streamer setup."""
+    def _execute_wound_move(self, move: SynchronizedMove) -> None:
+        """Execute a SynchronizedMove with explicit spindle/traverse streamer setup."""
         move.mark_running()
         axis_ids = move.axis_ids
 
@@ -878,41 +829,18 @@ class MoveQueue:
         finally:
             self._current_streamer = None
 
-        if streamer.endstop_triggered:
-            for ax_id in axis_ids:
-                if ax_id in self._axis_states:
-                    self._axis_states[ax_id].invalidate_position()
-            move.mark_aborted("endstop triggered", by_endstop=True)
-            return
+        self._finalize_streamer_move(move, streamer, axis_ids)
 
-        if self._stop_requested or streamer.has_stop_been_requested():
-            stop_plan = self._active_stop_plan or self._default_stop_plan(
-                axis_ids,
-                "stop requested",
-            )
-            self._apply_stop_plan(axis_ids, stop_plan)
-            move.mark_aborted(f"{stop_plan.mode.value} requested")
-            return
-
-        for ax_id in move.axis_ids:
-            if ax_id not in self._axis_states:
-                continue
-            delta = move.expected_delta_steps(ax_id)
-            if delta is None:
-                self._axis_states[ax_id].invalidate_position()
-                continue
-            self._axis_states[ax_id].advance_position(delta)
-        move.mark_completed()
-
-    def _execute_homing(self, move: HomingMove) -> None:
+    def _execute_composite(self, move: CompositeMove) -> None:
         """
-        Execute a HomingMove phase by phase.
+        Execute a CompositeMove phase by phase via HomingPhaseDescriptor.
 
-        Phase sequence:
-          1. approach (endstop armed) — stops when endstop fires
-          2. backoff  (endstop disarmed) — moves away from endstop
-          3. search   (endstop armed) — slow approach for precise home
-          4. set_position to move.home_position_steps
+        Phase sequence is driven by move.phases():
+          - approach (endstop armed) — stops when endstop fires
+          - backoff  (endstop disarmed, wait_for_open) — moves away from endstop
+          - search   (endstop armed) — slow approach for precise home
+        After all phases: set_position to move.home_position_steps.
+        The endstop is always disarmed in a finally block.
         """
         move.mark_running()
         axis_state = self._axis_states.get(move.axis_id)
@@ -924,138 +852,127 @@ class MoveQueue:
             )
             if initial_state == LATERAL_ENDSTOP_PRESENT_CLOSED:
                 initial_state = self._confirm_initial_closed_endstop(move.axis_id)
-            if initial_state == LATERAL_ENDSTOP_ABSENT:
-                self._ensure_homing_can_start(move.axis_id, "start")
-            elif initial_state == LATERAL_ENDSTOP_PRESENT_CLOSED:
+            if initial_state == LATERAL_ENDSTOP_PRESENT_CLOSED:
                 self._clear_closed_endstop_before_homing(move)
-                self._ensure_homing_can_start(move.axis_id, "start")
-            else:
-                self._ensure_homing_can_start(move.axis_id, "start")
+            self._ensure_homing_can_start(move.axis_id, "start")
         except Exception as exc:
             move.mark_failed(str(exc))
             return
 
         next_sequence = self._next_motion_sequence()
 
-        for phase_name, sub_move, arm_endstop in move.phases():
-            logger.info(
+        try:
+            for descriptor in move.phases():
+                logger.info(
                     "homing phase=%s arm=%s reverse=%s",
-                    phase_name,
-                    arm_endstop,
-                    sub_move.axis_configs[0].ramp.reverse_direction,
-                    
+                    descriptor.name,
+                    descriptor.arm_endstop,
+                    descriptor.move.axis_configs[0].ramp.reverse_direction,
                 )
-            if self._stop_requested:
-                self._set_endstop_armed(move.axis_id, arm=False)
-                stop_plan = self._active_stop_plan or self._default_stop_plan(
-                    [move.axis_id],
-                    "stop requested during homing",
-                )
-                self._apply_stop_plan([move.axis_id], stop_plan)
-                move.mark_aborted(f"{stop_plan.mode.value} requested during homing")
-                return
+                if self._stop_requested:
+                    stop_plan = self._active_stop_plan or self._default_stop_plan(
+                        [move.axis_id],
+                        "stop requested during homing",
+                    )
+                    self._apply_stop_plan([move.axis_id], stop_plan)
+                    move.mark_aborted(f"{stop_plan.mode.value} requested during homing")
+                    return
 
-            if arm_endstop:
+                if descriptor.arm_endstop:
+                    try:
+                        self._ensure_homing_can_start(move.axis_id, descriptor.name)
+                    except Exception as exc:
+                        move.mark_failed(str(exc))
+                        return
+
+                # Arm or disarm endstop for this phase and verify the mask in status.
                 try:
-                    self._ensure_homing_can_start(move.axis_id, phase_name)
+                    self._set_endstop_armed(move.axis_id, arm=descriptor.arm_endstop)
+                    if descriptor.arm_endstop:
+                        self._wait_for_endstop_latch_cleared(move.axis_id)
                 except Exception as exc:
                     move.mark_failed(str(exc))
                     return
 
-            # Arm or disarm endstop for this phase and verify the mask in status.
-            try:
-                self._set_endstop_armed(move.axis_id, arm=arm_endstop)
-                if arm_endstop:
-                    self._wait_for_endstop_latch_cleared(move.axis_id)
-            except Exception as exc:
-                move.mark_failed(str(exc))
-                return
-
-            try:
-                streamer = self._stream_homing_sub_move(
-                    move,
-                    phase_name=phase_name,
-                    sub_move=sub_move,
-                    arm_endstop=arm_endstop,
-                    start_sequence=next_sequence,
-                )
-            except Exception as exc:
-                self._set_endstop_armed(move.axis_id, arm=False)
-                move.mark_failed(str(exc))
-                return
-
-            next_sequence = self._next_sequence_after_streamer(streamer)
-
-            phase_completed_on_expected_endstop = arm_endstop and streamer.endstop_triggered
-            if self._stop_requested or (
-                self._streamer_stop_requested(streamer)
-                and not phase_completed_on_expected_endstop
-            ):
-                self._set_endstop_armed(move.axis_id, arm=False)
-                stop_plan = self._active_stop_plan or self._default_stop_plan(
-                    [move.axis_id],
-                    "stop requested during homing",
-                )
-                self._apply_stop_plan([move.axis_id], stop_plan)
-                move.mark_aborted(f"{stop_plan.mode.value} requested during homing")
-                return
-
-            if phase_name in ("approach", "search"):
                 try:
-                    self._check_armed_phase_result(move, phase_name, streamer)
-                except RuntimeError as exc:
-                    # Endstop did not fire — homing failed with diagnostics.
-                    self._set_endstop_armed(move.axis_id, arm=False)
-                    move.mark_failed(str(exc))
-                    return
-
-            if phase_name in ("approach", "search") and streamer.endstop_triggered:
-                try:
-                    self._wait_for_post_hit_recovery(move.axis_id)
-                except Exception as exc:
-                    self._set_endstop_armed(move.axis_id, arm=False)
-                    move.mark_failed(str(exc))
-                    return
-
-            if phase_name == "backoff":
-                try:
-                    self._wait_for_endstop_open(
-                        move.axis_id,
-                        timeout_s=self._compute_backoff_timeout(sub_move),
+                    streamer = self._stream_homing_sub_move(
+                        move,
+                        phase_name=descriptor.name,
+                        sub_move=descriptor.move,
+                        arm_endstop=descriptor.arm_endstop,
+                        start_sequence=next_sequence,
                     )
                 except Exception as exc:
-                    self._set_endstop_armed(move.axis_id, arm=False)
                     move.mark_failed(str(exc))
                     return
 
-                _deadline = time.monotonic() + 1.0
-                _status = None  # B5-FIX: ensure _status is bound before the else clause
-                while time.monotonic() < _deadline:
-                    _status = self._read_status(move.axis_id, allow_stale=False)
-                    if (int(getattr(_status, "running_mask", 0)) & (1 << move.axis_id)) == 0:
-                        break
-                    time.sleep(0.010)
-                else:
-                    _running_mask = int(getattr(_status, "running_mask", 0xFF)) if _status is not None else 0xFF
-                    self._set_endstop_armed(move.axis_id, arm=False)
-                    move.mark_failed(
-                        f"backoff stop timeout on axis {move.axis_id}: "
-                        f"running_mask=0x{_running_mask:02X} still non-zero after backoff"
+                next_sequence = self._next_sequence_after_streamer(streamer)
+
+                phase_completed_on_expected_endstop = descriptor.arm_endstop and streamer.endstop_triggered
+                if self._stop_requested or (
+                    self._streamer_stop_requested(streamer)
+                    and not phase_completed_on_expected_endstop
+                ):
+                    stop_plan = self._active_stop_plan or self._default_stop_plan(
+                        [move.axis_id],
+                        "stop requested during homing",
                     )
+                    self._apply_stop_plan([move.axis_id], stop_plan)
+                    move.mark_aborted(f"{stop_plan.mode.value} requested during homing")
                     return
 
-            if self._stop_requested:
-                self._set_endstop_armed(move.axis_id, arm=False)
-                stop_plan = self._active_stop_plan or self._default_stop_plan(
-                    [move.axis_id],
-                    "stop requested during homing",
-                )
-                self._apply_stop_plan([move.axis_id], stop_plan)
-                move.mark_aborted(f"{stop_plan.mode.value} requested during homing")
-                return
+                if descriptor.expect_endstop_hit:
+                    try:
+                        self._check_armed_phase_result(move, descriptor.name, streamer)
+                    except RuntimeError as exc:
+                        # Endstop did not fire — homing failed with diagnostics.
+                        move.mark_failed(str(exc))
+                        return
 
-        # All phases complete — disarm endstop and set home position.
-        self._set_endstop_armed(move.axis_id, arm=False)
+                if descriptor.expect_endstop_hit and streamer.endstop_triggered:
+                    try:
+                        self._wait_for_post_hit_recovery(move.axis_id)
+                    except Exception as exc:
+                        move.mark_failed(str(exc))
+                        return
+
+                if descriptor.wait_for_open:
+                    try:
+                        self._wait_for_endstop_open(
+                            move.axis_id,
+                            timeout_s=self._compute_backoff_timeout(descriptor.move),
+                        )
+                    except Exception as exc:
+                        move.mark_failed(str(exc))
+                        return
+
+                    _deadline = time.monotonic() + 1.0
+                    _status = None
+                    while time.monotonic() < _deadline:
+                        _status = self._read_status(move.axis_id, allow_stale=False)
+                        if (int(getattr(_status, "running_mask", 0)) & (1 << move.axis_id)) == 0:
+                            break
+                        time.sleep(0.010)
+                    else:
+                        _running_mask = int(getattr(_status, "running_mask", 0xFF)) if _status is not None else 0xFF
+                        move.mark_failed(
+                            f"backoff stop timeout on axis {move.axis_id}: "
+                            f"running_mask=0x{_running_mask:02X} still non-zero after backoff"
+                        )
+                        return
+
+                if self._stop_requested:
+                    stop_plan = self._active_stop_plan or self._default_stop_plan(
+                        [move.axis_id],
+                        "stop requested during homing",
+                    )
+                    self._apply_stop_plan([move.axis_id], stop_plan)
+                    move.mark_aborted(f"{stop_plan.mode.value} requested during homing")
+                    return
+
+        finally:
+            self._set_endstop_armed(move.axis_id, arm=False)
+
         if axis_state is not None:
             axis_state.mark_homed(move.home_position_steps)
 

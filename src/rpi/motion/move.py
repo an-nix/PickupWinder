@@ -4,9 +4,10 @@
 # RampMove, RampMoveConfig et AxisMotionConfig sont conservés intentionnellement
 # comme infrastructure interne de HomingMove.
 # Ils NE font PAS partie de l'API publique de mouvement.
-# HomingMove._make_approach_move(), _make_backoff_move(), _make_search_move()
-# sont corrects, testés et gelés — toute modification nécessite une tâche
-# spécifique au homing avec revue dédiée.
+# HomingMove._make_phase_move() est le point d'entrée unique de construction
+# de sous-mouvements ; _make_approach/backoff/search_move() y délèguent.
+# Toute modification du comportement de homing nécessite une tâche dédiée
+# avec revue spécifique.
 # Voir : doc/architecture.md § Politique d'isolement du homing
 # ---------------------------------------------------------------------------
 
@@ -157,13 +158,27 @@ class CompositeMove(BaseMove, ABC):
     Subclasses must implement:
       - ``phases()``              — returns ordered phase descriptors.
       - ``expected_delta_steps()``— inherited from ``BaseMove``.
+
+    Required attributes (set by subclass ``__init__``):
+      - ``axis_id: int``           — the single axis driven by this move.
+      - ``home_position_steps: int``— position to record after all phases.
     """
 
+    # Declared here so that move_queue.py can type-check accesses on CompositeMove
+    # without importing HomingMove.  Concrete subclasses set these in __init__.
+    axis_id: int
+    home_position_steps: int
+
     @abstractmethod
-    def phases(self) -> list[tuple[str, "Move", bool]]:
-        """Return an ordered list of ``(phase_name, sub_move, endstop_armed)``
-        tuples.  The ``MoveQueue`` iterates these, arming / disarming the
-        endstop between phases.
+    def preclear_move(self) -> RampMove:
+        """Return the move to execute if the endstop is found closed at start."""
+        ...
+
+    @abstractmethod
+    def phases(self) -> "list[HomingPhaseDescriptor]":
+        """Return an ordered list of :class:`HomingPhaseDescriptor` objects.
+        The ``MoveQueue`` iterates these, arming / disarming the endstop
+        between phases.
         """
         ...
 
@@ -224,6 +239,25 @@ class RampMove(Move):
         return None
 
 
+@dataclass(slots=True)
+class HomingPhaseDescriptor:
+    """Descriptor for a single homing phase.
+
+    arm_endstop        : the endstop must be armed before executing this phase.
+    expect_endstop_hit : the phase ends nominally by an endstop trigger
+                         (approach, search). If False, ends by segment
+                         exhaustion (backoff).
+    wait_for_open      : after execution, wait for endstop to return OPEN
+                         (backoff only).
+    """
+
+    name: str
+    move: RampMove
+    arm_endstop: bool
+    expect_endstop_hit: bool
+    wait_for_open: bool
+
+
 class HomingMove(CompositeMove):
     """
     A homing sequence on a single axis.
@@ -268,13 +302,21 @@ class HomingMove(CompositeMove):
         self.segment_duration_s = segment_duration_s
         self.reverse_direction = reverse_direction
 
-    def _make_approach_move(self) -> RampMove:
-        """Phase 1: fast move toward endstop."""
-        total_s = (self.max_approach_steps / float(self.steps_per_rev)) / (
-            self.approach_rpm / 60.0
-        )
+    def _make_phase_move(
+        self,
+        phase_name: str,
+        steps: int,
+        rpm: float,
+        *,
+        reverse: bool,
+        accel_frac: float,
+        accel_cap: float,
+        decel_frac: float,
+        decel_cap: float,
+    ) -> RampMove:
+        total_s = (steps / float(self.steps_per_rev)) / (rpm / 60.0)
         return RampMove(
-            name=f"{self.name}:approach",
+            name=f"{self.name}:{phase_name}",
             config=RampMoveConfig(
                 axis_configs=[
                     AxisMotionConfig(
@@ -282,11 +324,11 @@ class HomingMove(CompositeMove):
                         ramp=RampConfig(
                             axis_id=self.axis_id,
                             steps_per_rev=self.steps_per_rev,
-                            target_rpm=self.approach_rpm,
-                            accel_s=min(0.2, total_s * 0.2),
-                            cruise_s=max(total_s - 0.4, 0.0),
-                            decel_s=min(0.2, total_s * 0.2),
-                            reverse_direction=self.reverse_direction,
+                            target_rpm=rpm,
+                            accel_s=min(accel_cap, total_s * accel_frac),
+                            cruise_s=max(total_s - accel_cap - decel_cap, 0.0),
+                            decel_s=min(decel_cap, total_s * decel_frac),
+                            reverse_direction=reverse,
                         ),
                     )
                 ],
@@ -294,70 +336,50 @@ class HomingMove(CompositeMove):
             ),
         )
 
+    def _make_approach_move(self) -> RampMove:
+        """Phase 1: fast move toward endstop."""
+        return self._make_phase_move(
+            "approach",
+            self.max_approach_steps,
+            self.approach_rpm,
+            reverse=self.reverse_direction,
+            accel_frac=0.2, accel_cap=0.2,
+            decel_frac=0.2, decel_cap=0.2,
+        )
+
+    def preclear_move(self) -> RampMove:
+        return self._make_backoff_move()
+
     def _make_backoff_move(self) -> RampMove:
         """Phase 2: move away from endstop."""
-        backoff_rpm = max(self.search_rpm, self.approach_rpm * 0.5)
-        total_s = (self.backoff_steps / float(self.steps_per_rev)) / (
-            backoff_rpm / 60.0
-        )
-        return RampMove(
-            name=f"{self.name}:backoff",
-            config=RampMoveConfig(
-                axis_configs=[
-                    AxisMotionConfig(
-                        axis_id=self.axis_id,
-                        ramp=RampConfig(
-                            axis_id=self.axis_id,
-                            steps_per_rev=self.steps_per_rev,
-                            target_rpm=backoff_rpm,
-                            accel_s=min(0.1, total_s * 0.1),
-                            cruise_s=max(total_s - 0.2, 0.0),
-                            decel_s=min(0.1, total_s * 0.1),
-                            # Backoff moves AWAY from endstop = opposite direction
-                            reverse_direction=not self.reverse_direction,
-                        ),
-                    )
-                ],
-                segment_duration_s=self.segment_duration_s,
-            ),
+        rpm = max(self.search_rpm, self.approach_rpm * 0.5)
+        return self._make_phase_move(
+            "backoff",
+            self.backoff_steps,
+            rpm,
+            # Backoff moves AWAY from endstop = opposite direction
+            reverse=not self.reverse_direction,
+            accel_frac=0.1, accel_cap=0.1,
+            decel_frac=0.1, decel_cap=0.1,
         )
 
     def _make_search_move(self) -> RampMove:
         """Phase 3: slow move toward endstop for precise home."""
-        total_s = (self.backoff_steps * 2 / float(self.steps_per_rev)) / (
-            self.search_rpm / 60.0
-        )
-        return RampMove(
-            name=f"{self.name}:search",
-            config=RampMoveConfig(
-                axis_configs=[
-                    AxisMotionConfig(
-                        axis_id=self.axis_id,
-                        ramp=RampConfig(
-                            axis_id=self.axis_id,
-                            steps_per_rev=self.steps_per_rev,
-                            target_rpm=self.search_rpm,
-                            accel_s=min(0.1, total_s * 0.2),
-                            cruise_s=max(total_s - 0.2, 0.0),
-                            decel_s=min(0.1, total_s * 0.2),
-                            reverse_direction=self.reverse_direction,
-                        ),
-                    )
-                ],
-                segment_duration_s=self.segment_duration_s,
-            ),
+        return self._make_phase_move(
+            "search",
+            self.backoff_steps * 2,
+            self.search_rpm,
+            reverse=self.reverse_direction,
+            accel_frac=0.2, accel_cap=0.1,
+            decel_frac=0.2, decel_cap=0.1,
         )
 
-    def phases(self) -> list[tuple[str, Move, bool]]:
-        """
-        Return an ordered list of ``(phase_name, sub_move, endstop_armed)``.
-        The ``MoveQueue`` iterates this list, arming/disarming the endstop
-        between phases and updating ``AxisState`` after search completes.
-        """
+    def phases(self) -> list[HomingPhaseDescriptor]:
+        """Return an ordered list of :class:`HomingPhaseDescriptor` objects."""
         return [
-            ("approach", self._make_approach_move(), True),
-            ("backoff", self._make_backoff_move(), False),
-            ("search", self._make_search_move(), True),
+            HomingPhaseDescriptor("approach", self._make_approach_move(), arm_endstop=True,  expect_endstop_hit=True,  wait_for_open=False),
+            HomingPhaseDescriptor("backoff",  self._make_backoff_move(),  arm_endstop=False, expect_endstop_hit=False, wait_for_open=True),
+            HomingPhaseDescriptor("search",   self._make_search_move(),   arm_endstop=True,  expect_endstop_hit=True,  wait_for_open=False),
         ]
 
     def expected_delta_steps(self, axis_id: int) -> int | None:

@@ -1,16 +1,43 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import Iterator
 
-from motion.move import Move
 from motion import SpindleKinematics
+from motion.move import Move
 from winding.winding_pattern import WindingPattern
 from winding.scatter_engine import ScatterEngine
 from winding.synchronized_segment_generator import SyncAxisConfig, SynchronizedSegmentGenerator
 from transport.messages import MultiAxisSegment
 
 
-class WoundMove(Move):
+class SynchronizedMove(Move, ABC):
+    """Abstract base for moves that stream spindle+traverse in lock-step.
+
+    Both ``WoundMove`` and ``AdaptiveWindingMove`` satisfy this contract.
+    ``MoveQueue`` dispatches on ``isinstance(move, SynchronizedMove)`` so
+    that neither subclass needs duck-type markers.
+
+    Concrete subclasses must expose ``kinematics``, ``spindle_cfg``, and
+    ``segment_duration_s`` as instance attributes (assigned in ``__init__``).
+    These are declared as abstract properties so that mypy enforces the
+    contract statically on every subclass.
+    """
+
+    @property
+    @abstractmethod
+    def kinematics(self) -> SpindleKinematics: ...
+
+    @property
+    @abstractmethod
+    def spindle_cfg(self) -> SyncAxisConfig: ...
+
+    @property
+    @abstractmethod
+    def segment_duration_s(self) -> float: ...
+
+
+class WoundMove(SynchronizedMove):
     """
     A single continuous move executing the Electronic Gearing winding pattern.
     """
