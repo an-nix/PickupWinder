@@ -39,12 +39,11 @@ Le retour est donc pipeliné d'une transaction.
 Le CRC est calculé sur `header (crc16=0) + payload`.
 
 ## Messages actifs
-
-- `GET_STATUS (0x06)` : télémétrie pure, sans publication d'un nouvel ACK de contrôle.
-- `FLUSH (0x12)` : abandon des segments au-delà d'un seuil de séquence.
-- `MULTI_AXIS_SEGMENT_BLOCK (0x13)` : chemin de production.
-- `ENABLE_ENDSTOP (0x14)` : armement/désarmement matériel.
-- `STEP_BLOCK (0x10)` et `SEGMENT_BLOCK (0x11)` : **legacy, rejetés par le firmware avec `ESP_ERR_NOT_SUPPORTED`**.
+ - `GET_STATUS (0x06)` : télémétrie pure, sans publication d'un nouvel ACK de contrôle.
+ - `FLUSH (0x12)` : abandon des segments au-delà d'un seuil de séquence.
+ - `MULTI_AXIS_SEGMENT_BLOCK (0x13)` : chemin de production.
+ - `ENABLE_ENDSTOP (0x14)` : armement/désarmement matériel.
+ 
 
 ## `StatusPayload`
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from abc import ABC
+from abc import ABC, abstractmethod
 from typing import Iterator
 
 from motion import SpindleKinematics
@@ -18,15 +18,23 @@ class SynchronizedMove(Move, ABC):
     ``MoveQueue`` dispatches on ``isinstance(move, SynchronizedMove)`` so
     that neither subclass needs duck-type markers.
 
-    Required attributes (set by concrete ``__init__``):
-      - ``kinematics: SpindleKinematics``
-      - ``spindle_cfg: SyncAxisConfig``
-      - ``segment_duration_s: float``
+    Concrete subclasses must expose ``kinematics``, ``spindle_cfg``, and
+    ``segment_duration_s`` as instance attributes (assigned in ``__init__``).
+    These are declared as abstract properties so that mypy enforces the
+    contract statically on every subclass.
     """
 
-    kinematics: SpindleKinematics
-    spindle_cfg: SyncAxisConfig
-    segment_duration_s: float
+    @property
+    @abstractmethod
+    def kinematics(self) -> SpindleKinematics: ...
+
+    @property
+    @abstractmethod
+    def spindle_cfg(self) -> SyncAxisConfig: ...
+
+    @property
+    @abstractmethod
+    def segment_duration_s(self) -> float: ...
 
 
 class WoundMove(SynchronizedMove):
