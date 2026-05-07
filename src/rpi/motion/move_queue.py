@@ -9,7 +9,7 @@ from typing import Any, Iterator
 from core.coordinator import MotionStopPlan
 from core.events import EventBus, EventKind
 from motion.axis_state import AxisState
-from motion.move import BaseMove, CompositeMove, HomingPhaseDescriptor, Move, RampMove
+from motion.move import BaseMove, CompositeMove, Move, RampMove
 from motion.multi_axis_segment_generator import AxisMotionConfig
 from winding.wound_move import SynchronizedMove
 from transport.messages import (
