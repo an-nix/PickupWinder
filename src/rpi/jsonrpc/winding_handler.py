@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from core import WindingEngine
+from core import AppConfiguration, ConfigurationManager, WindingEngine
 from core.coordinator import MotionCoordinator
 from core.status import RuntimeStatusService
 from jsonrpc.handlers import RpcHandler
@@ -39,12 +39,16 @@ class WindingRpcHandler:
         adaptive_winding: AdaptiveWindingService,
         status_service: RuntimeStatusService,
         coordinator: MotionCoordinator,
+        config: AppConfiguration,
+        config_manager: ConfigurationManager,
     ) -> None:
         self._engine = engine
         self._commands = commands
         self._adaptive_winding = adaptive_winding
         self._status_service = status_service
         self._coordinator = coordinator
+        self._config = config
+        self._config_manager = config_manager
 
     # ── Registration ───────────────────────────────────────────────────────
 
@@ -63,6 +67,11 @@ class WindingRpcHandler:
         handler.register_method("winding.run_axis", self.run_axis)
         handler.register_method("winding.home_lateral", self.home_lateral)
         handler.register_method("winding.move_lateral_mm", self.move_lateral_mm)
+        handler.register_method("winding.set_axis_offset", self.set_axis_offset)
+        handler.register_method(
+            "winding.move_to_start_position",
+            self.move_to_start_position,
+        )
         handler.register_method("winding.clear_fault", self.clear_fault)
         handler.register_method("winding.flush_until", self.flush_until)
         handler.register_method("winding.status", self.status)
@@ -195,6 +204,40 @@ class WindingRpcHandler:
     def move_lateral_mm(self, position_mm: float, rpm: float) -> dict[str, Any]:
         """Move the lateral axis to an absolute mm position from home zero."""
         return self._commands.move_lateral_to_mm(position_mm=position_mm, rpm=rpm)
+
+    def set_axis_offset(self, offset_mm: float) -> dict[str, Any]:
+        """Set and persist the lateral winding start offset in mm."""
+        try:
+            offset_mm = float(offset_mm)
+        except (TypeError, ValueError) as exc:
+            raise JsonRpcError(-32602, f"offset_mm must be a number: {exc}") from exc
+
+        try:
+            AppConfiguration(
+                **{**vars(self._config), "lateral_axis_offset_mm": offset_mm}
+            )
+        except ValueError as exc:
+            raise JsonRpcError(-32602, str(exc)) from exc
+
+        self._config.lateral_axis_offset_mm = offset_mm
+        try:
+            self._config_manager.save_configuration(self._config)
+        except OSError as exc:
+            raise JsonRpcError(-32000, f"failed to persist configuration: {exc}") from exc
+
+        return {
+            "status": "ok",
+            "axis_offset_mm": offset_mm,
+            "start_position_mm": self._config.lateral_start_position_mm,
+            "soft_limit_min_mm": self._config.lateral_soft_limit_min_mm,
+        }
+
+    def move_to_start_position(self, _params: Any | None = None) -> dict[str, Any]:
+        """Move the lateral axis to soft_limit_min_mm + lateral_axis_offset_mm."""
+        try:
+            return self._commands.move_to_start_position()
+        except RuntimeError as exc:
+            raise JsonRpcError(-32000, str(exc)) from exc
 
     def clear_fault(self, _params: Any | None = None) -> dict[str, str]:
         """Clear FAULT state so a new program can be submitted."""

@@ -263,6 +263,21 @@ class MotionCommandService:
             "target_position_steps": target_steps,
         }
 
+    def move_to_start_position(self) -> dict[str, Any]:
+        """Move the lateral axis to its current winding start position."""
+        if self._state.engine_state != EngineState.IDLE:
+            raise RuntimeError(
+                "move_to_start_position only allowed when engine is IDLE"
+            )
+
+        self._lateral.move_to_start_position()
+        return {
+            "status": "completed",
+            "position_mm": self._config.lateral_start_position_mm,
+            "soft_limit_min_mm": self._config.lateral_soft_limit_min_mm,
+            "axis_offset_mm": self._config.lateral_axis_offset_mm,
+        }
+
     def wound_run(
         self,
         spindle_axis_id: int,

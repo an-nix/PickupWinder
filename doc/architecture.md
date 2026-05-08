@@ -133,8 +133,9 @@ The adaptive winding path is host-driven and chunked on purpose:
 
 - The lateral axis home position is volatile and is treated as lost after a restart.
 - `HomingMove` is isolated in `motion/move.py` and executed phase-by-phase in `motion/move_queue.py`. Homing logic must not leak into `MultiAxisRampStreamer` or transport layers.
-- The host refuses lateral free-motion commands until homing completes.
+- The host refuses lateral free-motion commands until homing completes; when homing succeeds it then performs a post-home jog to `lateral_soft_limit_min_mm + lateral_axis_offset_mm` before publishing `HOMING_COMPLETED`.
 - Soft travel limits are enforced on the host before a lateral move is enqueued, so queue serialization and SPI block delivery remain unchanged.
+- The winding start offset is persisted in host configuration and can be changed live via RPC, followed by `winding.move_to_start_position` to reposition without repeating the full homing sequence.
 - After homing, the host streamer keeps the lateral enable pin asserted across later moves; if firmware status shows the enable bit dropped, the host invalidates the stored home state.
 
 ## Firmware architecture

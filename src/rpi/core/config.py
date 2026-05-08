@@ -230,6 +230,7 @@ class ConfigurationManager:
         configuration: AppConfiguration | None = None,
     ) -> AppConfiguration:
         config = configuration or self.active_configuration
+        self._config_file_path.parent.mkdir(parents=True, exist_ok=True)
         with self._config_file_path.open("w", encoding="utf-8") as handle:
             json.dump(asdict(config), handle, indent=2, sort_keys=True)
         self.active_configuration = config
