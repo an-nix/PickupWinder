@@ -52,6 +52,15 @@ class AppConfiguration:
     lateral_homing_search_rpm: float = 10.0
     lateral_homing_backoff_steps: int | None = 6144
 
+    # Winding start position offset applied on top of lateral_soft_limit_min_mm.
+    # Defines where the axis parks after homing and before winding starts.
+    # Modifiable at runtime via RPC without re-homing.
+    # Can be negative (start before soft_limit_min) or positive (start after).
+    # Constraints:
+    #   soft_limit_min_mm + axis_offset_mm >= soft_limit_min_mm (or unbounded if None)
+    #   soft_limit_min_mm + axis_offset_mm <= soft_limit_max_mm (if set)
+    lateral_axis_offset_mm: float = 0.0
+
     def __post_init__(self) -> None:
         if self.spindle_steps_per_revolution <= 0:
             raise ValueError("spindle_steps_per_revolution must be positive")
@@ -86,6 +95,26 @@ class AppConfiguration:
             raise ValueError(
                 "lateral_soft_limit_max_mm must be greater than lateral_soft_limit_min_mm"
             )
+
+        start_mm = (self.lateral_soft_limit_min_mm or 0.0) + self.lateral_axis_offset_mm
+
+        if ( self.lateral_soft_limit_min_mm is not None and start_mm < self.lateral_soft_limit_min_mm ):
+            raise ValueError(
+                f"lateral_soft_limit_min_mm ({self.lateral_soft_limit_min_mm}) "
+                f"+ lateral_axis_offset_mm ({self.lateral_axis_offset_mm}) "
+                f"= {start_mm:.3f} mm is below lateral_soft_limit_min_mm "
+                f"({self.lateral_soft_limit_min_mm})"
+            )
+
+        if ( self.lateral_soft_limit_max_mm is not None and start_mm > self.lateral_soft_limit_max_mm):
+            raise ValueError(
+                f"lateral_soft_limit_min_mm ({self.lateral_soft_limit_min_mm}) "
+                f"+ lateral_axis_offset_mm ({self.lateral_axis_offset_mm}) "
+                f"= {start_mm:.3f} mm exceeds lateral_soft_limit_max_mm "
+                f"({self.lateral_soft_limit_max_mm})"
+            )
+
+
 
     @property
     def lateral_steps_per_mm(self) -> float:
@@ -155,6 +184,16 @@ class AppConfiguration:
         if self.lateral_max_deceleration_mm_per_s2 is not None:
             return float(self.lateral_max_deceleration_mm_per_s2) * self.lateral_steps_per_mm
         return self.lateral_max_acceleration_steps_per_s2
+
+    @property
+    def lateral_start_position_mm(self) -> float:
+        """Winding start position = soft_limit_min_mm + axis_offset_mm."""
+        return (self.lateral_soft_limit_min_mm or 0.0) + self.lateral_axis_offset_mm
+
+    @property
+    def lateral_start_position_steps(self) -> int:
+        """Winding start position converted to steps."""
+        return int(round(self.lateral_start_position_mm * self.lateral_steps_per_mm))
 
 
 class ConfigurationManager:

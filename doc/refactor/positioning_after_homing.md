@@ -63,8 +63,10 @@ Ajouter après `lateral_homing_backoff_steps` :
 # Winding start position offset applied on top of lateral_soft_limit_min_mm.
 # Defines where the axis parks after homing and before winding starts.
 # Modifiable at runtime via RPC without re-homing.
-# Constraint: lateral_soft_limit_min_mm + lateral_axis_offset_mm
-#             must not exceed lateral_soft_limit_max_mm.
+# Can be negative (start before soft_limit_min) or positive (start after).
+# Constraints:
+#   soft_limit_min_mm + axis_offset_mm >= soft_limit_min_mm (or unbounded if None)
+#   soft_limit_min_mm + axis_offset_mm <= soft_limit_max_mm (if set)
 lateral_axis_offset_mm: float = 0.0
 ```
 
@@ -73,21 +75,30 @@ lateral_axis_offset_mm: float = 0.0
 Ajouter après la validation de `lateral_soft_limit_min/max` :
 
 ```python
-if self.lateral_axis_offset_mm < 0.0:
-    raise ValueError("lateral_axis_offset_mm must be >= 0")
+# start_position must stay within [soft_limit_min, soft_limit_max].
+start_mm = (self.lateral_soft_limit_min_mm or 0.0) + self.lateral_axis_offset_mm
 
 if (
-    self.lateral_axis_offset_mm > 0.0
-    and self.lateral_soft_limit_max_mm is not None
+    self.lateral_soft_limit_min_mm is not None
+    and start_mm < self.lateral_soft_limit_min_mm
 ):
-    start_mm = (self.lateral_soft_limit_min_mm or 0.0) + self.lateral_axis_offset_mm
-    if start_mm > self.lateral_soft_limit_max_mm:
-        raise ValueError(
-            f"lateral_soft_limit_min_mm ({self.lateral_soft_limit_min_mm}) "
-            f"+ lateral_axis_offset_mm ({self.lateral_axis_offset_mm}) "
-            f"= {start_mm:.3f} mm exceeds lateral_soft_limit_max_mm "
-            f"({self.lateral_soft_limit_max_mm})"
-        )
+    raise ValueError(
+        f"lateral_soft_limit_min_mm ({self.lateral_soft_limit_min_mm}) "
+        f"+ lateral_axis_offset_mm ({self.lateral_axis_offset_mm}) "
+        f"= {start_mm:.3f} mm is below lateral_soft_limit_min_mm "
+        f"({self.lateral_soft_limit_min_mm})"
+    )
+
+if (
+    self.lateral_soft_limit_max_mm is not None
+    and start_mm > self.lateral_soft_limit_max_mm
+):
+    raise ValueError(
+        f"lateral_soft_limit_min_mm ({self.lateral_soft_limit_min_mm}) "
+        f"+ lateral_axis_offset_mm ({self.lateral_axis_offset_mm}) "
+        f"= {start_mm:.3f} mm exceeds lateral_soft_limit_max_mm "
+        f"({self.lateral_soft_limit_max_mm})"
+    )
 ```
 
 ### 1c. Propriétés dérivées
@@ -319,8 +330,9 @@ def set_axis_offset(self, offset_mm: float) -> dict[str, Any]:
     reposition without re-homing.
 
     Args:
-        offset_mm: Offset >= 0 mm. soft_limit_min_mm + offset_mm must
-                   not exceed soft_limit_max_mm.
+        offset_mm: Offset in mm (positive or negative).
+                   soft_limit_min_mm + offset_mm must stay within
+                   [soft_limit_min_mm, soft_limit_max_mm].
 
     Returns:
         {status, axis_offset_mm, start_position_mm, soft_limit_min_mm}
@@ -333,7 +345,7 @@ def set_axis_offset(self, offset_mm: float) -> dict[str, Any]:
     current = self._config_manager.active_configuration
 
     # Validate by constructing a new AppConfiguration — __post_init__
-    # enforces all constraints (>= 0, not exceeding soft_limit_max).
+    # enforces all soft-limit constraints (start position within bounds).
     try:
         updated = AppConfiguration(
             **{**vars(current), "lateral_axis_offset_mm": offset_mm}
@@ -422,8 +434,8 @@ Aucune régression : comportement identique à l'actuel, aucun mouvement superfl
 
 ## 7. Invariants et contrats
 
-- `lateral_axis_offset_mm >= 0` — validé dans `AppConfiguration.__post_init__`.
-- `soft_limit_min_mm + axis_offset_mm <= soft_limit_max_mm` — validé dans `__post_init__`.
+- `soft_limit_min_mm + axis_offset_mm >= soft_limit_min_mm` — validé dans `__post_init__` (si `soft_limit_min_mm` est défini).
+- `soft_limit_min_mm + axis_offset_mm <= soft_limit_max_mm` — validé dans `__post_init__` (si `soft_limit_max_mm` est défini).
 - `move_to_start_position()` requiert `homed = True` — délégué à `require_homed()`.
 - L'offset ne bypass pas les soft-limits à l'exécution : `check_move()` dans
   `AxisState` est le gardien final lors du jog.
