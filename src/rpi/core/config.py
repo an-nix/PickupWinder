@@ -236,9 +236,6 @@ class ConfigurationManager:
         self.active_configuration = config
         return config
 
-    def save_configration(self) -> AppConfiguration:
-        return self.save_configuration()
-
     def get_saved_configuration(self) -> AppConfiguration | None:
         if not self._config_file_path.exists():
             return None
@@ -248,9 +245,6 @@ class ConfigurationManager:
 
     def get_active_configuration(self) -> AppConfiguration:
         return self.active_configuration
-
-    def get_activate_configuration(self) -> AppConfiguration:
-        return self.get_active_configuration()
 
     # Return RPC Socket path
     def get_rpc_socket_path(self) -> str:

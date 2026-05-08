@@ -213,23 +213,25 @@ class WindingRpcHandler:
             raise JsonRpcError(-32602, f"offset_mm must be a number: {exc}") from exc
 
         try:
-            AppConfiguration(
+            validated = AppConfiguration(
                 **{**vars(self._config), "lateral_axis_offset_mm": offset_mm}
             )
         except ValueError as exc:
             raise JsonRpcError(-32602, str(exc)) from exc
 
+        old_offset_mm = self._config.lateral_axis_offset_mm
         self._config.lateral_axis_offset_mm = offset_mm
         try:
             self._config_manager.save_configuration(self._config)
         except OSError as exc:
+            self._config.lateral_axis_offset_mm = old_offset_mm
             raise JsonRpcError(-32000, f"failed to persist configuration: {exc}") from exc
 
         return {
             "status": "ok",
             "axis_offset_mm": offset_mm,
-            "start_position_mm": self._config.lateral_start_position_mm,
-            "soft_limit_min_mm": self._config.lateral_soft_limit_min_mm,
+            "start_position_mm": validated.lateral_start_position_mm,
+            "soft_limit_min_mm": validated.lateral_soft_limit_min_mm,
         }
 
     def move_to_start_position(self, _params: Any | None = None) -> dict[str, Any]:
