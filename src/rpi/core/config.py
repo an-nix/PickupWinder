@@ -27,7 +27,7 @@ class AppConfiguration:
     spindle_max_deceleration_rpm: float | None = None
 
     lateral_axis_id: int = 1
-    lateral_steps_per_revolution: int = 200
+    lateral_steps_per_revolution: int = 96
     lateral_microstepping: int = 32
     lateral_invert_direction: bool = True
     lateral_max_rpm: int = 1000
@@ -44,13 +44,17 @@ class AppConfiguration:
     lateral_steps_per_mm_override: float | None = None
     # Soft travel window for the lateral axis relative to the homing zero.
     # None disables the corresponding bound.
-    lateral_soft_limit_min_mm: float | None = 0.0
+    lateral_soft_limit_min_mm: float | None = 30.0
     lateral_soft_limit_max_mm: float | None = None
 
     # Homing parameters
     lateral_homing_approach_rpm: float = 15.0
     lateral_homing_search_rpm: float = 10.0
     lateral_homing_backoff_steps: int | None = 6144
+
+    # Target speed for post-homing and explicit start-position moves.
+    # Unit: RPM on the lateral motor. Capped at lateral_max_rpm at runtime.
+    lateral_target_speed: float = 60.0
 
     # Winding start position offset applied on top of lateral_soft_limit_min_mm.
     # Defines where the axis parks after homing and before winding starts.
@@ -74,6 +78,8 @@ class AppConfiguration:
             raise ValueError("lateral_microstepping must be positive")
         if self.lateral_max_rpm <= 0:
             raise ValueError("lateral_max_rpm must be positive")
+        if self.lateral_target_speed <= 0:
+            raise ValueError("lateral_target_speed must be positive")
         if self.lateral_traverse_pitch_mm <= 0.0:
             raise ValueError("lateral_traverse_pitch_mm must be positive")
         if (

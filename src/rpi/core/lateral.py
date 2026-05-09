@@ -138,13 +138,17 @@ class LateralAxisController:
             self._config.lateral_steps_per_revolution
             * self._config.lateral_microstepping
         )
+        target_rpm = min(
+            float(self._config.lateral_target_speed),
+            float(self._config.lateral_max_rpm),
+        )
 
         move = build_jog_move(
             name="post_home_goto_start_position",
             axis_id=self._config.lateral_axis_id,
             steps=abs(delta_steps),
             steps_per_rev=steps_per_rev,
-            rpm=self._config.lateral_homing_search_rpm,
+            rpm=target_rpm,
             reverse=(delta_steps < 0),
         )
 
