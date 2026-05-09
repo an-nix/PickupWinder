@@ -351,6 +351,9 @@ class AdaptiveWindingService:
                 if not success:
                     raise RuntimeError(reason or "lateral homing failed")
 
+            # Post-home start position and adaptive window low bound are distinct
+            # concepts. `home()` parks at soft_limit_min + axis_offset, then the
+            # session moves to the active winding window if needed.
             self._move_lateral_to(runtime, runtime.current_window.low_mm)
             runtime.mark_running()
             self._state.set_engine_state(EngineState.RUNNING)

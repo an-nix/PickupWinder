@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import re
 
-from core import WindingEngine
+from core import ConfigurationManager, WindingEngine
 from core.config import AppConfiguration
 from core.coordinator import MotionCoordinator
 from core.events import EventBus
@@ -20,6 +21,10 @@ from winding.service import AdaptiveWindingService
 
 
 logger = logging.getLogger(__name__)
+
+
+def _default_config_file_path() -> Path:
+    return Path.home() / ".config" / "pickupwinder" / "config.json"
 
 
 def _parse_spi_device(device_path: str) -> tuple[int, int]:
@@ -72,8 +77,23 @@ def _create_transport(config: AppConfiguration) -> Esp32SpiTransport:
 class WinderApplication:
     """Compose the host runtime and own its process lifecycle."""
 
-    def __init__(self, config: AppConfiguration | None = None) -> None:
-        self.config = config or AppConfiguration()
+    def __init__(
+        self,
+        config: AppConfiguration | None = None,
+        config_file_path: str | Path | None = None,
+    ) -> None:
+        resolved_config_path = (
+            Path(config_file_path)
+            if config_file_path is not None
+            else _default_config_file_path()
+        )
+        self.config_manager = ConfigurationManager(resolved_config_path)
+        if config is None and resolved_config_path.exists():
+            self.config = self.config_manager.load_configuration()
+        else:
+            self.config = config or self.config_manager.active_configuration
+            self.config_manager.active_configuration = self.config
+
         self.transport = _create_transport(self.config)
         self.shared_state = SharedState(axis_states=_build_axis_states(self.config))
         self.event_bus = EventBus()
@@ -136,6 +156,8 @@ class WinderApplication:
             adaptive_winding=self.adaptive_winding,
             status_service=self.status_service,
             coordinator=self.coordinator,
+            config=self.config,
+            config_manager=self.config_manager,
         ).register_all(self.rpc_handler)
         self.rpc_server = JsonRpcServer(
             handler=self.rpc_handler,

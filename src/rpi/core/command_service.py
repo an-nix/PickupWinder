@@ -151,6 +151,10 @@ class MotionCommandService:
 
     def home_lateral(
         self,
+        *,
+        approach_rpm: float | None = None,
+        search_rpm: float | None = None,
+        backoff_steps: int | None = None,
     ) -> dict[str, Any]:
         """Start lateral homing asynchronously and return immediately.
 
@@ -160,17 +164,29 @@ class MotionCommandService:
         release any standard mechanical endstop (typical release travel ≤ 2 mm).
         Pass an explicit integer to override (e.g. for non-standard hardware).
         """
-        approach_rpm = self._config.lateral_homing_approach_rpm
-        search_rpm = self._config.lateral_homing_search_rpm
-        backoff_steps = self._config.lateral_homing_backoff_steps
+        resolved_approach_rpm = (
+            self._config.lateral_homing_approach_rpm
+            if approach_rpm is None
+            else float(approach_rpm)
+        )
+        resolved_search_rpm = (
+            self._config.lateral_homing_search_rpm
+            if search_rpm is None
+            else float(search_rpm)
+        )
+        resolved_backoff_steps = (
+            self._config.lateral_homing_backoff_steps
+            if backoff_steps is None
+            else int(backoff_steps)
+        )
 
-        if backoff_steps is None:
+        if resolved_backoff_steps is None:
             steps_per_rev = (
                 self._config.lateral_steps_per_revolution
                 * self._config.lateral_microstepping
             )
             # 2 full revolutions — pitch-agnostic safe default for endstop release.
-            backoff_steps = steps_per_rev * 2
+            resolved_backoff_steps = steps_per_rev * 2
         if self._state.engine_state != EngineState.IDLE:
             raise RuntimeError(
                 "home_lateral only allowed when engine is IDLE; if a FAULT occurred, "
@@ -184,7 +200,11 @@ class MotionCommandService:
         self._state.set_engine_state(EngineState.HOMING)
         monitor = threading.Thread(
             target=self._run_lateral_home,
-            args=(approach_rpm, search_rpm, int(backoff_steps)),
+            args=(
+                resolved_approach_rpm,
+                resolved_search_rpm,
+                int(resolved_backoff_steps),
+            ),
             daemon=True,
             name="manual_home_monitor",
         )
@@ -195,9 +215,9 @@ class MotionCommandService:
         return {
             "status": "started",
             "axis_id": self._config.lateral_axis_id,
-            "approach_rpm": approach_rpm,
-            "search_rpm": search_rpm,
-            "backoff_steps": backoff_steps,  # actual value after default expansion
+            "approach_rpm": resolved_approach_rpm,
+            "search_rpm": resolved_search_rpm,
+            "backoff_steps": resolved_backoff_steps,
         }
 
     def _run_lateral_home(
@@ -261,6 +281,21 @@ class MotionCommandService:
             "status": "queued",
             "target_position_mm": position_mm,
             "target_position_steps": target_steps,
+        }
+
+    def move_to_start_position(self) -> dict[str, Any]:
+        """Move the lateral axis to its current winding start position."""
+        if self._state.engine_state != EngineState.IDLE:
+            raise RuntimeError(
+                "move_to_start_position only allowed when engine is IDLE"
+            )
+
+        self._lateral.move_to_start_position()
+        return {
+            "status": "completed",
+            "position_mm": self._config.lateral_start_position_mm,
+            "soft_limit_min_mm": self._config.lateral_soft_limit_min_mm,
+            "axis_offset_mm": self._config.lateral_axis_offset_mm,
         }
 
     def wound_run(

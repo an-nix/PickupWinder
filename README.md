@@ -46,6 +46,10 @@ Adaptive winding sessions use the same SPI streaming path, but they are planned 
 - The lateral axis starts with an unknown position after every host or controller restart.
 - Any free lateral motion now requires a successful homing cycle first.
 - Host-side soft limits are configured in `src/rpi/core/config.py` through `lateral_soft_limit_min_mm` and `lateral_soft_limit_max_mm`.
+- `lateral_axis_length_mm` can be set to the machine travel length so the homing approach move is long enough to reach the endstop even from the far end.
+- Post-homing travel toward the winding start position uses `lateral_target_speed` from `src/rpi/core/config.py`.
+- After homing, the host automatically repositions the lateral axis to `lateral_soft_limit_min_mm + lateral_axis_offset_mm` before reporting `HOMING_COMPLETED`.
+- The winding start offset is persisted in the host config and can be updated live through `winding.set_axis_offset`, then applied immediately with `winding.move_to_start_position` without re-homing.
 - Once the lateral axis is homed, the host keeps its enable line asserted across subsequent moves so the zero reference is not lost.
 - If the controller reports that the lateral enable bit dropped, the host invalidates the home state and requires a new homing cycle.
 

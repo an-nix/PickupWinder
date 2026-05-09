@@ -38,8 +38,11 @@ def serialize_firmware_status(status: StatusPayload) -> dict[str, Any]:
 def serialize_configuration(config: AppConfiguration) -> dict[str, Any]:
     snapshot = dataclasses.asdict(config)
     snapshot["lateral_steps_per_mm"] = config.lateral_steps_per_mm
+    snapshot["lateral_axis_length_steps"] = config.lateral_axis_length_steps
     snapshot["lateral_soft_limit_min_steps"] = config.lateral_soft_limit_min_steps
     snapshot["lateral_soft_limit_max_steps"] = config.lateral_soft_limit_max_steps
+    snapshot["lateral_start_position_mm"] = config.lateral_start_position_mm
+    snapshot["lateral_start_position_steps"] = config.lateral_start_position_steps
     snapshot["spindle_max_acceleration_steps_per_s2"] = (
         config.spindle_max_acceleration_steps_per_s2
     )

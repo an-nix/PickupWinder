@@ -27,7 +27,7 @@ class AppConfiguration:
     spindle_max_deceleration_rpm: float | None = None
 
     lateral_axis_id: int = 1
-    lateral_steps_per_revolution: int = 200
+    lateral_steps_per_revolution: int = 96
     lateral_microstepping: int = 32
     lateral_invert_direction: bool = True
     lateral_max_rpm: int = 1000
@@ -44,13 +44,29 @@ class AppConfiguration:
     lateral_steps_per_mm_override: float | None = None
     # Soft travel window for the lateral axis relative to the homing zero.
     # None disables the corresponding bound.
-    lateral_soft_limit_min_mm: float | None = 0.0
+    lateral_soft_limit_min_mm: float | None = 30.0
     lateral_soft_limit_max_mm: float | None = None
+    # Physical travel length used to size the maximum homing approach move.
+    # If unset, a conservative fallback based on motor revolutions is used.
+    lateral_axis_length_mm: float | None = 130
 
     # Homing parameters
-    lateral_homing_approach_rpm: float = 15.0
-    lateral_homing_search_rpm: float = 10.0
+    lateral_homing_approach_rpm: float = 60.0
+    lateral_homing_search_rpm: float = 20.0
     lateral_homing_backoff_steps: int | None = 6144
+
+    # Target speed for post-homing and explicit start-position moves.
+    # Unit: RPM on the lateral motor. Capped at lateral_max_rpm at runtime.
+    lateral_target_speed: float = 60.0
+
+    # Winding start position offset applied on top of lateral_soft_limit_min_mm.
+    # Defines where the axis parks after homing and before winding starts.
+    # Modifiable at runtime via RPC without re-homing.
+    # Can be negative (start before soft_limit_min) or positive (start after).
+    # Constraints:
+    #   soft_limit_min_mm + axis_offset_mm >= soft_limit_min_mm (or unbounded if None)
+    #   soft_limit_min_mm + axis_offset_mm <= soft_limit_max_mm (if set)
+    lateral_axis_offset_mm: float = 0.0
 
     def __post_init__(self) -> None:
         if self.spindle_steps_per_revolution <= 0:
@@ -65,8 +81,12 @@ class AppConfiguration:
             raise ValueError("lateral_microstepping must be positive")
         if self.lateral_max_rpm <= 0:
             raise ValueError("lateral_max_rpm must be positive")
+        if self.lateral_target_speed <= 0:
+            raise ValueError("lateral_target_speed must be positive")
         if self.lateral_traverse_pitch_mm <= 0.0:
             raise ValueError("lateral_traverse_pitch_mm must be positive")
+        if self.lateral_axis_length_mm is not None and self.lateral_axis_length_mm <= 0.0:
+            raise ValueError("lateral_axis_length_mm must be positive")
         if (
             self.lateral_steps_per_mm_override is not None
             and self.lateral_steps_per_mm_override <= 0.0
@@ -86,6 +106,26 @@ class AppConfiguration:
             raise ValueError(
                 "lateral_soft_limit_max_mm must be greater than lateral_soft_limit_min_mm"
             )
+
+        start_mm = (self.lateral_soft_limit_min_mm or 0.0) + self.lateral_axis_offset_mm
+
+        if ( self.lateral_soft_limit_min_mm is not None and start_mm < self.lateral_soft_limit_min_mm ):
+            raise ValueError(
+                f"lateral_soft_limit_min_mm ({self.lateral_soft_limit_min_mm}) "
+                f"+ lateral_axis_offset_mm ({self.lateral_axis_offset_mm}) "
+                f"= {start_mm:.3f} mm is below lateral_soft_limit_min_mm "
+                f"({self.lateral_soft_limit_min_mm})"
+            )
+
+        if ( self.lateral_soft_limit_max_mm is not None and start_mm > self.lateral_soft_limit_max_mm):
+            raise ValueError(
+                f"lateral_soft_limit_min_mm ({self.lateral_soft_limit_min_mm}) "
+                f"+ lateral_axis_offset_mm ({self.lateral_axis_offset_mm}) "
+                f"= {start_mm:.3f} mm exceeds lateral_soft_limit_max_mm "
+                f"({self.lateral_soft_limit_max_mm})"
+            )
+
+
 
     @property
     def lateral_steps_per_mm(self) -> float:
@@ -109,6 +149,12 @@ class AppConfiguration:
         if self.lateral_soft_limit_max_mm is None:
             return None
         return int(round(float(self.lateral_soft_limit_max_mm) * self.lateral_steps_per_mm))
+
+    @property
+    def lateral_axis_length_steps(self) -> int | None:
+        if self.lateral_axis_length_mm is None:
+            return None
+        return int(round(float(self.lateral_axis_length_mm) * self.lateral_steps_per_mm))
 
     @property
     def spindle_max_acceleration_steps_per_s2(self) -> float:
@@ -156,6 +202,16 @@ class AppConfiguration:
             return float(self.lateral_max_deceleration_mm_per_s2) * self.lateral_steps_per_mm
         return self.lateral_max_acceleration_steps_per_s2
 
+    @property
+    def lateral_start_position_mm(self) -> float:
+        """Winding start position = soft_limit_min_mm + axis_offset_mm."""
+        return (self.lateral_soft_limit_min_mm or 0.0) + self.lateral_axis_offset_mm
+
+    @property
+    def lateral_start_position_steps(self) -> int:
+        """Winding start position converted to steps."""
+        return int(round(self.lateral_start_position_mm * self.lateral_steps_per_mm))
+
 
 class ConfigurationManager:
 
@@ -191,13 +247,11 @@ class ConfigurationManager:
         configuration: AppConfiguration | None = None,
     ) -> AppConfiguration:
         config = configuration or self.active_configuration
+        self._config_file_path.parent.mkdir(parents=True, exist_ok=True)
         with self._config_file_path.open("w", encoding="utf-8") as handle:
             json.dump(asdict(config), handle, indent=2, sort_keys=True)
         self.active_configuration = config
         return config
-
-    def save_configration(self) -> AppConfiguration:
-        return self.save_configuration()
 
     def get_saved_configuration(self) -> AppConfiguration | None:
         if not self._config_file_path.exists():
@@ -208,9 +262,6 @@ class ConfigurationManager:
 
     def get_active_configuration(self) -> AppConfiguration:
         return self.active_configuration
-
-    def get_activate_configuration(self) -> AppConfiguration:
-        return self.get_active_configuration()
 
     # Return RPC Socket path
     def get_rpc_socket_path(self) -> str:
