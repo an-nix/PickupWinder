@@ -46,10 +46,13 @@ class AppConfiguration:
     # None disables the corresponding bound.
     lateral_soft_limit_min_mm: float | None = 30.0
     lateral_soft_limit_max_mm: float | None = None
+    # Physical travel length used to size the maximum homing approach move.
+    # If unset, a conservative fallback based on motor revolutions is used.
+    lateral_axis_length_mm: float | None = 130
 
     # Homing parameters
-    lateral_homing_approach_rpm: float = 15.0
-    lateral_homing_search_rpm: float = 10.0
+    lateral_homing_approach_rpm: float = 60.0
+    lateral_homing_search_rpm: float = 20.0
     lateral_homing_backoff_steps: int | None = 6144
 
     # Target speed for post-homing and explicit start-position moves.
@@ -82,6 +85,8 @@ class AppConfiguration:
             raise ValueError("lateral_target_speed must be positive")
         if self.lateral_traverse_pitch_mm <= 0.0:
             raise ValueError("lateral_traverse_pitch_mm must be positive")
+        if self.lateral_axis_length_mm is not None and self.lateral_axis_length_mm <= 0.0:
+            raise ValueError("lateral_axis_length_mm must be positive")
         if (
             self.lateral_steps_per_mm_override is not None
             and self.lateral_steps_per_mm_override <= 0.0
@@ -144,6 +149,12 @@ class AppConfiguration:
         if self.lateral_soft_limit_max_mm is None:
             return None
         return int(round(float(self.lateral_soft_limit_max_mm) * self.lateral_steps_per_mm))
+
+    @property
+    def lateral_axis_length_steps(self) -> int | None:
+        if self.lateral_axis_length_mm is None:
+            return None
+        return int(round(float(self.lateral_axis_length_mm) * self.lateral_steps_per_mm))
 
     @property
     def spindle_max_acceleration_steps_per_s2(self) -> float:

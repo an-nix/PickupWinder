@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from core.config import AppConfiguration
@@ -64,8 +65,14 @@ class LateralAxisController:
             self._config.lateral_steps_per_revolution
             * self._config.lateral_microstepping
         )
-        # Borne de sécurité : max 20 tours d'approche avant timeout.
-        max_approach_steps = steps_per_rev * 20
+        max_approach_steps = self._max_homing_approach_steps(steps_per_rev)
+        homing_timeout_s = self._estimate_homing_timeout_s(
+            approach_rpm=approach_rpm,
+            search_rpm=search_rpm,
+            backoff_steps=backoff_steps,
+            max_approach_steps=max_approach_steps,
+            steps_per_rev=steps_per_rev,
+        )
 
         self._events.publish(EventKind.HOMING_STARTED, axis_id=axis_id)
 
@@ -84,7 +91,7 @@ class LateralAxisController:
         self._move_queue.enqueue(move)
 
         try:
-            self._move_queue.wait_until_idle(timeout_s=120.0)
+            self._move_queue.wait_until_idle(timeout_s=homing_timeout_s)
         except TimeoutError as exc:
             self._events.publish(
                 EventKind.HOMING_FAILED,
@@ -107,6 +114,51 @@ class LateralAxisController:
             return False, reason
 
         return True, None
+
+    def _max_homing_approach_steps(self, steps_per_rev: int) -> int:
+        axis_length_steps = self._config.lateral_axis_length_steps
+        if axis_length_steps is None:
+            return steps_per_rev * 20
+
+        safety_margin_steps = max(steps_per_rev, int(math.ceil(axis_length_steps * 0.10)))
+        return axis_length_steps + safety_margin_steps
+
+    @staticmethod
+    def _estimate_phase_duration_s(*, steps: int, steps_per_rev: int, rpm: float) -> float:
+        if steps <= 0:
+            return 0.0
+        if rpm <= 0.0:
+            return float("inf")
+        return (steps / float(steps_per_rev)) / (rpm / 60.0)
+
+    def _estimate_homing_timeout_s(
+        self,
+        *,
+        approach_rpm: float,
+        search_rpm: float,
+        backoff_steps: int,
+        max_approach_steps: int,
+        steps_per_rev: int,
+    ) -> float:
+        backoff_rpm = max(search_rpm, approach_rpm * 0.5)
+        estimated_motion_s = (
+            self._estimate_phase_duration_s(
+                steps=max_approach_steps,
+                steps_per_rev=steps_per_rev,
+                rpm=approach_rpm,
+            )
+            + self._estimate_phase_duration_s(
+                steps=backoff_steps,
+                steps_per_rev=steps_per_rev,
+                rpm=backoff_rpm,
+            )
+            + self._estimate_phase_duration_s(
+                steps=backoff_steps * 2,
+                steps_per_rev=steps_per_rev,
+                rpm=search_rpm,
+            )
+        )
+        return max(estimated_motion_s * 3.0, 120.0)
 
     def move_to_start_position(self) -> None:
         """Move the lateral axis to the configured winding start position."""
