@@ -388,13 +388,27 @@ class MultiAxisRampStreamer:
         self._retry_batch = None
 
     def _sync_with_firmware_status(self) -> None:
-        """Synchronize stream state with the ESP32's last executed sequence."""
+        """Synchronize stream state with the ESP32's last executed sequence.
+
+        This is the only place where the stall advance tracker is seeded from
+        the firmware's current state.  Subsequent calls to
+        _update_confirmed_motion_sequence() deliberately do NOT touch these
+        fields so that the stall timer is not reset on every poll iteration.
+        """
         try:
             status = self._transport.get_status()
         except Exception:
             return
 
         self._update_confirmed_motion_sequence(status)
+
+        # Seed the stall-advance tracker from the firmware's current sequence.
+        # _update_confirmed_motion_sequence no longer does this, so we must do
+        # it explicitly here at creation time.
+        received_sequence = int(getattr(status, "last_executed_sequence", -1))
+        if received_sequence != 0xFFFF and received_sequence >= 0:
+            self._last_sequence_advance_value = received_sequence
+            self._last_sequence_advance_time = time.time()
 
     def _update_confirmed_motion_sequence(self, status) -> None:
         received_sequence = int(getattr(status, "last_executed_sequence", -1))
@@ -403,8 +417,11 @@ class MultiAxisRampStreamer:
 
         self._last_confirmed_motion_seq = received_sequence
         self._last_confirmed_sequence = received_sequence
-        self._last_sequence_advance_value = received_sequence
-        self._last_sequence_advance_time = time.time()
+        # NOTE: _last_sequence_advance_value and _last_sequence_advance_time are
+        # intentionally NOT updated here.  They are managed exclusively by
+        # _check_stall() so that calling _remove_confirmed_segments() on every
+        # poll cycle does not silently reset the stall timer when the firmware
+        # is stuck (e.g. RMT failed to restart after emergency stop).
 
     def _wait_for_request_result(self, sequence: int, send_status: Any = None) -> Any:
         try:
@@ -435,10 +452,15 @@ class MultiAxisRampStreamer:
 
     def _disable_axes(self) -> None:
         for axis_id in self._axis_ids:
-            # End each standalone move with a clean driver stop before EN goes high.
-            # Without this, the previous RMT transaction can still be coasting when
-            # the next move starts, which makes consecutive runs non-deterministic.
-            self._transport.stop_axis(axis_id)
+            if axis_id not in self._keep_enabled_axes:
+                # For axes that will be disabled, send an explicit stop before
+                # pulling EN high so the driver stops cleanly.
+                # For keep_enabled_axes (homing phases), the move already
+                # contains a built-in deceleration-to-zero profile; sending
+                # stop_axis() here would start a firmware coast/brake sequence
+                # on top of the ongoing decel, causing running_mask to stay
+                # asserted far longer than the 1-second timeout that follows.
+                self._transport.stop_axis(axis_id)
 
             stop_deadline = time.time() + 1.0
             while time.time() < stop_deadline:
@@ -512,10 +534,13 @@ class MultiAxisRampStreamer:
         if received_sequence == 0xFFFF or received_sequence < 0:
             return False
 
-        # Do not arm stall detection until the first executed segment
-        # has been confirmed by firmware.
+        # When no segment has been confirmed yet, only reset the stall timer if
+        # there is nothing in-flight.  If segments ARE in-flight but none have been
+        # confirmed, the timer keeps running so that a firmware RMT failure
+        # (kickStart not triggered after emergency stop) is caught.
         if self._last_confirmed_sequence < 0:
-            self._last_sequence_advance_time = time.time()
+            if not self._inflight:
+                self._last_sequence_advance_time = time.time()
             return False
 
         if not self._inflight:

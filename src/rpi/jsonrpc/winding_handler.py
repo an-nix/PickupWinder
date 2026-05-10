@@ -69,6 +69,8 @@ class WindingRpcHandler:
         handler.register_method("program.update", self.update_program)
         handler.register_method("program.load", self.load_program)
         handler.register_method("program.delete", self.delete_program)
+        handler.register_method("program.list_revisions", self.list_revisions)
+        handler.register_method("program.restore_revision", self.restore_revision)
         handler.register_method("winding.start_session", self.start_session)
         handler.register_method("winding.update_session", self.update_session)
         handler.register_method("winding.pause", self.pause)
@@ -201,6 +203,23 @@ class WindingRpcHandler:
             self._state.set_loaded_program(None)
         self._events.publish(EventKind.PROGRAM_DELETED, program_id=program_id)
         return {"status": "deleted", "program_id": program_id}
+
+    def list_revisions(self, program_id: str) -> dict[str, Any]:
+        """Return the backup revision list for *program_id*."""
+        try:
+            revisions = self._program_store.list_revisions(program_id)
+        except ProgramNotFoundError as exc:
+            raise JsonRpcError(-32004, str(exc)) from exc
+        return {"program_id": program_id, "revisions": revisions}
+
+    def restore_revision(self, program_id: str, revision: int) -> dict[str, Any]:
+        """Restore a backup *revision* of *program_id* as the new head."""
+        try:
+            restored = self._program_store.restore_revision(program_id, int(revision))
+        except ProgramNotFoundError as exc:
+            raise JsonRpcError(-32004, str(exc)) from exc
+        self._events.publish(EventKind.PROGRAM_SAVED, program=restored.snapshot())
+        return {"status": "restored", "program": restored.snapshot()}
 
     def start_session(self, session: dict[str, Any]) -> dict[str, Any]:
         """Start an adaptive winding session with live-controllable geometry."""

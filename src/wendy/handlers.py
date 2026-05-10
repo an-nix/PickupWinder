@@ -268,6 +268,83 @@ class ProgramQueueHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
         )
 
 
+class ProgramRevisionsHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """GET /api/programs/{id}/revisions — list backup revisions."""
+
+    def get(self, program_id: str) -> None:
+        self.rpc_result(
+            "program.list_revisions",
+            params={"program_id": unquote(program_id)},
+        )
+
+
+class ProgramRestoreHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/programs/{id}/restore/{revision} — restore a backup revision."""
+
+    def post(self, program_id: str, revision: str) -> None:
+        self.rpc_result(
+            "program.restore_revision",
+            params={"program_id": unquote(program_id), "revision": int(revision)},
+        )
+
+
+class SessionHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """GET/POST/DELETE/PATCH /api/session — adaptive winding session control."""
+
+    def get(self) -> None:
+        self.rpc_result("winding.session_status")
+
+    def post(self) -> None:
+        try:
+            body = json.loads(self.request.body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            self.write_json({"error": f"Invalid JSON: {exc}"}, status=400)
+            return
+        if not isinstance(body, dict):
+            self.write_json({"error": "Request body must be a JSON object"}, status=400)
+            return
+        session = body.get("session", body)
+        self.rpc_result("winding.start_session", params={"session": session}, success_status=202)
+
+    def delete(self) -> None:
+        mode = self.get_query_argument("mode", default="stop")
+        self.rpc_result("winding.stop", params={"mode": mode})
+
+    def patch(self) -> None:
+        try:
+            body = json.loads(self.request.body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            self.write_json({"error": f"Invalid JSON: {exc}"}, status=400)
+            return
+        if not isinstance(body, dict) or not body:
+            self.write_json({"error": "Body must be a non-empty JSON object"}, status=400)
+            return
+        self.rpc_result("winding.update_session", params=body)
+
+
+class SessionPauseHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/session/pause"""
+
+    def post(self) -> None:
+        body: dict[str, Any] = {}
+        if self.request.body:
+            try:
+                body = json.loads(self.request.body.decode("utf-8"))
+            except json.JSONDecodeError:
+                pass
+        self.rpc_result(
+            "winding.pause_session",
+            params={"pause_at_turn": body.get("pause_at_turn")},
+        )
+
+
+class SessionResumeHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/session/resume"""
+
+    def post(self) -> None:
+        self.rpc_result("winding.resume_session")
+
+
 class WindingClearFaultHandler(tornado.web.RequestHandler):
     def get(self) -> None:
         request_payload = make_request("winding.clear_fault", params=None, request_id=1)
@@ -399,9 +476,14 @@ def make_application(
             (r"/rpc", JsonRpcHttpHandler, dict(rpc_client=rpc_client)),
             (r"/ws", JsonRpcWebSocketHandler),
             (r"/api/programs", ProgramCollectionHandler),
-            (r"/api/programs/([^/]+)", ProgramItemHandler),
+            (r"/api/programs/([^/]+)/revisions", ProgramRevisionsHandler),
+            (r"/api/programs/([^/]+)/restore/(\d+)", ProgramRestoreHandler),
             (r"/api/programs/([^/]+)/load", ProgramLoadHandler),
             (r"/api/programs/([^/]+)/queue", ProgramQueueHandler),
+            (r"/api/programs/([^/]+)", ProgramItemHandler),
+            (r"/api/session/pause", SessionPauseHandler),
+            (r"/api/session/resume", SessionResumeHandler),
+            (r"/api/session", SessionHandler),
             (r"/run_axis", WindingRunAxisHandler),
             (r"/wound_run", WindingWoundRunHandler),
             (r"/stop", WindingStopHandler),

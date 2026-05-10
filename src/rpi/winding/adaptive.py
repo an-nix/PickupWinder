@@ -496,6 +496,12 @@ class AdaptiveWindingRuntime:
             if self._state == "paused":
                 self._state = "running"
 
+    def mark_homing(self) -> None:
+        """Transition to the pre-winding homing/repositioning state."""
+        with self._lock:
+            if self._state == "queued":
+                self._state = "homing"
+
     def mark_running(self) -> None:
         with self._lock:
             self._state = "running"

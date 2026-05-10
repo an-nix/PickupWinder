@@ -332,12 +332,12 @@ class AdaptiveWindingService:
             if runtime.current_window.low_mm < -_EPSILON:
                 raise ValueError("window_low_mm must be >= 0 relative to home")
 
-            if runtime.state == "queued":
-                self._state.set_engine_state(
-                    EngineState.HOMING
-                    if session_config.home_before_start
-                    else EngineState.RUNNING
-                )
+            if session_config.home_before_start:
+                runtime.mark_homing()
+                self._state.set_engine_state(EngineState.HOMING)
+            else:
+                runtime.mark_running()
+                self._state.set_engine_state(EngineState.RUNNING)
             self._publish_status(runtime)
 
             config = session_config

@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 import threading
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_BACKUP_KEEP = 5
 
 from winding.program import WindingProgram
 
@@ -122,7 +125,44 @@ class ProgramStore:
             path = self._program_path(normalized_id)
             if not path.exists():
                 raise ProgramNotFoundError(f"Unknown program_id: {normalized_id}")
-            path.unlink()
+            try:
+                existing = self._read_program(path)
+                backup_dir = self._storage_dir / ".backup"
+                backup_dir.mkdir(exist_ok=True)
+                backup_name = f"{normalized_id}_rev{existing.revision:04d}_deleted.json"
+                path.rename(backup_dir / backup_name)
+            except Exception as exc:
+                logger.warning("Could not backup before delete %s: %s", normalized_id, exc)
+                path.unlink()
+
+    def list_revisions(self, program_id: str) -> list[dict[str, Any]]:
+        """Return backup revisions for *program_id*, newest first."""
+        normalized_id = self._normalize_existing_id(program_id)
+        backup_dir = self._storage_dir / ".backup"
+        if not backup_dir.exists():
+            return []
+        revisions: list[dict[str, Any]] = []
+        for path in sorted(backup_dir.glob(f"{normalized_id}_rev[0-9]*.json"), reverse=True):
+            try:
+                revisions.append(self._summary(self._read_program(path)))
+            except Exception as exc:
+                logger.warning("Skipping unreadable backup %s: %s", path, exc)
+        return revisions
+
+    def restore_revision(self, program_id: str, revision: int) -> "WindingProgram":
+        """Restore *program_id* from backup *revision* and save as the new head."""
+        normalized_id = self._normalize_existing_id(program_id)
+        backup_path = (
+            self._storage_dir / ".backup" / f"{normalized_id}_rev{revision:04d}.json"
+        )
+        if not backup_path.exists():
+            raise ProgramNotFoundError(
+                f"Backup revision {revision} not found for program {program_id!r}"
+            )
+        with self._lock:
+            return self.save_program(
+                self._read_program(backup_path), program_id=normalized_id
+            )
 
     def _summary(self, program: WindingProgram) -> dict[str, Any]:
         snapshot = program.snapshot()
@@ -170,12 +210,36 @@ class ProgramStore:
 
     def _write_program(self, program: WindingProgram) -> None:
         self._storage_dir.mkdir(parents=True, exist_ok=True)
-        path = self._program_path(program.program_id or self._normalize_new_id(None, fallback_name=program.name))
+        path = self._program_path(
+            program.program_id or self._normalize_new_id(None, fallback_name=program.name)
+        )
+        # Backup existing revision before overwriting
+        if path.exists():
+            try:
+                existing = self._read_program(path)
+                backup_dir = self._storage_dir / ".backup"
+                backup_dir.mkdir(exist_ok=True)
+                backup_name = f"{existing.program_id}_rev{existing.revision:04d}.json"
+                shutil.copy2(path, backup_dir / backup_name)
+                self._prune_backups(backup_dir, existing.program_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not create backup for %s: %s", program.program_id, exc
+                )
         temp_path = path.with_suffix(".json.tmp")
         with temp_path.open("w", encoding="utf-8") as handle:
             json.dump(program.to_dict(), handle, indent=2, sort_keys=True)
             handle.write("\n")
         temp_path.replace(path)
+
+    def _prune_backups(self, backup_dir: Path, program_id: str) -> None:
+        """Keep only the last _BACKUP_KEEP non-deleted revisions for *program_id*."""
+        backups = sorted(backup_dir.glob(f"{program_id}_rev[0-9]*.json"))
+        for old in backups[:-_BACKUP_KEEP]:
+            try:
+                old.unlink()
+            except OSError as exc:
+                logger.warning("Could not prune backup %s: %s", old, exc)
 
     @staticmethod
     def _utc_now() -> str:
@@ -193,6 +257,10 @@ class ProgramStore:
 
     def _normalize_existing_id(self, program_id: str) -> str:
         normalized_id = self._normalize_new_id(program_id, fallback_name="program")
+        if not self._program_path(normalized_id).exists():
+            raise ProgramNotFoundError(
+                f"Unknown program_id: {program_id!r} (normalized: {normalized_id!r})"
+            )
         return normalized_id
 
     def _normalize_new_id(self, program_id: str | None, *, fallback_name: str) -> str:

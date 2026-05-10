@@ -51,13 +51,13 @@ class AppConfiguration:
     lateral_axis_length_mm: float | None = 130
 
     # Homing parameters
-    lateral_homing_approach_rpm: float = 60.0
+    lateral_homing_approach_rpm: float = 120.0
     lateral_homing_search_rpm: float = 20.0
     lateral_homing_backoff_steps: int | None = 6144
 
     # Target speed for post-homing and explicit start-position moves.
     # Unit: RPM on the lateral motor. Capped at lateral_max_rpm at runtime.
-    lateral_target_speed: float = 60.0
+    lateral_target_speed: float = 120.0
 
     # Winding start position offset applied on top of lateral_soft_limit_min_mm.
     # Defines where the axis parks after homing and before winding starts.
