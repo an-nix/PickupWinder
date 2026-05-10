@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from .trapezoidal_profile import TrapezoidalMotionProfile
 
 
-@dataclass(slots=True)
+@dataclass
 class SpindleKinematics(TrapezoidalMotionProfile):
     """Calculates absolute angular position (in turns) of the Spindle at time t."""
     target_rpm: float

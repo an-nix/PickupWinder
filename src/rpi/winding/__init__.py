@@ -1,4 +1,5 @@
 from winding.program import WindingProgram
+from winding.program_store import ProgramNotFoundError, ProgramStore
 from winding.adaptive import (
     AdaptiveChunkPlan,
     AdaptivePlanningSnapshot,
@@ -19,6 +20,8 @@ from winding.wound_move import SynchronizedMove, WoundMove
 
 __all__ = [
     "WindingProgram",
+    "ProgramNotFoundError",
+    "ProgramStore",
     "AdaptiveChunkPlan",
     "AdaptivePlanningSnapshot",
     "AdaptiveWindingMove",

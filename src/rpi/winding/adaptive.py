@@ -679,7 +679,7 @@ class AdaptiveWindingMove(SynchronizedMove):
         if turns_per_mm <= 0.0:
             raise ValueError("turns_per_mm must be positive")
 
-        self.kinematics = kinematics
+        self._kinematics = kinematics
         self.scatter = scatter
         self.window = window
         self.turns_per_mm = turns_per_mm
@@ -687,18 +687,30 @@ class AdaptiveWindingMove(SynchronizedMove):
         self.start_turns_abs = start_turns_abs
         self.start_guide_mm = start_guide_mm
         self.start_scatter_reference_mm = start_scatter_reference_mm
-        self.spindle_cfg = spindle_cfg
+        self._spindle_cfg = spindle_cfg
         self.traverse_cfg = traverse_cfg
-        self.segment_duration_s = segment_duration_s
+        self._segment_duration_s = segment_duration_s
 
-        self.spindle_turns_delta = self.kinematics.turns_at(self.kinematics.total_duration)
+        self.spindle_turns_delta = self._kinematics.turns_at(self._kinematics.total_duration)
         self.end_guide_mm = self._guide_position_mm_at(self.spindle_turns_delta)
         self.end_scatter_offset_mm = self._scatter_offset_at(self.spindle_turns_delta)
-        self._spindle_delta_steps = int(round(self.spindle_turns_delta * self.spindle_cfg.steps_per_unit))
+        self._spindle_delta_steps = int(round(self.spindle_turns_delta * self._spindle_cfg.steps_per_unit))
         self._traverse_delta_steps = int(round((self.end_guide_mm - self.start_guide_mm) * self.traverse_cfg.steps_per_unit))
 
     def _base_start_mm(self) -> float:
         return self.start_guide_mm - self.start_scatter_reference_mm
+
+    @property
+    def kinematics(self) -> SpindleKinematics:
+        return self._kinematics
+
+    @property
+    def spindle_cfg(self) -> SyncAxisConfig:
+        return self._spindle_cfg
+
+    @property
+    def segment_duration_s(self) -> float:
+        return self._segment_duration_s
 
     def _scatter_offset_at(self, delta_turns: float) -> float:
         absolute_turns = self.start_turns_abs + delta_turns

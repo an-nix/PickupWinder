@@ -41,6 +41,7 @@ class SharedState:
         self._lock = threading.RLock()
         self._engine_state = EngineState.IDLE
         self._current_program: WindingProgram | None = None
+        self._loaded_program: WindingProgram | None = None
         self._current_layer: LayerProgress | None = None
         self._completed_layers: int = 0
         self._winding_session: dict[str, Any] | None = None
@@ -74,6 +75,15 @@ class SharedState:
     def current_program(self) -> WindingProgram | None:
         with self._lock:
             return self._current_program
+
+    def set_loaded_program(self, program: WindingProgram | None) -> None:
+        with self._lock:
+            self._loaded_program = program
+
+    @property
+    def loaded_program(self) -> WindingProgram | None:
+        with self._lock:
+            return self._loaded_program
 
     # ── Layer progress ─────────────────────────────────────────────────────
 
@@ -163,6 +173,8 @@ class SharedState:
                 }
             return {
                 "engine_state": self._engine_state.name,
+                "loaded_program": self._loaded_program.snapshot()
+                                  if self._loaded_program else None,
                 "program": self._current_program.snapshot()
                            if self._current_program else None,
                 "current_layer": layer_snap,

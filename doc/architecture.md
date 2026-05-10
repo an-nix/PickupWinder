@@ -29,6 +29,7 @@ The split is deliberate. Geometry, winding strategy, retry policy, and session l
 - `src/rpi/jsonrpc/rpc_server.py`: RPC server bootstrap.
 - `src/rpi/jsonrpc/winding_handler.py`: JSON-RPC surface for the winding engine.
 - `src/rpi/winding/program.py`: high-level winding program definitions.
+- `src/rpi/winding/program_store.py`: persistent saved-program storage and versioning.
 
 ### Firmware
 
@@ -92,6 +93,7 @@ The host owns all high-level motion semantics.
 
 - planning,
 - winding geometry,
+- saved program persistence and loaded-program selection,
 - scatter behavior,
 - RPC session control,
 - flush/retry policy,
@@ -105,8 +107,19 @@ The host runtime is now split by responsibility rather than by startup order:
 - `core/engine.py` owns program orchestration and command entry points.
 - `core/lateral.py` owns traverse-specific rules.
 - `core/status.py` builds explicit status/config payloads instead of relying on generic object introspection.
+- `winding/program_store.py` persists winding programs as JSON files with stable IDs and revisions for UI/API consumption.
 - `winding/adaptive.py` defines the adaptive winding session model, chunk planner, and tracked synchronized winding move.
 - `winding/service.py` owns the live winding session thread: homing, chunk planning, controlled pause/resume, window retargeting, and progress tracking.
+
+### Program library model
+
+Saved programs follow a Moonraker-style host-owned resource model:
+
+- the program library is stored on the Raspberry Pi filesystem,
+- each program carries a `program_id`, `revision`, `created_at`, and `updated_at`,
+- `SharedState` tracks both `loaded_program` and the actively executing `program`,
+- JSON-RPC exposes `program.*` methods for list/read/save/update/load/delete,
+- Wendy exposes REST-style endpoints under `/api/programs/*` and forwards them to JSON-RPC.
 
 The winding path follows an electronic gearing model:
 
@@ -133,11 +146,8 @@ The adaptive winding path is host-driven and chunked on purpose:
 
 - The lateral axis home position is volatile and is treated as lost after a restart.
 - `HomingMove` is isolated in `motion/move.py` and executed phase-by-phase in `motion/move_queue.py`. Homing logic must not leak into `MultiAxisRampStreamer` or transport layers.
-- The host refuses lateral free-motion commands until homing completes; when homing succeeds it then performs a post-home jog to `lateral_soft_limit_min_mm + lateral_axis_offset_mm` before publishing `HOMING_COMPLETED`.
-- The maximum approach distance during homing is derived from `lateral_axis_length_mm` when configured, otherwise a conservative fallback is used.
-- The speed of that post-home jog is configured by `lateral_target_speed` on the host side.
+- The host refuses lateral free-motion commands until homing completes.
 - Soft travel limits are enforced on the host before a lateral move is enqueued, so queue serialization and SPI block delivery remain unchanged.
-- The winding start offset is persisted in host configuration and can be changed live via RPC, followed by `winding.move_to_start_position` to reposition without repeating the full homing sequence.
 - After homing, the host streamer keeps the lateral enable pin asserted across later moves; if firmware status shows the enable bit dropped, the host invalidates the stored home state.
 
 ## Firmware architecture

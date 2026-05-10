@@ -37,6 +37,7 @@ class WindingProgram:
     spindle_rpm: float
     layer_pitch_mm: float
     wire_diameter_mm: float
+    program_id: str | None = None
     bobbin_width_mm: float = 15.0
     scatter_amplitude_mm: float = 0.0
     scatter_damping_margin_mm: float = 0.0
@@ -51,9 +52,31 @@ class WindingProgram:
     home_approach_rpm: float = 100.0
     home_search_rpm: float = 20.0
     home_backoff_steps: int = 3200
+    revision: int = 1
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> WindingProgram:
+        if not isinstance(payload, dict):
+            raise ValueError("program payload must be an object")
+
+        normalized = dict(payload)
+        if "id" in normalized and "program_id" not in normalized:
+            normalized["program_id"] = normalized.pop("id")
+        normalized.pop("turns_per_mm", None)
+        normalized.pop("layer_duration_s", None)
+        return cls(**normalized)
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
 
     def validate(self) -> None:
         """Raise ValueError if any field is out of range."""
+        if not self.name.strip():
+            raise ValueError("name must not be empty")
+        if self.program_id is not None and not str(self.program_id).strip():
+            raise ValueError("program_id must not be empty when provided")
         if self.num_layers < 1:
             raise ValueError("num_layers must be >= 1")
         if self.spindle_rpm <= 0.0:
@@ -76,6 +99,8 @@ class WindingProgram:
             raise ValueError("accel_s and decel_s must be >= 0")
         if self.lateral_steps_per_mm <= 0.0:
             raise ValueError("lateral_steps_per_mm must be positive")
+        if self.revision < 1:
+            raise ValueError("revision must be >= 1")
 
     @property
     def turns_per_mm(self) -> float:
@@ -100,7 +125,8 @@ class WindingProgram:
         return total_turns / spindle_rps
 
     def snapshot(self) -> dict[str, Any]:
-        snapshot = dataclasses.asdict(self)
+        snapshot = self.to_dict()
+        snapshot["id"] = self.program_id
         snapshot["turns_per_mm"] = self.turns_per_mm
         snapshot["layer_duration_s"] = self.layer_duration_s()
         return snapshot
