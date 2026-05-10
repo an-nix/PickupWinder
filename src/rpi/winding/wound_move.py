@@ -60,12 +60,24 @@ class WoundMove(SynchronizedMove):
         if kinematics.total_duration <= 0.0:
             raise ValueError("kinematics.total_duration must be positive")
 
-        self.kinematics = kinematics
+        self._kinematics = kinematics
         self.pattern = pattern
         self.scatter = scatter
-        self.spindle_cfg = spindle_cfg
+        self._spindle_cfg = spindle_cfg
         self.traverse_cfg = traverse_cfg
-        self.segment_duration_s = segment_duration_s
+        self._segment_duration_s = segment_duration_s
+
+    @property
+    def kinematics(self) -> SpindleKinematics:
+        return self._kinematics
+
+    @property
+    def spindle_cfg(self) -> SyncAxisConfig:
+        return self._spindle_cfg
+
+    @property
+    def segment_duration_s(self) -> float:
+        return self._segment_duration_s
 
     def segments(self) -> Iterator[MultiAxisSegment]:
         gen = SynchronizedSegmentGenerator(

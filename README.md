@@ -23,6 +23,7 @@ The active host entry point is `src/rpi/winding_main.py`. The deprecated `Winder
 - `src/rpi/transport/streamer.py`: sequence-aware multi-axis streaming and backpressure logic.
 - `src/rpi/motion/`: ramp, winding, scatter, and synchronized segment generators.
 - `src/rpi/winding/adaptive.py`: adaptive winding session model, chunk planner, and tracked synchronized winding move.
+- `src/rpi/winding/program_store.py`: persistent saved-program library on the Raspberry Pi host.
 - `src/rpi/winding/service.py`: live-controllable winding session service for window, pitch, pause, and speed updates.
 - `src/esp32/src/main.cpp`: pin configuration and firmware startup.
 - `src/esp32/src/comm_interface.cpp`: SPI slave task, request dedupe, block dispatch, and status publishing.
@@ -40,6 +41,30 @@ The active host entry point is `src/rpi/winding_main.py`. The deprecated `Winder
 6. The host confirms each request through `wait_for_request_result()` because the SPI status frame is pipelined by one transfer.
 
 Adaptive winding sessions use the same SPI streaming path, but they are planned as tracked host-side chunks with live JSON-RPC controls for target RPM, winding window, pitch ratio, pause/resume, and controlled stop. The host keeps a `winding_session` snapshot in shared state so `winding.status` exposes turns completed, turns remaining, guide position, and current window.
+
+## Saved program library
+
+The Raspberry Pi host now persists winding programs in a local library, inspired by the Klipper / Moonraker / Mainsail split:
+
+- the host owns the authoritative saved-program store under `~/.local/share/pickupwinder/programs/`,
+- each program has a stable `program_id`, a monotonic `revision`, and `created_at` / `updated_at` timestamps,
+- the runtime distinguishes between a `loaded_program` (selected in the UI/API) and the currently executing `program`,
+- clients can save, list, read, update, load, queue, and delete programs through JSON-RPC and HTTP.
+
+JSON-RPC methods:
+
+- `program.list`, `program.get`, `program.save`, `program.update`, `program.load`, `program.delete`
+- `winding.submit_program` also accepts `program_id` and can queue the currently loaded program when no inline payload is provided
+
+HTTP endpoints exposed by Wendy:
+
+- `GET /api/programs`
+- `POST /api/programs`
+- `GET /api/programs/{program_id}`
+- `PUT /api/programs/{program_id}`
+- `DELETE /api/programs/{program_id}`
+- `POST /api/programs/{program_id}/load`
+- `POST /api/programs/{program_id}/queue`
 
 ## Lateral axis rules
 

@@ -10,6 +10,10 @@ logger = logging.getLogger(__name__)
 
 
 class EventKind(Enum):
+    PROGRAM_SAVED      = auto()
+    PROGRAM_UPDATED    = auto()
+    PROGRAM_LOADED     = auto()
+    PROGRAM_DELETED    = auto()
     PROGRAM_STARTED    = auto()
     PROGRAM_COMPLETED  = auto()
     PROGRAM_ABORTED    = auto()
