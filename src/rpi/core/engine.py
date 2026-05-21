@@ -15,6 +15,7 @@ from motion.move_queue import MoveQueue
 from transport.spi_transport import Esp32SpiTransport
 from winding import build_wound_move
 from winding.program import WindingProgram
+from winding.session import SessionParams
 
 
 logger = logging.getLogger(__name__)
@@ -83,7 +84,7 @@ class WindingEngine:
         self._shutdown_event = threading.Event()
         self._stop_request_event = threading.Event()
         self._program_event = threading.Event()
-        self._pending_program: WindingProgram | None = None
+        self._pending_program: tuple[WindingProgram, SessionParams] | None = None
         self._program_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._last_worker_error: str | None = None
@@ -122,7 +123,11 @@ class WindingEngine:
             )
             raise RuntimeError(self._last_worker_error)
 
-    def submit_program(self, program: WindingProgram) -> None:
+    def submit_program(
+        self,
+        program: WindingProgram,
+        params: SessionParams,
+    ) -> None:
         """
         Queue a winding program for execution.
         Raises RuntimeError if the engine is not IDLE.
@@ -133,7 +138,8 @@ class WindingEngine:
                     f"Cannot submit program: engine is {self._state.engine_state.name}"
                 )
             program.validate()
-            self._pending_program = program
+            params.validate()
+            self._pending_program = (program, params)
             self._stop_request_event.clear()
             self._program_event.set()
 
@@ -243,15 +249,15 @@ class WindingEngine:
                 self._program_event.clear()
 
                 with self._program_lock:
-                    program = self._pending_program
+                    pending = self._pending_program
                     self._pending_program = None
 
-                if program is None:
+                if pending is None:
                     continue
                 if self._shutdown_event.is_set():
                     break
 
-                self._execute_program(program)
+                self._execute_program(*pending)
         except Exception as exc:
             self._last_worker_error = str(exc)
             logger.exception("winding engine worker failed")
@@ -262,7 +268,11 @@ class WindingEngine:
                 error=str(exc),
             )
 
-    def _execute_program(self, program: WindingProgram) -> None:
+    def _execute_program(
+        self,
+        program: WindingProgram,
+        params: SessionParams,
+    ) -> None:
         """
         Execute one complete winding program.
 
@@ -278,22 +288,22 @@ class WindingEngine:
         self._stop_request_event.clear()
         self._state.set_program(program)
         self._state.set_engine_state(
-            EngineState.HOMING if program.home_before_start else EngineState.RUNNING
+            EngineState.HOMING if self._config.home_before_start else EngineState.RUNNING
         )
         self._events.publish(EventKind.PROGRAM_STARTED, program=program.snapshot())
 
-        if program.home_before_start:
+        if self._config.home_before_start:
             success, _reason = self._home_lateral_axis(
-                axis_id=program.lateral_axis_id,
-                approach_rpm=program.home_approach_rpm,
-                search_rpm=program.home_search_rpm,
-                backoff_steps=program.home_backoff_steps,
+                axis_id=self._config.lateral_axis_id,
+                approach_rpm=self._config.lateral_homing_approach_rpm,
+                search_rpm=self._config.lateral_homing_search_rpm,
+                backoff_steps=self._config.lateral_homing_backoff_steps or 6144,
             )
             if not success:
                 return
             self._state.set_engine_state(EngineState.RUNNING)
         else:
-            self._lateral.require_homed(program.lateral_axis_id)
+            self._lateral.require_homed(self._config.lateral_axis_id)
 
         for layer_index in range(program.num_layers):
             if self._stop_requested():
@@ -307,7 +317,7 @@ class WindingEngine:
                 EventKind.LAYER_STARTED, layer=layer_index, direction=direction
             )
 
-            ok = self._run_layer(program, layer_index, direction)
+            ok = self._run_layer(program, params, layer_index, direction)
             if not ok:
                 return
 
@@ -321,6 +331,7 @@ class WindingEngine:
     def _run_layer(
         self,
         program: WindingProgram,
+        params: SessionParams,
         layer_index: int,
         direction: str,
     ) -> bool:
@@ -328,40 +339,40 @@ class WindingEngine:
         Execute one winding layer: spindle + lateral move in sync.
         Returns True on completion, False on abort or fault.
         """
-        self._lateral.require_homed(program.lateral_axis_id)
+        self._lateral.require_homed(self._config.lateral_axis_id)
         reverse_lateral = direction == "reverse"
         total_turns = 2.0 * program.bobbin_width_mm * program.turns_per_mm
-        target_rps = program.spindle_rpm / 60.0
+        target_rps = params.spindle_rpm / 60.0
         duration_s = adjust_duration_for_ramp_deficit(
             total_turns=total_turns,
             target_rps=target_rps,
-            accel_s=program.accel_s,
-            decel_s=program.decel_s,
+            accel_s=self._config.spindle_accel_s,
+            decel_s=self._config.spindle_decel_s,
         )
-        cruise_s = max(duration_s - program.accel_s - program.decel_s, 0.0)
+        cruise_s = max(duration_s - self._config.spindle_accel_s - self._config.spindle_decel_s, 0.0)
 
         move = build_wound_move(
             name=f"layer_{layer_index}",
-            spindle_rpm=program.spindle_rpm,
-            accel_s=program.accel_s,
+            spindle_rpm=params.spindle_rpm,
+            accel_s=self._config.spindle_accel_s,
             cruise_s=cruise_s,
-            decel_s=program.decel_s,
+            decel_s=self._config.spindle_decel_s,
             bobbin_width_mm=program.bobbin_width_mm,
             turns_per_mm=program.turns_per_mm,
             scatter_amplitude_mm=program.scatter_amplitude_mm,
             scatter_damping_margin_mm=program.scatter_damping_margin_mm,
             scatter_freq1=program.scatter_freq1,
             scatter_freq2=program.scatter_freq2,
-            spindle_axis_id=program.spindle_axis_id,
+            spindle_axis_id=self._config.spindle_axis_id,
             spindle_steps_per_rev=(
                 self._config.spindle_steps_per_revolution
                 * self._config.spindle_microstepping
             ),
-            lateral_axis_id=program.lateral_axis_id,
+            lateral_axis_id=self._config.lateral_axis_id,
             lateral_steps_per_mm=self._config.lateral_steps_per_mm,
             lateral_reverse=reverse_lateral,
         )
-        estimated_duration_s = program.layer_duration_s()
+        estimated_duration_s = program.layer_duration_s(params.spindle_rpm)
         wait_timeout_s = min(max(estimated_duration_s * 3.0, 60.0), 300.0)
         self._move_queue.enqueue(move)
         self._wait_for_move_queue(timeout_s=wait_timeout_s)
@@ -372,7 +383,7 @@ class WindingEngine:
             self._events.publish(
                 EventKind.ENDSTOP_TRIGGERED,
                 layer=layer_index,
-                axis=program.lateral_axis_id,
+                axis=self._config.lateral_axis_id,
             )
             return False
 

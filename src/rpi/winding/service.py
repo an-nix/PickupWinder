@@ -15,10 +15,11 @@ from motion.spindle_kinematics import SpindleKinematics
 from winding.adaptive import (
     AdaptiveWindingMove,
     AdaptiveWindingRuntime,
-    AdaptiveWindingSessionConfig,
     WindingWindow,
     plan_next_chunk,
 )
+from winding.program import WindingProgram
+from winding.session import SessionParams
 from winding.synchronized_segment_generator import SyncAxisConfig
 
 
@@ -117,9 +118,27 @@ class AdaptiveWindingService:
         self._active_session: AdaptiveWindingRuntime | None = None
         self._last_worker_error: str | None = None
 
-    def start_session(self, session: AdaptiveWindingSessionConfig) -> dict[str, Any]:
-        session.validate()
-        self._validate_window(session.window)
+    def start_session(
+        self,
+        program: WindingProgram,
+        params: SessionParams,
+    ) -> dict[str, Any]:
+        params.validate()
+        program.validate()
+
+        # Resolve window bounds: use caller-provided values or fall back to
+        # the configured lateral start position and bobbin width.
+        window_low_mm = (
+            float(params.window_low_mm)
+            if params.window_low_mm is not None
+            else self._config.lateral_start_position_mm
+        )
+        window_high_mm = (
+            float(params.window_high_mm)
+            if params.window_high_mm is not None
+            else window_low_mm + program.bobbin_width_mm
+        )
+        self._validate_window(WindingWindow(window_low_mm, window_high_mm))
 
         with self._lock:
             if self._worker is not None and self._worker.is_alive():
@@ -134,7 +153,10 @@ class AdaptiveWindingService:
                 * self._config.spindle_microstepping
             )
             runtime = AdaptiveWindingRuntime(
-                session,
+                program,
+                params,
+                window_low_mm=window_low_mm,
+                window_high_mm=window_high_mm,
                 spindle_steps_per_rev=spindle_steps_per_rev,
                 lateral_steps_per_mm=self._config.lateral_steps_per_mm,
             )
@@ -156,13 +178,10 @@ class AdaptiveWindingService:
     def update_session(
         self,
         *,
-        target_rpm: float | None = None,
+        spindle_rpm: float | None = None,
+        total_turns: float | None = None,
         window_low_mm: float | None = None,
         window_high_mm: float | None = None,
-        wire_diameter_mm: float | None = None,
-        wire_awg: int | None = None,
-        turns_per_mm: float | None = None,
-        pitch_factor: float | None = None,
     ) -> dict[str, Any]:
         runtime = self._require_session()
         current_window = runtime.current_window
@@ -172,13 +191,10 @@ class AdaptiveWindingService:
         )
         self._validate_window(new_window)
         runtime.update_controls(
-            target_rpm=target_rpm,
+            spindle_rpm=spindle_rpm,
+            total_turns=total_turns,
             window_low_mm=window_low_mm,
             window_high_mm=window_high_mm,
-            wire_diameter_mm=wire_diameter_mm,
-            wire_awg=wire_awg,
-            turns_per_mm=turns_per_mm,
-            pitch_factor=pitch_factor,
         )
         self._publish_status(runtime)
         self._wake_event.set()
@@ -325,14 +341,13 @@ class AdaptiveWindingService:
         )
 
         try:
-            session_config = runtime.session_config()
-            if session_config.target_rpm <= 0.0:
-                raise ValueError("Adaptive winding session must start with target_rpm > 0")
+            if runtime.target_rpm <= 0.0:
+                raise ValueError("Adaptive winding session must start with spindle_rpm > 0")
 
             if runtime.current_window.low_mm < -_EPSILON:
                 raise ValueError("window_low_mm must be >= 0 relative to home")
 
-            if session_config.home_before_start:
+            if self._config.home_before_start:
                 runtime.mark_homing()
                 self._state.set_engine_state(EngineState.HOMING)
             else:
@@ -340,13 +355,12 @@ class AdaptiveWindingService:
                 self._state.set_engine_state(EngineState.RUNNING)
             self._publish_status(runtime)
 
-            config = session_config
-            if config.home_before_start:
+            if self._config.home_before_start:
                 success, reason = self._lateral.home(
                     axis_id=self._config.lateral_axis_id,
-                    approach_rpm=config.home_approach_rpm,
-                    search_rpm=config.home_search_rpm,
-                    backoff_steps=config.home_backoff_steps,
+                    approach_rpm=self._config.lateral_homing_approach_rpm,
+                    search_rpm=self._config.lateral_homing_search_rpm,
+                    backoff_steps=self._config.lateral_homing_backoff_steps or 6144,
                 )
                 if not success:
                     raise RuntimeError(reason or "lateral homing failed")
@@ -507,7 +521,7 @@ class AdaptiveWindingService:
                 self._config.lateral_steps_per_revolution
                 * self._config.lateral_microstepping
             ),
-            rpm=min(max(runtime.snapshot()["target_rpm"], 60.0), float(self._config.lateral_max_rpm)),
+            rpm=min(max(runtime.target_rpm, 60.0), float(self._config.lateral_max_rpm)),
             reverse=(delta_steps < 0),
         )
         self._move_queue.enqueue(move)

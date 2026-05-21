@@ -24,12 +24,16 @@ from winding.program_store import ProgramStore
 logger = logging.getLogger(__name__)
 
 
+def _default_data_dir() -> Path:
+    return Path.home() / "pickupwinder_data"
+
+
 def _default_config_file_path() -> Path:
-    return Path.home() / ".config" / "pickupwinder" / "config.json"
+    return _default_data_dir() / "config.json"
 
 
 def _default_program_store_dir() -> Path:
-    return Path.home() / ".local" / "share" / "pickupwinder" / "programs"
+    return _default_data_dir() / "programs"
 
 
 def _parse_spi_device(device_path: str) -> tuple[int, int]:
@@ -86,6 +90,7 @@ class WinderApplication:
         self,
         config: AppConfiguration | None = None,
         config_file_path: str | Path | None = None,
+        program_store_dir: str | Path | None = None,
     ) -> None:
         resolved_config_path = (
             Path(config_file_path)
@@ -100,7 +105,12 @@ class WinderApplication:
             self.config_manager.active_configuration = self.config
 
         self.transport = _create_transport(self.config)
-        self.program_store = ProgramStore(_default_program_store_dir())
+        resolved_program_store_dir = (
+            Path(program_store_dir)
+            if program_store_dir is not None
+            else _default_program_store_dir()
+        )
+        self.program_store = ProgramStore(resolved_program_store_dir)
         self.shared_state = SharedState(axis_states=_build_axis_states(self.config))
         self.event_bus = EventBus()
 

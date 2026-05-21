@@ -36,6 +36,23 @@ class StreamAxisConfig:
     ring_send_threshold: int = 1
 
 
+@dataclass
+class StreamerTuning:
+    """Tunable behavioural constants for ``MultiAxisRampStreamer``.
+
+    Inject via the ``tuning`` parameter to override defaults in tests
+    without subclassing.
+    """
+
+    segment_queue_depth: int = 128
+    prefill_max_buffer_time_s: float = 0.50
+    min_buffer_time_s: float = 0.06
+    max_buffer_time_s: float = 0.25
+    min_segment_time_s: float = 0.002
+    max_segment_time_s: float = 0.005
+    step_ring_capacity: int = 4096
+
+
 class MultiAxisRampStreamer:
     """Minimal deterministic SPI motion streamer.
 
@@ -117,6 +134,7 @@ class MultiAxisRampStreamer:
         send_log_path: str | None = None,
         keep_enabled_axes: set[int] | None = None,
         initial_segments_dropped: int = 0,
+        tuning: StreamerTuning | None = None,
     ):
         self._initialize_streamer_state(
             transport=transport,
@@ -132,6 +150,7 @@ class MultiAxisRampStreamer:
             explicit_target_hz=None,
             keep_enabled_axes=keep_enabled_axes,
             initial_segments_dropped=initial_segments_dropped,
+            tuning=tuning,
         )
 
     @classmethod
@@ -148,6 +167,7 @@ class MultiAxisRampStreamer:
         stall_timeout_s: float = 5.0,
         keep_enabled_axes: set[int] | None = None,
         initial_segments_dropped: int = 0,
+        tuning: StreamerTuning | None = None,
     ) -> "MultiAxisRampStreamer":
         """Build a streamer from explicit axis IDs and a known target frequency.
 
@@ -178,6 +198,7 @@ class MultiAxisRampStreamer:
             explicit_target_hz=target_hz,
             keep_enabled_axes=keep_enabled_axes,
             initial_segments_dropped=initial_segments_dropped,
+            tuning=tuning,
         )
         return streamer
 
@@ -197,7 +218,9 @@ class MultiAxisRampStreamer:
         explicit_target_hz: float | None,
         keep_enabled_axes: set[int] | None,
         initial_segments_dropped: int,
+        tuning: StreamerTuning | None = None,
     ) -> None:
+        self._tuning = tuning if tuning is not None else StreamerTuning()
         self._transport = transport
         self._poll_interval_s = poll_interval_s
         self._print_every = max(print_every, 1)
@@ -213,7 +236,7 @@ class MultiAxisRampStreamer:
 
         self._axis_configs = axis_configs
         self._axis_ids = list(axis_ids)
-        self._segment_duration_s = max(self.MIN_SEGMENT_TIME_S, min(self.MAX_SEGMENT_TIME_S, segment_duration_s))
+        self._segment_duration_s = max(self._tuning.min_segment_time_s, min(self._tuning.max_segment_time_s, segment_duration_s))
         if explicit_target_hz is None:
             max_hz = 0.0
             if self._axis_configs:
@@ -221,7 +244,7 @@ class MultiAxisRampStreamer:
             self._target_buffer_time_s = self._safe_buffer_time_s(target_buffer_time_s, max_hz)
         else:
             self._target_buffer_time_s = self._safe_buffer_time_s(target_buffer_time_s, explicit_target_hz)
-        self._min_buffer_time_s = min(self.MIN_BUFFER_TIME_S, self._target_buffer_time_s * 0.5)
+        self._min_buffer_time_s = min(self._tuning.min_buffer_time_s, self._target_buffer_time_s * 0.5)
 
         self._inflight: deque[tuple[MultiAxisSegment, int]] = deque()
         self._buffered_time_s = 0.0
@@ -297,7 +320,7 @@ class MultiAxisRampStreamer:
 
     def _planner_queue_free(self, status) -> int:
         """Return planner_queue_free from status, defaulting to full if absent."""
-        return int(getattr(status, "planner_queue_free", self.SEGMENT_QUEUE_DEPTH))
+        return int(getattr(status, "planner_queue_free", self._tuning.segment_queue_depth))
 
     def _check_planner_pressure(self, status) -> bool:
         """Return True (blocked) when the ESP32 planner buffer already has enough lookahead.
@@ -311,7 +334,7 @@ class MultiAxisRampStreamer:
           - 'planner recovered' when planner_queue_free recovers above 64
         """
         pqf = self._planner_queue_free(status)
-        self._buffered_segments = self.SEGMENT_QUEUE_DEPTH - pqf
+        self._buffered_segments = self._tuning.segment_queue_depth - pqf
 
         if pqf < 16 and not self._planner_under_pressure:
             self._planner_under_pressure = True
@@ -375,7 +398,7 @@ class MultiAxisRampStreamer:
         # only ~25ms but the planner segment_queue holds 512ms, so capping by
         # ring capacity forced the pipeline to 60ms — too small to sustain
         # required_lookahead=32 against SPI failure bursts.
-        return max(self.MIN_BUFFER_TIME_S, min(self.MAX_BUFFER_TIME_S, requested_time_s))
+        return max(self._tuning.min_buffer_time_s, min(self._tuning.max_buffer_time_s, requested_time_s))
 
     def set_generator(self, generator: SegmentProducer | Iterator[MultiAxisSegment]) -> None:
         """Override the segment generator for this streamer.
@@ -639,7 +662,7 @@ class MultiAxisRampStreamer:
         # always ~75% empty — a false positive that flooded the log.
         ring_nearly_empty = bool(
             tracked_ring_free
-            and min(tracked_ring_free) >= self.STEP_RING_CAPACITY - 256
+            and min(tracked_ring_free) >= self._tuning.step_ring_capacity - 256
         )
         no_sequence_progress_s = time.time() - self._last_sequence_advance_time
         if (
@@ -860,7 +883,7 @@ class MultiAxisRampStreamer:
         if self._prefilling:
             effective_buffer_target_s = max(
                 self._target_buffer_time_s,
-                self.PREFILL_MAX_BUFFER_TIME_S,
+                self._tuning.prefill_max_buffer_time_s,
             )
 
         planner_deficit = self._planner_buffer_deficit(status)
@@ -1018,7 +1041,7 @@ class MultiAxisRampStreamer:
         ring_free = getattr(status, "ring_free_slots", ())
         return any(
             0 <= axis_id < len(ring_free)
-            and int(ring_free[axis_id]) >= self.STEP_RING_CAPACITY - 256
+            and int(ring_free[axis_id]) >= self._tuning.step_ring_capacity - 256
             for axis_id in self._axis_ids
         )
 

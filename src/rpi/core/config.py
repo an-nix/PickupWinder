@@ -25,6 +25,11 @@ class AppConfiguration:
     spindle_max_acceleration_rpm: float | None = 500
     # Unit: RPM/s (revolutions per minute lost per second).
     spindle_max_deceleration_rpm: float | None = None
+    # Ramp durations for classic winding layers (seconds).
+    # These control how quickly the spindle accelerates/decelerates on each
+    # layer; they are fixed machine parameters, not per-program values.
+    spindle_accel_s: float = 0.5
+    spindle_decel_s: float = 0.5
 
     lateral_axis_id: int = 1
     lateral_steps_per_revolution: int = 96
@@ -51,6 +56,7 @@ class AppConfiguration:
     lateral_axis_length_mm: float | None = 130
 
     # Homing parameters
+    home_before_start: bool = True
     lateral_homing_approach_rpm: float = 120.0
     lateral_homing_search_rpm: float = 20.0
     lateral_homing_backoff_steps: int | None = 6144
@@ -85,6 +91,10 @@ class AppConfiguration:
             raise ValueError("lateral_target_speed must be positive")
         if self.lateral_traverse_pitch_mm <= 0.0:
             raise ValueError("lateral_traverse_pitch_mm must be positive")
+        if self.spindle_accel_s < 0.0:
+            raise ValueError("spindle_accel_s must be >= 0")
+        if self.spindle_decel_s < 0.0:
+            raise ValueError("spindle_decel_s must be >= 0")
         if self.lateral_axis_length_mm is not None and self.lateral_axis_length_mm <= 0.0:
             raise ValueError("lateral_axis_length_mm must be positive")
         if (

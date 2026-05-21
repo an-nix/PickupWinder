@@ -8,7 +8,9 @@ from typing import Any, Iterator
 from motion.segment_generator import AxisStepProfile, StepProfileSegmentGenerator
 from motion.spindle_kinematics import SpindleKinematics
 from transport.messages import MultiAxisSegment
+from winding.program import WindingProgram
 from winding.scatter_engine import ScatterEngine
+from winding.session import SessionParams
 from winding.synchronized_segment_generator import SyncAxisConfig
 from winding.wound_move import SynchronizedMove
 
@@ -85,90 +87,6 @@ class WindingWindow:
 
     def position_for_fraction(self, fraction: float) -> float:
         return self.low_mm + (_clamp(fraction, 0.0, 1.0) * self.width_mm)
-
-
-@dataclass(slots=True)
-class AdaptiveWindingSessionConfig:
-    name: str
-    total_turns: float
-    target_rpm: float
-    window_low_mm: float
-    window_high_mm: float
-    wire_diameter_mm: float | None = None
-    wire_awg: int | None = None
-    turns_per_mm_override: float | None = None
-    pitch_factor: float = 1.0
-    scatter_amplitude_mm: float = 0.0
-    scatter_damping_margin_mm: float = 0.0
-    scatter_freq1: float = 1.0
-    scatter_freq2: float = 1.618
-    spindle_axis_id: int = 0
-    lateral_axis_id: int = 1
-    home_before_start: bool = True
-    home_approach_rpm: float = 100.0
-    home_search_rpm: float = 20.0
-    home_backoff_steps: int = 3200
-    chunk_time_s: float = 0.25
-
-    def validate(self) -> None:
-        if not self.name.strip():
-            raise ValueError("name must not be empty")
-        if self.total_turns <= 0.0:
-            raise ValueError("total_turns must be positive")
-        if self.target_rpm < 0.0:
-            raise ValueError("target_rpm must be >= 0")
-        if self.pitch_factor <= 0.0:
-            raise ValueError("pitch_factor must be positive")
-        if self.chunk_time_s <= 0.0:
-            raise ValueError("chunk_time_s must be positive")
-        if self.turns_per_mm <= 0.0:
-            raise ValueError("turns_per_mm must be positive")
-        WindingWindow(self.window_low_mm, self.window_high_mm)
-
-    @property
-    def window(self) -> WindingWindow:
-        return WindingWindow(self.window_low_mm, self.window_high_mm)
-
-    @property
-    def resolved_wire_diameter_mm(self) -> float:
-        if self.wire_diameter_mm is not None:
-            if self.wire_diameter_mm <= 0.0:
-                raise ValueError("wire_diameter_mm must be positive")
-            return float(self.wire_diameter_mm)
-        if self.wire_awg is not None:
-            return awg_to_diameter_mm(int(self.wire_awg))
-        raise ValueError("Either wire_diameter_mm or wire_awg must be provided")
-
-    @property
-    def turns_per_mm(self) -> float:
-        if self.turns_per_mm_override is not None:
-            return float(self.turns_per_mm_override)
-        return 1.0 / (self.resolved_wire_diameter_mm * self.pitch_factor)
-
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "total_turns": self.total_turns,
-            "target_rpm": self.target_rpm,
-            "window_low_mm": self.window_low_mm,
-            "window_high_mm": self.window_high_mm,
-            "window_width_mm": self.window.width_mm,
-            "wire_diameter_mm": self.resolved_wire_diameter_mm,
-            "wire_awg": self.wire_awg,
-            "turns_per_mm": self.turns_per_mm,
-            "pitch_factor": self.pitch_factor,
-            "scatter_amplitude_mm": self.scatter_amplitude_mm,
-            "scatter_damping_margin_mm": self.scatter_damping_margin_mm,
-            "scatter_freq1": self.scatter_freq1,
-            "scatter_freq2": self.scatter_freq2,
-            "spindle_axis_id": self.spindle_axis_id,
-            "lateral_axis_id": self.lateral_axis_id,
-            "home_before_start": self.home_before_start,
-            "home_approach_rpm": self.home_approach_rpm,
-            "home_search_rpm": self.home_search_rpm,
-            "home_backoff_steps": self.home_backoff_steps,
-            "chunk_time_s": self.chunk_time_s,
-        }
 
 
 @dataclass(slots=True)
@@ -369,19 +287,28 @@ class AdaptiveWindingRuntime:
 
     def __init__(
         self,
-        session: AdaptiveWindingSessionConfig,
+        program: WindingProgram,
+        params: SessionParams,
         *,
+        window_low_mm: float,
+        window_high_mm: float,
         spindle_steps_per_rev: int,
         lateral_steps_per_mm: float,
     ) -> None:
-        session.validate()
         self._lock = threading.RLock()
-        self._session = session
-        self._window = session.window
-        self._wire_diameter_mm = session.resolved_wire_diameter_mm
-        self._turns_per_mm_override = session.turns_per_mm_override
-        self._pitch_factor = session.pitch_factor
-        self._target_rpm = session.target_rpm
+        self._program = program
+        self._params = params
+        self._total_turns: float = (
+            float(params.total_turns)
+            if params.total_turns is not None
+            else program.total_turns()
+        )
+        self._chunk_time_s: float = params.chunk_time_s
+        self._window = WindingWindow(window_low_mm, window_high_mm)
+        self._wire_diameter_mm: float = program.wire_diameter_mm
+        self._turns_per_mm_override: float | None = None
+        self._pitch_factor: float = program.layer_pitch_mm / program.wire_diameter_mm
+        self._target_rpm: float = params.spindle_rpm
         self._current_turns = 0.0
         self._current_rpm = 0.0
         self._current_guide_mm = self._window.low_mm
@@ -451,25 +378,26 @@ class AdaptiveWindingRuntime:
     def build_scatter_engine(self) -> ScatterEngine:
         with self._lock:
             return ScatterEngine(
-                amplitude_mm=self._session.scatter_amplitude_mm,
-                freq1=self._session.scatter_freq1,
-                freq2=self._session.scatter_freq2,
-                damping_margin_mm=self._session.scatter_damping_margin_mm,
+                amplitude_mm=self._program.scatter_amplitude_mm,
+                freq1=self._program.scatter_freq1,
+                freq2=self._program.scatter_freq2,
+                damping_margin_mm=self._program.scatter_damping_margin_mm,
             )
 
-    def session_config(self) -> AdaptiveWindingSessionConfig:
+    @property
+    def target_rpm(self) -> float:
         with self._lock:
-            return self._session
+            return self._target_rpm
 
     def planning_snapshot(self) -> AdaptivePlanningSnapshot:
         with self._lock:
             return AdaptivePlanningSnapshot(
-                total_turns=self._session.total_turns,
+                total_turns=self._total_turns,
                 completed_turns=self._current_turns,
                 current_rpm=self._current_rpm,
                 target_rpm=self._target_rpm,
                 turns_per_mm=self.turns_per_mm,
-                chunk_time_s=self._session.chunk_time_s,
+                chunk_time_s=self._chunk_time_s,
                 current_guide_mm=self._current_guide_mm,
                 direction_sign=self._direction_sign,
                 window=WindingWindow(self._window.low_mm, self._window.high_mm),
@@ -537,40 +465,23 @@ class AdaptiveWindingRuntime:
     def update_controls(
         self,
         *,
-        target_rpm: float | None = None,
+        spindle_rpm: float | None = None,
+        total_turns: float | None = None,
         window_low_mm: float | None = None,
         window_high_mm: float | None = None,
-        wire_diameter_mm: float | None = None,
-        wire_awg: int | None = None,
-        turns_per_mm: float | None = None,
-        pitch_factor: float | None = None,
     ) -> None:
         with self._lock:
-            if target_rpm is not None:
-                if target_rpm < 0.0:
-                    raise ValueError("target_rpm must be >= 0")
-                self._target_rpm = float(target_rpm)
+            if spindle_rpm is not None:
+                if spindle_rpm < 0.0:
+                    raise ValueError("spindle_rpm must be >= 0")
+                self._target_rpm = float(spindle_rpm)
                 if self._target_rpm <= _EPSILON:
                     self._pause_requested = True
 
-            if turns_per_mm is not None:
-                if turns_per_mm <= 0.0:
-                    raise ValueError("turns_per_mm must be positive")
-                self._turns_per_mm_override = float(turns_per_mm)
-
-            if pitch_factor is not None:
-                if pitch_factor <= 0.0:
-                    raise ValueError("pitch_factor must be positive")
-                self._pitch_factor = float(pitch_factor)
-
-            if wire_diameter_mm is not None:
-                if wire_diameter_mm <= 0.0:
-                    raise ValueError("wire_diameter_mm must be positive")
-                self._wire_diameter_mm = float(wire_diameter_mm)
-                self._turns_per_mm_override = None
-            elif wire_awg is not None:
-                self._wire_diameter_mm = awg_to_diameter_mm(int(wire_awg))
-                self._turns_per_mm_override = None
+            if total_turns is not None:
+                if total_turns <= 0.0:
+                    raise ValueError("total_turns must be positive")
+                self._total_turns = float(total_turns)
 
             if window_low_mm is not None or window_high_mm is not None:
                 old_window = self._window
@@ -604,7 +515,7 @@ class AdaptiveWindingRuntime:
     def apply_completed_move(self, plan: AdaptiveChunkPlan, move: "AdaptiveWindingMove") -> None:
         with self._lock:
             self._current_turns = min(
-                self._session.total_turns,
+                self._total_turns,
                 self._current_turns + move.spindle_turns_delta,
             )
             self._current_rpm = plan.end_rpm
@@ -620,25 +531,14 @@ class AdaptiveWindingRuntime:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            remaining_turns = max(self._session.total_turns - self._current_turns, 0.0)
-            config_snapshot = self._session.snapshot()
-            config_snapshot.update(
-                {
-                    "target_rpm": self._target_rpm,
-                    "window_low_mm": self._window.low_mm,
-                    "window_high_mm": self._window.high_mm,
-                    "window_width_mm": self._window.width_mm,
-                    "wire_diameter_mm": self._wire_diameter_mm,
-                    "turns_per_mm": self.turns_per_mm,
-                    "pitch_factor": self._pitch_factor,
-                }
-            )
+            remaining_turns = max(self._total_turns - self._current_turns, 0.0)
             return {
                 "state": self._state,
-                "name": self._session.name,
-                "target_turns": self._session.total_turns,
+                "name": self._program.name,
+                "target_turns": self._total_turns,
                 "completed_turns": self._current_turns,
                 "remaining_turns": remaining_turns,
+                "spindle_rpm": self._target_rpm,
                 "target_rpm": self._target_rpm,
                 "current_rpm": self._current_rpm,
                 "direction": "forward" if self._direction_sign > 0 else "reverse",
@@ -648,6 +548,12 @@ class AdaptiveWindingRuntime:
                 "window_width_mm": self._window.width_mm,
                 "turns_per_mm": self.turns_per_mm,
                 "wire_diameter_mm": self._wire_diameter_mm,
+                "pitch_factor": self._pitch_factor,
+                "chunk_time_s": self._chunk_time_s,
+                "scatter_amplitude_mm": self._program.scatter_amplitude_mm,
+                "scatter_damping_margin_mm": self._program.scatter_damping_margin_mm,
+                "scatter_freq1": self._program.scatter_freq1,
+                "scatter_freq2": self._program.scatter_freq2,
                 "pause_requested": self._pause_requested,
                 "pause_at_turn": self._pause_at_turn,
                 "stop_requested": self._stop_requested,
@@ -656,7 +562,6 @@ class AdaptiveWindingRuntime:
                 "spindle_steps_remaining": int(round(remaining_turns * self._spindle_steps_per_rev)),
                 "lateral_position_steps": int(round(self._current_guide_mm * self._lateral_steps_per_mm)),
                 "last_error": self._last_error,
-                "config": config_snapshot,
             }
 
 

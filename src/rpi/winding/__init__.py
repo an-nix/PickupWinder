@@ -1,11 +1,11 @@
 from winding.program import WindingProgram
 from winding.program_store import ProgramNotFoundError, ProgramStore
+from winding.session import SessionParams
 from winding.adaptive import (
     AdaptiveChunkPlan,
     AdaptivePlanningSnapshot,
     AdaptiveWindingMove,
     AdaptiveWindingRuntime,
-    AdaptiveWindingSessionConfig,
     WindingWindow,
     awg_to_diameter_mm,
     plan_next_chunk,
@@ -22,11 +22,11 @@ __all__ = [
     "WindingProgram",
     "ProgramNotFoundError",
     "ProgramStore",
+    "SessionParams",
     "AdaptiveChunkPlan",
     "AdaptivePlanningSnapshot",
     "AdaptiveWindingMove",
     "AdaptiveWindingRuntime",
-    "AdaptiveWindingSessionConfig",
     "WindingPattern",
     "WindingWindow",
     "ScatterEngine",

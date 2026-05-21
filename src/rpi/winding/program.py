@@ -2,41 +2,28 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from winding.adaptive import AdaptiveWindingSessionConfig
+from typing import Any
 
 
 @dataclass(slots=True)
 class WindingProgram:
     """
-    Describes a complete winding operation.
+    Persistent recipe describing WHAT to wind.
 
-    The engine executes layers in order, alternating traverse direction
-    on each layer. Each layer consists of:
-      - spindle rotating at spindle_rpm for the duration of the layer
-      - lateral axis traversing layer_pitch_mm * num_passes_per_layer
-        at a speed derived from spindle_rpm and the wire geometry
+    Machine settings (axis IDs, ramp times, homing parameters) and
+    execution context (spindle RPM) live in ``AppConfiguration`` and
+    ``SessionParams`` respectively — not here.
 
     Fields:
       name              Human-readable program name
       num_layers        Total number of winding layers
-      spindle_rpm       Spindle rotation speed in RPM
       layer_pitch_mm    Lateral advance per spindle revolution (mm)
-      wire_diameter_mm  Wire diameter used to compute traverse speed
-      accel_s           Acceleration time for both axes (seconds)
-      decel_s           Deceleration time for both axes (seconds)
-      spindle_axis_id   Axis ID of the spindle (default 0)
-      lateral_axis_id   Axis ID of the lateral traverse (default 1)
-      home_before_start     If True, home lateral axis before starting
-      home_approach_rpm     RPM for homing approach phase
-      home_search_rpm       RPM for homing search phase
-      home_backoff_steps    Steps to back off after first endstop contact
+      wire_diameter_mm  Wire diameter (mm)
+      bobbin_width_mm   Physical winding window width (mm)
+      scatter_*         Scatter-winding parameters
     """
     name: str
     num_layers: int
-    spindle_rpm: float
     layer_pitch_mm: float
     wire_diameter_mm: float
     program_id: str | None = None
@@ -45,14 +32,6 @@ class WindingProgram:
     scatter_damping_margin_mm: float = 0.0
     scatter_freq1: float = 1.0
     scatter_freq2: float = 1.618
-    accel_s: float = 0.5
-    decel_s: float = 0.5
-    spindle_axis_id: int = 0
-    lateral_axis_id: int = 1
-    home_before_start: bool = True
-    home_approach_rpm: float = 100.0
-    home_search_rpm: float = 20.0
-    home_backoff_steps: int = 3200
     revision: int = 1
     created_at: str | None = None
     updated_at: str | None = None
@@ -87,8 +66,6 @@ class WindingProgram:
             raise ValueError("program_id must not be empty when provided")
         if self.num_layers < 1:
             raise ValueError("num_layers must be >= 1")
-        if self.spindle_rpm <= 0.0:
-            raise ValueError("spindle_rpm must be positive")
         if self.layer_pitch_mm <= 0.0:
             raise ValueError("layer_pitch_mm must be positive")
         if self.wire_diameter_mm <= 0.0:
@@ -103,8 +80,6 @@ class WindingProgram:
             raise ValueError("scatter_freq1 must be positive")
         if self.scatter_freq2 <= 0.0:
             raise ValueError("scatter_freq2 must be positive")
-        if self.accel_s < 0.0 or self.decel_s < 0.0:
-            raise ValueError("accel_s and decel_s must be >= 0")
         if self.revision < 1:
             raise ValueError("revision must be >= 1")
 
@@ -112,19 +87,18 @@ class WindingProgram:
     def turns_per_mm(self) -> float:
         return 1.0 / self.layer_pitch_mm
 
-    def layer_duration_s(self) -> float:
+    def layer_duration_s(self, spindle_rpm: float) -> float:
         """
-        Duration of a full winding layer in seconds.
+        Duration of a full winding layer in seconds at the given RPM.
 
-        A single layer is defined as a forward/backward pass across the bobbin
-        width. The total spindle turns required for one layer are:
+        A single layer is a forward/backward pass across the bobbin width:
 
             total_turns = 2 * bobbin_width_mm * turns_per_mm
 
-        The layer duration is therefore the total spindle turns divided by
+        The layer duration is the total spindle turns divided by
         spindle revolutions per second.
         """
-        spindle_rps = self.spindle_rpm / 60.0
+        spindle_rps = spindle_rpm / 60.0
         if spindle_rps <= 0.0:
             raise ValueError("spindle_rpm must be positive to compute layer duration")
         total_turns = 2.0 * self.bobbin_width_mm * self.turns_per_mm
@@ -134,54 +108,9 @@ class WindingProgram:
         """Return the total spindle turns for the full classic program."""
         return float(self.num_layers) * 2.0 * self.bobbin_width_mm * self.turns_per_mm
 
-    def to_adaptive_session(
-        self,
-        *,
-        start_position_mm: float,
-        total_turns: float | None = None,
-        chunk_time_s: float | None = None,
-    ) -> "AdaptiveWindingSessionConfig":
-        """Translate a classic program into an adaptive session config.
-
-        The adaptive session uses the configured post-home start position as the
-        lower edge of the winding window so the physical start point matches the
-        classic program path.
-        """
-        from winding.adaptive import AdaptiveWindingSessionConfig
-
-        self.validate()
-        resolved_total_turns = self.total_turns() if total_turns is None else float(total_turns)
-        if resolved_total_turns <= 0.0:
-            raise ValueError("total_turns must be positive")
-
-        resolved_chunk_time_s = 0.25 if chunk_time_s is None else float(chunk_time_s)
-        if resolved_chunk_time_s <= 0.0:
-            raise ValueError("chunk_time_s must be positive")
-
-        return AdaptiveWindingSessionConfig(
-            name=self.name,
-            total_turns=resolved_total_turns,
-            target_rpm=self.spindle_rpm,
-            window_low_mm=float(start_position_mm),
-            window_high_mm=float(start_position_mm) + self.bobbin_width_mm,
-            wire_diameter_mm=self.wire_diameter_mm,
-            pitch_factor=self.layer_pitch_mm / self.wire_diameter_mm,
-            scatter_amplitude_mm=self.scatter_amplitude_mm,
-            scatter_damping_margin_mm=self.scatter_damping_margin_mm,
-            scatter_freq1=self.scatter_freq1,
-            scatter_freq2=self.scatter_freq2,
-            spindle_axis_id=self.spindle_axis_id,
-            lateral_axis_id=self.lateral_axis_id,
-            home_before_start=self.home_before_start,
-            home_approach_rpm=self.home_approach_rpm,
-            home_search_rpm=self.home_search_rpm,
-            home_backoff_steps=self.home_backoff_steps,
-            chunk_time_s=resolved_chunk_time_s,
-        )
-
     def snapshot(self) -> dict[str, Any]:
         snapshot = self.to_dict()
         snapshot["id"] = self.program_id
         snapshot["turns_per_mm"] = self.turns_per_mm
-        snapshot["layer_duration_s"] = self.layer_duration_s()
+        snapshot["total_turns"] = self.total_turns()
         return snapshot

@@ -20,6 +20,22 @@ from rpc import (
 )
 
 
+_RPC_CLIENT_ERROR_CODES: frozenset[int] = frozenset((-32700, -32600, -32601, -32602))
+
+
+def _rpc_error_to_http(code: int) -> int:
+    """Map a JSON-RPC error code to an HTTP status code.
+
+    Client errors (-32700/-32600/-32601/-32602) → 400/404.
+    Server errors (-32000 to -32099) and application errors → 502.
+    """
+    if code == -32601:
+        return 404
+    if code in _RPC_CLIENT_ERROR_CODES:
+        return 400
+    return 502
+
+
 class JsonRpcHandlerMixin:
     def write_jsonrpc_response(self, response: dict[str, Any]) -> None:
         self.set_header("Content-Type", "application/json")
@@ -43,12 +59,17 @@ class JsonRpcHandlerMixin:
     ) -> bool:
         request_id = int(time.time() * 1000)
         request_payload = make_request(method, params=params, request_id=request_id)
-        response = self.application.rpc_client.send_raw(request_payload)
+        try:
+            response = self.application.rpc_client.send_raw(request_payload)
+        except RuntimeError as exc:
+            self.write_json({"error": f"RPC transport error: {exc}"}, status=503)
+            return False
         if response is None:
             self.set_status(204)
             return False
         if "error" in response:
-            self.write_json(response, status=502)
+            _code = response["error"].get("code", -32000) if isinstance(response.get("error"), dict) else -32000
+            self.write_json(response, status=_rpc_error_to_http(_code))
             return False
         self.write_json(response.get("result", response), status=success_status)
         return True

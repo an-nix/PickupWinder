@@ -28,7 +28,8 @@ The split is deliberate. Geometry, winding strategy, retry policy, and session l
 - `src/rpi/transport/streamer.py`: buffered segment streaming and in-flight retirement.
 - `src/rpi/jsonrpc/rpc_server.py`: RPC server bootstrap.
 - `src/rpi/jsonrpc/winding_handler.py`: JSON-RPC surface for the winding engine.
-- `src/rpi/winding/program.py`: high-level winding program definitions.
+- `src/rpi/winding/program.py`: `WindingProgram` — persistent geometry recipe (num_layers, wire_diameter_mm, bobbin_width_mm, scatter params).
+- `src/rpi/winding/session.py`: `SessionParams` — transient execution context (spindle_rpm, optional live overrides).
 - `src/rpi/winding/program_store.py`: persistent saved-program storage and versioning.
 
 ### Firmware
@@ -108,7 +109,7 @@ The host runtime is now split by responsibility rather than by startup order:
 - `core/lateral.py` owns traverse-specific rules.
 - `core/status.py` builds explicit status/config payloads instead of relying on generic object introspection.
 - `winding/program_store.py` persists winding programs as JSON files with stable IDs and revisions for UI/API consumption.
-- `winding/adaptive.py` defines the adaptive winding session model, chunk planner, and tracked synchronized winding move.
+- `winding/adaptive.py` defines `AdaptiveWindingRuntime`, which takes `(WindingProgram, SessionParams)` plus resolved window bounds, and owns the chunk planner and tracked synchronized winding move.
 - `winding/service.py` owns the live winding session thread: homing, chunk planning, controlled pause/resume, window retargeting, and progress tracking.
 
 ### Program library model
