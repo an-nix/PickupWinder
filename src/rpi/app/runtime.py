@@ -136,6 +136,7 @@ class WinderApplication:
             shared_state=self.shared_state,
             move_queue=self.move_queue,
             lateral_controller=self.lateral_controller,
+            commands=self.commands,
             event_bus=self.event_bus,
             config=self.config,
         )
@@ -153,7 +154,11 @@ class WinderApplication:
             transport_diagnostics_provider=self.transport.transport_diagnostics,
             engine_health_provider=self.engine.health_status,
             adaptive_health_provider=self.adaptive_winding.health_status,
-            rpc_health_provider=lambda: self.rpc_server.health_status(),
+            rpc_health_provider=lambda: (
+                self.rpc_server.health_status()
+                if hasattr(self, "rpc_server")
+                else {"status": "initializing"}
+            ),
         )
         self.rpc_handler = SystemRpcHandler(status_service=self.status_service)
         WindingRpcHandler(

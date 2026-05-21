@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, fields
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from winding.adaptive import AdaptiveWindingSessionConfig
 
 
 @dataclass(slots=True)
@@ -26,7 +29,6 @@ class WindingProgram:
       decel_s           Deceleration time for both axes (seconds)
       spindle_axis_id   Axis ID of the spindle (default 0)
       lateral_axis_id   Axis ID of the lateral traverse (default 1)
-      lateral_steps_per_mm  Steps per mm on the lateral axis
       home_before_start     If True, home lateral axis before starting
       home_approach_rpm     RPM for homing approach phase
       home_search_rpm       RPM for homing search phase
@@ -47,7 +49,6 @@ class WindingProgram:
     decel_s: float = 0.5
     spindle_axis_id: int = 0
     lateral_axis_id: int = 1
-    lateral_steps_per_mm: float = 200.0 * 32.0 / 8.0  # 200step * 32µstep / 8mm/rev
     home_before_start: bool = True
     home_approach_rpm: float = 100.0
     home_search_rpm: float = 20.0
@@ -61,11 +62,18 @@ class WindingProgram:
         if not isinstance(payload, dict):
             raise ValueError("program payload must be an object")
 
-        normalized = dict(payload)
-        if "id" in normalized and "program_id" not in normalized:
-            normalized["program_id"] = normalized.pop("id")
-        normalized.pop("turns_per_mm", None)
-        normalized.pop("layer_duration_s", None)
+        known_fields = {f.name for f in fields(cls)}
+        normalized: dict[str, Any] = {}
+
+        for key, value in payload.items():
+            # Alias RPC: "id" → "program_id"
+            if key == "id":
+                normalized["program_id"] = value
+            elif key in known_fields:
+                normalized[key] = value
+            # Computed, obsolete, or hardware-only fields are silently ignored:
+            # turns_per_mm, layer_duration_s, lateral_steps_per_mm
+
         return cls(**normalized)
 
     def to_dict(self) -> dict[str, Any]:
@@ -97,8 +105,6 @@ class WindingProgram:
             raise ValueError("scatter_freq2 must be positive")
         if self.accel_s < 0.0 or self.decel_s < 0.0:
             raise ValueError("accel_s and decel_s must be >= 0")
-        if self.lateral_steps_per_mm <= 0.0:
-            raise ValueError("lateral_steps_per_mm must be positive")
         if self.revision < 1:
             raise ValueError("revision must be >= 1")
 
@@ -123,6 +129,55 @@ class WindingProgram:
             raise ValueError("spindle_rpm must be positive to compute layer duration")
         total_turns = 2.0 * self.bobbin_width_mm * self.turns_per_mm
         return total_turns / spindle_rps
+
+    def total_turns(self) -> float:
+        """Return the total spindle turns for the full classic program."""
+        return float(self.num_layers) * 2.0 * self.bobbin_width_mm * self.turns_per_mm
+
+    def to_adaptive_session(
+        self,
+        *,
+        start_position_mm: float,
+        total_turns: float | None = None,
+        chunk_time_s: float | None = None,
+    ) -> "AdaptiveWindingSessionConfig":
+        """Translate a classic program into an adaptive session config.
+
+        The adaptive session uses the configured post-home start position as the
+        lower edge of the winding window so the physical start point matches the
+        classic program path.
+        """
+        from winding.adaptive import AdaptiveWindingSessionConfig
+
+        self.validate()
+        resolved_total_turns = self.total_turns() if total_turns is None else float(total_turns)
+        if resolved_total_turns <= 0.0:
+            raise ValueError("total_turns must be positive")
+
+        resolved_chunk_time_s = 0.25 if chunk_time_s is None else float(chunk_time_s)
+        if resolved_chunk_time_s <= 0.0:
+            raise ValueError("chunk_time_s must be positive")
+
+        return AdaptiveWindingSessionConfig(
+            name=self.name,
+            total_turns=resolved_total_turns,
+            target_rpm=self.spindle_rpm,
+            window_low_mm=float(start_position_mm),
+            window_high_mm=float(start_position_mm) + self.bobbin_width_mm,
+            wire_diameter_mm=self.wire_diameter_mm,
+            pitch_factor=self.layer_pitch_mm / self.wire_diameter_mm,
+            scatter_amplitude_mm=self.scatter_amplitude_mm,
+            scatter_damping_margin_mm=self.scatter_damping_margin_mm,
+            scatter_freq1=self.scatter_freq1,
+            scatter_freq2=self.scatter_freq2,
+            spindle_axis_id=self.spindle_axis_id,
+            lateral_axis_id=self.lateral_axis_id,
+            home_before_start=self.home_before_start,
+            home_approach_rpm=self.home_approach_rpm,
+            home_search_rpm=self.home_search_rpm,
+            home_backoff_steps=self.home_backoff_steps,
+            chunk_time_s=resolved_chunk_time_s,
+        )
 
     def snapshot(self) -> dict[str, Any]:
         snapshot = self.to_dict()

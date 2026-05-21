@@ -10,11 +10,10 @@ from core.coordinator import MotionStopPlan
 from core.events import EventBus, EventKind
 from core.lateral import LateralAxisController
 from core.shared_state import EngineState, SharedState
-from motion import SpindleKinematics
 from core.command_service import MotionCommandService, adjust_duration_for_ramp_deficit
 from motion.move_queue import MoveQueue
 from transport.spi_transport import Esp32SpiTransport
-from winding import ScatterEngine, SyncAxisConfig, WindingPattern, WoundMove
+from winding import build_wound_move
 from winding.program import WindingProgram
 
 
@@ -48,6 +47,7 @@ class WindingEngine:
         shared_state: SharedState,
         move_queue: MoveQueue | None = None,
         lateral_controller: LateralAxisController | None = None,
+        commands: MotionCommandService | None = None,
         event_bus: EventBus,
         config: AppConfiguration | None = None,
     ) -> None:
@@ -72,7 +72,7 @@ class WindingEngine:
         self._lateral = resolved_lateral
         self._events = event_bus
         self._config = resolved_config
-        self._commands = MotionCommandService(
+        self._commands = commands or MotionCommandService(
             transport=transport,
             shared_state=shared_state,
             move_queue=resolved_move_queue,
@@ -340,40 +340,31 @@ class WindingEngine:
         )
         cruise_s = max(duration_s - program.accel_s - program.decel_s, 0.0)
 
-        move = WoundMove(
+        move = build_wound_move(
             name=f"layer_{layer_index}",
-            kinematics=SpindleKinematics(
-                target_rpm=program.spindle_rpm,
-                start_rpm=0.0,
-                accel_s=program.accel_s,
-                cruise_s=cruise_s,
-                decel_s=program.decel_s,
+            spindle_rpm=program.spindle_rpm,
+            accel_s=program.accel_s,
+            cruise_s=cruise_s,
+            decel_s=program.decel_s,
+            bobbin_width_mm=program.bobbin_width_mm,
+            turns_per_mm=program.turns_per_mm,
+            scatter_amplitude_mm=program.scatter_amplitude_mm,
+            scatter_damping_margin_mm=program.scatter_damping_margin_mm,
+            scatter_freq1=program.scatter_freq1,
+            scatter_freq2=program.scatter_freq2,
+            spindle_axis_id=program.spindle_axis_id,
+            spindle_steps_per_rev=(
+                self._config.spindle_steps_per_revolution
+                * self._config.spindle_microstepping
             ),
-            pattern=WindingPattern(
-                bobbin_width_mm=program.bobbin_width_mm,
-                turns_per_mm=program.turns_per_mm,
-            ),
-            scatter=ScatterEngine(
-                amplitude_mm=program.scatter_amplitude_mm,
-                freq1=program.scatter_freq1,
-                freq2=program.scatter_freq2,
-                damping_margin_mm=program.scatter_damping_margin_mm,
-            ),
-            spindle_cfg=SyncAxisConfig(
-                axis_index=program.spindle_axis_id,
-                steps_per_unit=(
-                    self._config.spindle_steps_per_revolution
-                    * self._config.spindle_microstepping
-                ),
-            ),
-            traverse_cfg=SyncAxisConfig(
-                axis_index=program.lateral_axis_id,
-                steps_per_unit=program.lateral_steps_per_mm,
-                reverse_direction=reverse_lateral,
-            ),
+            lateral_axis_id=program.lateral_axis_id,
+            lateral_steps_per_mm=self._config.lateral_steps_per_mm,
+            lateral_reverse=reverse_lateral,
         )
+        estimated_duration_s = program.layer_duration_s()
+        wait_timeout_s = min(max(estimated_duration_s * 3.0, 60.0), 300.0)
         self._move_queue.enqueue(move)
-        self._wait_for_move_queue()
+        self._wait_for_move_queue(timeout_s=wait_timeout_s)
 
         if move.aborted_by_endstop:
             msg = f"Endstop triggered during layer {layer_index}"

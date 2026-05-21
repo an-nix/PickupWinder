@@ -11,6 +11,30 @@ Compatibility guarantee
 -----------------------
 All ``winding.*`` method *names* and their JSON parameter contracts are
 unchanged.  Callers (e.g. ``run_axis_rpc.py``) require no modification.
+
+Three winding execution paths
+------------------------------
+1. PROGRAMME (classique) — recommandé pour la production
+   Appel  : winding.submit_program
+   Config : WindingProgram (couches, largeur bobine, vitesse fixe)
+   Moteur : WindingEngine._execute_program()
+   Move   : WoundMove par couche
+
+2. SESSION ADAPTATIVE — recommandé pour le bobinage interactif
+   Appel  : winding.start_session / winding.update_session
+   Config : AdaptiveWindingSessionConfig (fenêtre, turns total, ajustable live)
+   Moteur : AdaptiveWindingService._run_session()
+   Move   : AdaptiveWindingMove par chunk (~250 ms)
+
+    Variante simple depuis un programme existant
+    Appel  : winding.start_session_from_program
+    Config : WindingProgram résolu puis converti côté host
+
+3. WOUND_RUN (bas niveau) — outil de diagnostic / dev
+   Appel  : winding.wound_run
+   Config : paramètres directs RPC (pas de WindingProgram)
+   Moteur : MotionCommandService.wound_run() (bypass state machine)
+   Move   : WoundMove unique
 """
 
 from __future__ import annotations
@@ -72,9 +96,13 @@ class WindingRpcHandler:
         handler.register_method("program.list_revisions", self.list_revisions)
         handler.register_method("program.restore_revision", self.restore_revision)
         handler.register_method("winding.start_session", self.start_session)
+        handler.register_method(
+            "winding.start_session_from_program",
+            self.start_session_from_program,
+        )
         handler.register_method("winding.update_session", self.update_session)
         handler.register_method("winding.pause", self.pause)
-        handler.register_method("winding.pause_session", self.pause_session)
+        # winding.pause_session is a deprecated alias — not registered; use winding.pause
         handler.register_method("winding.resume_session", self.resume_session)
         handler.register_method("winding.session_status", self.session_status)
         handler.register_method("winding.stop", self.stop)
@@ -229,6 +257,44 @@ class WindingRpcHandler:
         snapshot = self._adaptive_winding.start_session(config)
         return {"status": "started", "session": snapshot}
 
+    def start_session_from_program(
+        self,
+        program: dict[str, Any] | None = None,
+        program_id: str | None = None,
+        load: bool = True,
+        total_turns: float | None = None,
+        chunk_time_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Start an adaptive session directly from a classic program.
+
+        This is the convenience bridge for UI/clients: select a stored program,
+        then let the host derive the adaptive window and session geometry.
+        """
+        try:
+            resolved_program = self._resolve_program(program=program, program_id=program_id)
+            if load:
+                self._state.set_loaded_program(resolved_program)
+                self._events.publish(
+                    EventKind.PROGRAM_LOADED,
+                    program=resolved_program.snapshot(),
+                )
+            session_config = resolved_program.to_adaptive_session(
+                start_position_mm=self._config.lateral_start_position_mm,
+                total_turns=total_turns,
+                chunk_time_s=chunk_time_s,
+            )
+        except ProgramNotFoundError as exc:
+            raise JsonRpcError(-32004, str(exc)) from exc
+        except ValueError as exc:
+            raise JsonRpcError(-32602, str(exc)) from exc
+
+        snapshot = self._adaptive_winding.start_session(session_config)
+        return {
+            "status": "started",
+            "program": resolved_program.snapshot(),
+            "session": snapshot,
+        }
+
     def _coerce_program(self, program: dict[str, Any]) -> WindingProgram:
         if not isinstance(program, dict):
             raise JsonRpcError(-32602, "Invalid params: expected program object")
@@ -265,7 +331,17 @@ class WindingRpcHandler:
         return result
 
     def pause_session(self, pause_at_turn: float | None = None) -> dict[str, Any]:
-        """Request a controlled pause for the adaptive winding session."""
+        """Deprecated alias for ``winding.pause``. Use ``winding.pause`` instead.
+
+        This method is intentionally **not** registered as a JSON-RPC endpoint.
+        It is kept for internal call compatibility only.
+        """
+        import warnings
+        warnings.warn(
+            "winding.pause_session is deprecated; use winding.pause instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.pause(pause_at_turn=pause_at_turn)
 
     def resume_session(self, _params: Any | None = None) -> dict[str, Any]:

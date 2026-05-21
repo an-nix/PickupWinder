@@ -96,3 +96,61 @@ class WoundMove(SynchronizedMove):
     @property
     def axis_ids(self) -> list[int]:
         return [self.spindle_cfg.axis_index, self.traverse_cfg.axis_index]
+
+
+def build_wound_move(
+    name: str,
+    *,
+    spindle_rpm: float,
+    accel_s: float,
+    cruise_s: float,
+    decel_s: float,
+    bobbin_width_mm: float,
+    turns_per_mm: float,
+    scatter_amplitude_mm: float = 0.0,
+    scatter_damping_margin_mm: float = 0.0,
+    scatter_freq1: float = 1.0,
+    scatter_freq2: float = 1.618,
+    spindle_axis_id: int = 0,
+    spindle_steps_per_rev: float,
+    spindle_reverse: bool = False,
+    lateral_axis_id: int = 1,
+    lateral_steps_per_mm: float,
+    lateral_reverse: bool = False,
+) -> WoundMove:
+    """Centralised factory for synchronised winding moves (Electronic Gearing).
+
+    Both ``WindingEngine._run_layer()`` and ``MotionCommandService.wound_run()``
+    delegate to this function so that ``WoundMove`` construction stays DRY and
+    ``lateral_steps_per_mm`` is always sourced from ``AppConfiguration``.
+    """
+    return WoundMove(
+        name=name,
+        kinematics=SpindleKinematics(
+            target_rpm=spindle_rpm,
+            start_rpm=0.0,
+            accel_s=accel_s,
+            cruise_s=cruise_s,
+            decel_s=decel_s,
+        ),
+        pattern=WindingPattern(
+            bobbin_width_mm=bobbin_width_mm,
+            turns_per_mm=turns_per_mm,
+        ),
+        scatter=ScatterEngine(
+            amplitude_mm=scatter_amplitude_mm,
+            freq1=scatter_freq1,
+            freq2=scatter_freq2,
+            damping_margin_mm=scatter_damping_margin_mm,
+        ),
+        spindle_cfg=SyncAxisConfig(
+            axis_index=spindle_axis_id,
+            steps_per_unit=spindle_steps_per_rev,
+            reverse_direction=spindle_reverse,
+        ),
+        traverse_cfg=SyncAxisConfig(
+            axis_index=lateral_axis_id,
+            steps_per_unit=lateral_steps_per_mm,
+            reverse_direction=lateral_reverse,
+        ),
+    )
