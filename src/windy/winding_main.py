@@ -16,8 +16,6 @@ logger = logging.getLogger("main")
 
 def main() -> None:
     app = WinderApplication()
-    app.start()
-    logger.info("Winding controller started")
 
     def _shutdown(sig, frame) -> None:
         logger.info("Shutdown requested (signal %s)", sig)
@@ -26,6 +24,9 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
+
+    app.start()
+    logger.info("Winding controller started")
 
     while True:
         time.sleep(1.0)

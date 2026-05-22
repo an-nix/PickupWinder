@@ -45,9 +45,10 @@ class LateralAxisController:
         approach_rpm: float,
         search_rpm: float,
         backoff_steps: int,
+        target_mm: float | None = None,
     ) -> tuple[bool, str | None]:
         """
-                Execute lateral homing then move to the configured winding start position.
+                Execute lateral homing then move to the winding start position.
 
         The MoveQueue handles the full event-driven sequence:
           1. Fast approach with endstop armed → waits for endstop_hit_mask event
@@ -55,8 +56,8 @@ class LateralAxisController:
           3. Slow search with endstop armed → waits for endstop_hit_mask event
           4. mark_homed(0) on AxisState
 
-                On success, a post-home jog moves the axis to:
-                    lateral_soft_limit_min_mm + lateral_axis_offset_mm
+                On success, a post-home jog moves the axis to *target_mm* when given,
+                or to ``lateral_soft_limit_min_mm + lateral_axis_offset_mm`` by default.
 
                 Returns (True, None) on success, (False, reason) on failure.
         """
@@ -106,7 +107,7 @@ class LateralAxisController:
             return False, reason
 
         try:
-            self.move_to_start_position()
+            self.move_to_start_position(target_mm)
         except Exception as exc:
             reason = f"post-home positioning failed: {exc}"
             logger.exception("lateral axis: move_to_start_position failed")
@@ -160,8 +161,12 @@ class LateralAxisController:
         )
         return max(estimated_motion_s * 3.0, 120.0)
 
-    def move_to_start_position(self) -> None:
-        """Move the lateral axis to the configured winding start position."""
+    def move_to_start_position(self, target_mm: float | None = None) -> None:
+        """Move the lateral axis to the winding start position.
+
+        If *target_mm* is given, that absolute position is used. Otherwise the
+        config default (``soft_limit_min_mm + lateral_axis_offset_mm``) applies.
+        """
         axis_state = self.require_homed()
         current_steps = axis_state.position_steps
         if current_steps is None:
@@ -169,18 +174,21 @@ class LateralAxisController:
                 "Lateral position unknown — cannot move to start position"
             )
 
-        target_steps = self._config.lateral_start_position_steps
+        effective_target_mm = (
+            target_mm if target_mm is not None else self._config.lateral_start_position_mm
+        )
+        target_steps = int(round(effective_target_mm * self._config.lateral_steps_per_mm))
         delta_steps = target_steps - current_steps
 
         if delta_steps == 0:
             logger.info(
                 "lateral axis already at start position (%.3f mm) — no move needed",
-                self._config.lateral_start_position_mm,
+                effective_target_mm,
             )
             self._events.publish(
                 EventKind.HOMING_COMPLETED,
                 axis_id=self._config.lateral_axis_id,
-                position_mm=self._config.lateral_start_position_mm,
+                position_mm=effective_target_mm,
             )
             return
 
@@ -205,11 +213,8 @@ class LateralAxisController:
         )
 
         logger.info(
-            "lateral axis: moving to start position %.3f mm "
-            "(soft_limit_min=%.3f mm + offset=%.3f mm), delta=%+d steps",
-            self._config.lateral_start_position_mm,
-            self._config.lateral_soft_limit_min_mm or 0.0,
-            self._config.lateral_axis_offset_mm,
+            "lateral axis: moving to start position %.3f mm, delta=%+d steps",
+            effective_target_mm,
             delta_steps,
         )
 
@@ -227,7 +232,7 @@ class LateralAxisController:
         self._events.publish(
             EventKind.HOMING_COMPLETED,
             axis_id=self._config.lateral_axis_id,
-            position_mm=self._config.lateral_start_position_mm,
+            position_mm=effective_target_mm,
         )
 
     def require_axis_state(self, axis_id: int) -> AxisState:

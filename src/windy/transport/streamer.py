@@ -95,13 +95,16 @@ class MultiAxisRampStreamer:
                 Thresholds are intentionally conservative for the 10..49 steps/segment
                 band because this is where the current 1500 RPM winding workload lands:
 
-                    < 10  steps → 64 segments (low speed, long host/firmware latency ratio)
-                    < 50  steps → 48 segments (current winding regime, needs more margin)
+                    < 10  steps → 48 segments (low speed, long host/firmware latency ratio)
+                    < 50  steps → 32 segments (current winding regime, needs more margin)
                     >= 50 steps → 32 segments (large segments already amortize comm latency)
 
         The source of truth is the firmware planner queue depth, not the host's
         buffered_time estimate. A deeper lookahead here reduces sensitivity to
         one or two transient SPI retries or short frames.
+
+        Note: ``_prefill()`` uses a more conservative value of 64 for the
+        ``< 10`` steps/segment tier so the ring is seeded deeper on startup.
         """
         if steps_per_segment < 10:
             return 48

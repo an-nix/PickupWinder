@@ -11,26 +11,36 @@ The split is deliberate. Geometry, winding strategy, retry policy, and session l
 
 ### Host
 
-- `src/rpi/winding_main.py`: process entry point.
-- `src/rpi/app/runtime.py`: runtime composition and lifecycle.
-- `src/rpi/core/engine.py`: runtime orchestration for moves and winding programs.
-- `src/rpi/core/lateral.py`: traverse-axis homing, home-state, and soft-limit rules.
-- `src/rpi/core/status.py`: explicit snapshots for `winder.*` and `winding.status`.
-- `src/rpi/motion/move_queue.py`: move serialization, flush coordination, sequence seeding.
-- `src/rpi/motion/segment_generator.py`: host-side segment generation utilities.
-- `src/rpi/motion/multi_axis_segment_generator.py`: general multi-axis move generator.
-- `src/rpi/motion/synchronized_segment_generator.py`: winding-specific synchronized bobbin/traverse generator.
-- `src/rpi/motion/spindle_kinematics.py`: bobbin kinematics over time.
-- `src/rpi/motion/winding_pattern.py`: traverse position from bobbin turns.
-- `src/rpi/motion/scatter_engine.py`: non-harmonic scatter offset with edge damping.
-- `src/rpi/transport/messages.py`: Python protocol mirror and wrap-aware sequence helpers.
-- `src/rpi/transport/spi_transport.py`: SPI frame transport and request confirmation.
-- `src/rpi/transport/streamer.py`: buffered segment streaming and in-flight retirement.
-- `src/rpi/jsonrpc/rpc_server.py`: RPC server bootstrap.
-- `src/rpi/jsonrpc/winding_handler.py`: JSON-RPC surface for the winding engine.
-- `src/rpi/winding/program.py`: `WindingProgram` — persistent geometry recipe (num_layers, wire_diameter_mm, bobbin_width_mm, scatter params).
-- `src/rpi/winding/session.py`: `SessionParams` — transient execution context (spindle_rpm, optional live overrides).
-- `src/rpi/winding/program_store.py`: persistent saved-program storage and versioning.
+- `src/windy/winding_main.py`: process entry point.
+- `src/windy/app/runtime.py`: runtime composition and lifecycle.
+- `src/windy/core/engine.py`: runtime orchestration for moves and winding programs.
+- `src/windy/core/command_service.py`: move building and queuing for all motion types (jog, homing, wound run).
+- `src/windy/core/coordinator.py`: centralized stop / fault coordination (`MotionCoordinator`, `MotionStopPlan`).
+- `src/windy/core/lateral.py`: traverse-axis homing, home-state, and soft-limit rules.
+- `src/windy/core/status.py`: explicit snapshots for `winder.*` and `winding.status`.
+- `src/windy/core/shared_state.py`: thread-safe shared runtime state (RLock, EngineState enum, session snapshot).
+- `src/windy/motion/move_queue.py`: move serialization, flush coordination, sequence seeding.
+- `src/windy/motion/move.py`: move hierarchy — `RampMove`, `HomingMove`, `CompositeMove`.
+- `src/windy/motion/segment_generator.py`: host-side segment generation utilities.
+- `src/windy/motion/multi_axis_segment_generator.py`: general multi-axis move generator.
+- `src/windy/motion/spindle_kinematics.py`: bobbin kinematics over time.
+- `src/windy/winding/synchronized_segment_generator.py`: winding-specific synchronized bobbin/traverse generator.
+- `src/windy/winding/winding_pattern.py`: traverse position from bobbin turns.
+- `src/windy/winding/scatter_engine.py`: non-harmonic scatter offset with edge damping.
+- `src/windy/transport/messages.py`: Python protocol mirror and wrap-aware sequence helpers.
+- `src/windy/transport/spi_transport.py`: SPI frame transport and request confirmation.
+- `src/windy/transport/streamer.py`: buffered segment streaming and in-flight retirement.
+- `src/windy/jsonrpc/rpc_server.py`: RPC server bootstrap.
+- `src/windy/jsonrpc/winding_handler.py`: JSON-RPC composition facade — instantiates the four sub-handlers below.
+- `src/windy/jsonrpc/execution_handler.py`: `winding.submit_program`, `wound_run`, `flush_until`, `status`, `axis_state`, `stop`.
+- `src/windy/jsonrpc/machine_handler.py`: `winding.jog`, `run_axis`, `home_lateral`, `move_lateral_mm`, `set_axis_offset`, `clear_fault`, `arm/disarm_endstop`.
+- `src/windy/jsonrpc/session_handler.py`: `winding.start_session`, `update_session`, `pause`, `resume_session`, `session_status`.
+- `src/windy/jsonrpc/program_handler.py`: `program.list`, `program.get`, `program.save`, `program.update`, `program.load`, `program.delete`.
+- `src/windy/winding/program.py`: `WindingProgram` — persistent geometry recipe (num_layers, wire_diameter_mm, bobbin_width_mm, scatter params).
+- `src/windy/winding/session.py`: `SessionParams` — transient execution context (spindle_rpm, optional live overrides).
+- `src/windy/winding/service.py`: `AdaptiveWindingService` — live winding session thread (homing, chunk planning, pause/resume, progress tracking).
+- `src/windy/winding/adaptive.py`: `AdaptiveWindingRuntime` — per-chunk planner and synchronized winding move owner.
+- `src/windy/winding/program_store.py`: persistent saved-program storage and versioning.
 
 ### Firmware
 
@@ -179,7 +189,7 @@ These invariants are intentional and should not be weakened:
 - `pushExpandedBlock()` does not start the driver.
 - `executeConstantRateBlock()` does not start the driver.
 - `kickStart()` runs once after a drain batch, not per segment.
-- Host-side streamer maintains a deeper planner queue at high speed: 32-segment lookahead and up to 200ms of buffered motion.
+- Host-side streamer maintains a speed-adaptive planner queue lookahead at high speed: 32 to 48 segments depending on steps-per-segment tier, and up to ~200 ms of buffered motion.
 - Coast mode emits pause symbols on transient starvation instead of stopping the RMT.
 - Coast pauses are timed to the last step interval so the ISR does not flood the executor at high speed.
 

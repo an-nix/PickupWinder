@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -15,15 +16,23 @@ class WindingProgram:
     ``SessionParams`` respectively — not here.
 
     Fields:
-      name              Human-readable program name
-      num_layers        Total number of winding layers
-      layer_pitch_mm    Lateral advance per spindle revolution (mm)
-      wire_diameter_mm  Wire diameter (mm)
-      bobbin_width_mm   Physical winding window width (mm)
-      scatter_*         Scatter-winding parameters
+      name                       Human-readable program name
+      target_turns               Total number of spindle turns to wind. The number of
+                                 layer passes (num_layers) is derived automatically from
+                                 bobbin_width_mm and layer_pitch_mm.
+      layer_pitch_mm             Lateral advance per spindle revolution (mm)
+      wire_diameter_mm           Wire diameter (mm)
+      bobbin_width_mm            Interior winding window width (mm), i.e. flatwork-to-flatwork
+      flatwork_thickness_mm      Bobbin flatwork/cheek thickness (mm). Added to soft_limit_min to
+                                 compute winding start before applying start clearance.
+      window_start_clearance_mm  Safety gap between flatwork top and first wire turn (mm).
+                                 Overrides AppConfiguration.window_start_clearance_mm when set.
+      window_end_clearance_mm    Safety reduction at the far end of the winding window (mm).
+                                 Overrides AppConfiguration.window_end_clearance_mm when set.
+      scatter_*                  Scatter-winding parameters
     """
     name: str
-    num_layers: int
+    target_turns: int
     layer_pitch_mm: float
     wire_diameter_mm: float
     program_id: str | None = None
@@ -35,6 +44,9 @@ class WindingProgram:
     revision: int = 1
     created_at: str | None = None
     updated_at: str | None = None
+    flatwork_thickness_mm: float = 0.0
+    window_start_clearance_mm: float | None = None
+    window_end_clearance_mm: float | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> WindingProgram:
@@ -51,7 +63,8 @@ class WindingProgram:
             elif key in known_fields:
                 normalized[key] = value
             # Computed, obsolete, or hardware-only fields are silently ignored:
-            # turns_per_mm, layer_duration_s, lateral_steps_per_mm
+            # num_layers (computed from target_turns + geometry), turns_per_mm,
+            # layer_duration_s, lateral_steps_per_mm
 
         return cls(**normalized)
 
@@ -64,8 +77,8 @@ class WindingProgram:
             raise ValueError("name must not be empty")
         if self.program_id is not None and not str(self.program_id).strip():
             raise ValueError("program_id must not be empty when provided")
-        if self.num_layers < 1:
-            raise ValueError("num_layers must be >= 1")
+        if self.target_turns < 1:
+            raise ValueError("target_turns must be >= 1")
         if self.layer_pitch_mm <= 0.0:
             raise ValueError("layer_pitch_mm must be positive")
         if self.wire_diameter_mm <= 0.0:
@@ -82,10 +95,35 @@ class WindingProgram:
             raise ValueError("scatter_freq2 must be positive")
         if self.revision < 1:
             raise ValueError("revision must be >= 1")
+        if self.flatwork_thickness_mm < 0.0:
+            raise ValueError("flatwork_thickness_mm must be >= 0")
+        if self.window_start_clearance_mm is not None and self.window_start_clearance_mm < 0.0:
+            raise ValueError("window_start_clearance_mm must be >= 0 when specified")
+        if self.window_end_clearance_mm is not None and self.window_end_clearance_mm < 0.0:
+            raise ValueError("window_end_clearance_mm must be >= 0 when specified")
+        if (
+            self.window_end_clearance_mm is not None
+            and self.window_end_clearance_mm >= self.bobbin_width_mm
+        ):
+            raise ValueError("window_end_clearance_mm must be less than bobbin_width_mm")
 
     @property
     def turns_per_mm(self) -> float:
         return 1.0 / self.layer_pitch_mm
+
+    @property
+    def num_layers(self) -> int:
+        """Number of full forward/backward passes to reach *target_turns*.
+
+        Computed as::
+
+            ceil(target_turns / (2 * bobbin_width_mm * turns_per_mm))
+
+        Uses ``bobbin_width_mm`` (not the effective width with end_clearance) so
+        the property stays self-contained without a config dependency.
+        """
+        turns_per_pass = 2.0 * self.bobbin_width_mm * self.turns_per_mm
+        return max(1, math.ceil(self.target_turns / turns_per_pass))
 
     def layer_duration_s(self, spindle_rpm: float) -> float:
         """
@@ -105,12 +143,64 @@ class WindingProgram:
         return total_turns / spindle_rps
 
     def total_turns(self) -> float:
-        """Return the total spindle turns for the full classic program."""
-        return float(self.num_layers) * 2.0 * self.bobbin_width_mm * self.turns_per_mm
+        """Return the total target spindle turns for the program."""
+        return float(self.target_turns)
+
+    def effective_winding_width_mm(self, *, default_end_clearance_mm: float) -> float:
+        """Effective lateral traversal width after applying end clearance.
+
+        Uses ``window_end_clearance_mm`` if set on this program, otherwise
+        falls back to *default_end_clearance_mm* from the machine config.
+        """
+        end_clearance = (
+            self.window_end_clearance_mm
+            if self.window_end_clearance_mm is not None
+            else default_end_clearance_mm
+        )
+        return max(0.0, self.bobbin_width_mm - end_clearance)
+
+    def effective_window(
+        self,
+        *,
+        soft_limit_min_mm: float,
+        machine_offset_mm: float,
+        default_start_clearance_mm: float,
+        default_end_clearance_mm: float,
+    ) -> tuple[float, float]:
+        """Compute the absolute winding window [window_low, window_high].
+
+        Chain::
+
+            window_low  = soft_limit_min + machine_offset + flatwork_thickness + start_clearance
+            window_high = window_low + effective_winding_width
+
+        *machine_offset_mm* is ``AppConfiguration.lateral_axis_offset_mm`` — a
+        machine-level fine-tuning offset that is ``0.0`` when *soft_limit_min*
+        is perfectly at the plateau edge.
+
+        Per-program clearance overrides are applied when set; otherwise the
+        *default_*_clearance_mm* values from the machine config are used.
+        """
+        start_clearance = (
+            self.window_start_clearance_mm
+            if self.window_start_clearance_mm is not None
+            else default_start_clearance_mm
+        )
+        window_low = (
+            soft_limit_min_mm
+            + machine_offset_mm
+            + self.flatwork_thickness_mm
+            + start_clearance
+        )
+        window_high = window_low + self.effective_winding_width_mm(
+            default_end_clearance_mm=default_end_clearance_mm
+        )
+        return window_low, window_high
 
     def snapshot(self) -> dict[str, Any]:
         snapshot = self.to_dict()
         snapshot["id"] = self.program_id
+        snapshot["num_layers"] = self.num_layers
         snapshot["turns_per_mm"] = self.turns_per_mm
         snapshot["total_turns"] = self.total_turns()
         return snapshot

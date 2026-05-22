@@ -7,11 +7,11 @@
 - `src/esp32/src/step_types.h`
 - `src/esp32/src/stepper_queue.cpp`
 - `src/esp32/src/stepper_driver.cpp`
-- `src/rpi/transport/messages.py`
-- `src/rpi/transport/spi_transport.py`
-- `src/rpi/transport/streamer.py`
-- `src/rpi/motion/segment_generator.py`
-- `src/rpi/motion/synchronized_segment_generator.py`
+- `src/windy/transport/messages.py`
+- `src/windy/transport/spi_transport.py`
+- `src/windy/transport/streamer.py`
+- `src/windy/motion/segment_generator.py`
+- `src/windy/winding/synchronized_segment_generator.py`
 
 ## Current design
 
@@ -38,9 +38,9 @@ This keeps `rmt_transmit()` to one call per continuous run and removes transient
 
 At high spindle RPMs the ESP32 consumes the step ring very quickly, so the host must keep a deeper planner queue and inflight segment window to tolerate SPI jitter.
 
-- High-speed lookahead is now 32 segments instead of 16.
-- The host target buffer time is increased to ~200ms.
-- High-speed inflight segment cap is increased to 64.
+- The host lookahead depth is now speed-adaptive: 48 segments for the low-speed tier (< 10 steps/segment), 32 segments for mid-speed and above.
+- The host target buffer time is increased to ~200 ms.
+- The in-flight segment cap is now speed-tier dependent: 96 (low-speed, < 10 steps), 48 (mid-speed, < 50 steps), 128 (high-speed, >= 50 steps).
 - The host buffer gate is now based on buffered depth, not the legacy free-space threshold.
 
 This ensures the ESP32 planner queue maintains enough headroom for brief transport hiccups without draining the ring.
@@ -83,6 +83,5 @@ This ensures the ESP32 planner queue maintains enough headroom for brief transpo
 
 - `STEP_BLOCK` and `SEGMENT_BLOCK` are rejected by the firmware with `ESP_ERR_NOT_SUPPORTED`. The host no longer emits them.
 - The production path is `MULTI_AXIS_SEGMENT_BLOCK` end-to-end.
- - The production path is `MULTI_AXIS_SEGMENT_BLOCK` end-to-end.
 - Host-side `clear()` and `stop()` must propagate `request_stop()` to the active streamer; interrupted streamers are treated as aborted host moves, not as successful completion.
 - `resources/FastAccelStepper` remains reference-only and is not linked into the firmware.

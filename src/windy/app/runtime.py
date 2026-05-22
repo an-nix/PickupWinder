@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def _default_data_dir() -> Path:
-    return Path.home() / "pickupwinder_data"
+    return Path.home() / "data"
 
 
 def _default_config_file_path() -> Path:

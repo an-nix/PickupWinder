@@ -68,11 +68,19 @@ class AppConfiguration:
     # Winding start position offset applied on top of lateral_soft_limit_min_mm.
     # Defines where the axis parks after homing and before winding starts.
     # Modifiable at runtime via RPC without re-homing.
-    # Can be negative (start before soft_limit_min) or positive (start after).
+    # Must be >= 0 when lateral_soft_limit_min_mm is set (start cannot go below
+    # the soft minimum). May be positive to start further into the window.
     # Constraints:
     #   soft_limit_min_mm + axis_offset_mm >= soft_limit_min_mm (or unbounded if None)
     #   soft_limit_min_mm + axis_offset_mm <= soft_limit_max_mm (if set)
     lateral_axis_offset_mm: float = 0.0
+    # Default safety clearances for the winding window.
+    # Represent the gap between the top of the flatwork and the first wire turn
+    # (start) and a safety reduction at the far end of the window (end).
+    # Both can be overridden per program via WindingProgram.window_start_clearance_mm
+    # and window_end_clearance_mm.
+    window_start_clearance_mm: float = 0.3
+    window_end_clearance_mm: float = 0.0
 
     def __post_init__(self) -> None:
         if self.spindle_steps_per_revolution <= 0:
@@ -118,6 +126,11 @@ class AppConfiguration:
             )
 
         start_mm = (self.lateral_soft_limit_min_mm or 0.0) + self.lateral_axis_offset_mm
+
+        if self.window_start_clearance_mm < 0.0:
+            raise ValueError("window_start_clearance_mm must be >= 0")
+        if self.window_end_clearance_mm < 0.0:
+            raise ValueError("window_end_clearance_mm must be >= 0")
 
         if ( self.lateral_soft_limit_min_mm is not None and start_mm < self.lateral_soft_limit_min_mm ):
             raise ValueError(

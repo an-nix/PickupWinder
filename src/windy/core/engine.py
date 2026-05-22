@@ -231,12 +231,14 @@ class WindingEngine:
         approach_rpm: float,
         search_rpm: float,
         backoff_steps: int,
+        target_mm: float | None = None,
     ) -> tuple[bool, str | None]:
         return self._lateral.home(
             axis_id=axis_id,
             approach_rpm=approach_rpm,
             search_rpm=search_rpm,
             backoff_steps=backoff_steps,
+            target_mm=target_mm,
         )
 
 
@@ -293,11 +295,18 @@ class WindingEngine:
         self._events.publish(EventKind.PROGRAM_STARTED, program=program.snapshot())
 
         if self._config.home_before_start:
+            window_low, _ = program.effective_window(
+                soft_limit_min_mm=self._config.lateral_soft_limit_min_mm or 0.0,
+                machine_offset_mm=self._config.lateral_axis_offset_mm,
+                default_start_clearance_mm=self._config.window_start_clearance_mm,
+                default_end_clearance_mm=self._config.window_end_clearance_mm,
+            )
             success, _reason = self._home_lateral_axis(
                 axis_id=self._config.lateral_axis_id,
                 approach_rpm=self._config.lateral_homing_approach_rpm,
                 search_rpm=self._config.lateral_homing_search_rpm,
                 backoff_steps=self._config.lateral_homing_backoff_steps or 6144,
+                target_mm=window_low,
             )
             if not success:
                 return
@@ -341,7 +350,10 @@ class WindingEngine:
         """
         self._lateral.require_homed(self._config.lateral_axis_id)
         reverse_lateral = direction == "reverse"
-        total_turns = 2.0 * program.bobbin_width_mm * program.turns_per_mm
+        effective_width = program.effective_winding_width_mm(
+            default_end_clearance_mm=self._config.window_end_clearance_mm
+        )
+        total_turns = 2.0 * effective_width * program.turns_per_mm
         target_rps = params.spindle_rpm / 60.0
         duration_s = adjust_duration_for_ramp_deficit(
             total_turns=total_turns,
@@ -357,7 +369,7 @@ class WindingEngine:
             accel_s=self._config.spindle_accel_s,
             cruise_s=cruise_s,
             decel_s=self._config.spindle_decel_s,
-            bobbin_width_mm=program.bobbin_width_mm,
+            bobbin_width_mm=effective_width,
             turns_per_mm=program.turns_per_mm,
             scatter_amplitude_mm=program.scatter_amplitude_mm,
             scatter_damping_margin_mm=program.scatter_damping_margin_mm,

@@ -10,21 +10,21 @@ Automated and assisted guitar pickup winding with a Raspberry Pi host and an ESP
 
 ## Active code layout
 
-The active host entry point is `src/rpi/winding_main.py`. The deprecated `WinderApp` stub in `src/rpi/core/app.py` is not part of the runtime path.
+The active host entry point is `src/windy/winding_main.py`. The deprecated `WinderApp` stub in `src/windy/core/app.py` is not part of the runtime path.
 
-- `src/rpi/winding_main.py`: thin process entry point and signal handling.
-- `src/rpi/app/runtime.py`: runtime composition for transport, shared state, engine, and JSON-RPC.
-- `src/rpi/core/engine.py`: orchestration layer for moves and winding programs.
-- `src/rpi/core/lateral.py`: lateral homing, home-state invalidation, and soft-limit checks.
-- `src/rpi/core/status.py`: explicit status/config snapshots for RPC and diagnostics.
-- `src/rpi/motion/move_queue.py`: serializes moves and aligns motion sequences with firmware state.
-- `src/rpi/transport/messages.py`: Python protocol mirror and 16-bit sequence helpers.
-- `src/rpi/transport/spi_transport.py`: SPI framing, polling, and pipelined ACK confirmation.
-- `src/rpi/transport/streamer.py`: sequence-aware multi-axis streaming and backpressure logic.
-- `src/rpi/motion/`: ramp, winding, scatter, and synchronized segment generators.
-- `src/rpi/winding/adaptive.py`: adaptive winding session model, chunk planner, and tracked synchronized winding move.
-- `src/rpi/winding/program_store.py`: persistent saved-program library on the Raspberry Pi host.
-- `src/rpi/winding/service.py`: live-controllable winding session service for window, pitch, pause, and speed updates.
+- `src/windy/winding_main.py`: thin process entry point and signal handling.
+- `src/windy/app/runtime.py`: runtime composition for transport, shared state, engine, and JSON-RPC.
+- `src/windy/core/engine.py`: orchestration layer for moves and winding programs.
+- `src/windy/core/lateral.py`: lateral homing, home-state invalidation, and soft-limit checks.
+- `src/windy/core/status.py`: explicit status/config snapshots for RPC and diagnostics.
+- `src/windy/motion/move_queue.py`: serializes moves and aligns motion sequences with firmware state.
+- `src/windy/transport/messages.py`: Python protocol mirror and 16-bit sequence helpers.
+- `src/windy/transport/spi_transport.py`: SPI framing, polling, and pipelined ACK confirmation.
+- `src/windy/transport/streamer.py`: sequence-aware multi-axis streaming and backpressure logic.
+- `src/windy/motion/`: ramp, winding, scatter, and synchronized segment generators.
+- `src/windy/winding/adaptive.py`: adaptive winding session model, chunk planner, and tracked synchronized winding move.
+- `src/windy/winding/program_store.py`: persistent saved-program library on the Raspberry Pi host.
+- `src/windy/winding/service.py`: live-controllable winding session service for window, pitch, pause, and speed updates.
 - `src/esp32/src/main.cpp`: pin configuration and firmware startup.
 - `src/esp32/src/comm_interface.cpp`: SPI slave task, request dedupe, block dispatch, and status publishing.
 - `src/esp32/src/motion_planner.cpp`: planner queue, monotonic motion filtering, and flush handling.
@@ -70,9 +70,9 @@ HTTP endpoints exposed by Wendy:
 
 - The lateral axis starts with an unknown position after every host or controller restart.
 - Any free lateral motion now requires a successful homing cycle first.
-- Host-side soft limits are configured in `src/rpi/core/config.py` through `lateral_soft_limit_min_mm` and `lateral_soft_limit_max_mm`.
+- Host-side soft limits are configured in `src/windy/core/config.py` through `lateral_soft_limit_min_mm` and `lateral_soft_limit_max_mm`.
 - `lateral_axis_length_mm` can be set to the machine travel length so the homing approach move is long enough to reach the endstop even from the far end.
-- Post-homing travel toward the winding start position uses `lateral_target_speed` from `src/rpi/core/config.py`.
+- Post-homing travel toward the winding start position uses `lateral_target_speed` from `src/windy/core/config.py`.
 - After homing, the host automatically repositions the lateral axis to `lateral_soft_limit_min_mm + lateral_axis_offset_mm` before reporting `HOMING_COMPLETED`.
 - The winding start offset is persisted in the host config and can be updated live through `winding.set_axis_offset`, then applied immediately with `winding.move_to_start_position` without re-homing.
 - Once the lateral axis is homed, the host keeps its enable line asserted across subsequent moves so the zero reference is not lost.
@@ -109,7 +109,7 @@ pio run -t upload
 Host application:
 
 ```bash
-cd src/rpi
+cd src/windy
 python3 winding_main.py
 ```
 

@@ -127,17 +127,25 @@ class AdaptiveWindingService:
         program.validate()
 
         # Resolve window bounds: use caller-provided values or fall back to
-        # the configured lateral start position and bobbin width.
-        window_low_mm = (
-            float(params.window_low_mm)
-            if params.window_low_mm is not None
-            else self._config.lateral_start_position_mm
-        )
-        window_high_mm = (
-            float(params.window_high_mm)
-            if params.window_high_mm is not None
-            else window_low_mm + program.bobbin_width_mm
-        )
+        # the program's effective window derived from flatwork geometry and config defaults.
+        if params.window_low_mm is not None:
+            window_low_mm = float(params.window_low_mm)
+            window_high_mm = (
+                float(params.window_high_mm)
+                if params.window_high_mm is not None
+                else window_low_mm + program.effective_winding_width_mm(
+                    default_end_clearance_mm=self._config.window_end_clearance_mm
+                )
+            )
+        else:
+            window_low_mm, window_high_mm = program.effective_window(
+                soft_limit_min_mm=self._config.lateral_soft_limit_min_mm or 0.0,
+                machine_offset_mm=self._config.lateral_axis_offset_mm,
+                default_start_clearance_mm=self._config.window_start_clearance_mm,
+                default_end_clearance_mm=self._config.window_end_clearance_mm,
+            )
+            if params.window_high_mm is not None:
+                window_high_mm = float(params.window_high_mm)
         self._validate_window(WindingWindow(window_low_mm, window_high_mm))
 
         with self._lock:
