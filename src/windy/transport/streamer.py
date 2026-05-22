@@ -36,6 +36,23 @@ class StreamAxisConfig:
     ring_send_threshold: int = 1
 
 
+@dataclass
+class StreamerTuning:
+    """Tunable behavioural constants for ``MultiAxisRampStreamer``.
+
+    Inject via the ``tuning`` parameter to override defaults in tests
+    without subclassing.
+    """
+
+    segment_queue_depth: int = 128
+    prefill_max_buffer_time_s: float = 0.50
+    min_buffer_time_s: float = 0.06
+    max_buffer_time_s: float = 0.25
+    min_segment_time_s: float = 0.002
+    max_segment_time_s: float = 0.005
+    step_ring_capacity: int = 4096
+
+
 class MultiAxisRampStreamer:
     """Minimal deterministic SPI motion streamer.
 
@@ -78,13 +95,16 @@ class MultiAxisRampStreamer:
                 Thresholds are intentionally conservative for the 10..49 steps/segment
                 band because this is where the current 1500 RPM winding workload lands:
 
-                    < 10  steps → 64 segments (low speed, long host/firmware latency ratio)
-                    < 50  steps → 48 segments (current winding regime, needs more margin)
+                    < 10  steps → 48 segments (low speed, long host/firmware latency ratio)
+                    < 50  steps → 32 segments (current winding regime, needs more margin)
                     >= 50 steps → 32 segments (large segments already amortize comm latency)
 
         The source of truth is the firmware planner queue depth, not the host's
         buffered_time estimate. A deeper lookahead here reduces sensitivity to
         one or two transient SPI retries or short frames.
+
+        Note: ``_prefill()`` uses a more conservative value of 64 for the
+        ``< 10`` steps/segment tier so the ring is seeded deeper on startup.
         """
         if steps_per_segment < 10:
             return 48
@@ -117,6 +137,7 @@ class MultiAxisRampStreamer:
         send_log_path: str | None = None,
         keep_enabled_axes: set[int] | None = None,
         initial_segments_dropped: int = 0,
+        tuning: StreamerTuning | None = None,
     ):
         self._initialize_streamer_state(
             transport=transport,
@@ -132,6 +153,7 @@ class MultiAxisRampStreamer:
             explicit_target_hz=None,
             keep_enabled_axes=keep_enabled_axes,
             initial_segments_dropped=initial_segments_dropped,
+            tuning=tuning,
         )
 
     @classmethod
@@ -148,6 +170,7 @@ class MultiAxisRampStreamer:
         stall_timeout_s: float = 5.0,
         keep_enabled_axes: set[int] | None = None,
         initial_segments_dropped: int = 0,
+        tuning: StreamerTuning | None = None,
     ) -> "MultiAxisRampStreamer":
         """Build a streamer from explicit axis IDs and a known target frequency.
 
@@ -178,6 +201,7 @@ class MultiAxisRampStreamer:
             explicit_target_hz=target_hz,
             keep_enabled_axes=keep_enabled_axes,
             initial_segments_dropped=initial_segments_dropped,
+            tuning=tuning,
         )
         return streamer
 
@@ -197,7 +221,9 @@ class MultiAxisRampStreamer:
         explicit_target_hz: float | None,
         keep_enabled_axes: set[int] | None,
         initial_segments_dropped: int,
+        tuning: StreamerTuning | None = None,
     ) -> None:
+        self._tuning = tuning if tuning is not None else StreamerTuning()
         self._transport = transport
         self._poll_interval_s = poll_interval_s
         self._print_every = max(print_every, 1)
@@ -213,7 +239,7 @@ class MultiAxisRampStreamer:
 
         self._axis_configs = axis_configs
         self._axis_ids = list(axis_ids)
-        self._segment_duration_s = max(self.MIN_SEGMENT_TIME_S, min(self.MAX_SEGMENT_TIME_S, segment_duration_s))
+        self._segment_duration_s = max(self._tuning.min_segment_time_s, min(self._tuning.max_segment_time_s, segment_duration_s))
         if explicit_target_hz is None:
             max_hz = 0.0
             if self._axis_configs:
@@ -221,7 +247,7 @@ class MultiAxisRampStreamer:
             self._target_buffer_time_s = self._safe_buffer_time_s(target_buffer_time_s, max_hz)
         else:
             self._target_buffer_time_s = self._safe_buffer_time_s(target_buffer_time_s, explicit_target_hz)
-        self._min_buffer_time_s = min(self.MIN_BUFFER_TIME_S, self._target_buffer_time_s * 0.5)
+        self._min_buffer_time_s = min(self._tuning.min_buffer_time_s, self._target_buffer_time_s * 0.5)
 
         self._inflight: deque[tuple[MultiAxisSegment, int]] = deque()
         self._buffered_time_s = 0.0
@@ -297,7 +323,7 @@ class MultiAxisRampStreamer:
 
     def _planner_queue_free(self, status) -> int:
         """Return planner_queue_free from status, defaulting to full if absent."""
-        return int(getattr(status, "planner_queue_free", self.SEGMENT_QUEUE_DEPTH))
+        return int(getattr(status, "planner_queue_free", self._tuning.segment_queue_depth))
 
     def _check_planner_pressure(self, status) -> bool:
         """Return True (blocked) when the ESP32 planner buffer already has enough lookahead.
@@ -311,7 +337,7 @@ class MultiAxisRampStreamer:
           - 'planner recovered' when planner_queue_free recovers above 64
         """
         pqf = self._planner_queue_free(status)
-        self._buffered_segments = self.SEGMENT_QUEUE_DEPTH - pqf
+        self._buffered_segments = self._tuning.segment_queue_depth - pqf
 
         if pqf < 16 and not self._planner_under_pressure:
             self._planner_under_pressure = True
@@ -375,7 +401,7 @@ class MultiAxisRampStreamer:
         # only ~25ms but the planner segment_queue holds 512ms, so capping by
         # ring capacity forced the pipeline to 60ms — too small to sustain
         # required_lookahead=32 against SPI failure bursts.
-        return max(self.MIN_BUFFER_TIME_S, min(self.MAX_BUFFER_TIME_S, requested_time_s))
+        return max(self._tuning.min_buffer_time_s, min(self._tuning.max_buffer_time_s, requested_time_s))
 
     def set_generator(self, generator: SegmentProducer | Iterator[MultiAxisSegment]) -> None:
         """Override the segment generator for this streamer.
@@ -388,13 +414,27 @@ class MultiAxisRampStreamer:
         self._retry_batch = None
 
     def _sync_with_firmware_status(self) -> None:
-        """Synchronize stream state with the ESP32's last executed sequence."""
+        """Synchronize stream state with the ESP32's last executed sequence.
+
+        This is the only place where the stall advance tracker is seeded from
+        the firmware's current state.  Subsequent calls to
+        _update_confirmed_motion_sequence() deliberately do NOT touch these
+        fields so that the stall timer is not reset on every poll iteration.
+        """
         try:
             status = self._transport.get_status()
         except Exception:
             return
 
         self._update_confirmed_motion_sequence(status)
+
+        # Seed the stall-advance tracker from the firmware's current sequence.
+        # _update_confirmed_motion_sequence no longer does this, so we must do
+        # it explicitly here at creation time.
+        received_sequence = int(getattr(status, "last_executed_sequence", -1))
+        if received_sequence != 0xFFFF and received_sequence >= 0:
+            self._last_sequence_advance_value = received_sequence
+            self._last_sequence_advance_time = time.time()
 
     def _update_confirmed_motion_sequence(self, status) -> None:
         received_sequence = int(getattr(status, "last_executed_sequence", -1))
@@ -403,8 +443,11 @@ class MultiAxisRampStreamer:
 
         self._last_confirmed_motion_seq = received_sequence
         self._last_confirmed_sequence = received_sequence
-        self._last_sequence_advance_value = received_sequence
-        self._last_sequence_advance_time = time.time()
+        # NOTE: _last_sequence_advance_value and _last_sequence_advance_time are
+        # intentionally NOT updated here.  They are managed exclusively by
+        # _check_stall() so that calling _remove_confirmed_segments() on every
+        # poll cycle does not silently reset the stall timer when the firmware
+        # is stuck (e.g. RMT failed to restart after emergency stop).
 
     def _wait_for_request_result(self, sequence: int, send_status: Any = None) -> Any:
         try:
@@ -435,10 +478,15 @@ class MultiAxisRampStreamer:
 
     def _disable_axes(self) -> None:
         for axis_id in self._axis_ids:
-            # End each standalone move with a clean driver stop before EN goes high.
-            # Without this, the previous RMT transaction can still be coasting when
-            # the next move starts, which makes consecutive runs non-deterministic.
-            self._transport.stop_axis(axis_id)
+            if axis_id not in self._keep_enabled_axes:
+                # For axes that will be disabled, send an explicit stop before
+                # pulling EN high so the driver stops cleanly.
+                # For keep_enabled_axes (homing phases), the move already
+                # contains a built-in deceleration-to-zero profile; sending
+                # stop_axis() here would start a firmware coast/brake sequence
+                # on top of the ongoing decel, causing running_mask to stay
+                # asserted far longer than the 1-second timeout that follows.
+                self._transport.stop_axis(axis_id)
 
             stop_deadline = time.time() + 1.0
             while time.time() < stop_deadline:
@@ -512,10 +560,13 @@ class MultiAxisRampStreamer:
         if received_sequence == 0xFFFF or received_sequence < 0:
             return False
 
-        # Do not arm stall detection until the first executed segment
-        # has been confirmed by firmware.
+        # When no segment has been confirmed yet, only reset the stall timer if
+        # there is nothing in-flight.  If segments ARE in-flight but none have been
+        # confirmed, the timer keeps running so that a firmware RMT failure
+        # (kickStart not triggered after emergency stop) is caught.
         if self._last_confirmed_sequence < 0:
-            self._last_sequence_advance_time = time.time()
+            if not self._inflight:
+                self._last_sequence_advance_time = time.time()
             return False
 
         if not self._inflight:
@@ -614,7 +665,7 @@ class MultiAxisRampStreamer:
         # always ~75% empty — a false positive that flooded the log.
         ring_nearly_empty = bool(
             tracked_ring_free
-            and min(tracked_ring_free) >= self.STEP_RING_CAPACITY - 256
+            and min(tracked_ring_free) >= self._tuning.step_ring_capacity - 256
         )
         no_sequence_progress_s = time.time() - self._last_sequence_advance_time
         if (
@@ -835,7 +886,7 @@ class MultiAxisRampStreamer:
         if self._prefilling:
             effective_buffer_target_s = max(
                 self._target_buffer_time_s,
-                self.PREFILL_MAX_BUFFER_TIME_S,
+                self._tuning.prefill_max_buffer_time_s,
             )
 
         planner_deficit = self._planner_buffer_deficit(status)
@@ -993,7 +1044,7 @@ class MultiAxisRampStreamer:
         ring_free = getattr(status, "ring_free_slots", ())
         return any(
             0 <= axis_id < len(ring_free)
-            and int(ring_free[axis_id]) >= self.STEP_RING_CAPACITY - 256
+            and int(ring_free[axis_id]) >= self._tuning.step_ring_capacity - 256
             for axis_id in self._axis_ids
         )
 

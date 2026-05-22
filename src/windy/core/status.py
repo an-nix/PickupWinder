@@ -149,11 +149,24 @@ class RuntimeStatusService:
 
     def engine_status(self) -> dict[str, Any]:
         self._lateral.refresh_home_state()
-        status = {
-            "shared_state": self._shared_state.snapshot(),
+        snap = self._shared_state.snapshot()
+        winding_session = snap.get("winding_session")
+        session_active = (
+            winding_session is not None
+            and winding_session.get("state") not in {"completed", "stopped", "fault"}
+        )
+        status: dict[str, Any] = {
+            "shared_state": snap,
             "move_queue": self._move_queue_status_provider(),
             "workers": self._workers_status(),
+            "winding_mode": (
+                "adaptive" if session_active
+                else "classic" if snap.get("program") is not None
+                else "idle"
+            ),
         }
+        if session_active:
+            status["session"] = winding_session
         if self._transport_diagnostics_provider is not None:
             status["transport"] = self._transport_diagnostics_provider()
         return status

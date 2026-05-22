@@ -25,6 +25,11 @@ class AppConfiguration:
     spindle_max_acceleration_rpm: float | None = 500
     # Unit: RPM/s (revolutions per minute lost per second).
     spindle_max_deceleration_rpm: float | None = None
+    # Ramp durations for classic winding layers (seconds).
+    # These control how quickly the spindle accelerates/decelerates on each
+    # layer; they are fixed machine parameters, not per-program values.
+    spindle_accel_s: float = 0.5
+    spindle_decel_s: float = 0.5
 
     lateral_axis_id: int = 1
     lateral_steps_per_revolution: int = 96
@@ -51,22 +56,31 @@ class AppConfiguration:
     lateral_axis_length_mm: float | None = 130
 
     # Homing parameters
-    lateral_homing_approach_rpm: float = 60.0
+    home_before_start: bool = True
+    lateral_homing_approach_rpm: float = 120.0
     lateral_homing_search_rpm: float = 20.0
     lateral_homing_backoff_steps: int | None = 6144
 
     # Target speed for post-homing and explicit start-position moves.
     # Unit: RPM on the lateral motor. Capped at lateral_max_rpm at runtime.
-    lateral_target_speed: float = 60.0
+    lateral_target_speed: float = 120.0
 
     # Winding start position offset applied on top of lateral_soft_limit_min_mm.
     # Defines where the axis parks after homing and before winding starts.
     # Modifiable at runtime via RPC without re-homing.
-    # Can be negative (start before soft_limit_min) or positive (start after).
+    # Must be >= 0 when lateral_soft_limit_min_mm is set (start cannot go below
+    # the soft minimum). May be positive to start further into the window.
     # Constraints:
     #   soft_limit_min_mm + axis_offset_mm >= soft_limit_min_mm (or unbounded if None)
     #   soft_limit_min_mm + axis_offset_mm <= soft_limit_max_mm (if set)
     lateral_axis_offset_mm: float = 0.0
+    # Default safety clearances for the winding window.
+    # Represent the gap between the top of the flatwork and the first wire turn
+    # (start) and a safety reduction at the far end of the window (end).
+    # Both can be overridden per program via WindingProgram.window_start_clearance_mm
+    # and window_end_clearance_mm.
+    window_start_clearance_mm: float = 0.3
+    window_end_clearance_mm: float = 0.0
 
     def __post_init__(self) -> None:
         if self.spindle_steps_per_revolution <= 0:
@@ -85,6 +99,10 @@ class AppConfiguration:
             raise ValueError("lateral_target_speed must be positive")
         if self.lateral_traverse_pitch_mm <= 0.0:
             raise ValueError("lateral_traverse_pitch_mm must be positive")
+        if self.spindle_accel_s < 0.0:
+            raise ValueError("spindle_accel_s must be >= 0")
+        if self.spindle_decel_s < 0.0:
+            raise ValueError("spindle_decel_s must be >= 0")
         if self.lateral_axis_length_mm is not None and self.lateral_axis_length_mm <= 0.0:
             raise ValueError("lateral_axis_length_mm must be positive")
         if (
@@ -108,6 +126,11 @@ class AppConfiguration:
             )
 
         start_mm = (self.lateral_soft_limit_min_mm or 0.0) + self.lateral_axis_offset_mm
+
+        if self.window_start_clearance_mm < 0.0:
+            raise ValueError("window_start_clearance_mm must be >= 0")
+        if self.window_end_clearance_mm < 0.0:
+            raise ValueError("window_end_clearance_mm must be >= 0")
 
         if ( self.lateral_soft_limit_min_mm is not None and start_mm < self.lateral_soft_limit_min_mm ):
             raise ValueError(

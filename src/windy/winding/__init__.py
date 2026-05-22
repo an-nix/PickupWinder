@@ -1,11 +1,11 @@
 from winding.program import WindingProgram
 from winding.program_store import ProgramNotFoundError, ProgramStore
+from winding.session import SessionParams
 from winding.adaptive import (
     AdaptiveChunkPlan,
     AdaptivePlanningSnapshot,
     AdaptiveWindingMove,
     AdaptiveWindingRuntime,
-    AdaptiveWindingSessionConfig,
     WindingWindow,
     awg_to_diameter_mm,
     plan_next_chunk,
@@ -16,17 +16,17 @@ from winding.synchronized_segment_generator import (
     SyncAxisConfig,
     SynchronizedSegmentGenerator,
 )
-from winding.wound_move import SynchronizedMove, WoundMove
+from winding.wound_move import SynchronizedMove, WoundMove, build_wound_move
 
 __all__ = [
     "WindingProgram",
     "ProgramNotFoundError",
     "ProgramStore",
+    "SessionParams",
     "AdaptiveChunkPlan",
     "AdaptivePlanningSnapshot",
     "AdaptiveWindingMove",
     "AdaptiveWindingRuntime",
-    "AdaptiveWindingSessionConfig",
     "WindingPattern",
     "WindingWindow",
     "ScatterEngine",
@@ -34,6 +34,7 @@ __all__ = [
     "SynchronizedMove",
     "SynchronizedSegmentGenerator",
     "WoundMove",
+    "build_wound_move",
     "awg_to_diameter_mm",
     "plan_next_chunk",
 ]

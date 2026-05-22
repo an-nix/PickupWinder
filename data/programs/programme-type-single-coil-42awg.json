@@ -1,0 +1,16 @@
+{
+  "name": "Programme type - single coil 42 AWG",
+  "program_id": "programme-type-single-coil-42awg",
+  "revision": 1,
+  "created_at": "2026-05-22T00:00:00Z",
+  "updated_at": "2026-05-22T00:00:00Z",
+  "target_turns": 8000,
+  "wire_diameter_mm": 0.063,
+  "bobbin_width_mm": 13.2,
+  "flatwork_thickness_mm": 3.2,
+  "layer_pitch_mm": 0.065,
+  "scatter_amplitude_mm": 0.03,
+  "scatter_damping_margin_mm": 0.6,
+  "scatter_freq1": 1.0,
+  "scatter_freq2": 1.618 
+}

@@ -30,6 +30,7 @@ _ENDSTOP_OPEN_CONFIRM_INTERVAL_S = 0.015
 _INITIAL_ENDSTOP_CONFIRM_SAMPLES = 3
 _INITIAL_ENDSTOP_CONFIRM_INTERVAL_S = 0.01
 _MULTI_AXIS_QUEUE_DEPTH = 64
+_HOMING_RELEASE_RETRY_COUNT = 3
 
 
 logger = logging.getLogger(__name__)
@@ -625,34 +626,55 @@ class MoveQueue:
             move.axis_id,
         )
         clearance_move = move.preclear_move()
-        self._set_endstop_armed(move.axis_id, arm=False)
-        streamer = self._stream_homing_sub_move(
-            move,
-            phase_name="preclear",
-            sub_move=clearance_move,
-            arm_endstop=False,
-        )
-        if streamer.endstop_triggered:
-            raise RuntimeError(
-                f"preclear failed: unexpected endstop trigger on axis {move.axis_id}"
+        last_error: RuntimeError | None = None
+        for attempt in range(1, _HOMING_RELEASE_RETRY_COUNT + 1):
+            if attempt > 1:
+                logger.warning(
+                    "homing axis %s: preclear retry %s/%s after CLOSED endstop",
+                    move.axis_id,
+                    attempt,
+                    _HOMING_RELEASE_RETRY_COUNT,
+                )
+
+            self._set_endstop_armed(move.axis_id, arm=False)
+            streamer = self._stream_homing_sub_move(
+                move,
+                phase_name="preclear",
+                sub_move=clearance_move,
+                arm_endstop=False,
             )
-        self._wait_for_endstop_open(
-            move.axis_id,
-            timeout_s=self._compute_backoff_timeout(clearance_move),
-        )
-        # R5: attente de stabilisation mécanique (debounce) — 2 cycles SPI minimum
-        # pour que le GPIO se stabilise après relâchement du contact physique.
-        time.sleep(0.020)
-        # Relecture finale pour confirmer l'état avant d'armer la phase approach.
-        final_status = self._read_status(move.axis_id, allow_stale=False)
-        lateral_state = int(
-            getattr(final_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
-        )
-        if lateral_state != LATERAL_ENDSTOP_PRESENT_OPEN:
-            raise RuntimeError(
+            if streamer.endstop_triggered:
+                raise RuntimeError(
+                    f"preclear failed: unexpected endstop trigger on axis {move.axis_id}"
+                )
+
+            try:
+                self._wait_for_endstop_open(
+                    move.axis_id,
+                    timeout_s=self._compute_backoff_timeout(clearance_move),
+                )
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+
+            # R5: attente de stabilisation mécanique (debounce) — 2 cycles SPI minimum
+            # pour que le GPIO se stabilise après relâchement du contact physique.
+            time.sleep(0.020)
+            # Relecture finale pour confirmer l'état avant d'armer la phase approach.
+            final_status = self._read_status(move.axis_id, allow_stale=False)
+            lateral_state = int(
+                getattr(final_status, "lateral_endstop_state", LATERAL_ENDSTOP_ABSENT)
+            )
+            if lateral_state == LATERAL_ENDSTOP_PRESENT_OPEN:
+                return
+
+            last_error = RuntimeError(
                 f"preclear did not clear the endstop on axis {move.axis_id}: "
                 f"lateral_endstop_state=0x{lateral_state:02X} after stabilisation wait"
             )
+
+        if last_error is not None:
+            raise last_error
 
     def _check_armed_phase_result(
         self,
@@ -937,29 +959,58 @@ class MoveQueue:
                         return
 
                 if descriptor.wait_for_open:
-                    try:
-                        self._wait_for_endstop_open(
-                            move.axis_id,
-                            timeout_s=self._compute_backoff_timeout(descriptor.move),
-                        )
-                    except Exception as exc:
-                        move.mark_failed(str(exc))
+                    release_timeout = self._compute_backoff_timeout(descriptor.move)
+                    release_error: Exception | None = None
+                    for release_attempt in range(1, _HOMING_RELEASE_RETRY_COUNT + 1):
+                        try:
+                            self._wait_for_endstop_open(
+                                move.axis_id,
+                                timeout_s=release_timeout,
+                            )
+                            release_error = None
+                            break
+                        except Exception as exc:
+                            release_error = exc
+                            if release_attempt >= _HOMING_RELEASE_RETRY_COUNT:
+                                break
+                            logger.warning(
+                                "homing axis %s: backoff retry %s/%s after CLOSED endstop: %s",
+                                move.axis_id,
+                                release_attempt + 1,
+                                _HOMING_RELEASE_RETRY_COUNT,
+                                exc,
+                            )
+                            try:
+                                self._set_endstop_armed(move.axis_id, arm=False)
+                                retry_streamer = self._stream_homing_sub_move(
+                                    move,
+                                    phase_name=f"{descriptor.name}_retry_{release_attempt + 1}",
+                                    sub_move=descriptor.move,
+                                    arm_endstop=False,
+                                )
+                            except Exception as retry_exc:
+                                move.mark_failed(str(retry_exc))
+                                return
+
+                            if retry_streamer.endstop_triggered:
+                                move.mark_failed(
+                                    f"{descriptor.name} retry failed: unexpected endstop trigger on axis {move.axis_id}"
+                                )
+                                return
+
+                    if release_error is not None:
+                        move.mark_failed(str(release_error))
                         return
 
-                    _deadline = time.monotonic() + 1.0
-                    _status = None
-                    while time.monotonic() < _deadline:
-                        _status = self._read_status(move.axis_id, allow_stale=False)
-                        if (int(getattr(_status, "running_mask", 0)) & (1 << move.axis_id)) == 0:
-                            break
-                        time.sleep(0.010)
-                    else:
-                        _running_mask = int(getattr(_status, "running_mask", 0xFF)) if _status is not None else 0xFF
-                        move.mark_failed(
-                            f"backoff stop timeout on axis {move.axis_id}: "
-                            f"running_mask=0x{_running_mask:02X} still non-zero after backoff"
-                        )
-                        return
+                    # Do NOT wait for running_mask to drop here.
+                    # In coast-mode streaming the firmware can keep the RMT
+                    # transaction alive with pause symbols after the last real
+                    # backoff step has executed. That leaves running_mask high
+                    # even though the motor is physically idle and the endstop
+                    # is already OPEN. The next homing phase can safely append
+                    # new segments into the live stream, so the correct gate is
+                    # the released endstop, not running_mask == 0.
+                    self._read_status(move.axis_id, allow_stale=False)
 
                 if self._stop_requested:
                     stop_plan = self._active_stop_plan or self._default_stop_plan(

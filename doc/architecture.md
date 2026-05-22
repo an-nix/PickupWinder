@@ -1,223 +1,389 @@
-# PickupWinder Architecture
+# PickupWinder — System Architecture
 
-PickupWinder is a two-processor system:
+This document describes the full software architecture of the PickupWinder system,
+intended as a guide for developers new to the project.
 
-- Raspberry Pi: high-level planning, orchestration, RPC, and SPI master transport.
-- ESP32: deterministic real-time executor, sensor concentrator, and SPI slave.
+---
 
-The split is deliberate. Geometry, winding strategy, retry policy, and session logic live on the host. Hard real-time pulse generation and safety-critical queue execution live on the ESP32.
+## 1. System overview
 
-## Active code map
+PickupWinder is a **two-processor system**:
 
-### Host
+```
+  ┌───────────────────────────────────────────────────────┐
+  │  Raspberry Pi (host)                                  │
+  │  ─────────────────────────────────────────────────    │
+  │  Python application (src/windy/)                      │
+  │    • Winding geometry computation                     │
+  │    • Program and session management                   │
+  │    • JSON-RPC API for operator UI                     │
+  │    • SPI master transport                             │
+  └────────────────┬──────────────────────────────────────┘
+                   │  SPI (512-byte frames, mode 1, CRC16)
+                   │  GPIO17 READY sideband
+                   ▼
+  ┌───────────────────────────────────────────────────────┐
+  │  ESP32 (firmware, src/esp32/)                         │
+  │  ─────────────────────────────────────────────────    │
+  │    • SPI slave, frame validation, request dedup       │
+  │    • Monotonic motion planner queue                   │
+  │    • Step ring fill + RMT pulse emission              │
+  │    • Sensor acquisition (tension, encoder, endstop)   │
+  └──────────┬───────────────────────────┬────────────────┘
+             │ STEP/DIR                  │ STEP/DIR
+             ▼                           ▼
+       Spindle driver             Lateral driver
+       (bobbin rotation)          (wire guide traverse)
+```
 
-- `src/rpi/winding_main.py`: process entry point.
-- `src/rpi/app/runtime.py`: runtime composition and lifecycle.
-- `src/rpi/core/engine.py`: runtime orchestration for moves and winding programs.
-- `src/rpi/core/lateral.py`: traverse-axis homing, home-state, and soft-limit rules.
-- `src/rpi/core/status.py`: explicit snapshots for `winder.*` and `winding.status`.
-- `src/rpi/motion/move_queue.py`: move serialization, flush coordination, sequence seeding.
-- `src/rpi/motion/segment_generator.py`: host-side segment generation utilities.
-- `src/rpi/motion/multi_axis_segment_generator.py`: general multi-axis move generator.
-- `src/rpi/motion/synchronized_segment_generator.py`: winding-specific synchronized bobbin/traverse generator.
-- `src/rpi/motion/spindle_kinematics.py`: bobbin kinematics over time.
-- `src/rpi/motion/winding_pattern.py`: traverse position from bobbin turns.
-- `src/rpi/motion/scatter_engine.py`: non-harmonic scatter offset with edge damping.
-- `src/rpi/transport/messages.py`: Python protocol mirror and wrap-aware sequence helpers.
-- `src/rpi/transport/spi_transport.py`: SPI frame transport and request confirmation.
-- `src/rpi/transport/streamer.py`: buffered segment streaming and in-flight retirement.
-- `src/rpi/jsonrpc/rpc_server.py`: RPC server bootstrap.
-- `src/rpi/jsonrpc/winding_handler.py`: JSON-RPC surface for the winding engine.
-- `src/rpi/winding/program.py`: high-level winding program definitions.
-- `src/rpi/winding/program_store.py`: persistent saved-program storage and versioning.
+The **RPi owns all planning logic**: winding geometry, scatter, session state, retries,
+and program persistence. The **ESP32 owns all real-time execution**: step pulse generation,
+RMT streaming, and sensor sampling.
 
-### Firmware
+The ESP32 firmware does **not** compute winding geometry. It only validates, queues,
+expands, and executes what the host planned.
 
-- `src/esp32/src/main.cpp`: pin map and `app_main()`.
-- `src/esp32/src/messages.h`: packed protocol types.
-- `src/esp32/src/comm_interface.cpp`: SPI task, CRC validation, retry dedupe, request dispatch.
-- `src/esp32/src/motion_planner.cpp`: monotonic motion filtering and executor queue management.
-- `src/esp32/src/stepper_queue.cpp`: segment expansion into step entries.
-- `src/esp32/src/stepper_driver.cpp`: RMT streaming driver and coast mode.
-- `src/esp32/src/sensor_task.cpp`: HX711, potentiometer, and encoder acquisition.
-- `src/esp32/src/endstop.cpp`: 2-contact lateral home sensor handling.
+---
 
-## Runtime flow
+## 2. Startup sequence
 
-1. A JSON-RPC request reaches the host process.
-2. `motion.engine` builds a move or winding program.
-3. A generator produces `MultiAxisSegment` objects with monotonic `motion_sequence` values.
-4. `transport.streamer` batches those segments into `MULTI_AXIS_SEGMENT_BLOCK` requests.
-5. `spi_transport` sends fixed 512-byte SPI frames and waits for confirmed results.
-6. `CommInterface` validates the frame, dedupes exact retries, and dispatches the payload.
-7. `MotionPlanner` rejects stale sequences, queues valid work, and honors flush floors.
-8. The executor expands segments into step timings, fills the RMT ring, and kicks the driver once per drain batch.
-9. The RMT ISR emits step pulses or pause symbols until motion completes.
-10. `StatusPayload.last_executed_sequence` feeds completion state back to the host streamer, while `last_planned_sequence` and `segments_dropped` expose planner backlog and stale/drop diagnostics.
+```
+winding_main.py
+  └─ WinderApplication.__init__()          # app/runtime.py
+       ├─ ConfigurationManager.load()      # reads data/config.json
+       ├─ Esp32SpiTransport(...)           # opens /dev/spidevX.Y
+       ├─ SharedState(axis_states)         # thread-safe runtime state
+       ├─ EventBus()                       # async event queue
+       ├─ MoveQueue(transport, ...)        # move serializer thread
+       ├─ LateralAxisController(...)       # homing and soft-limits
+       ├─ MotionCommandService(...)        # move building helpers
+       ├─ MotionCoordinator(...)           # centralized stop/fault
+       ├─ WindingEngine(...)               # classic program executor
+       ├─ AdaptiveWindingService(...)      # live session executor
+       ├─ ProgramStore(...)               # JSON program library
+       ├─ RuntimeStatusService(...)        # RPC snapshot builder
+       └─ JsonRpcServer(socket_path)       # Unix-socket RPC listener
+            └─ WindingRpcHandler           # wires 4 domain handlers
 
-## Protocol model
+winding_main.py registers SIGINT/SIGTERM → app.stop()
+then blocks in time.sleep(1) loop
+```
 
-The SPI link is full-duplex and fixed size.
+All components are constructed in `app/runtime.py`. The entry point `winding_main.py`
+is intentionally thin: it only handles signals and the blocking main loop.
 
-- Frame size: `512` bytes
-- Header size: `12` bytes
-- CRC: `CRC16-CCITT-FALSE`
-- Endianness: little-endian
-- Electrical mode: SPI mode 1 on both the Raspberry Pi host and the ESP32 slave
-- ESP32 uses IO_MUX-native SPI pins with an active `ready` handshake GPIO on GPIO17, as recommended by ESP-IDF for reliable slave timing
-- ESP32 also exposes a reserved Raspberry Pi sideband output `shutdown_req` on GPIO16 for a future coordinated host shutdown path
+---
 
-The production motion message is `MULTI_AXIS_SEGMENT_BLOCK`.
+## 3. Module responsibilities
+
+### Host — core
+
+| Module | Responsibility |
+|--------|----------------|
+| `core/config.py` | `AppConfiguration` dataclass. All machine parameters. Loaded from `data/config.json`. |
+| `core/shared_state.py` | `SharedState` — thread-safe store for engine state, active program, layer progress, and session snapshot. Written by engine/service, read by RPC handlers. |
+| `core/engine.py` | `WindingEngine` — executes classic winding programs. Owns the daemon thread, state machine, and layer loop. |
+| `core/lateral.py` | `LateralAxisController` — homing sequence, `move_to_start_position()`, soft-limit checks, home-state invalidation. |
+| `core/command_service.py` | `MotionCommandService` — convenience move builders used by RPC handlers (jog, endstop arm/disarm, manual axis moves). |
+| `core/coordinator.py` | `MotionCoordinator` — centralized stop and fault coordination across engine and session. |
+| `core/events.py` | `EventBus` — non-blocking multi-producer queue. Publishes `EventKind` events consumed by the RPC/UI layer. |
+| `core/status.py` | `RuntimeStatusService` — builds explicit status/config snapshots for `winder.status` and `winding.status`. |
+
+### Host — motion
+
+| Module | Responsibility |
+|--------|----------------|
+| `motion/move_queue.py` | `MoveQueue` — serializes moves into the SPI pipeline. Runs a dedicated thread. Handles `HomingMove` phase-by-phase, `RampMove` via `MultiAxisRampStreamer`, and `WoundMove`/`AdaptiveWindingMove` via the synchronized generator. |
+| `motion/move.py` | Move hierarchy: `Move` (base), `RampMove` (single trapezoidal axis), `HomingMove` (endstop-driven multi-phase), `CompositeMove`. |
+| `motion/move_builders.py` | Factory functions for standard move types (`build_jog_move`, etc.). |
+| `motion/segment_generator.py` | Host-side per-axis step profile generator. |
+| `motion/multi_axis_segment_generator.py` | Interleaves per-axis profiles into `MultiAxisSegment` objects with monotonic `motion_sequence` values. |
+| `motion/spindle_kinematics.py` | `SpindleKinematics` — computes spindle turns over time for a trapezoidal speed profile. |
+| `motion/axis_state.py` | `AxisState` — per-axis runtime state: current position in steps, homed flag, soft limits. |
+
+### Host — transport
+
+| Module | Responsibility |
+|--------|----------------|
+| `transport/messages.py` | Python mirror of the firmware's packed structs. `MultiAxisSegment`, `SpiMessageHeader`, `StatusPayload`, etc. Wrap-aware 16-bit sequence helpers. |
+| `transport/spi_transport.py` | `Esp32SpiTransport` — builds SPI frames, polls the READY GPIO, sends 512-byte transfers via `spidev`, and confirms requests via `wait_for_request_result()`. |
+| `transport/streamer.py` | `MultiAxisRampStreamer` — batches `MultiAxisSegment` objects into `MULTI_AXIS_SEGMENT_BLOCK` SPI requests, tracks in-flight segments, and applies backpressure. |
+
+### Host — winding
+
+| Module | Responsibility |
+|--------|----------------|
+| `winding/program.py` | `WindingProgram` — persistent recipe (target turns, geometry, scatter params). `num_layers` is a computed property, not stored. |
+| `winding/session.py` | `SessionParams` — transient execution parameters (RPM, window overrides, chunk time). Not persisted. |
+| `winding/program_store.py` | `ProgramStore` — JSON library on disk under `data/programs/`. CRUD with stable `program_id` and monotonic `revision`. |
+| `winding/service.py` | `AdaptiveWindingService` — adaptive winding thread. Resolves window geometry, plans chunks, streams motion, tracks progress, handles pause/resume. |
+| `winding/adaptive.py` | `AdaptiveWindingRuntime` + `plan_next_chunk()` — chunk planner: accelerates spindle, winds, decelerates at edges before reversing. |
+| `winding/wound_move.py` | `WoundMove` / `SynchronizedMove` — a move that streams spindle + lateral in lock-step using electronic gearing. |
+| `winding/winding_pattern.py` | `WindingPattern.guide_pos_mm(spindle_turns)` — triangular traverse wave. |
+| `winding/scatter_engine.py` | `ScatterEngine` — adds a small, non-harmonic perturbation to the guide position; damped near the flanges. |
+| `winding/synchronized_segment_generator.py` | `SynchronizedSegmentGenerator` — samples the time domain and emits `MultiAxisSegment` objects for winding moves. |
+
+### Host — JSON-RPC
+
+| Module | Responsibility |
+|--------|----------------|
+| `jsonrpc/rpc_server.py` | Unix-socket JSON-RPC 2.0 server. Accepts connections, deserializes requests, dispatches to handlers. |
+| `jsonrpc/winding_handler.py` | `WindingRpcHandler` — composition facade. Instantiates the four domain handlers and wires them to the dispatcher. |
+| `jsonrpc/execution_handler.py` | `winding.submit_program`, `wound_run`, `flush_until`, `status`, `axis_state`, `stop`. |
+| `jsonrpc/machine_handler.py` | `winding.jog`, `run_axis`, `home_lateral`, `move_lateral_mm`, `set_axis_offset`, `clear_fault`, `arm/disarm_endstop`. |
+| `jsonrpc/session_handler.py` | `winding.start_session`, `update_session`, `pause`, `resume_session`, `session_status`. |
+| `jsonrpc/program_handler.py` | `program.list`, `program.get`, `program.save`, `program.update`, `program.load`, `program.delete`. |
+
+### Firmware (ESP32)
+
+The firmware is split by CPU core:
+
+| Core | Responsibilities |
+|------|-----------------|
+| Core 0 | SPI slave task (`comm_interface.cpp`), sensor task (`sensor_task.cpp`), endstop event publication. |
+| Core 1 | Motion planner (`motion_planner.cpp`), ring fill and kick-start decisions (`multi_axis_executor.cpp`), RMT pulse streaming (`stepper_driver.cpp`). |
+
+---
+
+## 4. Motion pipeline — end to end
+
+A winding move goes through the following stages:
+
+```
+[Host] WindingProgram + SessionParams
+    │
+    ▼
+WindingEngine._run_layer()  or  AdaptiveWindingService
+    │  creates a WoundMove / AdaptiveWindingMove
+    ▼
+MoveQueue.enqueue(move)
+    │  move picked up by MoveQueue thread
+    ▼
+MultiAxisRampStreamer (transport/streamer.py)
+    │  pulls MultiAxisSegment objects from the move iterator
+    │  batches them into MULTI_AXIS_SEGMENT_BLOCK SPI requests
+    ▼
+Esp32SpiTransport.send_multi_axis_block()
+    │  builds a 512-byte frame with CRC16
+    │  polls GPIO17 READY
+    │  calls spidev.xfer2()
+    │  calls wait_for_request_result() → waits for pipelined ACK
+    ▼
+[ESP32] CommInterface (comm_interface.cpp)
+    │  validates magic, version, CRC
+    │  deduplicates exact retries (by sequence + type + len + CRC)
+    │  deduplicates already-accepted blocks (by block_seq)
+    ▼
+MotionPlanner (motion_planner.cpp)
+    │  enforces monotonic motion_sequence order
+    │  drops stale or out-of-order segments
+    │  feeds the executor queue
+    ▼
+MultiAxisExecutor (multi_axis_executor.cpp)
+    │  expands segments into constant-rate step entries
+    │  writes entries into the SPSC step ring
+    │  calls kickStart() once per drain batch
+    ▼
+StepperDriver / RMT ISR (stepper_driver.cpp)
+    │  encode_steps() emits STEP symbols from the ring
+    │  coast mode emits pause symbols on transient starvation
+    └─► motor pulses → STEP/DIR to stepper drivers
+```
 
 ### Pipelined ACK rule
 
-Status is pipelined by one transfer. The frame returned during request `N` reflects the processing status of request `N-1`.
+SPI is full-duplex: the status frame returned **during transfer N** reflects the
+processing result of transfer **N-1**. The host must therefore always call
+`wait_for_request_result(sequence)` after sending a control request, rather than
+trusting the immediate return value.
 
-The host must therefore confirm completion with `wait_for_request_result()` rather than trusting the immediate full-duplex reply as the ACK for the current request.
+```python
+seq = transport.send_multi_axis_block(segments)
+# seq is valid, but the ACK is in the NEXT transfer's response
+transport.wait_for_request_result(seq)   # blocks until confirmed
+```
 
-## Sequence domains
+---
 
-There are three separate 16-bit sequence spaces.
+## 5. Winding geometry model
 
-- Transport sequence: `SpiMessageHeader.sequence`
-- Block sequence: `MultiAxisSegmentBlockHeader.block_seq`
-- Motion sequence: `multi_axis_segment_t.motion_sequence`
+### Window computation chain
 
-All ordering checks use signed wrap-aware comparisons in both Python and firmware. This is overflow-safe because the real queue and inflight depths stay far below half the 16-bit space.
+The lateral axis traversal window for a winding run is computed as:
 
-Further details are in `doc/sequencing.md`.
+```
+window_low  = lateral_soft_limit_min_mm    ← machine reference (plateau edge)
+            + lateral_axis_offset_mm       ← machine fine-tuning offset (usually 0.0)
+            + flatwork_thickness_mm        ← pickup-specific (per program)
+            + window_start_clearance_mm    ← safety gap (config default, per-program override)
 
-## Host architecture
+window_high = window_low
+            + bobbin_width_mm              ← interior window width
+            - window_end_clearance_mm      ← safety reduction at far end
+```
 
-The host owns all high-level motion semantics.
+Implemented in `WindingProgram.effective_window()`:
 
-- planning,
-- winding geometry,
-- saved program persistence and loaded-program selection,
-- scatter behavior,
-- RPC session control,
-- flush/retry policy,
-- transport sequencing.
-- lateral homing state and host-side soft-limit enforcement.
+```python
+def effective_window(self, *, soft_limit_min_mm, machine_offset_mm,
+                     default_start_clearance_mm, default_end_clearance_mm):
+    start_clearance = self.window_start_clearance_mm or default_start_clearance_mm
+    window_low = soft_limit_min_mm + machine_offset_mm + self.flatwork_thickness_mm + start_clearance
+    window_high = window_low + self.effective_winding_width_mm(default_end_clearance_mm)
+    return window_low, window_high
+```
 
-The host runtime is now split by responsibility rather than by startup order:
+### Layer count computation
 
-- `winding_main.py` only handles process startup and signals.
-- `app/runtime.py` wires transport, shared state, engine, and RPC.
-- `core/engine.py` owns program orchestration and command entry points.
-- `core/lateral.py` owns traverse-specific rules.
-- `core/status.py` builds explicit status/config payloads instead of relying on generic object introspection.
-- `winding/program_store.py` persists winding programs as JSON files with stable IDs and revisions for UI/API consumption.
-- `winding/adaptive.py` defines the adaptive winding session model, chunk planner, and tracked synchronized winding move.
-- `winding/service.py` owns the live winding session thread: homing, chunk planning, controlled pause/resume, window retargeting, and progress tracking.
+```python
+# num_layers is a computed property, NOT a stored field
+@property
+def num_layers(self) -> int:
+    turns_per_pass = 2.0 * self.bobbin_width_mm * self.turns_per_mm
+    return max(1, math.ceil(self.target_turns / turns_per_pass))
+```
 
-### Program library model
+### Electronic gearing
 
-Saved programs follow a Moonraker-style host-owned resource model:
+The guide position is a triangular wave over spindle turns:
 
-- the program library is stored on the Raspberry Pi filesystem,
-- each program carries a `program_id`, `revision`, `created_at`, and `updated_at`,
-- `SharedState` tracks both `loaded_program` and the actively executing `program`,
-- JSON-RPC exposes `program.*` methods for list/read/save/update/load/delete,
-- Wendy exposes REST-style endpoints under `/api/programs/*` and forwards them to JSON-RPC.
+```python
+def guide_pos_mm(self, spindle_turns: float) -> float:
+    total_dist = spindle_turns / self.turns_per_mm
+    cycle_length = 2.0 * self.bobbin_width_mm
+    mod_dist = total_dist % cycle_length
+    return mod_dist if mod_dist <= self.bobbin_width_mm else cycle_length - mod_dist
+```
 
-The winding path follows an electronic gearing model:
+Scatter adds a small, damped, non-harmonic offset from `ScatterEngine` to avoid
+inter-layer wire resonance.
 
-- `SpindleKinematics` computes bobbin turns over time.
-- `WindingPattern` maps turns to traverse position.
-- `ScatterEngine` perturbs traverse position without spilling at the flanges.
-- `SynchronizedSegmentGenerator` samples the time domain and emits synchronized multi-axis segments.
+---
 
-Manual moves and jogs use `build_jog_move()` (in `motion/move_builders.py`) which constructs a single-axis `RampMove`. All move types produce the same `MultiAxisSegment` objects consumed by the streamer.
+## 6. State machine
 
-Segment producers implement the `SegmentProducer` structural protocol (`motion/segment_producer.py`): any object with `__iter__(self) -> Iterator[MultiAxisSegment]` is accepted by the streamer. `MultiAxisSegmentGenerator` is the general implementation; `RampMove` uses the trapezoidal profile generator.
+`WindingEngine` transitions through the following states (stored in `SharedState.engine_state`):
 
-Each `MultiAxisSegment` carries a `direction_mask: int` bitmask (one bit per axis) replacing the former `directions: list[int]` per-axis list.
+```
+         submit_program()
+IDLE ─────────────────────► HOMING
+  ▲                            │  homing success
+  │                            ▼
+  │                         RUNNING ──── stop/fault ──► FAULT
+  │                            │                          │
+  │         program complete   │                  clear_fault()
+  └────────────────────────────┘◄─────────────────────────┘
+```
 
-The adaptive winding path is host-driven and chunked on purpose:
+| State | Description |
+|-------|-------------|
+| `IDLE` | No program running. Ready to accept commands. |
+| `HOMING` | Lateral homing sequence in progress. |
+| `RUNNING` | Executing winding layers. |
+| `PAUSED` | Adaptive session paused between chunks. |
+| `STOPPING` | Controlled stop requested; finishing current move. |
+| `FAULT` | Error or endstop triggered. Requires `winding.clear_fault` to recover. |
 
-- spindle turns remain the primary progress unit,
-- traverse window low/high bounds can be updated while the session is paused or while the next chunk is being planned,
-- target RPM can be changed live and a target RPM of zero is treated as a controlled pause request,
-- the host tracks turns completed, turns remaining, guide position, and active window in shared state,
-- near a traverse edge the planner brakes the spindle to zero before reversing the guide so lateral inversion time is explicit rather than implicit.
+---
 
-### Lateral axis state model
+## 7. Classic vs adaptive winding
 
-- The lateral axis home position is volatile and is treated as lost after a restart.
-- `HomingMove` is isolated in `motion/move.py` and executed phase-by-phase in `motion/move_queue.py`. Homing logic must not leak into `MultiAxisRampStreamer` or transport layers.
-- The host refuses lateral free-motion commands until homing completes.
-- Soft travel limits are enforced on the host before a lateral move is enqueued, so queue serialization and SPI block delivery remain unchanged.
-- After homing, the host streamer keeps the lateral enable pin asserted across later moves; if firmware status shows the enable bit dropped, the host invalidates the stored home state.
+### Classic — `WindingEngine`
 
-## Firmware architecture
+Used via `winding.submit_program`. Parameters are fixed at the start.
 
-The ESP32 is split by responsibility, not by UI concepts.
+```
+submit_program(program, params)
+  │
+  ├─ [if home_before_start] home lateral → reposition to window_low
+  │
+  └─ for layer_index in range(program.num_layers):
+       WoundMove(spindle + lateral, full traversal, scatter)
+       → enqueue to MoveQueue
+       → wait for drain
+       → reverse direction for next layer
+```
 
-### Core 0
+### Adaptive — `AdaptiveWindingService`
 
-- SPI slave task
-- sensor task
-- endstop event publication
+Used via `winding.start_session`. Supports live parameter updates.
 
-### Core 1
+```
+start_session(program, params)
+  │
+  └─ worker thread:
+       resolve window via program.effective_window()
+       while turns_remaining > 0 and not stopped:
+         chunk = plan_next_chunk(runtime)   ← ~250 ms of motion
+         enqueue AdaptiveWindingMove
+         wait for drain
+         update progress
+         [apply pending window / RPM changes]
+```
 
-- planner execution path
-- ring fill and kick-start decisions
-- RMT pulse streaming
+The planner brakes the spindle to zero at each traverse edge so the reversal time
+is deterministic rather than implicit.
 
-The firmware does not compute winding geometry. It only validates, queues, expands, and executes what the host planned.
+---
 
-## Motion execution invariants
+## 8. Program library
 
-These invariants are intentional and should not be weakened:
+Saved programs are stored on the Raspberry Pi filesystem under `data/programs/`.
+Each file is a JSON object produced by `WindingProgram.to_dict()`.
 
-- `encode_steps()` and `on_trans_done_isr()` stay in IRAM.
-- SPI DMA frame buffers stay `DMA_ATTR`.
-- The ring buffer is SPSC lock-free.
-- `pushExpandedBlock()` does not start the driver.
-- `executeConstantRateBlock()` does not start the driver.
-- `kickStart()` runs once after a drain batch, not per segment.
-- Host-side streamer maintains a deeper planner queue at high speed: 32-segment lookahead and up to 200ms of buffered motion.
-- Coast mode emits pause symbols on transient starvation instead of stopping the RMT.
-- Coast pauses are timed to the last step interval so the ISR does not flood the executor at high speed.
+```json
+{
+  "program_id": "strat-bridge-42awg",
+  "name": "Stratocaster bridge — 42 AWG",
+  "revision": 1,
+  "target_turns": 8000,
+  "layer_pitch_mm": 0.065,
+  "wire_diameter_mm": 0.063,
+  "bobbin_width_mm": 13.2,
+  "flatwork_thickness_mm": 3.2,
+  "scatter_amplitude_mm": 0.03,
+  "scatter_freq1": 1.0,
+  "scatter_freq2": 1.618
+}
+```
 
-## Sensor model
+`ProgramStore` provides CRUD with stable `program_id` slugs, monotonic `revision`
+numbers, and `created_at` / `updated_at` timestamps.
 
-The ESP32 owns raw sensor acquisition.
+---
 
-- HX711 load cells are read non-blockingly.
-- The potentiometer is sampled through ADC1.
-- The manual encoder is decoded with PCNT.
-- The two-contact home sensor validates both NO and NC states.
+## 9. Data directory layout
 
-The Raspberry Pi consumes normalized state and owns higher-level policy such as tension control and workflow decisions.
+```
+~/data/                         Default root (configurable via WinderApplication)
+  config.json                   AppConfiguration — machine-level parameters
+  programs/
+    <program_id>.json           One file per saved WindingProgram
+```
 
-## Hardware map summary
+The data directory is created automatically on first run.
 
-| Function | GPIO |
-|---|---:|
-| Bobbin STEP / DIR / EN | 26 / 27 / 14 |
-| Lateral STEP / DIR / EN | 32 / 33 / 25 |
-| Lateral home NO / NC | 22 / 21 |
-| SPI MOSI / MISO / SCLK / CS | 23 / 19 / 18 / 5 |
-| SPI READY | 17 |
-| Raspberry Pi SHUTDOWN_REQ | 16 |
-| HX711 #0 SCK / DOUT | 13 / 34 |
-| HX711 #1 SCK / DOUT | 12 / 39 |
-| Potentiometer | 36 |
-| Encoder A / B | 0 / 15 |
+---
 
-## Repository boundaries
+## 10. Thread model
 
-- `src/` contains the active code.
-- `doc/` contains maintained project documentation.
-- `doc/generated/` is reserved for generated plots and exported segment JSON.
-- `resources/` and `migration/` are reference trees and are not the active implementation.
+| Thread | Owner | Role |
+|--------|-------|------|
+| Main | `winding_main.py` | Blocking sleep loop; handles signals. |
+| MoveQueue | `MoveQueue` | Serializes and streams moves to the firmware. |
+| WindingEngine | `WindingEngine` | Executes classic programs in a daemon thread. |
+| AdaptiveWinding | `AdaptiveWindingService` | Executes adaptive sessions in a daemon thread. |
+| JsonRpcServer | `JsonRpcServer` | Accepts and dispatches incoming RPC connections. |
 
-## Related documents
+`SharedState` is protected by a single `threading.RLock` (reentrant so the engine
+can call multiple setters without risk of deadlock).
 
-- `doc/spi_protocol.md`
-- `doc/stepper_engine.md`
-- `doc/sequencing.md`
-- `.github/copilot-instructions.md`
+---
+
+## 11. Cross-reference to other docs
+
+| Topic | Document |
+|-------|----------|
+| SPI frame format, message types, ACK semantics | [spi_protocol.md](spi_protocol.md) |
+| Sequence spaces, wrap-around, deduplication | [sequencing.md](sequencing.md) |
+| ESP32 RMT ring, coast mode, key constants | [stepper_engine.md](stepper_engine.md) |

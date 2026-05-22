@@ -1,8 +1,26 @@
-from __future__ import annotations
+"""
+Application composition root for the PickupWinder host.
 
-import logging
-from pathlib import Path
-import re
+``WinderApplication.__init__`` constructs every component in dependency order
+and wires them together. No business logic lives here — this module is a pure
+assembly layer.
+
+Component wiring order:
+  1. Load AppConfiguration from disk (or use the provided instance).
+  2. Open the SPI transport (``Esp32SpiTransport``).
+  3. Create ``ProgramStore`` (JSON program library on disk).
+  4. Create ``SharedState`` and ``EventBus`` (shared runtime state + events).
+  5. Create ``MoveQueue`` (serialises moves into the SPI pipeline).
+  6. Create ``LateralAxisController`` (homing and soft-limit enforcement).
+  7. Create ``MotionCommandService`` (convenience move builders for RPC).
+  8. Create ``AdaptiveWindingService`` (live session executor).
+  9. Create ``WindingEngine`` (classic program executor).
+ 10. Create ``MotionCoordinator`` (centralized stop/fault coordination).
+ 11. Create ``RuntimeStatusService`` (snapshot builder for RPC responses).
+ 12. Wire all handlers into ``JsonRpcServer`` via ``WindingRpcHandler``.
+"""
+
+
 
 from core import ConfigurationManager, WindingEngine
 from core.config import AppConfiguration
@@ -24,12 +42,16 @@ from winding.program_store import ProgramStore
 logger = logging.getLogger(__name__)
 
 
+def _default_data_dir() -> Path:
+    return Path.home() / "data"
+
+
 def _default_config_file_path() -> Path:
-    return Path.home() / ".config" / "pickupwinder" / "config.json"
+    return _default_data_dir() / "config.json"
 
 
 def _default_program_store_dir() -> Path:
-    return Path.home() / ".local" / "share" / "pickupwinder" / "programs"
+    return _default_data_dir() / "programs"
 
 
 def _parse_spi_device(device_path: str) -> tuple[int, int]:
@@ -86,6 +108,7 @@ class WinderApplication:
         self,
         config: AppConfiguration | None = None,
         config_file_path: str | Path | None = None,
+        program_store_dir: str | Path | None = None,
     ) -> None:
         resolved_config_path = (
             Path(config_file_path)
@@ -100,7 +123,12 @@ class WinderApplication:
             self.config_manager.active_configuration = self.config
 
         self.transport = _create_transport(self.config)
-        self.program_store = ProgramStore(_default_program_store_dir())
+        resolved_program_store_dir = (
+            Path(program_store_dir)
+            if program_store_dir is not None
+            else _default_program_store_dir()
+        )
+        self.program_store = ProgramStore(resolved_program_store_dir)
         self.shared_state = SharedState(axis_states=_build_axis_states(self.config))
         self.event_bus = EventBus()
 
@@ -136,6 +164,7 @@ class WinderApplication:
             shared_state=self.shared_state,
             move_queue=self.move_queue,
             lateral_controller=self.lateral_controller,
+            commands=self.commands,
             event_bus=self.event_bus,
             config=self.config,
         )
@@ -153,7 +182,11 @@ class WinderApplication:
             transport_diagnostics_provider=self.transport.transport_diagnostics,
             engine_health_provider=self.engine.health_status,
             adaptive_health_provider=self.adaptive_winding.health_status,
-            rpc_health_provider=lambda: self.rpc_server.health_status(),
+            rpc_health_provider=lambda: (
+                self.rpc_server.health_status()
+                if hasattr(self, "rpc_server")
+                else {"status": "initializing"}
+            ),
         )
         self.rpc_handler = SystemRpcHandler(status_service=self.status_service)
         WindingRpcHandler(

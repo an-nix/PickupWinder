@@ -20,6 +20,22 @@ from rpc import (
 )
 
 
+_RPC_CLIENT_ERROR_CODES: frozenset[int] = frozenset((-32700, -32600, -32601, -32602))
+
+
+def _rpc_error_to_http(code: int) -> int:
+    """Map a JSON-RPC error code to an HTTP status code.
+
+    Client errors (-32700/-32600/-32601/-32602) → 400/404.
+    Server errors (-32000 to -32099) and application errors → 502.
+    """
+    if code == -32601:
+        return 404
+    if code in _RPC_CLIENT_ERROR_CODES:
+        return 400
+    return 502
+
+
 class JsonRpcHandlerMixin:
     def write_jsonrpc_response(self, response: dict[str, Any]) -> None:
         self.set_header("Content-Type", "application/json")
@@ -43,12 +59,17 @@ class JsonRpcHandlerMixin:
     ) -> bool:
         request_id = int(time.time() * 1000)
         request_payload = make_request(method, params=params, request_id=request_id)
-        response = self.application.rpc_client.send_raw(request_payload)
+        try:
+            response = self.application.rpc_client.send_raw(request_payload)
+        except RuntimeError as exc:
+            self.write_json({"error": f"RPC transport error: {exc}"}, status=503)
+            return False
         if response is None:
             self.set_status(204)
             return False
         if "error" in response:
-            self.write_json(response, status=502)
+            _code = response["error"].get("code", -32000) if isinstance(response.get("error"), dict) else -32000
+            self.write_json(response, status=_rpc_error_to_http(_code))
             return False
         self.write_json(response.get("result", response), status=success_status)
         return True
@@ -97,20 +118,14 @@ class JsonRpcWebSocketHandler(tornado.websocket.WebSocketHandler, JsonRpcHandler
         return True
 
 
-class OpenApiHandler(tornado.web.RequestHandler):
-    def get(self) -> None:
-        self.set_header("Content-Type", "application/json")
-        self.write(json.dumps(self.application.openapi_schema))
-
-
 class WindingRunAxisHandler(tornado.web.RequestHandler):
     def get(self) -> None:
         try:
             axis_id = int(self.get_query_argument("axis_id"))
             rpm = float(self.get_query_argument("rpm"))
             duration_s = float(self.get_query_argument("duration_s"))
-            #reverse = bool(self.get_query_argument("reverse", default="0"))
-            reverse = self.get_query_argument("reverse", default=False)
+            _reverse_raw = self.get_query_argument("reverse", default="0")
+            reverse = _reverse_raw.lower() not in {"0", "false", "no", ""}
         except tornado.web.MissingArgumentError as exc:
             self.set_status(400)
             self.write(json.dumps({"error": str(exc)}))
@@ -268,6 +283,117 @@ class ProgramQueueHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
         )
 
 
+class ProgramRevisionsHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """GET /api/programs/{id}/revisions — list backup revisions."""
+
+    def get(self, program_id: str) -> None:
+        self.rpc_result(
+            "program.list_revisions",
+            params={"program_id": unquote(program_id)},
+        )
+
+
+class ProgramRestoreHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/programs/{id}/restore/{revision} — restore a backup revision."""
+
+    def post(self, program_id: str, revision: str) -> None:
+        self.rpc_result(
+            "program.restore_revision",
+            params={"program_id": unquote(program_id), "revision": int(revision)},
+        )
+
+
+class SessionHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """GET/POST/DELETE/PATCH /api/session — adaptive winding session control."""
+
+    def get(self) -> None:
+        self.rpc_result("winding.session_status")
+
+    def post(self) -> None:
+        try:
+            body = json.loads(self.request.body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            self.write_json({"error": f"Invalid JSON: {exc}"}, status=400)
+            return
+        if not isinstance(body, dict):
+            self.write_json({"error": "Request body must be a JSON object"}, status=400)
+            return
+        session = body.get("session", body)
+        self.rpc_result("winding.start_session", params={"session": session}, success_status=202)
+
+    def delete(self) -> None:
+        mode = self.get_query_argument("mode", default="stop")
+        self.rpc_result("winding.stop", params={"mode": mode})
+
+    def patch(self) -> None:
+        try:
+            body = json.loads(self.request.body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            self.write_json({"error": f"Invalid JSON: {exc}"}, status=400)
+            return
+        if not isinstance(body, dict) or not body:
+            self.write_json({"error": "Body must be a non-empty JSON object"}, status=400)
+            return
+        self.rpc_result("winding.update_session", params=body)
+
+
+class SessionFromProgramHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/session/from-program — start adaptive mode from a stored program."""
+
+    def post(self) -> None:
+        body: dict[str, Any] = {}
+        if self.request.body:
+            try:
+                body = json.loads(self.request.body.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                self.write_json({"error": f"Invalid JSON: {exc}"}, status=400)
+                return
+        if not isinstance(body, dict):
+            self.write_json({"error": "Request body must be a JSON object"}, status=400)
+            return
+
+        params: dict[str, Any] = {}
+        if "program_id" in body:
+            params["program_id"] = body["program_id"]
+        if "program" in body:
+            params["program"] = body["program"]
+        if "load" in body:
+            params["load"] = bool(body["load"])
+        if "total_turns" in body:
+            params["total_turns"] = float(body["total_turns"])
+        if "chunk_time_s" in body:
+            params["chunk_time_s"] = float(body["chunk_time_s"])
+
+        self.rpc_result(
+            "winding.start_session_from_program",
+            params=params,
+            success_status=202,
+        )
+
+
+class SessionPauseHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/session/pause"""
+
+    def post(self) -> None:
+        body: dict[str, Any] = {}
+        if self.request.body:
+            try:
+                body = json.loads(self.request.body.decode("utf-8"))
+            except json.JSONDecodeError:
+                pass
+        self.rpc_result(
+            "winding.pause",
+            params={"pause_at_turn": body.get("pause_at_turn")},
+        )
+
+
+class SessionResumeHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/session/resume"""
+
+    def post(self) -> None:
+        self.rpc_result("winding.resume_session")
+
+
 class WindingClearFaultHandler(tornado.web.RequestHandler):
     def get(self) -> None:
         request_payload = make_request("winding.clear_fault", params=None, request_id=1)
@@ -283,65 +409,23 @@ class WindingClearFaultHandler(tornado.web.RequestHandler):
         self.write(json.dumps(response.get("result", response)))
 
 
-class WindingWoundRunHandler(tornado.web.RequestHandler):
-    """POST /wound_run — launch a synchronized two-axis winding run.
+class WindingWoundRunHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /wound_run — launch a synchronized two-axis winding run (legacy).
 
-    Accepts a JSON body with the same fields as ``winding.wound_run``.
-    Required: spindle_axis_id, traverse_axis_id, target_rpm,
-              bobbin_width_mm, turns_per_mm.
-    Optional: accel_s, cruise_s, decel_s, scatter_amplitude_mm,
-              scatter_damping_margin_mm, scatter_freq1, scatter_freq2,
-              spindle_reverse, traverse_reverse.
+    .. deprecated::
+        Use ``POST /api/machine/wound-run`` instead.
     """
 
     def post(self) -> None:
         try:
             body = json.loads(self.request.body.decode("utf-8"))
         except json.JSONDecodeError as exc:
-            self.set_status(400)
-            self.write(json.dumps({"error": f"Invalid JSON: {exc}"}))
+            self.write_json({"error": f"Invalid JSON: {exc}"}, status=400)
             return
-
-        required = {"spindle_axis_id", "traverse_axis_id", "target_rpm",
-                    "bobbin_width_mm", "turns_per_mm"}
-        missing = required - body.keys()
-        if missing:
-            self.set_status(400)
-            self.write(json.dumps({"error": f"Missing required fields: {sorted(missing)}"}))
+        if not isinstance(body, dict):
+            self.write_json({"error": "Request body must be a JSON object"}, status=400)
             return
-
-        params: dict = {
-            "spindle_axis_id": int(body["spindle_axis_id"]),
-            "traverse_axis_id": int(body["traverse_axis_id"]),
-            "target_rpm": float(body["target_rpm"]),
-            "bobbin_width_mm": float(body["bobbin_width_mm"]),
-            "turns_per_mm": float(body["turns_per_mm"]),
-        }
-        for opt_float in ("accel_s", "cruise_s", "decel_s",
-                           "scatter_amplitude_mm", "scatter_damping_margin_mm",
-                           "scatter_freq1", "scatter_freq2"):
-            if opt_float in body:
-                params[opt_float] = float(body[opt_float])
-        for opt_bool in ("spindle_reverse", "traverse_reverse"):
-            if opt_bool in body:
-                params[opt_bool] = bool(body[opt_bool])
-
-        request_id = int(time.time() * 1000)
-        request_payload = make_request(
-            "winding.wound_run",
-            params=params,
-            request_id=request_id,
-        )
-        response = self.application.rpc_client.send_raw(request_payload)
-        if response is None:
-            self.set_status(204)
-            return
-        if "error" in response:
-            self.set_status(502)
-            self.write(json.dumps(response))
-            return
-        self.set_header("Content-Type", "application/json")
-        self.write(json.dumps(response.get("result", response)))
+        self.rpc_result("winding.wound_run", params=body, success_status=202)
 
 
 class WindingStopHandler(tornado.web.RequestHandler):
@@ -367,54 +451,142 @@ class WindingStopHandler(tornado.web.RequestHandler):
         self.write(json.dumps(response.get("result", response)))
 
 
-class ReDocHandler(tornado.web.RequestHandler):
+# MachineHomeHandler, MachineClearFaultHandler, MachineStopHandler,
+# MachineStatusHandler, MachineRunAxisHandler, MachineWoundRunHandler
+# live in the /api/machine/ namespace — proper REST verbs, no side-effects on GET.
+
+
+class MachineStatusHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """GET /api/machine/status — machine state, move-queue depth, axis positions."""
+
     def get(self) -> None:
-        self.set_header("Content-Type", "text/html")
-        self.write(
-            """
-            <!DOCTYPE html>
-            <html>
-            <head>
-              <title>Wendy JSON-RPC API</title>
-              <meta charset="utf-8" />
-            </head>
-            <body>
-              <redoc spec-url='/openapi.json'></redoc>
-              <script src='https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js'></script>
-            </body>
-            </html>
-            """
+        self.rpc_result("winding.status")
+
+
+class MachineHomeHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/machine/home — start the lateral homing sequence."""
+
+    def post(self) -> None:
+        self.rpc_result("winding.home_lateral", success_status=202)
+
+
+class MachineClearFaultHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/machine/clear-fault — clear the fault state."""
+
+    def post(self) -> None:
+        self.rpc_result("winding.clear_fault")
+
+
+class MachineStopHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/machine/stop — stop or pause motion."""
+
+    def post(self) -> None:
+        body: dict[str, Any] = {}
+        if self.request.body:
+            try:
+                body = json.loads(self.request.body.decode("utf-8"))
+            except json.JSONDecodeError:
+                pass
+        mode = body.get("mode", "stop")
+        self.rpc_result("winding.stop", params={"mode": mode})
+
+
+class MachineRunAxisHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/machine/run-axis — run one or two axes for duration_s."""
+
+    def post(self) -> None:
+        try:
+            body = json.loads(self.request.body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            self.write_json({"error": f"Invalid JSON: {exc}"}, status=400)
+            return
+        if not isinstance(body, dict):
+            self.write_json({"error": "Request body must be a JSON object"}, status=400)
+            return
+        self.rpc_result(
+            "winding.run_axis",
+            params={
+                "duration_s": body.get("duration_s"),
+                "targets": body.get("targets", []),
+            },
+            success_status=202,
         )
 
 
-from docs import make_openapi_schema, SwaggerUIHandler
+class MachineWoundRunHandler(tornado.web.RequestHandler, JsonRpcHandlerMixin):
+    """POST /api/machine/wound-run — diagnostic/dev synchronized winding."""
+
+    def post(self) -> None:
+        try:
+            body = json.loads(self.request.body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            self.write_json({"error": f"Invalid JSON: {exc}"}, status=400)
+            return
+        if not isinstance(body, dict):
+            self.write_json({"error": "Request body must be a JSON object"}, status=400)
+            return
+        self.rpc_result("winding.wound_run", params=body, success_status=202)
+
+
+from docs import make_openapi_schema, OpenApiHandler, ReDocHandler, SwaggerUIHandler
+
+
+class WinderApp(tornado.web.Application):
+    """Tornado application with typed RPC client and WebSocket registry."""
+
+    def __init__(
+        self,
+        handlers: list,
+        rpc_client: UnixJsonRpcClient,
+        openapi_schema: dict,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(handlers, **kwargs)
+        self.rpc_client: UnixJsonRpcClient = rpc_client
+        self.ws_clients: set[JsonRpcWebSocketHandler] = set()
+        self.openapi_schema: dict = openapi_schema
 
 
 def make_application(
     rpc_client: UnixJsonRpcClient,
     supported_methods: list[str] | None = None,
-) -> tornado.web.Application:
-    application = tornado.web.Application(
-        [
-            (r"/rpc", JsonRpcHttpHandler, dict(rpc_client=rpc_client)),
+) -> WinderApp:
+    openapi_schema = make_openapi_schema(supported_methods)
+    return WinderApp(
+        handlers=[
+            (r"/rpc", JsonRpcHttpHandler),
             (r"/ws", JsonRpcWebSocketHandler),
+            # REST API — /api/
             (r"/api/programs", ProgramCollectionHandler),
-            (r"/api/programs/([^/]+)", ProgramItemHandler),
+            (r"/api/programs/([^/]+)/revisions", ProgramRevisionsHandler),
+            (r"/api/programs/([^/]+)/restore/(\d+)", ProgramRestoreHandler),
             (r"/api/programs/([^/]+)/load", ProgramLoadHandler),
             (r"/api/programs/([^/]+)/queue", ProgramQueueHandler),
+            (r"/api/programs/([^/]+)", ProgramItemHandler),
+            (r"/api/session/from-program", SessionFromProgramHandler),
+            (r"/api/session/pause", SessionPauseHandler),
+            (r"/api/session/resume", SessionResumeHandler),
+            (r"/api/session", SessionHandler),
+            # Machine control — POST for side-effects, GET for status
+            (r"/api/machine/status", MachineStatusHandler),
+            (r"/api/machine/home", MachineHomeHandler),
+            (r"/api/machine/clear-fault", MachineClearFaultHandler),
+            (r"/api/machine/stop", MachineStopHandler),
+            (r"/api/machine/run-axis", MachineRunAxisHandler),
+            (r"/api/machine/wound-run", MachineWoundRunHandler),
+            # Legacy routes — kept for backward compatibility
             (r"/run_axis", WindingRunAxisHandler),
             (r"/wound_run", WindingWoundRunHandler),
             (r"/stop", WindingStopHandler),
             (r"/home", WindingHomeHandler),
             (r"/status", WindingStatusHandler),
             (r"/clear_fault", WindingClearFaultHandler),
+            # Documentation
             (r"/openapi.json", OpenApiHandler),
             (r"/docs", ReDocHandler),
             (r"/swagger", SwaggerUIHandler),
         ],
+        rpc_client=rpc_client,
+        openapi_schema=openapi_schema,
         debug=False,
     )
-    application.rpc_client = rpc_client
-    application.ws_clients = set()
-    application.openapi_schema = make_openapi_schema(supported_methods)
-    return application

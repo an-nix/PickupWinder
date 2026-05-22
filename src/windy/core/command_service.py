@@ -26,7 +26,7 @@ from motion.move_queue import MoveQueue
 from motion.ramp_config import compute_ramp_times
 from motion.spindle_kinematics import SpindleKinematics
 from transport.spi_transport import Esp32SpiTransport
-from winding import ScatterEngine, SyncAxisConfig, WindingPattern, WoundMove
+from winding import build_wound_move
 
 
 logger = logging.getLogger(__name__)
@@ -368,38 +368,27 @@ class MotionCommandService:
                     error_pct,
                 )
 
-        move = WoundMove(
+        move = build_wound_move(
             name="winding_electronic_gearing",
-            kinematics=SpindleKinematics(
-                target_rpm=target_rpm,
-                start_rpm=0.0,
-                accel_s=accel_s,
-                cruise_s=cruise_s,
-                decel_s=decel_s,
+            spindle_rpm=target_rpm,
+            accel_s=accel_s,
+            cruise_s=cruise_s,
+            decel_s=decel_s,
+            bobbin_width_mm=bobbin_width_mm,
+            turns_per_mm=turns_per_mm,
+            scatter_amplitude_mm=scatter_amplitude_mm,
+            scatter_damping_margin_mm=scatter_damping_margin_mm,
+            scatter_freq1=scatter_freq1,
+            scatter_freq2=scatter_freq2,
+            spindle_axis_id=spindle_axis_id,
+            spindle_steps_per_rev=(
+                self._config.spindle_steps_per_revolution
+                * self._config.spindle_microstepping
             ),
-            pattern=WindingPattern(
-                bobbin_width_mm=bobbin_width_mm,
-                turns_per_mm=turns_per_mm,
-            ),
-            scatter=ScatterEngine(
-                amplitude_mm=scatter_amplitude_mm,
-                freq1=scatter_freq1,
-                freq2=scatter_freq2,
-                damping_margin_mm=scatter_damping_margin_mm,
-            ),
-            spindle_cfg=SyncAxisConfig(
-                axis_index=spindle_axis_id,
-                steps_per_unit=(
-                    self._config.spindle_steps_per_revolution
-                    * self._config.spindle_microstepping
-                ),
-                reverse_direction=spindle_reverse,
-            ),
-            traverse_cfg=SyncAxisConfig(
-                axis_index=traverse_axis_id,
-                steps_per_unit=self._config.lateral_steps_per_mm,
-                reverse_direction=traverse_reverse,
-            ),
+            spindle_reverse=spindle_reverse,
+            lateral_axis_id=traverse_axis_id,
+            lateral_steps_per_mm=self._config.lateral_steps_per_mm,
+            lateral_reverse=traverse_reverse,
         )
         self._move_queue.enqueue(move)
 
