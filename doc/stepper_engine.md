@@ -2,11 +2,11 @@
 
 ## Active stack
 
-- `src/esp32/src/comm_interface.cpp`
-- `src/esp32/src/motion_planner.cpp`
-- `src/esp32/src/step_types.h`
-- `src/esp32/src/stepper_queue.cpp`
-- `src/esp32/src/stepper_driver.cpp`
+- `src/esp32/src/comm/comm_interface.cpp`
+- `src/esp32/src/motion/motion_planner.cpp`
+- `src/esp32/src/motion/step_types.h`
+- `src/esp32/src/motion/stepper_queue.cpp`
+- `src/esp32/src/motion/stepper_driver.cpp`
 - `src/windy/transport/messages.py`
 - `src/windy/transport/spi_transport.py`
 - `src/windy/transport/streamer.py`

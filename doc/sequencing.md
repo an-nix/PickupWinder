@@ -9,7 +9,7 @@ The runtime uses three distinct 16-bit sequence spaces.
 ### 1. Transport request sequence
 
 - Field: `SpiMessageHeader.sequence`
-- Producer: host transport in `src/rpi/transport/spi_transport.py`
+- Producer: host transport in `src/windy/transport/spi_transport.py`
 - Consumer: `CommInterface` status publishing through `last_rx_sequence`
 - Purpose: correlate a request with its real ACK/result
 

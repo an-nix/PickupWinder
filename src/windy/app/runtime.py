@@ -1,8 +1,26 @@
-from __future__ import annotations
+"""
+Application composition root for the PickupWinder host.
 
-import logging
-from pathlib import Path
-import re
+``WinderApplication.__init__`` constructs every component in dependency order
+and wires them together. No business logic lives here — this module is a pure
+assembly layer.
+
+Component wiring order:
+  1. Load AppConfiguration from disk (or use the provided instance).
+  2. Open the SPI transport (``Esp32SpiTransport``).
+  3. Create ``ProgramStore`` (JSON program library on disk).
+  4. Create ``SharedState`` and ``EventBus`` (shared runtime state + events).
+  5. Create ``MoveQueue`` (serialises moves into the SPI pipeline).
+  6. Create ``LateralAxisController`` (homing and soft-limit enforcement).
+  7. Create ``MotionCommandService`` (convenience move builders for RPC).
+  8. Create ``AdaptiveWindingService`` (live session executor).
+  9. Create ``WindingEngine`` (classic program executor).
+ 10. Create ``MotionCoordinator`` (centralized stop/fault coordination).
+ 11. Create ``RuntimeStatusService`` (snapshot builder for RPC responses).
+ 12. Wire all handlers into ``JsonRpcServer`` via ``WindingRpcHandler``.
+"""
+
+
 
 from core import ConfigurationManager, WindingEngine
 from core.config import AppConfiguration
